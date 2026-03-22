@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      * { margin: 0; padding: 0; }
+      html, body { height: 100%; overflow: hidden; background: #000; }
+      body {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      img {
+        width: 380px;
+        height: auto;
+        animation: appear 0.5s ease-out;
+      }
+      @keyframes appear {
+        from { opacity: 0; transform: translateY(10px); }
+        to   { opacity: 1; transform: translateY(0); }
+      }
+    </style>
+  </head>
+  <body>
+    <img src="/desktop-shell/alfred-splash.png" alt="Alfred" />
+  </body>
+</html>

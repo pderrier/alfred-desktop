@@ -1,0 +1,537 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Alfred Desktop Shell</title>
+    <link rel="stylesheet" href="/shared/shell-theme.css" />
+    <link rel="stylesheet" href="/desktop-shell/styles.css" />
+  </head>
+  <body>
+    <div id="js-runtime-error" class="js-runtime-error hidden" role="alert" aria-live="assertive"></div>
+    <script>
+      (function () {
+        function showRuntimeError(message) {
+          var text = "JavaScript error: " + String(message || "unknown_error");
+          // Show in splash status if splash is visible
+          var splashStatus = document.getElementById("splash-status");
+          if (splashStatus) {
+            splashStatus.style.color = "#f08a77";
+            splashStatus.textContent = text;
+          }
+          // Also show in error bar
+          var node = document.getElementById("js-runtime-error");
+          if (node) {
+            node.classList.remove("hidden");
+            node.textContent = text;
+          }
+        }
+        window.addEventListener("error", function (event) {
+          showRuntimeError(event && (event.message || (event.error && event.error.message)));
+        });
+        window.addEventListener("unhandledrejection", function (event) {
+          var reason = event && event.reason;
+          var message = reason && reason.message ? reason.message : reason;
+          showRuntimeError(message || "unhandled_rejection");
+        });
+      })();
+    </script>
+
+    <!-- ── Splash screen ─────────────────────────────────────────── -->
+    <div id="splash-screen" class="splash-screen">
+      <div class="splash-content">
+        <img class="splash-image" src="/desktop-shell/alfred-splash.png" alt="Alfred" />
+        <div class="splash-text">
+          <div id="splash-loader" class="splash-loader">
+            <div class="splash-loader-bar"></div>
+          </div>
+          <p id="splash-status" class="splash-status">Starting up...</p>
+
+          <!-- Unified connection check -->
+          <div id="splash-connect" class="splash-setup hidden">
+            <div id="splash-row-openai" class="splash-connect-row">
+              <span id="splash-openai-icon" class="splash-connect-icon">&#9679;</span>
+              <span class="splash-connect-label">OpenAI</span>
+              <span id="splash-openai-status" class="splash-connect-status">checking...</span>
+              <button id="splash-openai-btn" class="cmd-btn cmd-btn-sm hidden" type="button">Connect</button>
+            </div>
+            <div id="splash-row-finary" class="splash-connect-row">
+              <span id="splash-finary-icon" class="splash-connect-icon">&#9679;</span>
+              <span class="splash-connect-label">Finary</span>
+              <span id="splash-finary-status" class="splash-connect-status">checking...</span>
+              <button id="splash-finary-btn" class="cmd-btn cmd-btn-sm hidden" type="button">Connect</button>
+            </div>
+            <p id="splash-connect-hint" class="splash-setup-hint"></p>
+            <div class="splash-connect-actions">
+              <button id="splash-continue" class="cmd-btn splash-continue" type="button">Continue</button>
+              <button id="splash-csv-bypass" class="cmd-btn ghost-btn" type="button">Use CSV this session</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Top bar ─────────────────────────────────────────────────── -->
+    <header class="top-bar">
+      <img class="top-bar-icon" src="/desktop-shell/alfred-icon.png" alt="Alfred" />
+      <span class="top-bar-title">Alfred</span>
+      <button id="home-btn" class="home-btn ghost-btn" type="button" title="Home">&#8962;</button>
+      <nav class="command-bar" aria-label="Actions">
+        <button id="cmd-run-analysis" class="cmd-btn" type="button">Run Analysis</button>
+        <button id="cmd-stop-analysis" class="cmd-btn cmd-btn-danger hidden" type="button">Stop</button>
+        <button id="cmd-connect-openai" class="cmd-btn ghost-btn hidden" type="button">Connect OpenAI</button>
+        <button id="cmd-sync-finary" class="cmd-btn ghost-btn hidden" type="button">Reconnect Finary</button>
+        <button id="cmd-retry-synthesis" class="cmd-btn ghost-btn hidden" type="button">Retry Synthesis</button>
+      </nav>
+      <div class="top-bar-spacer"></div>
+      <div class="status-pills-row">
+        <button id="status-pill" class="status-pill tone-unknown" type="button" title="System status">
+          <span class="status-pill-dot"></span>
+          <span id="status-pill-label" class="status-pill-label">Checking</span>
+        </button>
+        <button id="auth-pill-openai" class="auth-pill tone-unknown" type="button" title="OpenAI status">
+          <span class="auth-pill-dot"></span>
+          <span class="auth-pill-label">OpenAI</span>
+        </button>
+        <button id="auth-pill-finary" class="auth-pill tone-unknown" type="button" title="Finary status">
+          <span class="auth-pill-dot"></span>
+          <span class="auth-pill-label">Finary</span>
+        </button>
+      </div>
+      <button id="gear-btn" class="gear-btn ghost-btn" type="button" title="Settings & advanced">&#9881;</button>
+      <div class="window-controls">
+        <button id="win-minimize" class="win-ctrl-btn" type="button" title="Minimize">&#x2015;</button>
+        <button id="win-maximize" class="win-ctrl-btn" type="button" title="Maximize">&#9633;</button>
+        <button id="win-close" class="win-ctrl-btn win-ctrl-close" type="button" title="Close">&#10005;</button>
+      </div>
+    </header>
+
+    <!-- ── Status popover ──────────────────────────────────────────── -->
+    <div id="status-popover" class="status-popover hidden">
+      <p id="popover-finary-status" class="popover-row">All services native</p>
+      <p id="popover-snapshot-ts" class="popover-row popover-muted">Snapshot: none</p>
+      <p id="popover-run-status" class="popover-row popover-muted">Run: idle</p>
+      <button id="popover-reconnect-btn" class="ghost-btn popover-btn hidden" type="button">Reconnect</button>
+    </div>
+
+    <!-- ── Auth popover (opens on auth pill click) ─────────────────── -->
+    <div id="auth-popover" class="status-popover hidden">
+      <div class="auth-popover-row">
+        <span class="auth-popover-label">OpenAI / Codex</span>
+        <span id="auth-popover-openai-status" class="auth-popover-status">checking...</span>
+        <button id="auth-popover-openai-login" class="ghost-btn popover-btn" type="button">Sign in</button>
+        <button id="auth-popover-openai-logout" class="ghost-btn popover-btn danger-btn hidden" type="button">Sign out</button>
+      </div>
+      <div class="auth-popover-row">
+        <span class="auth-popover-label">Finary</span>
+        <span id="auth-popover-finary-status" class="auth-popover-status">checking...</span>
+        <button id="auth-popover-finary-connect" class="ghost-btn popover-btn" type="button">Connect</button>
+      </div>
+    </div>
+
+    <!-- ── Top bar progress ──────────────────────────────────────── -->
+    <div id="top-bar-progress" class="top-bar-progress hidden">
+      <div id="top-bar-progress-fill" class="top-bar-progress-fill"></div>
+    </div>
+
+    <!-- ── Main layout: sidebar + content ──────────────────────────── -->
+    <div class="app-layout">
+
+      <!-- ── Sidebar ─────────────────────────────────────────────── -->
+      <aside class="sidebar" id="sidebar">
+        <div id="sidebar-accounts" class="sidebar-accounts"></div>
+        <div id="sidebar-empty" class="sidebar-empty">
+          <p class="sidebar-empty-text">No portfolio data yet.</p>
+          <button id="sidebar-sync-btn" class="cmd-btn" type="button">Run Analysis</button>
+        </div>
+        <button id="sidebar-new-run" class="sidebar-new-run cmd-btn ghost-btn" type="button">+ New run</button>
+      </aside>
+
+      <!-- ── Main panel ──────────────────────────────────────────── -->
+      <main id="main-panel">
+
+        <!-- Welcome / Home state (no run selected) -->
+        <section id="main-welcome" class="card main-welcome">
+          <h2 id="welcome-title">Alfred</h2>
+          <div id="welcome-content"></div>
+        </section>
+
+        <!-- Account view (no run selected yet — show snapshot positions + CTA) -->
+        <section id="main-account-view" class="main-run-view hidden">
+          <div class="main-run-header">
+            <h2 id="account-view-label" class="main-account-label"></h2>
+          </div>
+          <section class="card">
+            <h2>Positions</h2>
+            <div class="positions-table-wrap">
+              <table class="positions-table">
+                <thead>
+                  <tr>
+                    <th>Ticker</th><th>Name</th><th class="num">Qty</th>
+                    <th class="num">PRU</th><th class="num">Price</th>
+                    <th class="num">PV/MV</th><th class="num">%</th>
+                  </tr>
+                </thead>
+                <tbody id="account-positions-tbody"></tbody>
+              </table>
+            </div>
+            <p id="account-positions-empty" class="empty-hint">No positions in this account.</p>
+          </section>
+          <div class="main-account-cta">
+            <button id="account-run-analysis-btn" class="cmd-btn" type="button">Run Analysis on this account</button>
+          </div>
+        </section>
+
+        <!-- Run overview (shown when a run is selected) -->
+        <section id="main-run-view" class="main-run-view hidden">
+
+          <!-- Account + run header -->
+          <div class="main-run-header">
+            <h2 id="main-account-label" class="main-account-label"></h2>
+            <p id="main-run-label" class="main-run-label"></p>
+          </div>
+
+          <!-- Global pipeline progress (visible during run) -->
+          <div id="run-pipeline-bar" class="run-pipeline-bar hidden"></div>
+
+          <!-- Synthesis card -->
+          <section id="report-synthesis-card" class="card report-synthesis-card">
+            <h2>Market Synthesis</h2>
+            <p id="report-provenance" class="settings-note">No provenance available yet.</p>
+            <p id="report-synthesis" class="report-synthesis">No synthesis yet.</p>
+          </section>
+
+          <!-- Recommended actions -->
+          <section class="card actions-now-card">
+            <h2>Recommended Actions</h2>
+            <div id="actions-now" class="actions-now">
+              <div class="empty-hint">No immediate action proposed.</div>
+            </div>
+            <p id="next-analysis" class="next-analysis-hint hidden"></p>
+            <p id="watchlist-summary" class="watchlist-summary-hint hidden"></p>
+          </section>
+
+          <!-- Positions table -->
+          <section class="card positions-card">
+            <div class="positions-header">
+              <h2>Positions</h2>
+              <p id="positions-progress" class="status-chip tone-running hidden">Analyzing...</p>
+            </div>
+            <div class="positions-table-wrap">
+              <table class="positions-table">
+                <thead>
+                  <tr>
+                    <th>Ticker</th>
+                    <th>Name</th>
+                    <th class="num">Qty</th>
+                    <th class="num">PRU</th>
+                    <th class="num">Price</th>
+                    <th class="num">PV/MV</th>
+                    <th class="num">%</th>
+                    <th>Signal</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody id="positions-tbody"></tbody>
+              </table>
+            </div>
+            <p id="positions-empty" class="empty-hint">No positions to display.</p>
+
+            <!-- Lines detail panel (reuses existing IDs) -->
+            <div id="recommendations-list" class="recommendations-list hidden"></div>
+            <p id="recommendations-empty" class="empty-hint hidden">No recommendation line available.</p>
+            <div id="recommendation-detail" class="recommendation-detail hidden">
+              <p class="empty-hint">Select a line to inspect details.</p>
+            </div>
+            <p id="recommendation-provenance" class="settings-note hidden">No line provenance available yet.</p>
+          </section>
+
+        </section>
+
+        <!-- KPI row (moved from old overview, now always visible when run selected) -->
+        <section id="tab-overview-panel" class="report-kpi-strip hidden">
+          <section class="report-kpi-grid">
+            <article class="report-kpi-card">
+              <p class="report-kpi-label">Portfolio Value</p>
+              <p id="report-value" class="report-kpi-value">&mdash;</p>
+            </article>
+            <article class="report-kpi-card">
+              <p class="report-kpi-label">Total PnL</p>
+              <p id="report-gain" class="report-kpi-value">&mdash;</p>
+            </article>
+            <article class="report-kpi-card">
+              <p class="report-kpi-label">Cash</p>
+              <p id="report-cash" class="report-kpi-value">&mdash;</p>
+            </article>
+            <article class="report-kpi-card">
+              <p class="report-kpi-label">Recommendations</p>
+              <p id="report-reco-count" class="report-kpi-value">0</p>
+            </article>
+          </section>
+          <div id="allocation-bar" class="allocation-bar hidden"></div>
+        </section>
+      </main>
+    </div>
+
+    <!-- ── Toast container ─────────────────────────────────────────── -->
+    <div id="toast-container" class="toast-container" aria-live="polite"></div>
+
+    <!-- ── Run Wizard Modal ────────────────────────────────────────── -->
+    <section id="run-wizard" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="run-wizard-title">
+      <div class="modal-card run-wizard-card">
+        <div class="run-wizard-head">
+          <h2 id="run-wizard-title">Run Portfolio Analysis</h2>
+          <button id="wizard-close-btn" class="modal-close-btn" type="button" aria-label="Close">&times;</button>
+        </div>
+        <p id="wizard-step-breadcrumb" class="wizard-label">Step 1 &middot; Choose your source</p>
+        <p id="wizard-status" class="status-idle">Choose how Alfred should get your portfolio data.</p>
+
+        <div id="wizard-step-source" class="wizard-step">
+          <div class="wizard-account-row">
+            <label for="wizard-account-select">Account</label>
+            <select id="wizard-account-select">
+              <option value="">All accounts</option>
+            </select>
+            <input id="wizard-new-account-name" class="hidden" type="text" placeholder="Account name (e.g. PEA Boursorama)" />
+          </div>
+          <div class="wizard-guidelines-row">
+            <label for="agent-guidelines-input">Investment guidelines (optional)</label>
+            <textarea
+              id="agent-guidelines-input"
+              placeholder="Example: cap single-line allocation at 15%, prioritize downside risk."
+              rows="2"
+            ></textarea>
+          </div>
+          <label for="wizard-run-mode">Data source</label>
+          <select id="wizard-run-mode"></select>
+          <p id="wizard-run-mode-help" class="wizard-help"></p>
+          <label for="wizard-analysis-mode">Analysis mode</label>
+          <select id="wizard-analysis-mode">
+            <option value="full_run">Full analysis (all positions)</option>
+            <option value="refresh_synthesis">Refresh + synthesis only (fast)</option>
+            <option value="retry_failed">Retry failed lines + synthesis</option>
+          </select>
+          <p id="wizard-analysis-mode-help" class="wizard-help"></p>
+          <div id="wizard-csv-inputs" class="wizard-step hidden">
+            <p class="wizard-help">
+              Select your portfolio CSV export files (positions, history, orders).
+            </p>
+            <label for="wizard-csv-file" class="csv-file-label">
+              <span id="wizard-csv-file-text">Choose CSV files...</span>
+              <input id="wizard-csv-file" type="file" accept=".csv,.CSV" multiple style="display:none" />
+            </label>
+            <ul id="wizard-csv-file-list" class="csv-file-list"></ul>
+            <!-- Hidden fields for backward compat with submit handler -->
+            <textarea id="wizard-csv-text" class="hidden"></textarea>
+            <input id="wizard-csv-path" type="hidden" />
+          </div>
+          <div class="shell-actions">
+            <button id="wizard-run-submit-btn" type="button">Start Analysis</button>
+            <button id="wizard-finary-connect-btn" class="ghost-btn hidden" type="button">Reconnect Finary</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Position Detail Modal ──────────────────────────────────── -->
+    <section id="line-memory-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="line-memory-modal-title">
+      <div class="modal-card line-memory-modal-card">
+        <div class="modal-head">
+          <h2 id="line-memory-modal-title">Position Detail</h2>
+          <button id="line-memory-close-top-btn" class="modal-close-btn" type="button" aria-label="Close">&times;</button>
+        </div>
+        <p id="line-memory-modal-subtitle" class="lm-subtitle">No position selected.</p>
+
+        <!-- ① Recommendation (hero) -->
+        <div class="lm-hero">
+          <p id="line-memory-summary" class="lm-recommendation">No recommendation available.</p>
+          <p id="line-memory-reanalyse" class="lm-reanalyse hidden"></p>
+        </div>
+
+        <!-- ② Analysis (technique, fondamentale, sentiment) -->
+        <article class="lm-section">
+          <h3 class="lm-heading">Analysis</h3>
+          <ul id="line-memory-analysis" class="lm-analysis-list"></ul>
+        </article>
+
+        <!-- ③ Market Data + Position Metrics (side by side) -->
+        <div class="lm-metrics-row">
+          <article class="lm-section lm-half">
+            <h3 class="lm-heading-sm">Market Data <button id="line-memory-market-detail-btn" class="inline-detail-btn" type="button" title="Collection detail">&#9432;</button></h3>
+            <ul id="line-memory-market" class="lm-metric-list"></ul>
+            <div id="line-memory-collection-detail" class="collection-detail-panel hidden">
+              <div id="line-memory-indicators-grid" class="indicators-grid"></div>
+              <div id="line-memory-collection-issues" class="collection-issues"></div>
+            </div>
+          </article>
+          <article class="lm-section lm-half">
+            <h3 class="lm-heading-sm">Position</h3>
+            <ul id="line-memory-position" class="lm-metric-list"></ul>
+          </article>
+        </div>
+
+        <!-- ④ News Analysis + Context -->
+        <article class="lm-section">
+          <h3 class="lm-heading">News Analysis</h3>
+          <p id="line-memory-deep-news-summary" class="lm-news-analysis"></p>
+          <div class="lm-news-context">
+            <p id="line-memory-deep-news-memory-summary" class="lm-news-context-text"></p>
+          </div>
+        </article>
+
+        <!-- ⑤ Memory + Signals -->
+        <div class="lm-metrics-row">
+          <article class="lm-section lm-half">
+            <h3 class="lm-heading-sm">Memory</h3>
+            <p id="line-memory-memory-summary" class="lm-memory-text"></p>
+          </article>
+          <article class="lm-section lm-half">
+            <h3 class="lm-heading-sm">Signals</h3>
+            <ul id="line-memory-signals" class="lm-tag-list"></ul>
+          </article>
+        </div>
+        <article class="lm-section">
+          <h3 class="lm-heading-sm">Key History</h3>
+          <ul id="line-memory-history" class="lm-tag-list"></ul>
+        </article>
+
+        <!-- ⑥ News sources (collapsed) -->
+        <details class="lm-news-details">
+          <summary class="lm-heading-sm">News Sources <button id="line-memory-news-detail-btn" class="inline-detail-btn" type="button" title="Expand">&#9432;</button></summary>
+          <ul id="line-memory-news" class="lm-news-list"></ul>
+          <div id="line-memory-news-detail" class="news-detail-panel hidden">
+            <div id="line-memory-news-articles"></div>
+          </div>
+        </details>
+
+        <!-- Hidden: source tracking (populated by deep news cache) -->
+        <article class="hidden">
+          <p id="line-memory-deep-news-selected-url"></p>
+          <ul id="line-memory-seen-urls"></ul>
+          <ul id="line-memory-banlist"></ul>
+        </article>
+
+        <div class="shell-actions">
+          <button id="line-memory-close-btn" class="ghost-btn" type="button">Close</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Troubleshooting (hidden by default) ─────────────────────── -->
+    <section id="desktop-troubleshooting-panel" class="card troubleshooting-panel hidden">
+      <h2>Dependency Troubleshooting</h2>
+      <p id="desktop-troubleshooting-summary"></p>
+      <ul id="desktop-troubleshooting-steps"></ul>
+    </section>
+
+    <!-- ── Gear panel (Settings + Diagnostics) ─────────────────────── -->
+    <section id="gear-panel" class="modal-overlay hidden">
+      <div class="modal-card gear-panel-card">
+        <div class="gear-panel-head">
+          <h2>Settings</h2>
+          <button id="gear-close-btn" class="modal-close-btn" type="button" aria-label="Close">&times;</button>
+        </div>
+
+        <p id="settings-status" class="status-idle"></p>
+
+        <!-- Accounts (top level) -->
+        <article class="settings-card">
+          <h3>Accounts</h3>
+          <div class="settings-accounts-row">
+            <div class="settings-account-item">
+              <span class="settings-account-label">OpenAI / Codex</span>
+              <span id="settings-openai-status" class="settings-account-status">checking...</span>
+              <button id="settings-openai-login-btn" class="ghost-btn" type="button">Sign in</button>
+              <button id="settings-openai-logout-btn" class="ghost-btn danger-btn" type="button">Sign out</button>
+            </div>
+            <div class="settings-account-item">
+              <span class="settings-account-label">Finary</span>
+              <span id="settings-finary-status" class="settings-account-status">checking...</span>
+              <button id="settings-finary-connect-btn" class="ghost-btn" type="button">Connect</button>
+              <button id="settings-finary-reconnect-btn" class="ghost-btn hidden" type="button">Reconnect</button>
+            </div>
+          </div>
+        </article>
+
+        <!-- Preferences -->
+        <article class="settings-card">
+          <h3>Preferences</h3>
+          <div class="settings-field">
+            <label for="settings-default-run-mode">Default analysis source</label>
+            <select id="settings-default-run-mode">
+              <option value="finary_resync">Sync from Finary now</option>
+              <option value="finary_cached">Use latest Finary snapshot</option>
+              <option value="csv">Use CSV import</option>
+            </select>
+          </div>
+          <div class="settings-field">
+            <label for="settings-shell-theme">Theme</label>
+            <select id="settings-shell-theme">
+              <option value="dark">Dark</option>
+              <option value="midnight">Midnight</option>
+              <option value="system">Follow system</option>
+            </select>
+          </div>
+        </article>
+
+        <!-- Storage -->
+        <article class="settings-card">
+          <h3>Storage</h3>
+          <p id="storage-usage" class="settings-note">Calculating...</p>
+          <div class="settings-storage-actions">
+            <button id="storage-prune-btn" class="ghost-btn" type="button">Prune old runs (keep 10)</button>
+            <button id="storage-clear-log-btn" class="ghost-btn" type="button">Clear debug log</button>
+          </div>
+          <p id="storage-result" class="settings-note"></p>
+        </article>
+
+        <div class="shell-actions">
+          <button id="settings-save-btn" type="button">Save settings</button>
+          <button id="settings-reset-btn" class="ghost-btn" type="button">Reset to defaults</button>
+        </div>
+
+        <!-- Advanced (collapsed) — kept for diagnostics -->
+        <details class="gear-advanced">
+          <summary>Advanced</summary>
+          <!-- Hidden fields still needed by save/load but not shown -->
+          <div class="hidden">
+            <input id="settings-line-analysis-concurrency" type="number" value="6" />
+            <input id="settings-line-analysis-throttle-ms" type="number" value="80" />
+            <input id="settings-litellm-generation-timeout-ms" type="number" value="120000" />
+            <input id="settings-stack-health-timeout-ms" type="number" value="1500" />
+            <input id="settings-finary-connector-timeout-ms" type="number" value="0" />
+            <input id="settings-finary-connector-snapshot-timeout-ms" type="number" value="0" />
+            <input id="settings-finary-connector-snapshot-retries" type="number" value="0" />
+          </div>
+          <article class="settings-card">
+            <h3>Credentials</h3>
+            <ul id="settings-credentials" class="line-memory-list">
+              <li class="empty-hint">Loading...</li>
+            </ul>
+          </article>
+          <p class="diag-caption">Events</p>
+          <ul id="analysis-events" class="analysis-events-list">
+            <li class="empty-hint">No events yet.</li>
+          </ul>
+        </details>
+      </div>
+    </section>
+
+    <script>
+      // Window control buttons (borderless mode)
+      document.addEventListener('DOMContentLoaded', function () {
+        var win = window.__TAURI__ && window.__TAURI__.window
+          ? window.__TAURI__.window.getCurrentWindow() : null;
+        if (!win) return;
+        var on = function (id, fn) {
+          var el = document.getElementById(id);
+          if (el) el.addEventListener('click', fn);
+        };
+        on('win-minimize', function () { win.minimize(); });
+        on('win-maximize', function () { win.toggleMaximize(); });
+        on('win-close',    function () { win.close(); });
+      });
+    </script>
+    <script type="module" src="/desktop-shell/app.js"></script>
+  </body>
+</html>

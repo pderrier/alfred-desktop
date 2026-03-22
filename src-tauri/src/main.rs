@@ -1,0 +1,454 @@
+// Hide the console window on Windows release builds.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+//! Alfred Desktop Backend — Tauri application entry point.
+//!
+//! This file is a thin orchestrator: module declarations, Tauri async command
+//! wrappers (required by `tauri::generate_handler![]`), and `fn main()`.
+//! All domain logic lives in the extracted modules below.
+
+mod models;
+
+// ── Pre-existing service modules (path-redirected) ──────────────────────────
+#[path = "services/local_db_service.rs"]
+mod local_db_service;
+#[path = "services/local_http.rs"]
+mod local_http;
+#[path = "services/native_collection.rs"]
+mod native_collection;
+#[path = "services/native_collection_modes.rs"]
+mod native_collection_modes;
+#[path = "services/native_collection_dispatch.rs"]
+mod native_collection_dispatch;
+#[path = "services/native_collection_helpers.rs"]
+mod native_collection_helpers;
+#[path = "services/native_line_analysis.rs"]
+mod native_line_analysis;
+// node_bridge_support removed — Playwright/Node replaced by native Rust CDP
+#[path = "repositories/sqlite/migrations.rs"]
+mod sqlite_migrations;
+
+// ── Extracted domain modules ────────────────────────────────────────────────
+mod storage;
+mod paths;
+mod helpers;
+mod runtime_settings;
+mod health;
+mod run_state;
+mod run_state_cache;
+mod finary;
+mod report;
+mod analysis_ops;
+mod command_handlers;
+mod cli;
+mod alfred_api_client;
+mod codex;
+mod enrichment;
+mod llm;
+mod llm_prompts;
+mod llm_parsing;
+mod mcp_server;
+mod mcp_progress_relay;
+mod run_stats;
+mod storage_cleanup;
+mod run_index;
+#[path = "services/native_mcp_analysis.rs"]
+mod native_mcp_analysis;
+
+use std::env;
+
+use anyhow::anyhow;
+
+// ── Global AppHandle for event emission from worker threads ───────────────
+static APP_HANDLE: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+
+pub fn emit_event(event: &str, payload: serde_json::Value) {
+    if let Some(handle) = APP_HANDLE.get() {
+        use tauri::Emitter;
+        let _ = handle.emit(event, payload);
+    }
+}
+
+// ── Re-exports for service modules that still use `crate::function_name` ─────
+pub use helpers::{debug_log, now_epoch_ms, now_iso_string, pick_json_fields};
+pub use local_http::request_http_json;
+pub use paths::{resolve_runtime_state_dir, resolve_source_snapshot_store_path};
+pub use run_state::{
+    load_run_by_id as load_run_by_id_direct,
+    patch_run_state_with as patch_run_state_direct_with,
+    set_native_run_stage,
+    update_line_status,
+};
+pub use runtime_settings::integer_direct as runtime_setting_integer_direct;
+pub use storage::write_json_file;
+
+// ── Tauri async command wrappers ────────────────────────────────────────────
+// These must live here because `tauri::generate_handler![]` resolves function
+// paths at compile time relative to the invoking module.
+
+#[tauri::command]
+async fn analysis_run_start_local(options: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || command_handlers::run_analysis_start(options))
+        .await
+        .map_err(|e| format!("analysis_run_start_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn retry_global_synthesis_local(run_id: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || command_handlers::run_retry_global_synthesis(run_id))
+        .await
+        .map_err(|e| format!("retry_global_synthesis_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn analysis_stop_local(operation_id: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || analysis_ops::request_cancellation(&operation_id))
+        .await
+        .map_err(|e| format!("analysis_stop_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn analysis_run_status_local(operation_id: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || command_handlers::run_analysis_status(operation_id))
+        .await
+        .map_err(|e| format!("analysis_run_status_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn dashboard_snapshot_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_dashboard_snapshot)
+        .await
+        .map_err(|e| format!("dashboard_snapshot_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn dashboard_overview_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_dashboard_overview)
+        .await
+        .map_err(|e| format!("dashboard_overview_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn dashboard_details_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_dashboard_details)
+        .await
+        .map_err(|e| format!("dashboard_details_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn runtime_settings_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_runtime_settings)
+        .await
+        .map_err(|e| format!("runtime_settings_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn runtime_settings_update_local(settings: serde_json::Value) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || command_handlers::run_runtime_settings_update(settings))
+        .await
+        .map_err(|e| format!("runtime_settings_update_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn runtime_settings_reset_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_runtime_settings_reset)
+        .await
+        .map_err(|e| format!("runtime_settings_reset_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn run_by_id_local(run_id: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || command_handlers::run_by_id(run_id))
+        .await
+        .map_err(|e| format!("run_by_id_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn stack_health_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_stack_health)
+        .await
+        .map_err(|e| format!("stack_health_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn finary_session_status_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_finary_session_status)
+        .await
+        .map_err(|e| format!("finary_session_status_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn finary_session_connect_local(payload: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || command_handlers::run_finary_session_connect(payload))
+        .await
+        .map_err(|e| format!("finary_session_connect_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn finary_session_refresh_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_finary_session_refresh)
+        .await
+        .map_err(|e| format!("finary_session_refresh_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn finary_session_browser_start_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_finary_session_browser_start)
+        .await
+        .map_err(|e| format!("finary_session_browser_start_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn finary_session_browser_complete_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_finary_session_browser_complete)
+        .await
+        .map_err(|e| format!("finary_session_browser_complete_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn finary_session_browser_playwright_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_finary_session_browser_playwright)
+        .await
+        .map_err(|e| format!("finary_session_browser_playwright_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn finary_session_browser_reuse_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_finary_session_browser_reuse)
+        .await
+        .map_err(|e| format!("finary_session_browser_reuse_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn desktop_open_external_url(url: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || command_handlers::open_external_url(&url))
+        .await
+        .map_err(|e| format!("desktop_open_external_url_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_user_preferences_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_get_user_preferences)
+        .await
+        .map_err(|e| format!("get_user_preferences_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn save_user_preferences_local(prefs: serde_json::Value) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || command_handlers::run_save_user_preferences(prefs))
+        .await
+        .map_err(|e| format!("save_user_preferences_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn account_positions_local(account: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || command_handlers::run_account_positions(account))
+        .await
+        .map_err(|e| format!("account_positions_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn storage_usage_local() -> Result<serde_json::Value, String> {
+    Ok(storage_cleanup::get_storage_usage())
+}
+
+#[tauri::command]
+async fn storage_prune_local(keep: Option<usize>) -> Result<serde_json::Value, String> {
+    let keep = keep.unwrap_or(10);
+    tauri::async_runtime::spawn_blocking(move || storage_cleanup::prune_old_runs(keep))
+        .await
+        .map_err(|e| format!("storage_prune_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn storage_clear_log_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(storage_cleanup::clear_debug_log)
+        .await
+        .map_err(|e| format!("storage_clear_log_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn ensure_codex_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_ensure_codex)
+        .await
+        .map_err(|e| format!("ensure_codex_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn codex_session_status_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_codex_session_status)
+        .await
+        .map_err(|e| format!("codex_session_status_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn codex_session_login_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_codex_session_login)
+        .await
+        .map_err(|e| format!("codex_session_login_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn codex_session_logout_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_codex_session_logout)
+        .await
+        .map_err(|e| format!("codex_session_logout_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+// ── Application bootstrap ───────────────────────────────────────────────────
+
+/// Load env vars from `.alfred.local.env` (repo root) if it exists.
+/// Only sets vars that are not already set in the environment.
+fn load_local_env() {
+    // Try repo root (two levels up from src-tauri, or APP_ROOT)
+    let candidates = [
+        std::env::var("APP_ROOT").ok().map(std::path::PathBuf::from),
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .and_then(|p| p.parent().map(|d| d.to_path_buf())),
+        std::env::current_dir().ok(),
+        // Common dev layout: apps/desktop-ui/src-tauri -> repo root
+        std::env::current_dir()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .and_then(|p| p.parent().map(|d| d.to_path_buf())),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        let env_path = candidate.join(".alfred.local.env");
+        if env_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&env_path) {
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() || trimmed.starts_with('#') {
+                        continue;
+                    }
+                    if let Some((key, value)) = trimmed.split_once('=') {
+                        let key = key.trim();
+                        let value = value.trim();
+                        if !key.is_empty() && std::env::var(key).is_err() {
+                            std::env::set_var(key, value);
+                        }
+                    }
+                }
+                helpers::debug_log(&format!("loaded env from {}", env_path.display()));
+            }
+            return;
+        }
+    }
+}
+
+fn run_tauri_app() -> anyhow::Result<()> {
+    load_local_env();
+
+    tauri::Builder::default()
+        .setup(|app| {
+            let _ = APP_HANDLE.set(app.handle().clone());
+            // Cleanup orphaned runs — uses the in-memory index so it's instant.
+            run_state::cleanup_orphaned_runs();
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            analysis_run_start_local,
+            analysis_stop_local,
+            retry_global_synthesis_local,
+            analysis_run_status_local,
+            dashboard_snapshot_local,
+            dashboard_overview_local,
+            dashboard_details_local,
+            runtime_settings_local,
+            runtime_settings_update_local,
+            runtime_settings_reset_local,
+            run_by_id_local,
+            stack_health_local,
+            finary_session_status_local,
+            finary_session_connect_local,
+            finary_session_refresh_local,
+            finary_session_browser_start_local,
+            finary_session_browser_complete_local,
+            finary_session_browser_playwright_local,
+            finary_session_browser_reuse_local,
+            desktop_open_external_url,
+            ensure_codex_local,
+            codex_session_status_local,
+            codex_session_login_local,
+            codex_session_logout_local,
+            account_positions_local,
+            get_user_preferences_local,
+            save_user_preferences_local,
+            storage_usage_local,
+            storage_prune_local,
+            storage_clear_log_local
+        ])
+        .run(tauri::generate_context!())
+        .map_err(|e| anyhow!("tauri_app_launch_failed:{e}"))?;
+    Ok(())
+}
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+
+    // MCP server mode — run as stdio JSON-RPC server for Codex tool calls
+    if args.iter().any(|a| a == "--mcp-server") {
+        let data_dir = args
+            .windows(2)
+            .find(|w| w[0] == "--data-dir")
+            .map(|w| std::path::PathBuf::from(&w[1]))
+            .unwrap_or_else(|| {
+                paths::resolve_runtime_state_dir()
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .to_path_buf()
+            });
+        if let Err(error) = mcp_server::run_stdio_server(data_dir) {
+            eprintln!("mcp_server_failed:{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    let result = if cli::should_run_cli(&args) {
+        cli::run(&args)
+    } else {
+        run_tauri_app()
+    };
+    if let Err(error) = result {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;

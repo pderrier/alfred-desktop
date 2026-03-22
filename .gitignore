@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Rust build artifacts
+src-tauri/target/
+
+# Runtime data (user-specific, not committed)
+data/
+*.db
+*.db-journal
+
+# Logs
+*.log
+debug.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment overrides
+.alfred.local.env
+.env
+.env.local

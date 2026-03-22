@@ -1,0 +1,16 @@
+{
+  "name": "alfred-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Alfred Desktop — AI-powered portfolio analysis for retail investors",
+  "scripts": {
+    "dev": "node src-tauri/scripts/tauri-cli-runner.mjs dev",
+    "build": "node src-tauri/scripts/tauri-cli-runner.mjs build",
+    "build:windows": "node src-tauri/scripts/tauri-cli-runner.mjs build src-tauri/tauri.windows.conf.json",
+    "check": "cd src-tauri && cargo check",
+    "test": "cd src-tauri && cargo test"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

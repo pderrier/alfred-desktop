@@ -1,0 +1,207 @@
+:root {
+  color-scheme: dark;
+  --bg: #081017;
+  --layer-canvas: #081017;
+  --layer-orbit: #0d1823;
+  --surface-card: #121d28;
+  --surface-muted: #0d1720;
+  --surface-strong: #182635;
+  --surface-elevated: #1d2f42;
+  --text-primary: #e4edf5;
+  --text-secondary: #92a8bc;
+  --text-strong: #f6fbff;
+  --border-soft: #2d4356;
+  --border-strong: #49647e;
+  --accent: #8ecae6;
+  --accent-ink: #08121a;
+  --accent-strong: #f6c453;
+  --state-loading: #78c1ff;
+  --state-success: #67cf8e;
+  --state-error: #f08a77;
+  --state-warning: #f4c46a;
+  --state-degraded: #f0ad66;
+  --focus-ring: 0 0 0 3px rgba(142, 202, 230, 0.28);
+  --field-bg: #0b141c;
+  --shadow-soft: 0 18px 42px rgba(0, 0, 0, 0.22);
+  --shadow-strong: 0 24px 64px rgba(0, 0, 0, 0.34);
+}
+
+:root[data-shell-theme="midnight"] {
+  --bg: #04070b;
+  --layer-canvas: #04070b;
+  --layer-orbit: #09111a;
+  --surface-card: #0a1118;
+  --surface-muted: #081018;
+  --surface-strong: #111b26;
+  --surface-elevated: #162433;
+  --text-primary: #e7eff7;
+  --text-secondary: #8fa2b5;
+  --text-strong: #fcfeff;
+  --border-soft: #203346;
+  --border-strong: #42617d;
+  --accent: #9fd8ff;
+  --accent-ink: #041019;
+  --accent-strong: #ffd477;
+  --field-bg: #0a121a;
+  --shadow-soft: 0 18px 42px rgba(0, 0, 0, 0.28);
+  --shadow-strong: 0 24px 64px rgba(0, 0, 0, 0.4);
+}
+
+body {
+  margin: 0;
+  font-family: "Space Grotesk", "Avenir Next", "Segoe UI", sans-serif;
+  background:
+    radial-gradient(900px 460px at 100% 0%, rgba(53, 116, 142, 0.18) 0%, transparent 65%),
+    radial-gradient(780px 420px at 0% 100%, rgba(244, 196, 106, 0.08) 0%, transparent 60%),
+    linear-gradient(180deg, var(--layer-orbit) 0%, var(--layer-canvas) 55%);
+  color: var(--text-primary);
+  min-height: 100vh;
+}
+
+.card {
+  background: var(--surface-card);
+  border: 1px solid var(--border-soft);
+  border-radius: 20px;
+  padding: 1.15rem;
+  box-shadow: var(--shadow-soft);
+}
+
+button {
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%);
+  color: var(--accent-ink);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  padding: 0.72rem 1.05rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition:
+    transform 180ms ease,
+    box-shadow 180ms ease,
+    filter 180ms ease;
+}
+
+button:hover:not([disabled]) {
+  filter: brightness(1.06);
+  transform: translateY(-1px);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.2);
+}
+
+button:focus-visible,
+input:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+button[disabled] {
+  opacity: 0.62;
+  cursor: wait;
+}
+
+input {
+  border: 1px solid var(--border-soft);
+  border-radius: 14px;
+  padding: 0.58rem 0.72rem;
+  font: inherit;
+  min-width: 0;
+  color: inherit;
+  background: var(--field-bg);
+}
+
+select {
+  border: 1px solid var(--border-soft);
+  border-radius: 14px;
+  padding: 0.58rem 0.72rem;
+  font: inherit;
+  min-width: 0;
+  color: inherit;
+  background: var(--field-bg);
+}
+
+textarea {
+  border: 1px solid var(--border-soft);
+  border-radius: 14px;
+  padding: 0.58rem 0.72rem;
+  font: inherit;
+  min-height: 90px;
+  resize: vertical;
+  color: inherit;
+  background: var(--field-bg);
+}
+
+pre {
+  background: var(--surface-muted);
+  border: 1px solid var(--border-soft);
+  border-radius: 14px;
+  padding: 0.85rem;
+  overflow: auto;
+  line-height: 1.45;
+}
+
+.status-idle {
+  color: var(--text-secondary);
+}
+
+.status-loading {
+  color: var(--state-loading);
+}
+
+.status-success {
+  color: var(--state-success);
+}
+
+.status-error {
+  color: var(--state-error);
+}
+
+.app-header {
+  display: grid;
+  gap: 0.45rem;
+  margin-bottom: 1rem;
+  padding: 1.3rem 1.35rem 0.2rem;
+}
+
+.app-kicker {
+  color: var(--text-secondary);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
+.app-title {
+  margin: 0;
+  font-size: clamp(2rem, 4vw, 3rem);
+  line-height: 1.05;
+  max-width: 12ch;
+  color: var(--text-strong);
+}
+
+.app-subtitle {
+  margin: 0;
+  color: var(--text-secondary);
+  max-width: 42rem;
+  line-height: 1.5;
+}
+
+.status-chip {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 0.34rem 0.72rem;
+  font-size: 0.79rem;
+  border: 1px solid var(--border-soft);
+  background: linear-gradient(180deg, rgba(29, 47, 66, 0.96) 0%, rgba(18, 29, 40, 0.96) 100%);
+  color: var(--text-secondary);
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}

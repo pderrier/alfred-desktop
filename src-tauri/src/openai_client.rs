@@ -54,6 +54,7 @@ fn api_base() -> String {
     DEFAULT_API_BASE.to_string()
 }
 
+/// Resolve model: explicit override > user setting > auto-detect best available.
 fn model_name() -> String {
     if let Ok(m) = env::var("ALFRED_MODEL") {
         let t = m.trim().to_string();
@@ -67,7 +68,81 @@ fn model_name() -> String {
             return t;
         }
     }
+    // Auto-detect: query /v1/models and pick the best one
+    if let Ok(best) = resolve_best_model() {
+        return best;
+    }
     DEFAULT_MODEL.to_string()
+}
+
+/// Query /v1/models and pick the best available model.
+/// Same ranking logic as the Codex backend: gpt-5.x > o4 > o3 > gpt-4.x
+fn resolve_best_model() -> Result<String> {
+    let key = api_key()?;
+    let base = api_base();
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(10))
+        .build();
+
+    let resp = agent
+        .get(&format!("{base}/models"))
+        .set("Authorization", &format!("Bearer {key}"))
+        .call()
+        .map_err(|e| anyhow!("model_list_failed:{e}"))?;
+
+    let body: Value = resp.into_json().unwrap_or(json!({}));
+    let models: Vec<String> = body
+        .get("data")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("id").and_then(|v| v.as_str()))
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if models.is_empty() {
+        return Err(anyhow!("no_models_available"));
+    }
+
+    let mut best: Option<&str> = None;
+    let mut best_score: i32 = -1;
+
+    for model in &models {
+        let score = model_score(model);
+        if score > best_score {
+            best_score = score;
+            best = Some(model);
+        }
+    }
+
+    let selected = best.unwrap_or(&models[0]).to_string();
+    crate::debug_log(&format!("openai_client: auto-selected model {selected} (score={best_score}, {} available)", models.len()));
+    Ok(selected)
+}
+
+/// Score a model name for ranking. Higher is better.
+fn model_score(name: &str) -> i32 {
+    if name.starts_with("gpt-5") {
+        let version: f32 = name
+            .strip_prefix("gpt-")
+            .and_then(|s| s.split('-').next())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5.0);
+        (version * 10.0) as i32
+    } else if name.starts_with("gpt-4.1") {
+        41
+    } else if name.starts_with("o4") {
+        40
+    } else if name.starts_with("o3") {
+        30
+    } else if name.starts_with("gpt-4") {
+        20
+    } else {
+        0
+    }
 }
 
 fn data_dir() -> PathBuf {

@@ -474,6 +474,15 @@ fn call_responses_streamed(
                     }
                 }
 
+                // Reasoning tokens (o-series models) — stream to UI
+                "response.reasoning.delta" => {
+                    if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
+                        if let Some(ref cb) = on_progress {
+                            cb(0, 0, &format!("thinking: {delta}"));
+                        }
+                    }
+                }
+
                 // Function call argument deltas
                 "response.function_call_arguments.delta" => {
                     let idx = event.get("output_index").and_then(|v| v.as_u64()).unwrap_or(0);

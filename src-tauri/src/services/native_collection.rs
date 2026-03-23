@@ -1165,7 +1165,13 @@ pub(crate) fn execute_native_local_analysis_workflow_with(
         "global_banned_articles_filtered": 0,
         "total_articles_filtered": 0
     });
-    let mcp_batch_size = crate::runtime_setting_integer_direct("mcp_batch_size", 5).max(1) as usize;
+    let mcp_batch_size = if crate::llm_backend::current_backend_name() != "codex" {
+        // Native backend: each line runs as its own API call with clean context.
+        // batch_size=1 means pool_size (line_analysis_concurrency) controls total parallelism.
+        1
+    } else {
+        crate::runtime_setting_integer_direct("mcp_batch_size", 5).max(1) as usize
+    };
     let data_dir = crate::resolve_runtime_state_dir()
         .parent()
         .map(|p| p.to_string_lossy().to_string())

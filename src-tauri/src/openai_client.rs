@@ -286,7 +286,11 @@ pub fn run_prompt(
                 "openai_client: completed in {round} rounds, {} chars",
                 final_text.len()
             ));
-            return extract_json_result(&final_text);
+            // Same behavior as Codex: try JSON extraction, fall back to success marker
+            match extract_json_result(&final_text) {
+                Ok(v) => return Ok(v),
+                Err(_) => return Ok(json!({"ok": true, "mcp_turn": true, "agent_text_chars": final_text.len()})),
+            }
         }
 
         // Execute function calls and build input for next round

@@ -318,71 +318,87 @@ impl McpBatchDispatchQueue {
 
         thread::spawn(move || {
             if is_native {
-                // Native backend: per-line dispatch with pre-injected data, clean context each time
+                // Native backend: parallel per-line dispatch, each with pre-injected data + clean context
                 let dd = std::path::PathBuf::from(&progress_data_dir);
-                let mut ok_tickers: Vec<String> = Vec::new();
-                let mut has_error = false;
 
-                for (ticker, nom, line_type) in &tickers {
-                    let timeout_ms = 180_000u64;
-                    let prid = progress_run_id.clone();
-                    let pdd = dd.clone();
-                    let tk = ticker.clone();
-
-                    // Pre-fetch line data (same as get_line_data tool, but no IPC)
+                // Pre-fetch all line data on the batch thread (fast, local disk reads)
+                let line_prompts: Vec<(String, String)> = tickers.iter().map(|(ticker, nom, line_type)| {
                     let line_data = crate::mcp_server::dispatch_tool_direct(
                         &dd,
                         "get_line_data",
                         &serde_json::json!({"run_id": progress_run_id, "line_id": format!("{line_type}:{ticker}")}),
                     );
-
                     let prompt = build_native_line_prompt(&progress_run_id, ticker, nom, line_type, &line_data);
+                    (ticker.clone(), prompt)
+                }).collect();
 
-                    let progress_cb: Option<crate::llm_backend::ProgressFn> = Some(Box::new(move |_bytes, _lines, label| {
-                        if label.starts_with("tokens:") || label.starts_with("rate_limit:") {
-                            let path = pdd.join("runtime-state").join(format!("{prid}_mcp_progress.jsonl"));
-                            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-                                use std::io::Write;
-                                let event = if label.starts_with("tokens:") {
-                                    let parts: Vec<&str> = label.split(':').collect();
-                                    serde_json::json!({
-                                        "type": "token_usage",
-                                        "total": parts.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
-                                        "input": parts.get(2).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
-                                        "output": parts.get(3).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
-                                    })
-                                } else {
-                                    serde_json::json!({
-                                        "type": "rate_limit",
-                                        "used_pct": label.trim_start_matches("rate_limit:").trim_end_matches('%'),
-                                    })
-                                };
-                                let _ = writeln!(file, "{}", serde_json::to_string(&event).unwrap_or_default());
+                // Spawn one thread per line — all run in parallel
+                let handles: Vec<_> = line_prompts.into_iter().map(|(ticker, prompt)| {
+                    let rid = progress_run_id.clone();
+                    let pdd = dd.clone();
+                    let tk = ticker.clone();
+
+                    thread::spawn(move || {
+                        let timeout_ms = 180_000u64;
+                        let prid = rid.clone();
+                        let pdd2 = pdd.clone();
+                        let tk2 = tk.clone();
+
+                        let progress_cb: Option<crate::llm_backend::ProgressFn> = Some(Box::new(move |_bytes, _lines, label| {
+                            if label.starts_with("tokens:") || label.starts_with("rate_limit:") {
+                                let path = pdd2.join("runtime-state").join(format!("{prid}_mcp_progress.jsonl"));
+                                if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                                    use std::io::Write;
+                                    let event = if label.starts_with("tokens:") {
+                                        let parts: Vec<&str> = label.split(':').collect();
+                                        serde_json::json!({
+                                            "type": "token_usage",
+                                            "total": parts.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+                                            "input": parts.get(2).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+                                            "output": parts.get(3).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+                                        })
+                                    } else {
+                                        serde_json::json!({
+                                            "type": "rate_limit",
+                                            "used_pct": label.trim_start_matches("rate_limit:").trim_end_matches('%'),
+                                        })
+                                    };
+                                    let _ = writeln!(file, "{}", serde_json::to_string(&event).unwrap_or_default());
+                                }
+                                return;
                             }
-                            return;
-                        }
-                        if !tk.is_empty() {
-                            crate::mcp_progress_relay::write_progress_event(
-                                &pdd, &prid, &tk, "analyzing", &label.replace('\u{2026}', "..."),
-                            );
-                        }
-                    }));
+                            if !tk2.is_empty() {
+                                crate::mcp_progress_relay::write_progress_event(
+                                    &pdd2, &prid, &tk2, "analyzing", &label.replace('\u{2026}', "..."),
+                                );
+                            }
+                        }));
 
-                    match crate::llm_backend::run_prompt(&prompt, timeout_ms, progress_cb) {
-                        Ok(_) => ok_tickers.push(ticker.clone()),
-                        Err(e) => {
-                            eprintln!("[mcp-native] line {ticker} failed: {e}");
-                            let err_msg = format!("{e}");
-                            let _ = crate::run_state::update_line_status_with_error(
-                                &progress_run_id, ticker, "failed", Some(&err_msg),
-                            );
-                            crate::emit_event("alfred://line-progress", serde_json::json!({
-                                "run_id": progress_run_id,
-                                "ticker": ticker,
-                                "line_status": { "status": "failed", "error": err_msg },
-                            }));
-                            has_error = true;
+                        match crate::llm_backend::run_prompt(&prompt, timeout_ms, progress_cb) {
+                            Ok(_) => Ok(tk.clone()),
+                            Err(e) => {
+                                eprintln!("[mcp-native] line {tk} failed: {e}");
+                                let err_msg = format!("{e}");
+                                let _ = crate::run_state::update_line_status_with_error(&rid, &tk, "failed", Some(&err_msg));
+                                crate::emit_event("alfred://line-progress", serde_json::json!({
+                                    "run_id": rid,
+                                    "ticker": tk,
+                                    "line_status": { "status": "failed", "error": err_msg },
+                                }));
+                                Err(e)
+                            }
                         }
+                    })
+                }).collect();
+
+                // Join all line threads
+                let mut ok_tickers: Vec<String> = Vec::new();
+                let mut has_error = false;
+                for handle in handles {
+                    match handle.join() {
+                        Ok(Ok(ticker)) => ok_tickers.push(ticker),
+                        Ok(Err(_)) => has_error = true,
+                        Err(_) => has_error = true,
                     }
                 }
 

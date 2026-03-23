@@ -145,6 +145,11 @@ fn model_score(name: &str) -> i32 {
     }
 }
 
+/// Whether a model is a reasoning model (o-series) that doesn't support temperature.
+fn is_reasoning_model(name: &str) -> bool {
+    name.starts_with("o1") || name.starts_with("o3") || name.starts_with("o4")
+}
+
 fn data_dir() -> PathBuf {
     crate::paths::resolve_runtime_state_dir()
         .parent()
@@ -212,14 +217,19 @@ pub fn run_prompt(
             cb(0, round, &format!("round {round}\u{2026}"));
         }
 
-        // Build request body
+        // Build request body — adapt parameters per model family
         let mut body = json!({
             "model": model,
             "input": input,
             "tools": tools,
-            "temperature": 0.3,
             "stream": true,
         });
+        if is_reasoning_model(&model) {
+            // Reasoning models (o-series): no temperature, use reasoning effort instead
+            body["reasoning"] = json!({"effort": "medium"});
+        } else {
+            body["temperature"] = json!(0.3);
+        }
         if let Some(ref prev_id) = previous_response_id {
             body["previous_response_id"] = json!(prev_id);
         }

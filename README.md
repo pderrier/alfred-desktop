@@ -16,9 +16,12 @@
 
 - **Portfolio sync** — connect Finary for automatic brokerage account sync, or import CSV exports
 - **Market enrichment** — real-time prices, fundamentals, and news from multiple sources
-- **AI analysis** — per-position technical, fundamental, and sentiment analysis via OpenAI Codex
+- **AI analysis** — per-position technical, fundamental, and sentiment analysis powered by OpenAI
+- **Dual LLM backend** — choose Codex (free tier, OAuth) or native OpenAI API (API key, pay-per-use)
+- **Web search** — the AI searches and reads web pages during analysis to find missing data
 - **Synthesis report** — portfolio-wide recommendations with conviction levels and action items
 - **Watchlist** — AI-suggested positions to monitor based on your portfolio profile
+- **Auto-update** — checks for new versions on startup with optional mandatory updates
 - **Multi-account** — manage and analyze multiple brokerage accounts independently
 
 ## Required accounts
@@ -27,9 +30,18 @@ Alfred relies on two external services:
 
 ### OpenAI (required)
 
-Alfred uses [OpenAI Codex](https://github.com/openai/codex) to perform AI-powered analysis of each position in your portfolio — technical, fundamental, and sentiment analysis with actionable recommendations. An OpenAI account is required. Alfred communicates with Codex locally via the Codex CLI app-server protocol (JSON-RPC over stdio); your prompts and portfolio data are sent directly to OpenAI, not through any intermediary.
+Alfred uses OpenAI models for AI-powered analysis — technical, fundamental, and sentiment analysis with actionable recommendations per position. An OpenAI account is required.
 
-Sign up at [platform.openai.com](https://platform.openai.com/signup) if you don't have an account. Alfred handles the rest automatically — it installs the Codex CLI if needed and prompts you to sign in on first launch.
+Two LLM backends are available (choose on first launch or in Settings):
+
+| Backend | Auth | Cost | How it works |
+|---|---|---|---|
+| **Codex** (default) | OpenAI OAuth sign-in | Free tier available | Uses the [Codex CLI](https://github.com/openai/codex) app-server (bundled in installer). Generic context management. |
+| **Native API** | OpenAI API key | Pay-per-use | Calls the [Responses API](https://platform.openai.com/docs/api-reference/responses) directly. Optimized for lower token usage — tools execute as native Rust calls (no IPC overhead), position-aware context windowing avoids redundant data. |
+
+The native backend auto-detects the best available model (gpt-5.x > gpt-4.1 > o4 > o3), supports native web search (the model reads web pages to find missing data), and works with custom API endpoints (for proxies or compatible providers). It also supports reasoning model streaming (o-series thinking tokens shown in the UI).
+
+Sign up at [platform.openai.com](https://platform.openai.com/signup). For the Codex backend, Alfred handles everything — it installs the CLI if needed and prompts you to sign in. For the native backend, generate an API key at [platform.openai.com/api-keys](https://platform.openai.com/api-keys) and enter it in the app.
 
 ### Finary (optional)
 
@@ -43,9 +55,10 @@ Alfred Desktop is a [Tauri 2](https://v2.tauri.app/) application:
 
 - **Frontend** — vanilla JavaScript with a custom shell UI (no framework)
 - **Backend** — Rust (Tauri commands, async analysis worker, native enrichment)
-- **LLM** — OpenAI Codex via the [Codex CLI](https://github.com/openai/codex) app-server protocol
+- **LLM** — dual backend: [Codex CLI](https://github.com/openai/codex) app-server OR native OpenAI Responses API
 - **Data** — local JSON files for run state, SQLite for structured data
 - **Remote API** — market data and news enrichment (see below)
+- **Auto-update** — version manifest check on startup, mandatory/optional update flows
 
 ```
 src/
@@ -54,8 +67,12 @@ src/
 src-tauri/
   src/              # Rust backend
     main.rs         # Tauri app entry point + command handlers
+    llm_backend.rs  # Backend dispatcher (Codex or native)
+    openai_client.rs # Native OpenAI Responses API client + tool-use loop
     codex.rs        # Codex app-server client (JSON-RPC over stdio)
     llm.rs          # LLM generation (line analysis, synthesis, watchlist)
+    mcp_server.rs   # 10 analysis tools (data fetch, validation, persistence)
+    updater.rs      # Auto-update mechanism (manifest check, download, install)
     finary.rs       # Finary connector (CDP browser automation)
     enrichment.rs   # Remote API client for market data + news enrichment
     services/       # Native collection, enrichment, MCP analysis
@@ -120,13 +137,12 @@ Set `ALFRED_API_URL` to your instance URL once deployed.
 
 ## Prerequisites
 
-**End users:** just install the MSI/NSIS package — Node.js and Codex are bundled automatically.
+**End users:** just install the MSI/NSIS package. If using the native backend, no additional dependencies — just your API key. If using Codex, it's bundled in the installer.
 
 **Developers:**
-- [Node.js](https://nodejs.org/) 18+
+- [Node.js](https://nodejs.org/) 18+ (for Tauri CLI and Codex bundling)
 - [Rust](https://rustup.rs/) 1.75+
-- [OpenAI Codex CLI](https://github.com/openai/codex) (`npm install -g @openai/codex`)
-- An OpenAI account with Codex access
+- An OpenAI account (API key or Codex access)
 
 ## Getting started
 
@@ -159,6 +175,10 @@ Alfred stores data in `<exe_dir>/data/` (production) or `src-tauri/../data/` (de
 | `ALFRED_DEBUG_LOG_PATH` | `<data>/debug.log` | Debug log file |
 | `ALFRED_API_URL` | hosted instance | Remote enrichment API |
 | `ALFRED_API_ENABLED` | `true` | Disable with `0` for offline mode |
+| `ALFRED_LLM_BACKEND` | `codex` | `codex` or `native` (OpenAI API) |
+| `OPENAI_API_KEY` | — | API key for native backend |
+| `OPENAI_API_BASE` | `https://api.openai.com/v1` | Custom API endpoint |
+| `ALFRED_MODEL` | auto-detected | Override model (e.g. `gpt-4.1`) |
 
 ## License
 

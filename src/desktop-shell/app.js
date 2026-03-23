@@ -770,8 +770,10 @@ function updateAuthPills() {
   }
   // Main status pill — if either auth is bad, show warning
   if (!lastOpenaiOk) {
-    if (statusPillNode) statusPillNode.className = "status-pill tone-error";
-    if (statusPillLabelNode) statusPillLabelNode.textContent = "OpenAI not connected";
+    const pill = document.getElementById("status-pill");
+    const label = document.getElementById("status-pill-label");
+    if (pill) pill.className = "status-pill tone-error";
+    if (label) label.textContent = "OpenAI not connected";
   }
   // Auth popover statuses
   if (authPopoverOpenaiStatus) {

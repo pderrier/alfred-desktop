@@ -53,6 +53,8 @@ mod run_stats;
 mod storage_cleanup;
 mod run_index;
 mod updater;
+mod llm_backend;
+mod openai_client;
 #[path = "services/native_mcp_analysis.rs"]
 mod native_mcp_analysis;
 

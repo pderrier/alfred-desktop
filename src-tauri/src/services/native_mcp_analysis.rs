@@ -155,8 +155,10 @@ pub struct McpBatchDispatchQueue {
 
 impl McpBatchDispatchQueue {
     pub fn new(run_id: &str, data_dir: &str, batch_size: usize) -> Self {
-        // Ensure MCP config is written before first analysis
-        crate::codex::ensure_mcp_config();
+        // Ensure MCP config is written before first analysis (codex backend only)
+        if crate::llm_backend::current_backend_name() == "codex" {
+            crate::codex::ensure_mcp_config();
+        }
 
         let (result_tx, result_rx) = mpsc::channel();
         Self {
@@ -247,7 +249,7 @@ impl McpBatchDispatchQueue {
             let prid = progress_run_id.clone();
             let pdd = std::path::PathBuf::from(&progress_data_dir);
 
-            let progress_cb: Option<crate::codex::CodexProgressFn> = Some(Box::new(move |_bytes, _lines, label| {
+            let progress_cb: Option<crate::llm_backend::ProgressFn> = Some(Box::new(move |_bytes, _lines, label| {
                 let ticker = ct.lock().map(|g| g.clone()).unwrap_or_default();
 
                 // Token usage and rate limit events → write as stats events (no ticker needed)
@@ -281,7 +283,7 @@ impl McpBatchDispatchQueue {
                 );
             }));
 
-            let result = crate::codex::run_codex_prompt_with_progress(&prompt, timeout_ms, progress_cb);
+            let result = crate::llm_backend::run_prompt(&prompt, timeout_ms, progress_cb);
             let _ = tx.send(match result {
                 Ok(_) => Ok(batch_tickers),
                 Err(e) => {
@@ -317,13 +319,13 @@ pub fn run_synthesis_turn(run_id: &str, data_dir: &str) -> Result<Value> {
     let prompt = build_synthesis_prompt(run_id);
     let pdd = std::path::PathBuf::from(data_dir);
     let prid = run_id.to_string();
-    let synthesis_cb: Option<crate::codex::CodexProgressFn> = Some(Box::new(move |_bytes, _lines, label| {
+    let synthesis_cb: Option<crate::llm_backend::ProgressFn> = Some(Box::new(move |_bytes, _lines, label| {
         let progress_text = label.replace('\u{2026}', "...");
         crate::mcp_progress_relay::write_progress_event(
             &pdd, &prid, "__synthesis__", "generating", &progress_text,
         );
     }));
-    let result = crate::codex::run_codex_prompt_with_progress(&prompt, 300_000, synthesis_cb);
+    let result = crate::llm_backend::run_prompt(&prompt, 300_000, synthesis_cb);
 
     relay_stop.store(true, Ordering::Relaxed);
     let _ = relay_handle.join();

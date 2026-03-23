@@ -1105,6 +1105,47 @@ fn dispatch_tool(data_dir: &Path, name: &str, arguments: &Value) -> Value {
     }
 }
 
+// ── Public API for native backend (no IPC) ─────────────────────────────────
+
+/// Execute a tool directly without JSON-RPC wrapping. Used by `openai_client.rs`.
+/// Returns the raw tool result (not wrapped in MCP content/isError envelope).
+pub fn dispatch_tool_direct(data_dir: &std::path::Path, name: &str, arguments: &Value) -> Value {
+    let result = match name {
+        "get_run_context" => tool_get_run_context(data_dir, arguments),
+        "get_line_data" => tool_get_line_data(data_dir, arguments),
+        "validate_recommendation" => tool_validate_recommendation(data_dir, arguments),
+        "validate_synthesis" => tool_validate_synthesis(data_dir, arguments),
+        "check_coverage" => tool_check_coverage(data_dir, arguments),
+        "finalize_report" => tool_finalize_report(data_dir, arguments),
+        "persist_extracted_fundamentals" => tool_persist_extracted_fundamentals(data_dir, arguments),
+        "persist_shared_insights" => tool_persist_shared_insights(data_dir, arguments),
+        "persist_deep_news" => tool_persist_deep_news(data_dir, arguments),
+        "ban_deep_news" => tool_ban_deep_news(data_dir, arguments),
+        _ => Err(anyhow!("unknown_tool:{name}")),
+    };
+    match result {
+        Ok(v) => v,
+        Err(e) => json!({ "error": e.to_string() }),
+    }
+}
+
+/// Tool definitions in OpenAI function-calling format (for native backend).
+pub fn tool_definitions_openai() -> Vec<Value> {
+    let mcp_tools = tool_definitions();
+    mcp_tools
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .map(|t| {
+            json!({
+                "name": t.get("name").and_then(|v| v.as_str()).unwrap_or_default(),
+                "description": t.get("description").and_then(|v| v.as_str()).unwrap_or_default(),
+                "parameters": t.get("inputSchema").cloned().unwrap_or(json!({"type": "object", "properties": {}})),
+            })
+        })
+        .collect()
+}
+
 // ── MCP Request Handler ─────────────────────────────────────────────────────
 
 fn handle_request(data_dir: &Path, msg: &Value) -> Option<Value> {

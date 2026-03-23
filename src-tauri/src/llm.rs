@@ -8,7 +8,6 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
-use crate::codex;
 use crate::llm_parsing::{
     extract_draft_from_response, extract_recommendation_from_response,
     extract_watchlist_from_response, is_repair_pass,
@@ -311,7 +310,7 @@ fn generate_report_codex(run_state: &Value, run_id: &str) -> Result<Value> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(180_000);
     let rid = run_id.to_string();
-    let progress_cb: Option<codex::CodexProgressFn> = if !rid.is_empty() {
+    let progress_cb: Option<crate::llm_backend::ProgressFn> = if !rid.is_empty() {
         let rid2 = rid.clone();
         Some(Box::new(move |_bytes, _lines, latest| {
             update_synthesis_progress(&rid2, latest);
@@ -320,7 +319,7 @@ fn generate_report_codex(run_state: &Value, run_id: &str) -> Result<Value> {
         None
     };
     update_synthesis_progress(&rid, "codex process started\u{2026}");
-    let result = codex::run_codex_prompt_with_progress(&prompt, timeout_ms, progress_cb)?;
+    let result = crate::llm_backend::run_prompt(&prompt, timeout_ms, progress_cb)?;
     update_synthesis_progress(&rid, "parsing response\u{2026}");
     let draft = if result.get("draft").is_some() {
         result.get("draft").unwrap().clone()
@@ -355,7 +354,7 @@ fn generate_line_codex(
     let ticker = line_context.get("ticker").and_then(|v| v.as_str()).unwrap_or_default().to_string();
 
     let status_label = if is_repair_pass(validation_context) { "repairing" } else { "analyzing" };
-    let progress_cb: Option<codex::CodexProgressFn> = if !run_id.is_empty() && !ticker.is_empty() {
+    let progress_cb: Option<crate::llm_backend::ProgressFn> = if !run_id.is_empty() && !ticker.is_empty() {
         let rid = run_id.clone();
         let tk = ticker.clone();
         let label = status_label.to_string();
@@ -368,7 +367,7 @@ fn generate_line_codex(
         None
     };
 
-    let result = codex::run_codex_prompt_with_progress(&prompt, timeout_ms, progress_cb)?;
+    let result = crate::llm_backend::run_prompt(&prompt, timeout_ms, progress_cb)?;
     let recommendation = if result.get("recommendation").is_some() {
         result.get("recommendation").unwrap().clone()
     } else {
@@ -509,7 +508,7 @@ pub fn generate_watchlist_suggestions(
             call_upstream_llm_streamed(&model, &prompt, None)?
         }
         _ => {
-            codex::run_codex_prompt_with_progress(&prompt, timeout_ms, None)?
+            crate::llm_backend::run_prompt(&prompt, timeout_ms, None)?
         }
     };
 
@@ -545,7 +544,7 @@ pub fn adapt_csv_columns(
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60_000);
-            codex::run_codex_prompt_with_progress(&prompt, timeout_ms, None)?
+            crate::llm_backend::run_prompt(&prompt, timeout_ms, None)?
         }
     };
 

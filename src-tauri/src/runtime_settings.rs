@@ -271,6 +271,18 @@ pub fn integer_direct(key: &str, default_value: i64) -> i64 {
     }
 }
 
+pub fn string_direct(key: &str) -> Result<String, ()> {
+    match get_payload() {
+        Ok(payload) => payload
+            .get("values")
+            .and_then(|value| value.get(key))
+            .and_then(|value| value.as_str())
+            .map(|s| s.to_string())
+            .ok_or(()),
+        Err(_) => Err(()),
+    }
+}
+
 fn build_advanced_payload() -> serde_json::Value {
     let endpoints = vec![
         ("Control plane", "native (built-in)".to_string()),

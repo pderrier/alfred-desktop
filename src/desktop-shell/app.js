@@ -1238,6 +1238,14 @@ window.__connectFinary = async () => {
     await bridge.runFinaryPlaywrightBrowserSession();
     await refreshAccountStatus();
     updateAuthPills();
+    // Only refresh dashboard if we don't have accounts yet
+    const snap = latestDashboardPayload?.snapshot || {};
+    const fMeta = snap.latest_finary_snapshot || {};
+    const accts = Array.isArray(fMeta.accounts) ? fMeta.accounts : [];
+    if (accts.length === 0) {
+      showToast("Syncing portfolio\u2026", "info");
+      try { await refreshDashboard(); } catch { /* ok if no data yet */ }
+    }
     renderWelcome();
     showToast("Finary connected", "success");
   } catch (error) {
@@ -1270,6 +1278,16 @@ bootstrap.runStartupSessionCheck().then(async () => {
   await refreshAccountStatus();
   updateAuthPills();
   renderWelcome();
+  // If Finary is connected but we have no accounts, force a dashboard refresh
+  const snapshot = latestDashboardPayload?.snapshot || {};
+  const finaryMeta = snapshot.latest_finary_snapshot || {};
+  const accounts = Array.isArray(finaryMeta.accounts) ? finaryMeta.accounts : [];
+  if (lastFinaryOk && accounts.length === 0) {
+    const welcomeTitle = document.getElementById("welcome-title");
+    if (welcomeTitle) welcomeTitle.textContent = "Syncing portfolio\u2026";
+    try { await refreshDashboard(); } catch { /* ok if no data yet */ }
+    renderWelcome();
+  }
 }).catch((err) => {
   bootstrap.showStartupError("Startup failed", String(err?.message || err));
 });

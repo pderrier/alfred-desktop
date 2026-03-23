@@ -1106,7 +1106,8 @@ function renderWelcome() {
   }
 
   // ── Step 3: Connected but no accounts in Finary ──
-  if (lastFinaryOk && accounts.length === 0 && runs.length === 0) {
+  // Only show this if we actually have a snapshot (accounts fetched) — not if snapshot is pending
+  if (lastFinaryOk && hasSnapshot && accounts.length === 0 && runs.length === 0) {
     if (titleNode) titleNode.textContent = "Setup your accounts";
     html += `
       <div class="welcome-step">
@@ -1117,6 +1118,20 @@ function renderWelcome() {
           <button class="cmd-btn" onclick="document.getElementById('cmd-run-analysis')?.click()">Run Analysis</button>
           <button class="cmd-btn ghost-btn" onclick="document.getElementById('cmd-run-analysis')?.click()">Import CSV instead</button>
         </div>
+      </div>
+    `;
+    contentNode.innerHTML = html;
+    return;
+  }
+
+  // ── Step 3b: Finary connected, snapshot not loaded yet, no runs ──
+  if (lastFinaryOk && !hasSnapshot && runs.length === 0) {
+    if (titleNode) titleNode.textContent = "Ready to analyze";
+    html += `
+      <div class="welcome-step" style="text-align:center">
+        <h3 style="margin-bottom:0.5rem">Finary connected</h3>
+        <p style="color:var(--sea-muted);font-size:0.85rem;margin-bottom:1rem">Run your first analysis to sync portfolio data and generate recommendations.</p>
+        <button class="cmd-btn" onclick="document.getElementById('cmd-run-analysis')?.click()">Run Analysis</button>
       </div>
     `;
     contentNode.innerHTML = html;

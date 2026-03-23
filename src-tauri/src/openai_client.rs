@@ -1,9 +1,8 @@
-//! Native OpenAI API client with agentic tool-use loop.
+//! Native OpenAI Responses API client with agentic tool-use loop.
 //!
-//! Replaces Codex app-server for users who prefer direct API access.
-//! Calls chat completions with tool definitions, executes tool calls
-//! via `mcp_server::dispatch_tool_direct()`, and loops until the model
-//! returns a final text response.
+//! Uses the Responses API (`/v1/responses`) which supports both function
+//! tools and native web search. The model decides when to search.
+//! Tool calls are executed locally via `mcp_server::dispatch_tool_direct()`.
 
 use std::env;
 use std::io::{BufRead, BufReader};
@@ -24,14 +23,12 @@ const RETRY_BASE_MS: u64 = 500;
 // ── Configuration ─────────────────────────────────────────────────
 
 fn api_key() -> Result<String> {
-    // 1. Env var
     if let Ok(key) = env::var("OPENAI_API_KEY") {
         let k = key.trim().to_string();
         if !k.is_empty() {
             return Ok(k);
         }
     }
-    // 2. User preferences
     if let Ok(prefs) = crate::runtime_settings::string_direct("openai_api_key") {
         let k = prefs.trim().to_string();
         if !k.is_empty() {
@@ -80,16 +77,28 @@ fn data_dir() -> PathBuf {
         .unwrap_or_else(|| crate::paths::default_data_dir())
 }
 
-// ── Tool Definitions (OpenAI function calling format) ─────────────
+// ── Tool definitions (Responses API format) ───────────────────────
 
-fn tool_definitions() -> Vec<Value> {
-    crate::mcp_server::tool_definitions_openai()
+fn build_tools() -> Vec<Value> {
+    let mut tools: Vec<Value> = crate::mcp_server::tool_definitions_openai()
+        .into_iter()
+        .map(|t| json!({
+            "type": "function",
+            "name": t.get("name").and_then(|v| v.as_str()).unwrap_or_default(),
+            "description": t.get("description").and_then(|v| v.as_str()).unwrap_or_default(),
+            "parameters": t.get("parameters").cloned().unwrap_or(json!({"type": "object", "properties": {}})),
+        }))
+        .collect();
+    // Native web search — model decides when to search
+    tools.push(json!({"type": "web_search_preview"}));
+    tools
 }
 
 // ── Public API ────────────────────────────────────────────────────
 
-/// Execute a prompt with the native OpenAI client.
-/// Implements the agentic tool-use loop: prompt → tool_calls → execute → repeat.
+/// Execute a prompt via the Responses API with tool-use loop.
+/// Sends prompt → model returns output items → execute function_call items
+/// → send tool results as new input → repeat until model returns message.
 pub fn run_prompt(
     prompt: &str,
     timeout_ms: u64,
@@ -99,21 +108,20 @@ pub fn run_prompt(
     let base = api_base();
     let model = model_name();
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    let tools = tool_definitions();
+    let tools = build_tools();
     let dd = data_dir();
 
     crate::debug_log(&format!(
-        "openai_client: model={model} tools={} timeout={timeout_ms}ms",
+        "openai_client: responses api, model={model} tools={} timeout={timeout_ms}ms",
         tools.len()
     ));
 
-    // Build initial messages
-    let mut messages: Vec<Value> = vec![
-        json!({
-            "role": "user",
-            "content": prompt
-        }),
-    ];
+    // First request: send the user prompt
+    let mut input: Vec<Value> = vec![json!({
+        "role": "user",
+        "content": prompt,
+    })];
+    let mut previous_response_id: Option<String> = None;
 
     let mut round = 0;
     loop {
@@ -129,80 +137,93 @@ pub fn run_prompt(
             cb(0, round, &format!("round {round}\u{2026}"));
         }
 
-        // Call chat completions
-        // Include both function tools and native web search
-        let mut all_tools: Vec<Value> = tools
-            .iter()
-            .map(|t| json!({"type": "function", "function": t}))
-            .collect();
-        // Native web search — lets the model search and read pages directly.
-        // Only works with OpenAI models; silently ignored by other providers.
-        all_tools.push(json!({"type": "web_search_preview"}));
-
-        let body = json!({
+        // Build request body
+        let mut body = json!({
             "model": model,
-            "messages": messages,
-            "tools": all_tools,
+            "input": input,
+            "tools": tools,
             "temperature": 0.3,
             "stream": true,
         });
+        if let Some(ref prev_id) = previous_response_id {
+            body["previous_response_id"] = json!(prev_id);
+        }
 
-        let response_text = call_chat_completions_streamed(
+        // Call Responses API with streaming
+        let (response_id, output_items) = call_responses_streamed(
             &base, &key, &body, &on_progress, deadline,
         )?;
 
-        // Parse the accumulated response
-        let assistant_msg = parse_streamed_response(&response_text)?;
+        previous_response_id = Some(response_id);
 
-        // Add assistant message to history
-        messages.push(assistant_msg.clone());
+        // Process output items — collect function calls and final text
+        let mut function_calls: Vec<(String, String, String)> = Vec::new(); // (call_id, name, arguments)
+        let mut final_text = String::new();
 
-        // Check for tool calls
-        let tool_calls = assistant_msg
-            .get("tool_calls")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-
-        if tool_calls.is_empty() {
-            // No tool calls — model returned final text
-            let content = assistant_msg
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-
-            crate::debug_log(&format!(
-                "openai_client: completed in {round} rounds, {} chars",
-                content.len()
-            ));
-
-            // Parse JSON from the content
-            return extract_json_result(content);
+        for item in &output_items {
+            let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+            match item_type {
+                "function_call" => {
+                    let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                    let arguments = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}").to_string();
+                    function_calls.push((call_id, name, arguments));
+                }
+                "message" => {
+                    // Extract text from content array
+                    if let Some(content) = item.get("content").and_then(|v| v.as_array()) {
+                        for part in content {
+                            if part.get("type").and_then(|v| v.as_str()) == Some("output_text") {
+                                if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                                    final_text.push_str(text);
+                                }
+                            }
+                        }
+                    }
+                }
+                "web_search_call" => {
+                    // Web search executed by OpenAI — logged but no action needed
+                    let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    crate::debug_log(&format!("openai_client: web_search_call status={status}"));
+                    if let Some(ref cb) = on_progress {
+                        cb(0, round, "searching the web\u{2026}");
+                    }
+                }
+                _ => {
+                    crate::debug_log(&format!("openai_client: unknown output item type={item_type}"));
+                }
+            }
         }
 
-        // Execute tool calls and add results to messages
-        for tc in &tool_calls {
-            let call_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-            let empty = json!({});
-            let func = tc.get("function").unwrap_or(&empty);
-            let name = func.get("name").and_then(|v| v.as_str()).unwrap_or_default();
-            let args_str = func.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
-            let args: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+        // If no function calls, we have the final response
+        if function_calls.is_empty() {
+            crate::debug_log(&format!(
+                "openai_client: completed in {round} rounds, {} chars",
+                final_text.len()
+            ));
+            return extract_json_result(&final_text);
+        }
 
+        // Execute function calls and build input for next round
+        input = Vec::new();
+        for (call_id, name, arguments) in &function_calls {
             if let Some(ref cb) = on_progress {
                 cb(0, round, &format!("tool:{name}"));
             }
-
             crate::debug_log(&format!("openai_client: calling tool {name}"));
 
-            // Execute tool directly — no IPC, no subprocess
-            let tool_result = crate::mcp_server::dispatch_tool_direct(&dd, name, &args);
-            let result_text = tool_result_to_string(&tool_result);
+            let args: Value = serde_json::from_str(arguments).unwrap_or(json!({}));
+            let tool_result = crate::mcp_server::dispatch_tool_direct(&dd, &name, &args);
+            let result_str = if let Some(s) = tool_result.as_str() {
+                s.to_string()
+            } else {
+                serde_json::to_string(&tool_result).unwrap_or_else(|_| "{}".to_string())
+            };
 
-            messages.push(json!({
-                "role": "tool",
-                "tool_call_id": call_id,
-                "content": result_text,
+            input.push(json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": result_str,
             }));
         }
     }
@@ -238,16 +259,18 @@ pub fn validate_api_key() -> Result<Value> {
     }))
 }
 
-// ── Streaming chat completions ────────────────────────────────────
+// ── Streaming Responses API call ──────────────────────────────────
 
-fn call_chat_completions_streamed(
+/// Call POST /v1/responses with SSE streaming.
+/// Returns (response_id, output_items).
+fn call_responses_streamed(
     base: &str,
     key: &str,
     body: &Value,
     on_progress: &Option<ProgressFn>,
     deadline: Instant,
-) -> Result<String> {
-    let url = format!("{base}/chat/completions");
+) -> Result<(String, Vec<Value>)> {
+    let url = format!("{base}/responses");
     let body_str = serde_json::to_string(body)?;
 
     let mut last_err = None;
@@ -274,23 +297,29 @@ fn call_chat_completions_streamed(
         {
             Ok(r) => r,
             Err(ureq::Error::Status(status, resp)) => {
-                let body = resp.into_string().unwrap_or_default();
+                let err_body = resp.into_string().unwrap_or_default();
                 if status == 429 || status >= 500 {
-                    last_err = Some(anyhow!("openai_api_error:{status}:{body}"));
-                    continue; // retryable
+                    last_err = Some(anyhow!("openai_api_error:{status}:{err_body}"));
+                    continue;
                 }
-                return Err(anyhow!("openai_api_error:{status}:{body}"));
+                return Err(anyhow!("openai_api_error:{status}:{err_body}"));
             }
             Err(e) => {
                 last_err = Some(anyhow!("openai_api_request_failed:{e}"));
-                continue; // retryable
+                continue;
             }
         };
 
-        // Read SSE stream
+        // Parse SSE stream
         let reader = BufReader::new(resp.into_reader());
-        let mut accumulated = String::new();
-        let mut bytes_received: usize = 0;
+        let mut response_id = String::new();
+        let mut output_items: Vec<Value> = Vec::new();
+
+        // Accumulate streamed text deltas per output item index
+        let mut text_bufs: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+        // Accumulate function_call argument deltas per output item index
+        let mut fn_arg_bufs: std::collections::HashMap<u64, (String, String, String)> =
+            std::collections::HashMap::new(); // index → (call_id, name, args_buf)
 
         for line in reader.lines() {
             let line = line.map_err(|e| anyhow!("openai_sse_read_error:{e}"))?;
@@ -303,128 +332,119 @@ fn call_chat_completions_streamed(
                 break;
             }
 
-            bytes_received += line.len();
-            accumulated.push_str(data);
-            accumulated.push('\n');
+            let event: Value = match serde_json::from_str(data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
 
-            // Extract delta text for progress
-            if let Ok(chunk) = serde_json::from_str::<Value>(data) {
-                if let Some(delta_text) = chunk
-                    .pointer("/choices/0/delta/content")
-                    .and_then(|v| v.as_str())
-                {
-                    if let Some(ref cb) = on_progress {
-                        cb(bytes_received, 0, delta_text);
+            let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+
+            match event_type {
+                // Response created — capture ID
+                "response.created" | "response.completed" => {
+                    if let Some(resp_obj) = event.get("response") {
+                        if let Some(id) = resp_obj.get("id").and_then(|v| v.as_str()) {
+                            response_id = id.to_string();
+                        }
+                        // On completed, capture any output items from the full response
+                        if event_type == "response.completed" {
+                            if let Some(output) = resp_obj.get("output").and_then(|v| v.as_array()) {
+                                output_items = output.clone();
+                            }
+                        }
                     }
                 }
+
+                // Output item completed — add to our list
+                "response.output_item.done" => {
+                    if let Some(item) = event.get("item") {
+                        // For function_call items, merge accumulated arguments
+                        let idx = event.get("output_index").and_then(|v| v.as_u64()).unwrap_or(0);
+                        if let Some((call_id, name, args)) = fn_arg_bufs.remove(&idx) {
+                            let mut item = item.clone();
+                            if item.get("call_id").and_then(|v| v.as_str()).unwrap_or_default().is_empty() {
+                                item["call_id"] = json!(call_id);
+                            }
+                            if item.get("name").and_then(|v| v.as_str()).unwrap_or_default().is_empty() {
+                                item["name"] = json!(name);
+                            }
+                            if item.get("arguments").and_then(|v| v.as_str()).unwrap_or_default().is_empty() {
+                                item["arguments"] = json!(args);
+                            }
+                            output_items.push(item);
+                        } else {
+                            output_items.push(item.clone());
+                        }
+                    }
+                }
+
+                // Text deltas for progress display
+                "response.output_text.delta" => {
+                    if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
+                        let idx = event.get("output_index").and_then(|v| v.as_u64()).unwrap_or(0);
+                        text_bufs.entry(idx).or_default().push_str(delta);
+                        if let Some(ref cb) = on_progress {
+                            cb(0, 0, delta);
+                        }
+                    }
+                }
+
+                // Function call argument deltas
+                "response.function_call_arguments.delta" => {
+                    let idx = event.get("output_index").and_then(|v| v.as_u64()).unwrap_or(0);
+                    if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
+                        fn_arg_bufs.entry(idx).or_insert_with(|| (String::new(), String::new(), String::new())).2.push_str(delta);
+                    }
+                }
+                "response.function_call_arguments.done" => {
+                    let idx = event.get("output_index").and_then(|v| v.as_u64()).unwrap_or(0);
+                    // call_id and name come from output_item.added
+                    if let Some(args) = event.get("arguments").and_then(|v| v.as_str()) {
+                        let entry = fn_arg_bufs.entry(idx).or_insert_with(|| (String::new(), String::new(), String::new()));
+                        entry.2 = args.to_string(); // replace with final complete args
+                    }
+                }
+
+                // Output item added — capture call_id and name for function calls
+                "response.output_item.added" => {
+                    if let Some(item) = event.get("item") {
+                        let idx = event.get("output_index").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+                        if item_type == "function_call" {
+                            let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                            fn_arg_bufs.entry(idx).or_insert_with(|| (call_id, name, String::new()));
+                        }
+                    }
+                }
+
+                // Web search status
+                "response.web_search_call.in_progress" | "response.web_search_call.searching" => {
+                    if let Some(ref cb) = on_progress {
+                        cb(0, 0, "searching the web\u{2026}");
+                    }
+                }
+
+                _ => {} // Ignore other event types
             }
         }
 
-        return Ok(accumulated);
+        // If we didn't get output_items from response.completed, build from accumulated items
+        // (output_items is already populated from output_item.done events)
+
+        return Ok((response_id, output_items));
     }
 
     Err(last_err.unwrap_or_else(|| anyhow!("openai_api_retries_exhausted")))
 }
 
-// ── Response parsing ──────────────────────────────────────────────
-
-/// Reassemble a streamed SSE response into a single assistant message.
-fn parse_streamed_response(accumulated: &str) -> Result<Value> {
-    let mut content = String::new();
-    let mut tool_calls: Vec<Value> = Vec::new();
-    // Track tool call assembly: index → {id, name, arguments_buf}
-    let mut tc_map: std::collections::HashMap<u64, (String, String, String)> =
-        std::collections::HashMap::new();
-
-    for line in accumulated.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        let chunk: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        let delta = match chunk.pointer("/choices/0/delta") {
-            Some(d) => d,
-            None => continue,
-        };
-
-        // Content delta
-        if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
-            content.push_str(text);
-        }
-
-        // Tool call deltas
-        if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
-            for tc in tcs {
-                let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
-                let entry = tc_map.entry(idx).or_insert_with(|| {
-                    let id = tc
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    let name = tc
-                        .pointer("/function/name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    (id, name, String::new())
-                });
-                if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
-                    if !id.is_empty() {
-                        entry.0 = id.to_string();
-                    }
-                }
-                if let Some(name) = tc.pointer("/function/name").and_then(|v| v.as_str()) {
-                    if !name.is_empty() {
-                        entry.1 = name.to_string();
-                    }
-                }
-                if let Some(args) = tc.pointer("/function/arguments").and_then(|v| v.as_str()) {
-                    entry.2.push_str(args);
-                }
-            }
-        }
-    }
-
-    // Assemble tool calls
-    let mut indices: Vec<u64> = tc_map.keys().copied().collect();
-    indices.sort();
-    for idx in indices {
-        let (id, name, args) = tc_map.remove(&idx).unwrap();
-        tool_calls.push(json!({
-            "id": id,
-            "type": "function",
-            "function": {
-                "name": name,
-                "arguments": args,
-            }
-        }));
-    }
-
-    let mut msg = json!({
-        "role": "assistant",
-        "content": if content.is_empty() { Value::Null } else { Value::String(content) },
-    });
-
-    if !tool_calls.is_empty() {
-        msg["tool_calls"] = Value::Array(tool_calls);
-    }
-
-    Ok(msg)
-}
+// ── JSON extraction ───────────────────────────────────────────────
 
 /// Extract JSON from the model's final text output.
 fn extract_json_result(text: &str) -> Result<Value> {
-    // Try direct parse
     if let Ok(v) = serde_json::from_str::<Value>(text) {
         return Ok(v);
     }
-    // Try extracting from markdown fences
     if let Some(start) = text.find("```json") {
         let after = &text[start + 7..];
         if let Some(end) = after.find("```") {
@@ -441,19 +461,8 @@ fn extract_json_result(text: &str) -> Result<Value> {
             }
         }
     }
-    // Try finding first { ... } or [ ... ]
     if let Some(v) = crate::llm_parsing::extract_json_object(text) {
         return Ok(v);
     }
     Err(anyhow!("openai_client:no_json_in_response"))
-}
-
-/// Convert a tool dispatch result to a string for the chat message.
-fn tool_result_to_string(result: &Value) -> String {
-    // dispatch_tool_direct returns the raw result Value
-    if let Some(text) = result.as_str() {
-        text.to_string()
-    } else {
-        serde_json::to_string(result).unwrap_or_else(|_| "{}".to_string())
-    }
 }

@@ -241,6 +241,22 @@ fn normalize_value(key: &str, value: &serde_json::Value) -> Result<serde_json::V
                 Err(anyhow!("runtime_setting_invalid:{key}"))
             }
         }
+        "llm_backend" => {
+            let normalized = value.as_str().unwrap_or_default().trim();
+            if ["codex", "native"].contains(&normalized) {
+                Ok(json!(normalized))
+            } else {
+                Err(anyhow!("runtime_setting_invalid:{key}"))
+            }
+        }
+        "openai_api_key" | "openai_model" | "openai_api_base" => {
+            let normalized = value.as_str().unwrap_or_default().trim();
+            if normalized.len() > 200 {
+                Err(anyhow!("runtime_setting_out_of_range:{key}"))
+            } else {
+                Ok(json!(normalized))
+            }
+        }
         "agent_guidelines" => {
             let normalized = value.as_str().unwrap_or_default().trim();
             if normalized.len() > 4000 {

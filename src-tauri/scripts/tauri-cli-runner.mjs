@@ -45,10 +45,12 @@ function runTauri(tauriBin, args) {
   return spawnSync(tauriBin, args, { cwd: projectRoot, stdio: "inherit" });
 }
 
-const tauriBin = resolveTauriCliBin(projectRoot);
+// Check submodule node_modules first, then monorepo root
+const tauriBin = resolveTauriCliBin(projectRoot)
+  || resolveTauriCliBin(path.resolve(projectRoot, "../.."));
 const result = tauriBin
   ? runTauri(tauriBin, commandArgs)
-  : spawnSync(npmCommand, ["exec", "--no", "--", "tauri", ...commandArgs], {
+  : spawnSync(npmCommand, ["exec", "--yes", "--", "tauri", ...commandArgs], {
       cwd: projectRoot,
       stdio: "inherit"
     });

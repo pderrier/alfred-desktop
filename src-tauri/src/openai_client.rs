@@ -130,10 +130,19 @@ pub fn run_prompt(
         }
 
         // Call chat completions
+        // Include both function tools and native web search
+        let mut all_tools: Vec<Value> = tools
+            .iter()
+            .map(|t| json!({"type": "function", "function": t}))
+            .collect();
+        // Native web search — lets the model search and read pages directly.
+        // Only works with OpenAI models; silently ignored by other providers.
+        all_tools.push(json!({"type": "web_search_preview"}));
+
         let body = json!({
             "model": model,
             "messages": messages,
-            "tools": tools.iter().map(|t| json!({"type": "function", "function": t})).collect::<Vec<_>>(),
+            "tools": all_tools,
             "temperature": 0.3,
             "stream": true,
         });

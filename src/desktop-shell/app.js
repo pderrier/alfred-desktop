@@ -1091,7 +1091,7 @@ function renderWelcome() {
   if (!lastFinaryOk && accounts.length === 0 && runs.length === 0) {
     if (titleNode) titleNode.textContent = "Import your portfolio";
     html += `
-      <div class="welcome-step" style="text-align:center">
+      <div class="welcome-step">
         <h3 style="margin-bottom:0.5rem">Connect Finary or import a CSV</h3>
         <p style="color:var(--sea-muted);font-size:0.85rem;margin-bottom:1rem">Alfred needs your portfolio data to get started.</p>
         <div style="display:flex;gap:0.5rem;justify-content:center">
@@ -1112,9 +1112,9 @@ function renderWelcome() {
     html += `
       <div class="welcome-step">
         <h3>No accounts found in Finary</h3>
-        <p>Your Finary session is connected but no brokerage accounts were found. Make sure you have linked your PEA, CTO, or other accounts in Finary first.</p>
+        <p>Your Finary session is connected but no brokerage accounts were found.<br/>Make sure you have linked your PEA, CTO, or other accounts in Finary first.</p>
         <p style="font-size:0.8rem;color:var(--sea-muted)">Go to <a href="https://app.finary.com/connections" target="_blank" style="color:#8ecae6">Finary Connections</a> to add your accounts, then come back and run analysis.</p>
-        <div style="display:flex;gap:0.5rem;margin-top:0.6rem">
+        <div style="display:flex;gap:0.5rem;margin-top:0.6rem;justify-content:center">
           <button class="cmd-btn" onclick="document.getElementById('cmd-run-analysis')?.click()">Run Analysis</button>
           <button class="cmd-btn ghost-btn" onclick="document.getElementById('cmd-run-analysis')?.click()">Import CSV instead</button>
         </div>
@@ -1128,7 +1128,7 @@ function renderWelcome() {
   if (lastFinaryOk && !hasSnapshot && runs.length === 0) {
     if (titleNode) titleNode.textContent = "Ready to analyze";
     html += `
-      <div class="welcome-step" style="text-align:center">
+      <div class="welcome-step">
         <h3 style="margin-bottom:0.5rem">Finary connected</h3>
         <p style="color:var(--sea-muted);font-size:0.85rem;margin-bottom:1rem">Run your first analysis to sync portfolio data and generate recommendations.</p>
         <button class="cmd-btn" onclick="document.getElementById('cmd-run-analysis')?.click()">Run Analysis</button>

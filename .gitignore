@@ -3,6 +3,7 @@ node_modules/
 
 # Rust build artifacts
 src-tauri/target/
+src-tauri/gen/
 
 # Runtime data (user-specific, not committed)
 data/

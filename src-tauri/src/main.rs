@@ -375,6 +375,12 @@ fn run_tauri_app() -> anyhow::Result<()> {
     tauri::Builder::default()
         .setup(|app| {
             let _ = APP_HANDLE.set(app.handle().clone());
+            // Ensure the window is visible and focused on startup
+            use tauri::Manager;
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+                let _ = win.set_focus();
+            }
             // Cleanup orphaned runs — uses the in-memory index so it's instant.
             run_state::cleanup_orphaned_runs();
             Ok(())

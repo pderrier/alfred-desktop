@@ -26,7 +26,13 @@ fn default_data_dir() -> PathBuf {
             }
         }
     }
-    // Production: put data next to the executable.
+    // Production: use %APPDATA%/alfred-desktop (Windows) or ~/.alfred-desktop (Unix).
+    // Avoids permission issues in Program Files.
+    if let Some(app_data) = env::var("APPDATA").ok().or_else(|| env::var("HOME").ok()) {
+        let dir = PathBuf::from(app_data).join("alfred-desktop");
+        return dir;
+    }
+    // Fallback: next to the executable
     env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("data")))

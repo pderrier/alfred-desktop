@@ -188,82 +188,21 @@ fn api_url() -> Option<String> {
     )
 }
 
-fn get_jwt() -> Option<String> {
-    if let Some(token) = env::var("ALFRED_API_TOKEN").ok().filter(|t| !t.is_empty()) {
-        return Some(token);
-    }
-    let home = env::var("HOME")
-        .or_else(|_| env::var("USERPROFILE"))
-        .ok()?;
-    let auth_path = format!("{home}/.codex/auth.json");
-    if let Ok(content) = fs::read_to_string(&auth_path) {
-        if let Ok(parsed) = serde_json::from_str::<Value>(&content) {
-            if let Some(tokens) = parsed.get("tokens") {
-                for key in &["access_token", "id_token"] {
-                    if let Some(token) = tokens.get(key).and_then(|v| v.as_str()) {
-                        if !token.is_empty() {
-                            return Some(token.to_string());
-                        }
-                    }
-                }
-            }
-            for key in &["access_token", "token", "jwt", "id_token"] {
-                if let Some(token) = parsed.get(key).and_then(|v| v.as_str()) {
-                    if !token.is_empty() {
-                        return Some(token.to_string());
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
+// Delegate to alfred_api_client (HMAC-signed requests).
 fn api_persist_extracted_fundamentals(ticker: &str, isin: &str, extracted: &Value) {
-    let base = match api_url() {
-        Some(u) => u,
-        None => return,
-    };
-    let jwt = match get_jwt() {
-        Some(t) => t,
-        None => return,
-    };
-    let url = format!("{base}/api/market/extracted");
-    let body = json!({
-        "ticker": ticker,
-        "isin": isin,
-        "extracted_fundamentals": extracted,
-    });
-    match ureq::post(&url)
-        .set("Authorization", &format!("Bearer {jwt}"))
-        .set("Content-Type", "application/json")
-        .timeout(Duration::from_secs(5))
-        .send_string(&serde_json::to_string(&body).unwrap_or_default())
-    {
-        Ok(_) => log(&format!("api: persisted extracted fundamentals for {ticker}")),
-        Err(e) => log(&format!(
-            "api: failed to persist extracted fundamentals for {ticker}: {e}"
-        )),
-    }
+    crate::alfred_api_client::persist_extracted_fundamentals(ticker, isin, extracted);
 }
 
 fn api_persist_shared_insights(ticker: &str, isin: &str, insights: &Value) {
-    let base = match api_url() {
-        Some(u) => u,
-        None => return,
-    };
-    let jwt = match get_jwt() {
-        Some(t) => t,
-        None => return,
-    };
+    crate::alfred_api_client::persist_shared_insights(ticker, isin, insights);
+}
+
+// Kept for backward compat — but no longer used directly.
+fn _api_persist_shared_insights_legacy(ticker: &str, isin: &str, insights: &Value) {
+    let base = match api_url() { Some(u) => u, None => return };
     let url = format!("{base}/api/insights");
-    let body = json!({
-        "ticker": ticker,
-        "isin": isin,
-        "insights": insights,
-    });
+    let body = json!({ "ticker": ticker, "isin": isin, "insights": insights });
     match ureq::post(&url)
-        .set("Authorization", &format!("Bearer {jwt}"))
         .set("Content-Type", "application/json")
         .timeout(Duration::from_secs(5))
         .send_string(&serde_json::to_string(&body).unwrap_or_default())

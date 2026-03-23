@@ -399,6 +399,11 @@ export function initWizard(deps) {
         source = "finary_cached";
       }
       const account = getSelectedWizardAccount();
+      if (!account) {
+        setWizardStatus("Enter an account name.", "status-error");
+        if (wizardNewAccountName) wizardNewAccountName.focus();
+        return;
+      }
       const guidelines = agentGuidelinesInputNode?.value || "";
       const analysisMode = wizardAnalysisModeNode?.value || "full_run";
       const options = buildRunAnalysisOptions({

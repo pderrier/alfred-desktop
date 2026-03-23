@@ -138,11 +138,7 @@ fn parse_positions_text(text: &str, account_name: &str) -> Result<Value> {
             }
             let nom = cols[0].clone();
             let isin = cols[1].clone();
-            let ticker = if !isin.trim().is_empty() {
-                isin.to_uppercase()
-            } else {
-                nom.to_uppercase()
-            };
+            let ticker = derive_ticker_from_name(&nom, &isin);
             positions.push(serde_json::to_value(crate::models::Position {
                 ticker,
                 nom,
@@ -430,11 +426,7 @@ fn apply_column_mapping(mapping: &ColumnMapping, rows: &[Vec<String>], account_n
 
         positions.push(
             serde_json::to_value(crate::models::Position {
-                ticker: if !isin_raw.trim().is_empty() && isin_raw.len() == 12 {
-                    isin_raw.to_uppercase()
-                } else {
-                    ticker.clone()
-                },
+                ticker: ticker.clone(),
                 nom: if nom.is_empty() { ticker.clone() } else { nom },
                 isin: if isin_raw.trim().is_empty() { None } else { Some(isin_raw) },
                 quantite,

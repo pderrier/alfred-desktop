@@ -1,4 +1,4 @@
-name: Build Windows Release
+name: Build, Sign & Deploy Windows Release
 
 on:
   push:
@@ -10,12 +10,12 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -29,18 +29,114 @@ jobs:
         run: npm install
 
       - name: Build Tauri app
+        env:
+          ALFRED_API_SECRET: ${{ secrets.ALFRED_API_SECRET }}
         run: npm run build:windows
 
       - name: Upload MSI artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
-          name: alfred-desktop-windows-msi
+          name: alfred-desktop-msi
           path: src-tauri/target/release/bundle/msi/*.msi
-          retention-days: 30
+          retention-days: 90
 
       - name: Upload NSIS artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
-          name: alfred-desktop-windows-nsis
+          name: alfred-desktop-exe
           path: src-tauri/target/release/bundle/nsis/*.exe
-          retention-days: 30
+          retention-days: 90
+
+  # ── Code signing (optional — runs only when SignPath is configured) ──
+  sign:
+    needs: build
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - artifact: alfred-desktop-msi
+            slug: msi
+            output: signed-msi
+          - artifact: alfred-desktop-exe
+            slug: exe
+            output: signed-exe
+    steps:
+      - name: Sign via SignPath
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: alfred-desktop
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: ${{ matrix.slug }}
+          github-artifact-id: ${{ matrix.artifact }}
+          wait-for-completion: true
+          output-artifact-directory: ${{ matrix.output }}
+
+      - name: Upload signed artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ matrix.artifact }}-signed
+          path: ${{ matrix.output }}/*
+          retention-days: 90
+
+  # ── Deploy to VPS (uses signed if available, unsigned otherwise) ──
+  deploy:
+    needs: [build]
+    if: always() && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      # Try signed artifacts first, fall back to unsigned
+      - name: Download signed MSI
+        id: signed-msi
+        uses: actions/download-artifact@v5
+        continue-on-error: true
+        with:
+          name: alfred-desktop-msi-signed
+          path: release
+
+      - name: Download unsigned MSI (fallback)
+        if: steps.signed-msi.outcome == 'failure'
+        uses: actions/download-artifact@v5
+        with:
+          name: alfred-desktop-msi
+          path: release
+
+      - name: Download signed EXE
+        id: signed-exe
+        uses: actions/download-artifact@v5
+        continue-on-error: true
+        with:
+          name: alfred-desktop-exe-signed
+          path: release
+
+      - name: Download unsigned EXE (fallback)
+        if: steps.signed-exe.outcome == 'failure'
+        uses: actions/download-artifact@v5
+        with:
+          name: alfred-desktop-exe
+          path: release
+
+      - name: Deploy to VPS
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$VPS_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          for file in release/*; do
+            [ -f "$file" ] || continue
+            filename=$(basename "$file")
+            echo "Uploading $filename..."
+            scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$file" "${VPS_USER}@${VPS_HOST}:/tmp/$filename"
+            ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "${VPS_USER}@${VPS_HOST}" \
+              "sudo mkdir -p /opt/alfred/releases/windows && sudo mv '/tmp/$filename' '/opt/alfred/releases/windows/$filename'"
+            echo "Deployed: $filename"
+          done

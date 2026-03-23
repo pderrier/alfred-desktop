@@ -56,6 +56,10 @@ fn is_transient_lock_error(error: &std::io::Error) -> bool {
 
 fn with_file_lock<T, F: FnOnce() -> Result<T>>(path: &PathBuf, task: F) -> Result<T> {
     let lock_path = path.with_extension("lock");
+    // Ensure parent directory exists before attempting lock
+    if let Some(parent) = lock_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
     for attempt in 0..200 {
         match fs::OpenOptions::new()
             .write(true)

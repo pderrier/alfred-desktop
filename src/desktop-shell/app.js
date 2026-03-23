@@ -1057,17 +1057,14 @@ function renderWelcome() {
   if (!lastFinaryOk && accounts.length === 0 && runs.length === 0) {
     if (titleNode) titleNode.textContent = "Import your portfolio";
     html += `
-      <div class="welcome-step">
-        <h3>Connect Finary or import a CSV</h3>
-        <p>Alfred needs your portfolio data. You can either:</p>
-        <ul style="margin:0.5rem 0;padding-left:1.2rem;color:var(--sea-muted);font-size:0.85rem">
-          <li><strong>Connect Finary</strong> — syncs your brokerage accounts automatically</li>
-          <li><strong>Import CSV</strong> — upload a Boursorama export file</li>
-        </ul>
-        <div style="display:flex;gap:0.5rem;margin-top:0.6rem">
-          <button class="cmd-btn" onclick="document.getElementById('auth-pill-finary')?.click()">Connect Finary</button>
+      <div class="welcome-step" style="text-align:center">
+        <h3 style="margin-bottom:0.5rem">Connect Finary or import a CSV</h3>
+        <p style="color:var(--sea-muted);font-size:0.85rem;margin-bottom:1rem">Alfred needs your portfolio data to get started.</p>
+        <div style="display:flex;gap:0.5rem;justify-content:center">
+          <button class="cmd-btn" onclick="window.__connectFinary()">Connect Finary</button>
           <button class="cmd-btn ghost-btn" onclick="document.getElementById('cmd-run-analysis')?.click()">Import CSV</button>
         </div>
+        <p style="color:var(--sea-muted);font-size:0.75rem;margin-top:0.8rem">Finary syncs your brokerage accounts automatically. CSV import supports any broker format.</p>
       </div>
     `;
     contentNode.innerHTML = html;

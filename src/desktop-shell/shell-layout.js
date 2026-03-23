@@ -487,6 +487,12 @@ export function populateWizardAccounts(accounts) {
   newOpt.value = "__new__";
   newOpt.textContent = "+ New account...";
   wizardAccountSelect.appendChild(newOpt);
+  // If "New account" is the only option, show the name input immediately
+  const newAccountInput = document.getElementById("wizard-new-account-name");
+  if (newAccountInput) {
+    const isNew = wizardAccountSelect.value === "__new__";
+    newAccountInput.classList.toggle("hidden", !isNew);
+  }
 }
 
 export function getSelectedWizardAccount() {

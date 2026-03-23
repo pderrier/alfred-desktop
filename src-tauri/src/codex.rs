@@ -41,6 +41,26 @@ fn codex_install_dir() -> PathBuf {
     }
 }
 
+/// Directory containing the bundled Node.js + codex shipped with the installer.
+/// Located at `<exe_dir>/codex-runtime/` in production builds.
+fn bundled_codex_dir() -> Option<PathBuf> {
+    let exe = env::current_exe().ok()?;
+    let exe_dir = exe.parent()?;
+    let dir = exe_dir.join("codex-runtime");
+    if dir.exists() { Some(dir) } else { None }
+}
+
+/// Prepare a Command for codex execution: hide console on Windows and
+/// prepend the bundled codex-runtime dir to PATH (so codex.cmd finds node.exe).
+fn prepare_codex_cmd(cmd: &mut Command) {
+    if let Some(dir) = bundled_codex_dir() {
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let current = env::var("PATH").unwrap_or_default();
+        cmd.env("PATH", format!("{}{sep}{current}", dir.display()));
+    }
+    hide_console_window(cmd);
+}
+
 fn resolve_codex_binary() -> Result<PathBuf> {
     // Explicit override
     if let Ok(path) = env::var("CODEX_PROXY_CLI_CMD") {
@@ -50,15 +70,29 @@ fn resolve_codex_binary() -> Result<PathBuf> {
         }
     }
 
-    let install_dir = codex_install_dir();
+    // 1. Check bundled codex-runtime (shipped with installer)
+    if let Some(bundle_dir) = bundled_codex_dir() {
+        let candidates: &[&str] = if cfg!(windows) {
+            &["codex.cmd", "codex.exe", "codex"]
+        } else {
+            &["codex"]
+        };
+        for name in candidates {
+            let path = bundle_dir.join(name);
+            if path.exists() {
+                crate::debug_log(&format!("codex: using bundled binary {}", path.display()));
+                return Ok(path);
+            }
+        }
+    }
 
-    // Check install dir for codex.cmd / codex.exe / codex
+    // 2. Check legacy install dir (%APPDATA%/alfred/bin)
+    let install_dir = codex_install_dir();
     let candidates: &[&str] = if cfg!(windows) {
         &["codex.cmd", "codex.exe", "codex"]
     } else {
         &["codex"]
     };
-
     for name in candidates {
         let path = install_dir.join(name);
         if path.exists() {
@@ -66,7 +100,7 @@ fn resolve_codex_binary() -> Result<PathBuf> {
         }
     }
 
-    // Check if codex is on PATH
+    // 3. Check system PATH
     let cmd_name = if cfg!(windows) { "codex.cmd" } else { "codex" };
     let mut check = Command::new(cmd_name);
     check.arg("--version").stdout(Stdio::null()).stderr(Stdio::null());
@@ -75,11 +109,12 @@ fn resolve_codex_binary() -> Result<PathBuf> {
         return Ok(PathBuf::from(cmd_name));
     }
 
-    // Not found — try auto-install
+    // 4. Fallback — try npm auto-install (requires Node.js on the system)
     match auto_install_codex() {
         Ok(path) => Ok(path),
         Err(e) => Err(anyhow!(
-            "codex_not_found:install with `npm install -g @openai/codex` or set CODEX_PROXY_CLI_CMD. Auto-install failed: {e}"
+            "codex_not_found:codex-runtime bundle missing and npm auto-install failed: {e}. \
+             Reinstall Alfred Desktop or install codex manually: npm install -g @openai/codex"
         )),
     }
 }
@@ -118,7 +153,7 @@ pub fn ensure_codex_available() -> Result<Value> {
     crate::debug_log(&format!("codex: found at {}", path.display()));
     let mut ver_cmd = Command::new(path.as_os_str());
     ver_cmd.arg("--version").stdout(Stdio::piped()).stderr(Stdio::piped());
-    hide_console_window(&mut ver_cmd);
+    prepare_codex_cmd(&mut ver_cmd);
     let version = ver_cmd.output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
@@ -290,7 +325,7 @@ impl AppServerClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        hide_console_window(&mut cmd);
+        prepare_codex_cmd(&mut cmd);
         let mut child = cmd.spawn()
             .map_err(|e| anyhow!("codex_app_server_spawn_failed:{e}"))?;
 
@@ -949,7 +984,7 @@ pub fn session_status() -> Result<Value> {
         return Ok(json!({
             "status": "no_binary",
             "logged_in": false,
-            "message": "Codex CLI not found. Install with: npm install -g @openai/codex"
+            "message": "Codex CLI not found. Reinstall Alfred Desktop or install manually: npm install -g @openai/codex"
         }));
     }
 
@@ -1003,34 +1038,33 @@ pub fn session_status() -> Result<Value> {
     }
 }
 
-/// Launch `codex login` in the user's default browser.
-/// This is a blocking call that waits for the login to complete.
-pub fn session_login() -> Result<Value> {
+/// Run a codex subcommand (login/logout), restart the app-server afterward,
+/// and return a JSON status result.
+fn run_codex_session_cmd(subcmd: &str, ok_status: &str) -> Result<Value> {
     let bin = resolve_codex_binary()?;
+    crate::debug_log(&format!("codex: launching 'codex {subcmd}'"));
 
-    crate::debug_log("codex: launching 'codex login'");
+    let mut cmd = Command::new(bin.as_os_str());
+    cmd.arg(subcmd).stdout(Stdio::piped()).stderr(Stdio::piped());
+    prepare_codex_cmd(&mut cmd);
+    let output = cmd.output()
+        .map_err(|e| anyhow!("codex_{subcmd}_spawn_failed:{e}"))?;
 
-    let mut login_cmd = Command::new(bin.as_os_str());
-    login_cmd.arg("login").stdout(Stdio::piped()).stderr(Stdio::piped());
-    hide_console_window(&mut login_cmd);
-    let output = login_cmd.output()
-        .map_err(|e| anyhow!("codex_login_spawn_failed:{e}"))?;
+    // Always restart the app-server so it picks up the new auth state
+    stop_app_server();
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
     if output.status.success() {
-        crate::debug_log("codex: login completed successfully");
-        // Stop existing app-server so it restarts with new auth
-        stop_app_server();
+        crate::debug_log(&format!("codex: {subcmd} completed successfully"));
         Ok(json!({
             "ok": true,
-            "status": "logged_in",
+            "status": ok_status,
             "message": stdout.trim()
         }))
     } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         Err(anyhow!(
-            "codex_login_failed:exit_code={:?}:stdout={}:stderr={}",
+            "codex_{subcmd}_failed:exit_code={:?}:stdout={}:stderr={}",
             output.status.code(),
             truncate(&stdout, 200),
             truncate(&stderr, 200)
@@ -1038,37 +1072,14 @@ pub fn session_login() -> Result<Value> {
     }
 }
 
+/// Launch `codex login` in the user's default browser.
+pub fn session_login() -> Result<Value> {
+    run_codex_session_cmd("login", "logged_in")
+}
+
 /// Log out of the current Codex/OpenAI session.
 pub fn session_logout() -> Result<Value> {
-    let bin = resolve_codex_binary()?;
-
-    crate::debug_log("codex: launching 'codex logout'");
-
-    let mut logout_cmd = Command::new(bin.as_os_str());
-    logout_cmd.arg("logout").stdout(Stdio::piped()).stderr(Stdio::piped());
-    hide_console_window(&mut logout_cmd);
-    let output = logout_cmd.output()
-        .map_err(|e| anyhow!("codex_logout_spawn_failed:{e}"))?;
-
-    // Stop the app-server — it's using the old session
-    stop_app_server();
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    if output.status.success() {
-        crate::debug_log("codex: logout completed");
-        Ok(json!({
-            "ok": true,
-            "status": "logged_out",
-            "message": stdout.trim()
-        }))
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        Err(anyhow!(
-            "codex_logout_failed:exit_code={:?}:stderr={}",
-            output.status.code(),
-            truncate(&stderr, 200)
-        ))
-    }
+    run_codex_session_cmd("logout", "logged_out")
 }
 
 // ── JSON extraction (safety net for agent output) ─────────────────

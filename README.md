@@ -120,6 +120,9 @@ Set `ALFRED_API_URL` to your instance URL once deployed.
 
 ## Prerequisites
 
+**End users:** just install the MSI/NSIS package — Node.js and Codex are bundled automatically.
+
+**Developers:**
 - [Node.js](https://nodejs.org/) 18+
 - [Rust](https://rustup.rs/) 1.75+
 - [OpenAI Codex CLI](https://github.com/openai/codex) (`npm install -g @openai/codex`)
@@ -134,9 +137,14 @@ npm install
 # Run in development mode
 npm run dev
 
-# Build for production
-npm run build            # Linux / macOS
-npm run build:windows    # Windows (MSI + NSIS)
+# Build for production (Windows)
+# 1. Bundle portable Node.js + codex into the installer
+powershell -ExecutionPolicy Bypass -File scripts/prepare-codex-bundle.ps1
+# 2. Build the MSI/NSIS installer
+npm run build:windows
+
+# Build for production (Linux / macOS)
+npm run build
 ```
 
 ## Configuration

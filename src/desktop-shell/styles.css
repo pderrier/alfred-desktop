@@ -1199,8 +1199,9 @@ main {
 /* Welcome / Home screen */
 .welcome-step {
   padding: 0.8rem;
-  margin-bottom: 0.6rem;
+  margin: 0 auto 0.6rem;
   text-align: center;
+  max-width: 480px;
 }
 .welcome-step h3 {
   margin: 0 0 0.4rem;

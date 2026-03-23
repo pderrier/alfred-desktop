@@ -294,6 +294,10 @@ export function initBootstrap(deps) {
 
     refreshWizardSourcePolicy(getLatestFinarySessionPayload());
 
+    // 2b. Health check — verify API is reachable
+    setSplashStatus("Checking API\u2026");
+    refreshHealthPill();
+
     // 3. All OK → dismiss
     if (openaiOk && finaryOk) {
       dismissSplash();

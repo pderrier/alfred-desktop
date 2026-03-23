@@ -559,10 +559,18 @@ async function refreshHealthPill() {
   try {
     const health = await tauriInvoke("stack_health_local");
     const payload = health?.result || health;
+    latestStackHealthPayload = payload;
     renderStatusPill(payload, null, null);
   } catch {
-    renderStatusPill({ status: "unreachable", ok: false, services: [] }, null, null);
+    latestStackHealthPayload = { status: "unreachable", ok: false, services: [] };
+    renderStatusPill(latestStackHealthPayload, null, null);
   }
+}
+
+function isApiHealthy() {
+  if (!latestStackHealthPayload) return true; // unknown = assume ok
+  const status = latestStackHealthPayload.status || "unknown";
+  return status === "healthy" || status === "degraded";
 }
 
 const bootstrap = initBootstrap({
@@ -821,11 +829,13 @@ function updateAuthPills() {
   if (authPopoverFinaryConnect) {
     authPopoverFinaryConnect.textContent = lastFinaryOk ? "Reconnect" : "Connect";
   }
-  // Disable Run Analysis button when OpenAI is not connected
+  // Disable Run Analysis when OpenAI not connected or API unreachable
   const cmdRunAnalysis = document.getElementById("cmd-run-analysis");
   if (cmdRunAnalysis) {
-    cmdRunAnalysis.disabled = !lastOpenaiOk;
-    cmdRunAnalysis.title = lastOpenaiOk ? "" : "Connect OpenAI first";
+    const apiOk = isApiHealthy();
+    const canRun = lastOpenaiOk && apiOk;
+    cmdRunAnalysis.disabled = !canRun;
+    cmdRunAnalysis.title = !lastOpenaiOk ? "Connect OpenAI first" : !apiOk ? "API unreachable — analysis needs market data" : "";
   }
 }
 
@@ -1061,6 +1071,18 @@ function renderWelcome() {
   const latestAccount = latestRun.account || "";
 
   let html = "";
+
+  // ── API health warning (shown above everything else) ──
+  if (!isApiHealthy()) {
+    const apiStatus = latestStackHealthPayload?.status || "unreachable";
+    html += `
+      <div class="welcome-step welcome-step-error">
+        <h3>API ${apiStatus === "unreachable" ? "Unreachable" : "Degraded"}</h3>
+        <p>The enrichment API is ${apiStatus}. Analysis is disabled — market data and news cannot be fetched.</p>
+        <p style="font-size:0.8rem;color:var(--sea-muted)">You can still browse existing reports and data.</p>
+      </div>
+    `;
+  }
 
   // ── Step 1: OpenAI connection ──
   if (!lastOpenaiOk) {

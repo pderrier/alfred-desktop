@@ -546,10 +546,31 @@ pub(crate) fn read_line_memory_store() -> Result<Value> {
     Ok(serde_json::from_str(&raw)?)
 }
 
-/// Fetch a Finary snapshot (accounts + positions) without starting a run.
-/// Used at startup to populate the account list.
+/// Fetch a Finary snapshot if no cached one exists. Persists to disk.
+/// Returns the snapshot (cached or fresh).
 pub fn fetch_finary_snapshot_standalone() -> Result<Value> {
-    fetch_finary_snapshot("__startup__", crate::request_http_json)
+    // Check if we already have a cached snapshot with positions
+    if let Ok(Some(existing)) = get_latest_local_finary_snapshot() {
+        let count = existing.get("snapshot")
+            .and_then(|s| s.get("positions"))
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        if count > 0 {
+            crate::debug_log(&format!("finary_sync: using cached snapshot ({count} positions)"));
+            return Ok(existing.get("snapshot").cloned().unwrap_or(existing));
+        }
+    }
+
+    crate::debug_log("finary_sync: no cached snapshot, fetching from Finary API...");
+    let snapshot = fetch_finary_snapshot("__startup__", crate::request_http_json)?;
+    if let Err(e) = persist_local_finary_snapshot(&snapshot) {
+        crate::debug_log(&format!("finary_sync: persist failed (may be empty): {e}"));
+    } else {
+        let count = snapshot.get("positions").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+        crate::debug_log(&format!("finary_sync: persisted snapshot with {count} positions"));
+    }
+    Ok(snapshot)
 }
 
 fn fetch_finary_snapshot(run_id: &str, _request_fn: HttpRequestFn) -> Result<Value> {

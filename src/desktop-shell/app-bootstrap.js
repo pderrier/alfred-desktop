@@ -284,8 +284,12 @@ export function initBootstrap(deps) {
     } catch { finaryOk = false; }
 
     if (finaryOk) {
-      setSplashStatus("Loading portfolio...");
-      try { await refreshDashboard(); } catch { /* cached data is fine */ }
+      // Load cached portfolio, or fetch from Finary API if no cache exists
+      setSplashStatus("Loading portfolio\u2026");
+      try {
+        if (tauriInvoke) await tauriInvoke("finary_sync_snapshot_local");
+        await refreshDashboard();
+      } catch { /* will show on welcome page */ }
     }
 
     refreshWizardSourcePolicy(getLatestFinarySessionPayload());

@@ -13,7 +13,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Path
-$TauriDir    = Join-Path $ScriptDir ".." "src-tauri"
+$TauriDir    = Join-Path (Join-Path $ScriptDir "..") "src-tauri"
 $OutDir      = Join-Path $TauriDir "codex-runtime"
 $NodeDirName = "node-$NodeVersion-win-$Arch"
 $NodeUrl     = "https://nodejs.org/dist/$NodeVersion/$NodeDirName.zip"

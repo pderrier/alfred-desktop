@@ -62,7 +62,7 @@ pub fn request_cancellation(operation_id: &str) -> Result<serde_json::Value> {
     crate::debug_log(&format!("analysis: cancellation requested for {safe_id}"));
     // Kill any active codex child processes immediately
     crate::codex::kill_all_active();
-    // Mark the run state as aborted (marks stuck line_status entries)
+    // Mark the run state as aborted + all "analyzing" lines as aborted
     if let Ok(ops) = ops_store().lock() {
         if let Some(record) = ops.get(safe_id) {
             if let Some(run_id) = record.run_id.as_ref() {
@@ -75,6 +75,15 @@ pub fn request_cancellation(operation_id: &str) -> Result<serde_json::Value> {
                             "error_message": "Run was stopped by user.",
                             "updated_at": crate::helpers::now_iso_string()
                         }));
+                        // Mark all in-progress lines as aborted
+                        if let Some(line_status) = obj.get_mut("line_status").and_then(|v| v.as_object_mut()) {
+                            for (_ticker, status) in line_status.iter_mut() {
+                                let s = status.as_str().unwrap_or_default();
+                                if s == "analyzing" || s == "repairing" || s == "pending" {
+                                    *status = json!("aborted");
+                                }
+                            }
+                        }
                     }
                 });
             }

@@ -14,6 +14,84 @@ use serde_json::{json, Value};
 
 // ── Batch prompt ─────────────────────────────────────────────────
 
+/// Build a per-line prompt for the native backend. Data is pre-injected —
+/// no get_line_data tool call needed, saving a round-trip and keeping context clean.
+fn build_native_line_prompt(run_id: &str, ticker: &str, nom: &str, line_type: &str, line_data: &Value) -> String {
+    let position = serde_json::to_string_pretty(&line_data["position"]).unwrap_or_default();
+    let market = serde_json::to_string_pretty(&line_data["market_data"]).unwrap_or_default();
+    let news = serde_json::to_string_pretty(&line_data["news"]).unwrap_or_default();
+    let insights = serde_json::to_string_pretty(&line_data["shared_insights"]).unwrap_or_default();
+    let memory = serde_json::to_string_pretty(&line_data["line_memory"]).unwrap_or_default();
+    let quality = serde_json::to_string_pretty(&line_data["quality"]).unwrap_or_default();
+
+    format!(
+        r#"Tu es Alfred, un conseiller financier bienveillant. Analyse cette ligne pour le run "{run_id}".
+
+Ligne: {line_type}:{ticker} ({nom})
+
+=== DONNEES (pre-chargees) ===
+
+Position:
+{position}
+
+Donnees de marche:
+{market}
+
+Actualites:
+{news}
+
+Insights partages:
+{insights}
+
+Memoire precedente:
+{memory}
+
+Qualite des donnees:
+{quality}
+
+=== INSTRUCTIONS ===
+
+Produis un JSON de recommandation avec :
+- line_id: "{line_type}:{ticker}"
+- ticker: "{ticker}", type: "{line_type}", nom: "{nom}"
+- signal: ACHAT_FORT | ACHAT | RENFORCEMENT | CONSERVER | ALLEGEMENT | VENTE | SURVEILLANCE
+- conviction: faible | moderee | forte
+- synthese: minimum 150 caracteres (explique comme a un ami)
+- analyse_technique, analyse_fondamentale, analyse_sentiment
+- raisons_principales: 3-5 raisons (array)
+- risques, catalyseurs, badges_keywords: arrays
+- action_recommandee: instruction CHIFFREE (nb titres, montant EUR, prix)
+- deep_news_summary: synthese 100-500 chars des actualites cles (OBLIGATOIRE si news disponibles)
+- deep_news_quality_score: 0-100
+- deep_news_relevance: high|medium|low
+- deep_news_staleness: fresh|recent|stale
+- reanalyse_after: date ISO, reanalyse_reason
+- llm_memory_summary: resume factuel
+
+Appelle `validate_recommendation(run_id="{run_id}", recommendation=...)`.
+Si ok=false, corrige les issues et re-appelle jusqu'a ok=true.
+
+BUDGET WEB: maximum 1 recherche web, uniquement si deep_news_quality_score < 30.
+Si tu fais une recherche web et lis un article, appelle `persist_deep_news`.
+Si un article est du bruit, appelle `ban_deep_news`.
+Si fondamentaux manquants trouves, appelle `persist_extracted_fundamentals`.
+Appelle `persist_shared_insights` avec tes analyses generiques.
+
+Les articles marques "RESUME APPROFONDI (cache)" sont deja resumes — utilise-les directement.
+Les articles marques "A APPROFONDIR" n'ont pas de resume — lis-les via recherche web."#,
+        run_id = run_id,
+        ticker = ticker,
+        nom = nom,
+        line_type = line_type,
+        position = position,
+        market = market,
+        news = news,
+        insights = insights,
+        memory = memory,
+        quality = quality,
+    )
+}
+
 fn build_batch_prompt(run_id: &str, tickers: &[(String, String, String)]) -> String {
     let lines_list = tickers
         .iter()
@@ -232,76 +310,151 @@ impl McpBatchDispatchQueue {
         self.relay_stop_flags.push(relay_stop);
 
         let batch_tickers: Vec<String> = tickers.iter().map(|(t, _, _)| t.clone()).collect();
-        let prompt = build_batch_prompt(&run_id, &tickers);
+        let is_native = crate::llm_backend::current_backend_name() != "codex";
 
         let progress_run_id = run_id.clone();
         let progress_data_dir = data_dir.clone();
         let progress_tickers = batch_tickers.clone();
 
         thread::spawn(move || {
-            let timeout_ms = 180_000 + (progress_tickers.len() as u64 * 30_000);
+            if is_native {
+                // Native backend: per-line dispatch with pre-injected data, clean context each time
+                let dd = std::path::PathBuf::from(&progress_data_dir);
+                let mut ok_tickers: Vec<String> = Vec::new();
+                let mut has_error = false;
 
-            // Track which ticker Codex is working on based on MCP tool call pattern
-            let current_ticker = std::sync::Arc::new(std::sync::Mutex::new(
-                progress_tickers.first().cloned().unwrap_or_default()
-            ));
-            let ct = std::sync::Arc::clone(&current_ticker);
-            let prid = progress_run_id.clone();
-            let pdd = std::path::PathBuf::from(&progress_data_dir);
+                for (ticker, nom, line_type) in &tickers {
+                    let timeout_ms = 180_000u64;
+                    let prid = progress_run_id.clone();
+                    let pdd = dd.clone();
+                    let tk = ticker.clone();
 
-            let progress_cb: Option<crate::llm_backend::ProgressFn> = Some(Box::new(move |_bytes, _lines, label| {
-                let ticker = ct.lock().map(|g| g.clone()).unwrap_or_default();
+                    // Pre-fetch line data (same as get_line_data tool, but no IPC)
+                    let line_data = crate::mcp_server::dispatch_tool_direct(
+                        &dd,
+                        "get_line_data",
+                        &serde_json::json!({"run_id": progress_run_id, "line_id": format!("{line_type}:{ticker}")}),
+                    );
 
-                // Token usage and rate limit events → write as stats events (no ticker needed)
-                if label.starts_with("tokens:") || label.starts_with("rate_limit:") {
-                    let path = pdd.join("runtime-state").join(format!("{prid}_mcp_progress.jsonl"));
-                    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-                        use std::io::Write;
-                        let event = if label.starts_with("tokens:") {
-                            let parts: Vec<&str> = label.split(':').collect();
-                            serde_json::json!({
-                                "type": "token_usage",
-                                "total": parts.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
-                                "input": parts.get(2).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
-                                "output": parts.get(3).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
-                            })
-                        } else {
-                            serde_json::json!({
-                                "type": "rate_limit",
-                                "used_pct": label.trim_start_matches("rate_limit:").trim_end_matches('%'),
-                            })
-                        };
-                        let _ = writeln!(file, "{}", serde_json::to_string(&event).unwrap_or_default());
+                    let prompt = build_native_line_prompt(&progress_run_id, ticker, nom, line_type, &line_data);
+
+                    let progress_cb: Option<crate::llm_backend::ProgressFn> = Some(Box::new(move |_bytes, _lines, label| {
+                        if label.starts_with("tokens:") || label.starts_with("rate_limit:") {
+                            let path = pdd.join("runtime-state").join(format!("{prid}_mcp_progress.jsonl"));
+                            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                                use std::io::Write;
+                                let event = if label.starts_with("tokens:") {
+                                    let parts: Vec<&str> = label.split(':').collect();
+                                    serde_json::json!({
+                                        "type": "token_usage",
+                                        "total": parts.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+                                        "input": parts.get(2).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+                                        "output": parts.get(3).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+                                    })
+                                } else {
+                                    serde_json::json!({
+                                        "type": "rate_limit",
+                                        "used_pct": label.trim_start_matches("rate_limit:").trim_end_matches('%'),
+                                    })
+                                };
+                                let _ = writeln!(file, "{}", serde_json::to_string(&event).unwrap_or_default());
+                            }
+                            return;
+                        }
+                        if !tk.is_empty() {
+                            crate::mcp_progress_relay::write_progress_event(
+                                &pdd, &prid, &tk, "analyzing", &label.replace('\u{2026}', "..."),
+                            );
+                        }
+                    }));
+
+                    match crate::llm_backend::run_prompt(&prompt, timeout_ms, progress_cb) {
+                        Ok(_) => ok_tickers.push(ticker.clone()),
+                        Err(e) => {
+                            eprintln!("[mcp-native] line {ticker} failed: {e}");
+                            let err_msg = format!("{e}");
+                            let _ = crate::run_state::update_line_status_with_error(
+                                &progress_run_id, ticker, "failed", Some(&err_msg),
+                            );
+                            crate::emit_event("alfred://line-progress", serde_json::json!({
+                                "run_id": progress_run_id,
+                                "ticker": ticker,
+                                "line_status": { "status": "failed", "error": err_msg },
+                            }));
+                            has_error = true;
+                        }
                     }
-                    return;
                 }
 
-                if ticker.is_empty() { return; }
-                let progress_text = label.replace('\u{2026}', "...");
-                crate::mcp_progress_relay::write_progress_event(
-                    &pdd, &prid, &ticker, "analyzing", &progress_text,
-                );
-            }));
+                let _ = tx.send(if ok_tickers.is_empty() && has_error {
+                    Err(anyhow::anyhow!("all_lines_failed"))
+                } else {
+                    Ok(ok_tickers)
+                });
+                drop(relay_handle);
+            } else {
+                // Codex backend: batch prompt (model calls get_line_data via MCP tools)
+                let prompt = build_batch_prompt(&progress_run_id, &tickers);
+                let timeout_ms = 180_000 + (progress_tickers.len() as u64 * 30_000);
 
-            let result = crate::llm_backend::run_prompt(&prompt, timeout_ms, progress_cb);
-            let _ = tx.send(match result {
-                Ok(_) => Ok(batch_tickers),
-                Err(e) => {
-                    eprintln!("[mcp-batch] turn failed: {e}");
-                    // Mark all tickers in this batch as failed immediately + push to UI
-                    let err_msg = format!("{e}");
-                    for t in &batch_tickers {
-                        let _ = crate::run_state::update_line_status_with_error(&run_id, t, "failed", Some(&err_msg));
-                        crate::emit_event("alfred://line-progress", serde_json::json!({
-                            "run_id": run_id,
-                            "ticker": t,
-                            "line_status": { "status": "failed", "error": err_msg },
-                        }));
+                let current_ticker = std::sync::Arc::new(std::sync::Mutex::new(
+                    progress_tickers.first().cloned().unwrap_or_default()
+                ));
+                let ct = std::sync::Arc::clone(&current_ticker);
+                let prid = progress_run_id.clone();
+                let pdd = std::path::PathBuf::from(&progress_data_dir);
+
+                let progress_cb: Option<crate::llm_backend::ProgressFn> = Some(Box::new(move |_bytes, _lines, label| {
+                    let ticker = ct.lock().map(|g| g.clone()).unwrap_or_default();
+
+                    if label.starts_with("tokens:") || label.starts_with("rate_limit:") {
+                        let path = pdd.join("runtime-state").join(format!("{prid}_mcp_progress.jsonl"));
+                        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                            use std::io::Write;
+                            let event = if label.starts_with("tokens:") {
+                                let parts: Vec<&str> = label.split(':').collect();
+                                serde_json::json!({
+                                    "type": "token_usage",
+                                    "total": parts.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+                                    "input": parts.get(2).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+                                    "output": parts.get(3).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+                                })
+                            } else {
+                                serde_json::json!({
+                                    "type": "rate_limit",
+                                    "used_pct": label.trim_start_matches("rate_limit:").trim_end_matches('%'),
+                                })
+                            };
+                            let _ = writeln!(file, "{}", serde_json::to_string(&event).unwrap_or_default());
+                        }
+                        return;
                     }
-                    Err(e)
-                }
-            });
-            drop(relay_handle);
+
+                    if ticker.is_empty() { return; }
+                    crate::mcp_progress_relay::write_progress_event(
+                        &pdd, &prid, &ticker, "analyzing", &label.replace('\u{2026}', "..."),
+                    );
+                }));
+
+                let result = crate::llm_backend::run_prompt(&prompt, timeout_ms, progress_cb);
+                let _ = tx.send(match result {
+                    Ok(_) => Ok(batch_tickers),
+                    Err(e) => {
+                        eprintln!("[mcp-batch] turn failed: {e}");
+                        let err_msg = format!("{e}");
+                        for t in &batch_tickers {
+                            let _ = crate::run_state::update_line_status_with_error(&progress_run_id, t, "failed", Some(&err_msg));
+                            crate::emit_event("alfred://line-progress", serde_json::json!({
+                                "run_id": progress_run_id,
+                                "ticker": t,
+                                "line_status": { "status": "failed", "error": err_msg },
+                            }));
+                        }
+                        Err(e)
+                    }
+                });
+                drop(relay_handle);
+            }
         });
 
         self.active_batches += 1;

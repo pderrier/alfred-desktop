@@ -474,6 +474,30 @@
           </div>
         </article>
 
+        <!-- LLM Backend -->
+        <article class="settings-card">
+          <h3>LLM Backend</h3>
+          <div class="settings-field">
+            <label for="settings-llm-backend">Backend</label>
+            <select id="settings-llm-backend">
+              <option value="codex">Codex (free tier — OpenAI OAuth)</option>
+              <option value="native">Native (API key — pay-per-use)</option>
+            </select>
+          </div>
+          <div id="settings-native-fields" class="hidden">
+            <div class="settings-field">
+              <label for="settings-openai-api-key">OpenAI API key</label>
+              <input id="settings-openai-api-key" type="password" placeholder="sk-..." autocomplete="off" />
+              <button id="settings-apikey-toggle" class="ghost-btn" type="button" style="font-size:0.7rem">Show</button>
+            </div>
+            <div class="settings-field">
+              <label for="settings-openai-model">Model</label>
+              <input id="settings-openai-model" type="text" placeholder="gpt-4.1" value="gpt-4.1" />
+            </div>
+            <p id="settings-apikey-status" class="settings-note"></p>
+          </div>
+        </article>
+
         <!-- Storage -->
         <article class="settings-card">
           <h3>Storage</h3>

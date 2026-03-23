@@ -238,25 +238,43 @@ export function initBootstrap(deps) {
     let openaiOk = false;
     let finaryOk = false;
 
-    setSplashStatus("Checking OpenAI\u2026");
-
-    // Check OpenAI
+    // Detect LLM backend
+    let llmBackend = "codex";
     try {
-      const status = await bridge.getCodexSessionStatus();
-      const r = status?.result || status;
-      if (r?.status === "no_binary") {
-        // Auto-install codex, then recheck
-        setSplashStatus("Installing Codex CLI...");
-        try {
-          if (tauriInvoke) await tauriInvoke("ensure_codex_local");
-          const status2 = await bridge.getCodexSessionStatus();
-          const r2 = status2?.result || status2;
-          openaiOk = r2?.logged_in === true;
-        } catch { openaiOk = false; }
-      } else {
-        openaiOk = r?.logged_in === true;
+      if (tauriInvoke) {
+        const settings = await tauriInvoke("runtime_settings_local");
+        llmBackend = settings?.values?.llm_backend || "codex";
       }
-    } catch { openaiOk = false; }
+    } catch { /* default to codex */ }
+
+    if (llmBackend === "native") {
+      // Native backend — validate API key
+      setSplashStatus("Validating API key\u2026");
+      try {
+        if (tauriInvoke) {
+          const result = await tauriInvoke("check_openai_api_key_local");
+          openaiOk = result?.ok === true;
+        }
+      } catch { openaiOk = false; }
+    } else {
+      // Codex backend — check session
+      setSplashStatus("Checking OpenAI\u2026");
+      try {
+        const status = await bridge.getCodexSessionStatus();
+        const r = status?.result || status;
+        if (r?.status === "no_binary") {
+          setSplashStatus("Installing Codex CLI...");
+          try {
+            if (tauriInvoke) await tauriInvoke("ensure_codex_local");
+            const status2 = await bridge.getCodexSessionStatus();
+            const r2 = status2?.result || status2;
+            openaiOk = r2?.logged_in === true;
+          } catch { openaiOk = false; }
+        } else {
+          openaiOk = r?.logged_in === true;
+        }
+      } catch { openaiOk = false; }
+    }
 
     // Check Finary
     setSplashStatus("Checking Finary\u2026");
@@ -296,7 +314,9 @@ export function initBootstrap(deps) {
       }
     }
 
-    setRowStatus(openaiIconNode, openaiStatusNode, openaiBtn, openaiOk, "not connected");
+    const nativeLabel = llmBackend === "native" ? "API key missing" : "not connected";
+    setRowStatus(openaiIconNode, openaiStatusNode, openaiBtn, openaiOk, nativeLabel);
+    if (llmBackend === "native" && openaiBtn) openaiBtn.textContent = "Configure";
     setRowStatus(finaryIconNode, finaryStatusNode, finaryBtn, finaryOk, "session expired");
 
     // Enable "Continue" only when OpenAI is connected (required)
@@ -308,6 +328,11 @@ export function initBootstrap(deps) {
 
     // OpenAI connect handler
     openaiBtn?.addEventListener("click", async function handler() {
+      if (llmBackend === "native") {
+        // Native backend — open settings to configure API key
+        if (hintNode) hintNode.textContent = "Set your API key in Settings (gear icon) then restart.";
+        return;
+      }
       this.disabled = true;
       this.textContent = "Signing in...";
       if (hintNode) hintNode.textContent = "A browser window will open for sign-in.";

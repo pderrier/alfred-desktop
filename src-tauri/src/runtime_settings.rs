@@ -32,6 +32,42 @@ pub fn definitions_json() -> serde_json::Value {
             "whyItMatters": "Theme choice affects readability and contrast during long review sessions.",
             "resetLabel": "Use dark theme"
         },
+        "llm_backend": {
+            "type": "enum",
+            "values": ["codex", "native"],
+            "defaultValue": "codex",
+            "section": "product",
+            "restartRequired": false,
+            "envName": "ALFRED_LLM_BACKEND",
+            "label": "LLM backend",
+            "description": "Codex uses OpenAI OAuth (free tier). Native uses your own API key (pay-per-use, lighter install).",
+            "whyItMatters": "Codex is free for new OpenAI users. Native requires an API key but removes the Node.js dependency.",
+            "resetLabel": "Use Codex (free tier)"
+        },
+        "openai_api_key": {
+            "type": "text",
+            "maxLength": 200,
+            "defaultValue": "",
+            "section": "product",
+            "restartRequired": false,
+            "envName": "OPENAI_API_KEY",
+            "label": "OpenAI API key",
+            "description": "Required when using the native backend. Get your key at platform.openai.com/api-keys.",
+            "whyItMatters": "The native backend calls the OpenAI API directly with your key. Your key stays on-device.",
+            "resetLabel": "Clear API key"
+        },
+        "openai_model": {
+            "type": "text",
+            "maxLength": 50,
+            "defaultValue": "gpt-4.1",
+            "section": "product",
+            "restartRequired": false,
+            "envName": "ALFRED_MODEL",
+            "label": "OpenAI model (native backend)",
+            "description": "Model to use with the native backend. Leave empty for default.",
+            "whyItMatters": "More capable models produce better analysis but cost more per call.",
+            "resetLabel": "Use default model"
+        },
         "agent_guidelines": {
             "type": "text",
             "maxLength": 4000,

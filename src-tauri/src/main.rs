@@ -372,6 +372,16 @@ fn load_local_env() {
     }
 }
 
+// ── LLM backend commands ─────────────────────────────────────────────────
+
+#[tauri::command]
+async fn check_openai_api_key_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(openai_client::validate_api_key)
+        .await
+        .map_err(|e| format!("check_openai_api_key_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
 // ── Updater commands ──────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -454,6 +464,7 @@ fn run_tauri_app() -> anyhow::Result<()> {
             storage_usage_local,
             storage_prune_local,
             storage_clear_log_local,
+            check_openai_api_key_local,
             check_for_update_local,
             download_update_local,
             install_update_local

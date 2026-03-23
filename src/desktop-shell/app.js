@@ -85,6 +85,12 @@ const settingsShellThemeNode = document.getElementById("settings-shell-theme");
 const settingsCredentialsNode = document.getElementById("settings-credentials");
 const settingsSaveBtn = document.getElementById("settings-save-btn");
 const settingsResetBtn = document.getElementById("settings-reset-btn");
+const settingsLlmBackendNode = document.getElementById("settings-llm-backend");
+const settingsNativeFieldsNode = document.getElementById("settings-native-fields");
+const settingsOpenaiApiKeyNode = document.getElementById("settings-openai-api-key");
+const settingsOpenaiModelNode = document.getElementById("settings-openai-model");
+const settingsApikeyToggleNode = document.getElementById("settings-apikey-toggle");
+const settingsApikeyStatusNode = document.getElementById("settings-apikey-status");
 
 // ── State ────────────────────────────────────────────────────────
 
@@ -487,6 +493,9 @@ function collectRuntimeSettingsFormValues() {
   return {
     default_run_mode: settingsDefaultRunModeNode?.value || "finary_resync",
     shell_theme: settingsShellThemeNode?.value || "dark",
+    llm_backend: settingsLlmBackendNode?.value || "codex",
+    openai_api_key: settingsOpenaiApiKeyNode?.value || "",
+    openai_model: settingsOpenaiModelNode?.value || "",
   };
 }
 
@@ -495,6 +504,10 @@ function renderRuntimeSettings(settings) {
   const values = settings?.values || {};
   if (settingsDefaultRunModeNode) settingsDefaultRunModeNode.value = values.default_run_mode || "finary_resync";
   if (settingsShellThemeNode) settingsShellThemeNode.value = values.shell_theme || "dark";
+  if (settingsLlmBackendNode) settingsLlmBackendNode.value = values.llm_backend || "codex";
+  if (settingsOpenaiApiKeyNode) settingsOpenaiApiKeyNode.value = values.openai_api_key || "";
+  if (settingsOpenaiModelNode) settingsOpenaiModelNode.value = values.openai_model || "gpt-4.1";
+  toggleNativeFields();
   const credentials = Array.isArray(settings?.credentials) ? settings.credentials : [];
   if (settingsCredentialsNode) {
     settingsCredentialsNode.innerHTML = credentials.length === 0 ? "<li class=\"empty-hint\">No credentials.</li>" : "";
@@ -505,6 +518,22 @@ function renderRuntimeSettings(settings) {
     }
   }
 }
+
+function toggleNativeFields() {
+  const isNative = settingsLlmBackendNode?.value === "native";
+  if (settingsNativeFieldsNode) settingsNativeFieldsNode.classList.toggle("hidden", !isNative);
+}
+
+// Backend selector toggle
+settingsLlmBackendNode?.addEventListener("change", toggleNativeFields);
+
+// API key show/hide toggle
+settingsApikeyToggleNode?.addEventListener("click", () => {
+  if (!settingsOpenaiApiKeyNode) return;
+  const isPassword = settingsOpenaiApiKeyNode.type === "password";
+  settingsOpenaiApiKeyNode.type = isPassword ? "text" : "password";
+  settingsApikeyToggleNode.textContent = isPassword ? "Hide" : "Show";
+});
 
 async function refreshRuntimeSettings() {
   try {

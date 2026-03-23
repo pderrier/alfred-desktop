@@ -184,8 +184,7 @@ fn resolve_session_dir() -> PathBuf {
     env::var("FINARY_SESSION_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            manifest.join("../data/finary-session")
+            crate::paths::default_data_dir().join("finary-session")
         })
 }
 

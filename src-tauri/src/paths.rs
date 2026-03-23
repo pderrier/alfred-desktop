@@ -6,7 +6,7 @@ use std::{env, path::PathBuf};
 /// 1. `ALFRED_DATA_DIR` env var (explicit override)
 /// 2. Dev mode (`CARGO_MANIFEST_DIR` exists at runtime) → `<manifest>/../data`
 /// 3. Production → `<exe_dir>/data` (next to the installed binary)
-fn default_data_dir() -> PathBuf {
+pub fn default_data_dir() -> PathBuf {
     if let Ok(raw) = env::var("ALFRED_DATA_DIR") {
         let p = PathBuf::from(raw.trim());
         if !p.as_os_str().is_empty() {

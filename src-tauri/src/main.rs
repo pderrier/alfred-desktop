@@ -375,6 +375,13 @@ fn run_tauri_app() -> anyhow::Result<()> {
     tauri::Builder::default()
         .setup(|app| {
             let _ = APP_HANDLE.set(app.handle().clone());
+
+            // Ensure critical data directories exist on fresh install.
+            let data_dir = paths::default_data_dir();
+            for sub in &["finary-session", "reports", "report-history", "runtime-state"] {
+                let _ = std::fs::create_dir_all(data_dir.join(sub));
+            }
+
             // Ensure the window is visible and focused on startup
             use tauri::Manager;
             if let Some(win) = app.get_webview_window("main") {

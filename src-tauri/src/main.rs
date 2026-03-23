@@ -372,6 +372,16 @@ fn load_local_env() {
     }
 }
 
+// ── Finary sync commands ─────────────────────────────────────────────────
+
+#[tauri::command]
+async fn finary_sync_snapshot_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(native_collection::fetch_finary_snapshot_standalone)
+        .await
+        .map_err(|e| format!("finary_sync_snapshot_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
 // ── LLM backend commands ─────────────────────────────────────────────────
 
 #[tauri::command]
@@ -464,6 +474,7 @@ fn run_tauri_app() -> anyhow::Result<()> {
             storage_usage_local,
             storage_prune_local,
             storage_clear_log_local,
+            finary_sync_snapshot_local,
             check_openai_api_key_local,
             check_for_update_local,
             download_update_local,

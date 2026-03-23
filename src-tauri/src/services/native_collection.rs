@@ -546,6 +546,12 @@ pub(crate) fn read_line_memory_store() -> Result<Value> {
     Ok(serde_json::from_str(&raw)?)
 }
 
+/// Fetch a Finary snapshot (accounts + positions) without starting a run.
+/// Used at startup to populate the account list.
+pub fn fetch_finary_snapshot_standalone() -> Result<Value> {
+    fetch_finary_snapshot("__startup__", crate::request_http_json)
+}
+
 fn fetch_finary_snapshot(run_id: &str, _request_fn: HttpRequestFn) -> Result<Value> {
     let raw = crate::finary::fetch_snapshot()
         .map_err(|e| anyhow!("finary_snapshot_failed:{e}"))?;

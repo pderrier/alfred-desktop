@@ -1238,13 +1238,19 @@ window.__connectFinary = async () => {
     await bridge.runFinaryPlaywrightBrowserSession();
     await refreshAccountStatus();
     updateAuthPills();
-    // Only refresh dashboard if we don't have accounts yet
+    // Only sync from Finary API if we don't have accounts yet
     const snap = latestDashboardPayload?.snapshot || {};
     const fMeta = snap.latest_finary_snapshot || {};
     const accts = Array.isArray(fMeta.accounts) ? fMeta.accounts : [];
-    if (accts.length === 0) {
+    const tauriInv = window?.__TAURI__?.core?.invoke;
+    if (accts.length === 0 && tauriInv) {
       showToast("Syncing portfolio\u2026", "info");
-      try { await refreshDashboard(); } catch { /* ok if no data yet */ }
+      try {
+        await tauriInv("finary_sync_snapshot_local");
+        await refreshDashboard();
+      } catch (err) {
+        showToast(`Portfolio sync failed: ${formatBridgeError(err)}. You can use CSV import instead.`, "error");
+      }
     }
     renderWelcome();
     showToast("Finary connected", "success");
@@ -1278,14 +1284,20 @@ bootstrap.runStartupSessionCheck().then(async () => {
   await refreshAccountStatus();
   updateAuthPills();
   renderWelcome();
-  // If Finary is connected but we have no accounts, force a dashboard refresh
+  // If Finary is connected but we have no accounts, sync from Finary API
   const snapshot = latestDashboardPayload?.snapshot || {};
   const finaryMeta = snapshot.latest_finary_snapshot || {};
   const accounts = Array.isArray(finaryMeta.accounts) ? finaryMeta.accounts : [];
-  if (lastFinaryOk && accounts.length === 0) {
+  const tauriInvokePost = window?.__TAURI__?.core?.invoke;
+  if (lastFinaryOk && accounts.length === 0 && tauriInvokePost) {
     const welcomeTitle = document.getElementById("welcome-title");
     if (welcomeTitle) welcomeTitle.textContent = "Syncing portfolio\u2026";
-    try { await refreshDashboard(); } catch { /* ok if no data yet */ }
+    try {
+      await tauriInvokePost("finary_sync_snapshot_local");
+      await refreshDashboard();
+    } catch (err) {
+      showToast(`Portfolio sync failed: ${formatBridgeError(err)}. You can use CSV import instead.`, "error");
+    }
     renderWelcome();
   }
 }).catch((err) => {

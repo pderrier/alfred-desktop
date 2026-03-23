@@ -42,10 +42,19 @@ fn api_key() -> Result<String> {
 }
 
 fn api_base() -> String {
-    env::var("OPENAI_API_BASE")
-        .unwrap_or_else(|_| DEFAULT_API_BASE.to_string())
-        .trim_end_matches('/')
-        .to_string()
+    if let Ok(v) = env::var("OPENAI_API_BASE") {
+        let t = v.trim().to_string();
+        if !t.is_empty() {
+            return t.trim_end_matches('/').to_string();
+        }
+    }
+    if let Ok(v) = crate::runtime_settings::string_direct("openai_api_base") {
+        let t = v.trim().to_string();
+        if !t.is_empty() {
+            return t.trim_end_matches('/').to_string();
+        }
+    }
+    DEFAULT_API_BASE.to_string()
 }
 
 fn model_name() -> String {

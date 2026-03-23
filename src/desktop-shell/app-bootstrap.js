@@ -302,6 +302,34 @@ export function initBootstrap(deps) {
     const connectNode = document.getElementById("splash-connect");
     if (connectNode) connectNode.classList.remove("hidden");
 
+    // Show backend selector when OpenAI is not connected
+    const backendSelector = document.getElementById("splash-backend-selector");
+    const splashNativeFields = document.getElementById("splash-native-fields");
+    const splashApiKey = document.getElementById("splash-api-key");
+    const splashApiBase = document.getElementById("splash-api-base");
+    const splashApikeyHint = document.getElementById("splash-apikey-hint");
+    const backendRadios = document.querySelectorAll('input[name="splash-backend"]');
+
+    if (!openaiOk && backendSelector) {
+      backendSelector.classList.remove("hidden");
+      // Pre-select current backend
+      const currentRadio = document.querySelector(`input[name="splash-backend"][value="${llmBackend}"]`);
+      if (currentRadio) currentRadio.checked = true;
+      if (llmBackend === "native") splashNativeFields?.classList.remove("hidden");
+
+      // Toggle native fields on radio change
+      for (const radio of backendRadios) {
+        radio.addEventListener("change", () => {
+          const isNative = document.querySelector('input[name="splash-backend"]:checked')?.value === "native";
+          splashNativeFields?.classList.toggle("hidden", !isNative);
+          // Update OpenAI row label
+          if (openaiBtn) openaiBtn.textContent = isNative ? "Validate" : "Connect";
+          if (openaiStatusNode) openaiStatusNode.textContent = isNative ? "API key required" : "not connected";
+          if (splashApikeyHint) splashApikeyHint.textContent = "";
+        });
+      }
+    }
+
     function setRowStatus(iconNode, statusNode, btn, ok, label) {
       if (ok) {
         if (iconNode) { iconNode.textContent = "\u2713"; iconNode.style.color = "#2f8f5d"; }
@@ -314,9 +342,9 @@ export function initBootstrap(deps) {
       }
     }
 
-    const nativeLabel = llmBackend === "native" ? "API key missing" : "not connected";
+    const nativeLabel = llmBackend === "native" ? "API key required" : "not connected";
     setRowStatus(openaiIconNode, openaiStatusNode, openaiBtn, openaiOk, nativeLabel);
-    if (llmBackend === "native" && openaiBtn) openaiBtn.textContent = "Configure";
+    if (llmBackend === "native" && openaiBtn) openaiBtn.textContent = "Validate";
     setRowStatus(finaryIconNode, finaryStatusNode, finaryBtn, finaryOk, "session expired");
 
     // Enable "Continue" only when OpenAI is connected (required)
@@ -326,12 +354,58 @@ export function initBootstrap(deps) {
     }
     updateContinueBtn();
 
-    // OpenAI connect handler
+    // OpenAI connect handler — adapts to selected backend
     openaiBtn?.addEventListener("click", async function handler() {
-      if (llmBackend === "native") {
-        // Native backend — open settings to configure API key
-        if (hintNode) hintNode.textContent = "Set your API key in Settings (gear icon) then restart.";
+      const selectedBackend = document.querySelector('input[name="splash-backend"]:checked')?.value || llmBackend;
+
+      if (selectedBackend === "native") {
+        // Native backend — validate API key from splash input
+        const key = splashApiKey?.value?.trim();
+        if (!key) {
+          if (splashApikeyHint) splashApikeyHint.textContent = "Enter your OpenAI API key above.";
+          return;
+        }
+        this.disabled = true;
+        this.textContent = "Validating\u2026";
+        if (splashApikeyHint) splashApikeyHint.textContent = "";
+
+        try {
+          // Save backend + key to settings, then validate
+          const apiBase = splashApiBase?.value?.trim() || "";
+          if (tauriInvoke) {
+            await tauriInvoke("runtime_settings_update_local", {
+              settings: {
+                llm_backend: "native",
+                openai_api_key: key,
+                ...(apiBase ? { openai_api_base: apiBase } : {}),
+              }
+            });
+          }
+          const result = tauriInvoke ? await tauriInvoke("check_openai_api_key_local") : null;
+          openaiOk = result?.ok === true;
+          setRowStatus(openaiIconNode, openaiStatusNode, openaiBtn, openaiOk, "API key invalid");
+          if (openaiOk) {
+            if (splashApikeyHint) splashApikeyHint.textContent = `Connected (${result.models_available} models)`;
+            splashApikeyHint.style.color = "#2f8f5d";
+            backendSelector?.classList.add("hidden");
+          } else {
+            if (splashApikeyHint) splashApikeyHint.textContent = "API key validation failed. Check your key.";
+            this.textContent = "Validate";
+            this.disabled = false;
+          }
+          updateContinueBtn();
+          if (openaiOk && finaryOk) dismissSplash();
+        } catch (error) {
+          this.textContent = "Retry";
+          this.disabled = false;
+          if (splashApikeyHint) splashApikeyHint.textContent = typeof error === "string" ? error : (error?.message || "Validation failed");
+        }
         return;
+      }
+
+      // Codex backend — save backend choice, then do OAuth login
+      if (tauriInvoke) {
+        try { await tauriInvoke("runtime_settings_update_local", { settings: { llm_backend: "codex" } }); } catch {}
       }
       this.disabled = true;
       this.textContent = "Signing in...";
@@ -343,6 +417,7 @@ export function initBootstrap(deps) {
         openaiOk = r?.logged_in === true;
         setRowStatus(openaiIconNode, openaiStatusNode, openaiBtn, openaiOk, "not connected");
         if (hintNode) hintNode.textContent = openaiOk ? "" : "Sign-in did not complete.";
+        if (openaiOk) backendSelector?.classList.add("hidden");
         if (!openaiOk) { this.textContent = "Connect"; this.disabled = false; }
         updateContinueBtn();
         if (openaiOk && finaryOk) dismissSplash();

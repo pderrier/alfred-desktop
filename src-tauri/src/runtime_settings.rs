@@ -68,6 +68,18 @@ pub fn definitions_json() -> serde_json::Value {
             "whyItMatters": "More capable models produce better analysis but cost more per call.",
             "resetLabel": "Use default model"
         },
+        "openai_api_base": {
+            "type": "text",
+            "maxLength": 200,
+            "defaultValue": "",
+            "section": "product",
+            "restartRequired": false,
+            "envName": "OPENAI_API_BASE",
+            "label": "OpenAI API base URL",
+            "description": "Custom API endpoint. Leave empty for default (api.openai.com). Useful for proxies or compatible APIs.",
+            "whyItMatters": "Allows routing API calls through a custom endpoint or compatible provider.",
+            "resetLabel": "Use default endpoint"
+        },
         "agent_guidelines": {
             "type": "text",
             "maxLength": 4000,

@@ -49,6 +49,28 @@
 
           <!-- Unified connection check -->
           <div id="splash-connect" class="splash-setup hidden">
+            <!-- Backend selector (shown when OpenAI not connected) -->
+            <div id="splash-backend-selector" class="splash-backend-selector hidden">
+              <label class="splash-setup-label" style="margin-bottom:0.3rem">LLM Backend</label>
+              <div class="splash-backend-options">
+                <label class="splash-backend-option">
+                  <input type="radio" name="splash-backend" value="codex" checked />
+                  <span>Codex <em style="color:rgba(255,255,255,0.4)">(free — OpenAI sign-in)</em></span>
+                </label>
+                <label class="splash-backend-option">
+                  <input type="radio" name="splash-backend" value="native" />
+                  <span>API Key <em style="color:rgba(255,255,255,0.4)">(pay-per-use)</em></span>
+                </label>
+              </div>
+              <div id="splash-native-fields" class="hidden" style="margin-top:0.4rem">
+                <input id="splash-api-key" type="password" placeholder="sk-..." autocomplete="off"
+                  style="width:100%;padding:0.35rem 0.5rem;border-radius:6px;border:1px solid rgba(255,255,255,0.15);background:rgba(0,0,0,0.3);color:#fff;font-size:0.78rem" />
+                <input id="splash-api-base" type="text" placeholder="https://api.openai.com/v1 (optional)"
+                  style="width:100%;padding:0.35rem 0.5rem;border-radius:6px;border:1px solid rgba(255,255,255,0.15);background:rgba(0,0,0,0.3);color:rgba(255,255,255,0.6);font-size:0.72rem;margin-top:0.3rem" />
+                <p id="splash-apikey-hint" style="font-size:0.68rem;color:rgba(255,255,255,0.4);margin:0.2rem 0 0"></p>
+              </div>
+            </div>
+
             <div id="splash-row-openai" class="splash-connect-row">
               <span id="splash-openai-icon" class="splash-connect-icon">&#9679;</span>
               <span class="splash-connect-label">OpenAI</span>
@@ -493,6 +515,10 @@
             <div class="settings-field">
               <label for="settings-openai-model">Model</label>
               <input id="settings-openai-model" type="text" placeholder="gpt-4.1" value="gpt-4.1" />
+            </div>
+            <div class="settings-field">
+              <label for="settings-openai-api-base">API endpoint <em style="font-weight:normal;color:rgba(255,255,255,0.4)">(optional)</em></label>
+              <input id="settings-openai-api-base" type="text" placeholder="https://api.openai.com/v1" />
             </div>
             <p id="settings-apikey-status" class="settings-note"></p>
           </div>

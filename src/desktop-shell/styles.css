@@ -181,6 +181,28 @@ body {
   justify-content: center;
 }
 
+.splash-backend-selector {
+  margin-bottom: 0.6rem;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+}
+.splash-backend-options {
+  display: flex;
+  gap: 0.8rem;
+}
+.splash-backend-option {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.78rem;
+  color: rgba(255, 255, 255, 0.8);
+  cursor: pointer;
+}
+.splash-backend-option input[type="radio"] {
+  accent-color: #2f8f5d;
+}
 
 /* ── Top bar ───────────────────────────────────────────────────── */
 

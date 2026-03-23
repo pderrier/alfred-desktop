@@ -89,6 +89,7 @@ const settingsLlmBackendNode = document.getElementById("settings-llm-backend");
 const settingsNativeFieldsNode = document.getElementById("settings-native-fields");
 const settingsOpenaiApiKeyNode = document.getElementById("settings-openai-api-key");
 const settingsOpenaiModelNode = document.getElementById("settings-openai-model");
+const settingsOpenaiApiBaseNode = document.getElementById("settings-openai-api-base");
 const settingsApikeyToggleNode = document.getElementById("settings-apikey-toggle");
 const settingsApikeyStatusNode = document.getElementById("settings-apikey-status");
 
@@ -496,6 +497,7 @@ function collectRuntimeSettingsFormValues() {
     llm_backend: settingsLlmBackendNode?.value || "codex",
     openai_api_key: settingsOpenaiApiKeyNode?.value || "",
     openai_model: settingsOpenaiModelNode?.value || "",
+    openai_api_base: settingsOpenaiApiBaseNode?.value || "",
   };
 }
 
@@ -507,6 +509,7 @@ function renderRuntimeSettings(settings) {
   if (settingsLlmBackendNode) settingsLlmBackendNode.value = values.llm_backend || "codex";
   if (settingsOpenaiApiKeyNode) settingsOpenaiApiKeyNode.value = values.openai_api_key || "";
   if (settingsOpenaiModelNode) settingsOpenaiModelNode.value = values.openai_model || "gpt-4.1";
+  if (settingsOpenaiApiBaseNode) settingsOpenaiApiBaseNode.value = values.openai_api_base || "";
   toggleNativeFields();
   const credentials = Array.isArray(settings?.credentials) ? settings.credentials : [];
   if (settingsCredentialsNode) {

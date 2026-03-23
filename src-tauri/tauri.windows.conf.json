@@ -27,8 +27,6 @@
     "active": true,
     "targets": ["msi", "nsis"],
     "icon": ["icons/icon.png", "icons/icon.icns", "icons/icon.ico"],
-    "resources": {
-      "codex-runtime/**": "codex-runtime/"
-    }
+    "resources": ["codex-runtime/**/*"]
   }
 }

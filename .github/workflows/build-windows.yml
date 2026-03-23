@@ -36,6 +36,17 @@ jobs:
       - name: Bundle codex runtime
         run: powershell -ExecutionPolicy Bypass -File scripts/prepare-codex-bundle.ps1
 
+      - name: Verify codex-runtime exists
+        run: |
+          echo "Listing src-tauri/codex-runtime/:"
+          dir src-tauri\codex-runtime /b 2>&1 || echo "NOT FOUND"
+          echo "---"
+          echo "node.exe exists:"
+          if (Test-Path src-tauri\codex-runtime\node.exe) { echo "YES" } else { echo "NO" }
+          echo "codex.cmd exists:"
+          if (Test-Path src-tauri\codex-runtime\codex.cmd) { echo "YES" } else { echo "NO" }
+        shell: pwsh
+
       - name: Build Tauri app
         env:
           ALFRED_API_SECRET: ${{ secrets.ALFRED_API_SECRET }}

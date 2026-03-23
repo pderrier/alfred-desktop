@@ -553,12 +553,20 @@ function setThemeMode(theme) {
 
 // ── Splash + startup (delegated to app-bootstrap.js) ─────────────
 
-async function refreshHealthPill() {
+async function refreshHealthPill(checkAuth = false) {
   const tauriInvoke = window?.__TAURI__?.core?.invoke;
   if (!tauriInvoke) return;
   try {
-    const health = await tauriInvoke("stack_health_local");
-    const payload = health?.result || health;
+    let payload;
+    if (checkAuth) {
+      // Full check: API reachability + HMAC auth verification
+      const authResult = await tauriInvoke("check_api_auth_local");
+      payload = authResult;
+    } else {
+      // Basic check: API reachability only
+      const health = await tauriInvoke("stack_health_local");
+      payload = health?.result || health;
+    }
     latestStackHealthPayload = payload;
     renderStatusPill(payload, null, null);
   } catch {

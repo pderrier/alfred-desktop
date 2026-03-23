@@ -294,9 +294,9 @@ export function initBootstrap(deps) {
 
     refreshWizardSourcePolicy(getLatestFinarySessionPayload());
 
-    // 2b. Health check — verify API is reachable
+    // 2b. Health check — includes auth verification when OpenAI is connected
     setSplashStatus("Checking API\u2026");
-    refreshHealthPill();
+    await refreshHealthPill(openaiOk);
 
     // 3. All OK → dismiss
     if (openaiOk && finaryOk) {

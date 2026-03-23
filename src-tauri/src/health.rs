@@ -103,27 +103,15 @@ fn normalize_service(
 fn check_alfred_api_health(timeout_ms: u64) -> serde_json::Value {
     let api_url = env::var("ALFRED_API_URL")
         .unwrap_or_else(|_| "https://vps-c5793aab.vps.ovh.net/alfred/api".to_string());
-    let url = format!("{}/healthz", api_url.trim_end_matches('/'));
+    let base = api_url.trim_end_matches('/');
+    let url = format!("{base}/healthz");
 
-    match ureq::get(&url)
+    // 1. Public health check (no auth)
+    let healthz = match ureq::get(&url)
         .timeout(Duration::from_millis(timeout_ms.max(3000)))
         .call()
     {
-        Ok(resp) => {
-            let body: serde_json::Value = resp.into_json().unwrap_or(json!({}));
-            let redis_ok = body.get("redis").and_then(|v| v.as_str()) == Some("up");
-            let searxng_ok = body.get("searxng").and_then(|v| v.as_str()) == Some("up");
-            let ok = redis_ok && searxng_ok;
-            json!({
-                "name": "alfred-api",
-                "ok": ok,
-                "ready": ok,
-                "live": true,
-                "accepted": true,
-                "status": if ok { "healthy" } else { "degraded" },
-                "diagnostics": body
-            })
-        }
+        Ok(resp) => resp.into_json::<serde_json::Value>().unwrap_or(json!({})),
         Err(e) => {
             let status = match &e {
                 ureq::Error::Status(401, _) => "unauthorized",
@@ -134,17 +122,77 @@ fn check_alfred_api_health(timeout_ms: u64) -> serde_json::Value {
                 }
                 _ => "unreachable",
             };
-            json!({
+            return json!({
                 "name": "alfred-api",
-                "ok": false,
-                "ready": false,
+                "ok": false, "ready": false,
                 "live": status != "unreachable",
                 "accepted": false,
                 "status": status,
                 "error": e.to_string()
-            })
+            });
         }
+    };
+
+    let redis_ok = healthz.get("redis").and_then(|v| v.as_str()) == Some("up");
+    let searxng_ok = healthz.get("searxng").and_then(|v| v.as_str()) == Some("up");
+    let services_ok = redis_ok && searxng_ok;
+
+    json!({
+        "name": "alfred-api",
+        "ok": services_ok,
+        "ready": services_ok,
+        "live": true,
+        "accepted": true,
+        "status": if services_ok { "healthy" } else { "degraded" },
+        "auth_checked": false,
+        "diagnostics": healthz
+    })
+}
+
+/// Verify authenticated API access works (HMAC signature).
+/// Call this after OpenAI is connected — if auth fails, analysis will
+/// get no market data. Returns the full health payload with auth status.
+pub fn check_api_auth() -> serde_json::Value {
+    let timeout_ms = resolve_stack_health_timeout_ms();
+    let base_health = check_alfred_api_health(timeout_ms);
+    let live = base_health.get("live").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !live {
+        return base_health; // API unreachable, no point checking auth
     }
+
+    // Try an authenticated call (lightweight insights fetch for a dummy ticker)
+    let auth_ok = match crate::enrichment::fetch_shared_insights("__healthcheck__", "__healthcheck__") {
+        Ok(_) => true,
+        Err(e) => {
+            let err = e.to_string();
+            if err.contains("unauthorized") || err.contains("401") {
+                crate::debug_log("alfred-api auth check: HMAC failed — check ALFRED_API_SECRET");
+                false
+            } else {
+                // Other errors (empty result, etc.) mean auth worked
+                true
+            }
+        }
+    };
+
+    let services_ok = base_health.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    let ok = services_ok && auth_ok;
+    let status = if ok {
+        "healthy"
+    } else if !auth_ok {
+        "auth_failed"
+    } else {
+        "degraded"
+    };
+
+    json!({
+        "ok": ok,
+        "live": true,
+        "ready": ok,
+        "status": status,
+        "auth": if auth_ok { "ok" } else { "hmac_failed" },
+        "services": base_health.get("diagnostics").cloned().unwrap_or(json!({}))
+    })
 }
 
 /// Check Codex app-server health — tries session status.

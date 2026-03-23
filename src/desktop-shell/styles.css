@@ -2049,3 +2049,27 @@ main {
     display: none;
   }
 }
+
+/* ── Update banner (optional update notification) ──────────────── */
+.update-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.5rem 1rem;
+  background: rgba(18, 29, 40, 0.95);
+  border-bottom: 1px solid rgba(47, 143, 93, 0.5);
+  font-size: 0.8rem;
+  color: rgba(255, 255, 255, 0.85);
+  z-index: 50;
+  flex-wrap: wrap;
+}
+.update-banner .update-progress {
+  width: 100%;
+}
+
+/* ── Mandatory update overlay (inside splash) ──────────────────── */
+.update-mandatory {
+  text-align: center;
+  max-width: 340px;
+  margin: 0 auto;
+}

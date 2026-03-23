@@ -5,6 +5,11 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      mandatory:
+        description: 'Mark this release as a mandatory update'
+        type: boolean
+        default: false
 
 jobs:
   build:
@@ -143,3 +148,46 @@ jobs:
               "sudo mkdir -p /opt/alfred/releases/windows && sudo mv '/tmp/$filename' '/opt/alfred/releases/windows/$filename'"
             echo "Deployed: $filename"
           done
+
+      - name: Generate and deploy update manifest
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          # Extract version from tag (strip leading 'v')
+          TAG="${GITHUB_REF_NAME:-v0.1.0}"
+          VERSION="${TAG#v}"
+          MANDATORY="${{ github.event.inputs.mandatory || 'false' }}"
+          BASE_URL="https://vps-c5793aab.vps.ovh.net/alfred/release/windows"
+
+          # Find the NSIS exe and compute SHA-256
+          EXE_FILE=$(find release -name '*.exe' -type f | head -1)
+          if [ -n "$EXE_FILE" ]; then
+            SHA256=$(sha256sum "$EXE_FILE" | cut -d' ' -f1)
+            EXE_NAME=$(basename "$EXE_FILE")
+          else
+            SHA256=""
+            EXE_NAME="Alfred-Desktop_${VERSION}_x64-setup.exe"
+          fi
+
+          cat > /tmp/update-manifest.json <<MANIFEST
+          {
+            "version": "${VERSION}",
+            "mandatory": ${MANDATORY},
+            "min_version": null,
+            "release_notes": null,
+            "installer_url": "${BASE_URL}/${EXE_NAME}",
+            "installer_sha256": "${SHA256}",
+            "published_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          MANIFEST
+
+          echo "Generated manifest:"
+          cat /tmp/update-manifest.json
+
+          scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            /tmp/update-manifest.json "${VPS_USER}@${VPS_HOST}:/tmp/update-manifest.json"
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "${VPS_USER}@${VPS_HOST}" \
+            "sudo mv /tmp/update-manifest.json /opt/alfred/releases/windows/update-manifest.json"
+          echo "Update manifest deployed"

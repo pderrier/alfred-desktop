@@ -12,12 +12,15 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# PS 5.1 compat: Join-Path only accepts 2 args, so chain calls for deeper paths.
+function JP { param([string]$a, [string]$b) Join-Path $a $b }
+
 $ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Path
-$TauriDir    = Join-Path (Join-Path $ScriptDir "..") "src-tauri"
-$OutDir      = Join-Path $TauriDir "codex-runtime"
+$TauriDir    = JP (JP $ScriptDir "..") "src-tauri"
+$OutDir      = JP $TauriDir "codex-runtime"
 $NodeDirName = "node-$NodeVersion-win-$Arch"
 $NodeUrl     = "https://nodejs.org/dist/$NodeVersion/$NodeDirName.zip"
-$ZipPath     = Join-Path $env:TEMP "$NodeDirName.zip"
+$ZipPath     = JP $env:TEMP "$NodeDirName.zip"
 
 Write-Host "=== Prepare Codex Bundle ===" -ForegroundColor Cyan
 Write-Host "Node version : $NodeVersion ($Arch)"
@@ -43,33 +46,34 @@ Write-Host "Extracting Node.js..."
 Expand-Archive -Path $ZipPath -DestinationPath $OutDir -Force
 
 # The zip extracts to codex-runtime/node-vXX-win-x64/. Flatten one level.
-$Nested = Join-Path $OutDir $NodeDirName
+$Nested = JP $OutDir $NodeDirName
 if (Test-Path $Nested) {
     Get-ChildItem -Path $Nested | Move-Item -Destination $OutDir -Force
     Remove-Item -Recurse -Force $Nested
 }
 
 # Verify node.exe
-$NodeExe = Join-Path $OutDir "node.exe"
+$NodeExe = JP $OutDir "node.exe"
 if (-not (Test-Path $NodeExe)) {
     throw "node.exe not found at $NodeExe after extraction"
 }
 Write-Host "node.exe OK: $NodeExe"
 
 # ── 3. Install @openai/codex using the portable npm ──────────────
-$NpmCmd = Join-Path $OutDir "npm.cmd"
+$NpmCmd = JP $OutDir "npm.cmd"
 Write-Host "Installing @openai/codex via portable npm..."
 
 # Set prefix to the codex-runtime dir so codex.cmd lands there
 & $NpmCmd install -g "@openai/codex" --prefix="$OutDir" 2>&1 | Write-Host
 
-$CodexCmd = Join-Path $OutDir "codex.cmd"
+$CodexCmd = JP $OutDir "codex.cmd"
 if (-not (Test-Path $CodexCmd)) {
     throw "codex.cmd not found at $CodexCmd after npm install"
 }
 
 # Verify version
-$ver = & $NodeExe (Join-Path $OutDir "node_modules" "@openai" "codex" "bin" "codex.js") --version 2>&1
+$CodexJs = JP (JP (JP (JP (JP $OutDir "node_modules") "@openai") "codex") "bin") "codex.js"
+$ver = & $NodeExe $CodexJs --version 2>&1
 Write-Host "codex version: $ver" -ForegroundColor Green
 
 # ── 4. Trim unnecessary files to reduce bundle size ───────────────
@@ -82,12 +86,12 @@ $Removals = @(
     "LICENSE"
 )
 foreach ($item in $Removals) {
-    $p = Join-Path $OutDir $item
+    $p = JP $OutDir $item
     if (Test-Path $p) { Remove-Item -Recurse -Force $p }
 }
 
 # Remove npm cache
-$NpmCache = Join-Path $OutDir "node_modules" ".cache"
+$NpmCache = JP (JP $OutDir "node_modules") ".cache"
 if (Test-Path $NpmCache) { Remove-Item -Recurse -Force $NpmCache }
 
 $Size = (Get-ChildItem -Recurse $OutDir | Measure-Object -Property Length -Sum).Sum / 1MB

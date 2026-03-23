@@ -52,6 +52,7 @@ mod mcp_progress_relay;
 mod run_stats;
 mod storage_cleanup;
 mod run_index;
+mod updater;
 #[path = "services/native_mcp_analysis.rs"]
 mod native_mcp_analysis;
 
@@ -369,6 +370,34 @@ fn load_local_env() {
     }
 }
 
+// ── Updater commands ──────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn check_for_update_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(updater::check_for_update)
+        .await
+        .map_err(|e| format!("check_for_update_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn download_update_local(url: String, sha256: Option<String>) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        updater::download_update(&url, sha256.as_deref())
+    })
+    .await
+    .map_err(|e| format!("download_update_local_failed:join:{e}"))?
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn install_update_local(path: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || updater::install_update(&path))
+        .await
+        .map_err(|e| format!("install_update_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
 fn run_tauri_app() -> anyhow::Result<()> {
     load_local_env();
 
@@ -422,7 +451,10 @@ fn run_tauri_app() -> anyhow::Result<()> {
             save_user_preferences_local,
             storage_usage_local,
             storage_prune_local,
-            storage_clear_log_local
+            storage_clear_log_local,
+            check_for_update_local,
+            download_update_local,
+            install_update_local
         ])
         .run(tauri::generate_context!())
         .map_err(|e| anyhow!("tauri_app_launch_failed:{e}"))?;

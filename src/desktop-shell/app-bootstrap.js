@@ -30,7 +30,11 @@ export function initBootstrap(deps) {
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
         splash.classList.add("fade-out");
-        setTimeout(() => splash.remove(), 600);
+        setTimeout(() => {
+          splash.remove();
+          // Show optional update banner after splash is gone
+          if (pendingUpdate) showOptionalUpdateBanner(pendingUpdate);
+        }, 600);
       });
     });
     // Trigger background health check to update status pill
@@ -59,9 +63,162 @@ export function initBootstrap(deps) {
     }
   }
 
+  // ── Update state (shared between startup and post-splash) ────────
+  let pendingUpdate = null; // { mandatory, latest_version, release_notes, installer_url }
+
+  function showMandatoryUpdateUI(update) {
+    const splash = document.getElementById("splash-screen");
+    if (!splash) return;
+    const loaderNode = document.getElementById("splash-loader");
+    const connectNode = document.getElementById("splash-connect");
+    if (loaderNode) loaderNode.classList.add("hidden");
+    if (connectNode) connectNode.classList.add("hidden");
+
+    setSplashStatus("");
+    const statusNode = document.getElementById("splash-status");
+    if (!statusNode) return;
+
+    statusNode.innerHTML = "";
+    const wrap = document.createElement("div");
+    wrap.className = "update-mandatory";
+    wrap.innerHTML = `
+      <h3 style="margin:0 0 0.4rem;color:#fff">Update Required</h3>
+      <p style="margin:0 0 0.6rem;color:rgba(255,255,255,0.7);font-size:0.8rem">
+        Version ${update.latest_version} is available (you have ${update.current_version}).
+      </p>
+      ${update.release_notes ? `<p style="margin:0 0 0.8rem;color:rgba(255,255,255,0.5);font-size:0.72rem">${update.release_notes}</p>` : ""}
+      <div class="update-progress hidden" style="margin:0 0 0.6rem">
+        <div class="splash-loader" style="display:block"><div class="splash-loader-bar" style="width:0%;animation:none"></div></div>
+        <span class="update-progress-text" style="font-size:0.7rem;color:rgba(255,255,255,0.5)"></span>
+      </div>
+      <button class="cmd-btn update-download-btn">Download &amp; Install</button>
+      <p class="update-error hidden" style="margin:0.5rem 0 0;color:#f08a77;font-size:0.72rem"></p>
+    `;
+    statusNode.appendChild(wrap);
+
+    const downloadBtn = wrap.querySelector(".update-download-btn");
+    const progressWrap = wrap.querySelector(".update-progress");
+    const progressBar = wrap.querySelector(".splash-loader-bar");
+    const progressText = wrap.querySelector(".update-progress-text");
+    const errorText = wrap.querySelector(".update-error");
+
+    downloadBtn.addEventListener("click", () =>
+      runDownloadAndInstall(update, downloadBtn, progressWrap, progressBar, progressText, errorText)
+    );
+  }
+
+  function showOptionalUpdateBanner(update) {
+    const layout = document.querySelector(".app-layout") || document.body;
+    const existing = document.getElementById("update-banner");
+    if (existing) existing.remove();
+
+    const banner = document.createElement("div");
+    banner.id = "update-banner";
+    banner.className = "update-banner";
+    banner.innerHTML = `
+      <span>Update available: <strong>v${update.latest_version}</strong>${update.release_notes ? " — " + update.release_notes : ""}</span>
+      <button class="cmd-btn-sm update-banner-install">Update</button>
+      <button class="cmd-btn-sm update-banner-dismiss" style="background:transparent;border:1px solid rgba(255,255,255,0.2)">Dismiss</button>
+    `;
+    layout.prepend(banner);
+
+    const progressWrap = document.createElement("div");
+    progressWrap.className = "update-progress hidden";
+    progressWrap.innerHTML = `
+      <div class="splash-loader" style="display:block;margin:0.3rem 0"><div class="splash-loader-bar" style="width:0%;animation:none"></div></div>
+      <span class="update-progress-text" style="font-size:0.7rem;color:rgba(255,255,255,0.5)"></span>
+      <p class="update-error hidden" style="margin:0.3rem 0 0;color:#f08a77;font-size:0.72rem"></p>
+    `;
+    banner.appendChild(progressWrap);
+
+    banner.querySelector(".update-banner-dismiss").addEventListener("click", async () => {
+      banner.remove();
+      // Remember dismissed version
+      try {
+        const tauriInvoke = window?.__TAURI__?.core?.invoke;
+        if (tauriInvoke) await tauriInvoke("save_user_preferences_local", {
+          prefs: { dismissed_update_version: update.latest_version }
+        });
+      } catch { /* not critical */ }
+    });
+
+    banner.querySelector(".update-banner-install").addEventListener("click", () => {
+      const installBtn = banner.querySelector(".update-banner-install");
+      const dismissBtn = banner.querySelector(".update-banner-dismiss");
+      const errorText = progressWrap.querySelector(".update-error");
+      dismissBtn.classList.add("hidden");
+      runDownloadAndInstall(update, installBtn, progressWrap,
+        progressWrap.querySelector(".splash-loader-bar"),
+        progressWrap.querySelector(".update-progress-text"),
+        errorText
+      );
+    });
+  }
+
+  async function runDownloadAndInstall(update, btn, progressWrap, progressBar, progressText, errorText) {
+    const tauriInvoke = window?.__TAURI__?.core?.invoke;
+    if (!tauriInvoke) return;
+
+    btn.disabled = true;
+    btn.textContent = "Downloading\u2026";
+    progressWrap.classList.remove("hidden");
+    errorText.classList.add("hidden");
+
+    // Listen for progress events
+    let unlisten = null;
+    try {
+      const { listen } = window.__TAURI__.event;
+      unlisten = await listen("update-download-progress", (ev) => {
+        const { downloaded, total } = ev.payload;
+        if (total > 0) {
+          const pct = Math.round((downloaded / total) * 100);
+          progressBar.style.width = pct + "%";
+          progressText.textContent = `${(downloaded / 1048576).toFixed(1)} / ${(total / 1048576).toFixed(1)} MB`;
+        }
+      });
+    } catch { /* event API unavailable */ }
+
+    try {
+      const result = await tauriInvoke("download_update_local", {
+        url: update.installer_url, sha256: null
+      });
+      btn.textContent = "Installing\u2026";
+      await tauriInvoke("install_update_local", { path: result.path });
+      // App exits after this — if we're still here, something went wrong
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = "Retry";
+      errorText.classList.remove("hidden");
+      errorText.textContent = typeof err === "string" ? err : (err?.message || "Download failed");
+    } finally {
+      if (unlisten) unlisten();
+    }
+  }
+
   async function runStartupSessionCheck() {
     const tauriInvoke = window?.__TAURI__?.core?.invoke;
     const loaderNode = document.getElementById("splash-loader");
+
+    // 0. Check for updates (non-blocking on failure)
+    if (tauriInvoke) {
+      try {
+        setSplashStatus("Checking for updates\u2026");
+        const update = await tauriInvoke("check_for_update_local");
+        if (update?.update_available) {
+          if (update.mandatory) {
+            showMandatoryUpdateUI(update);
+            return; // Block — user must update
+          }
+          // Optional — check if user already dismissed this version
+          try {
+            const prefs = await tauriInvoke("get_user_preferences_local");
+            if (prefs?.dismissed_update_version !== update.latest_version) {
+              pendingUpdate = update;
+            }
+          } catch { pendingUpdate = update; }
+        }
+      } catch { /* update check failed — continue normally */ }
+    }
 
     // 1. Load cached dashboard (fast, local)
     setSplashStatus("Loading cached data\u2026");

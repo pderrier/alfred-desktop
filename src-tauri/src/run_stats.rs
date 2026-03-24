@@ -76,14 +76,14 @@ pub fn aggregate_from_progress_file(data_dir: &str, run_id: &str) -> Value {
                 if status == "repairing" {
                     validation_failures += 1;
                 }
-                // Count tool calls from progress text
-                if progress.contains("persisting fundamentals") { fundamentals_persisted += 1; }
-                if progress.contains("sharing insights") { insights_persisted += 1; }
-                if progress.contains("caching deep news") { deep_news_persisted += 1; }
-                if progress.contains("banning noise") { deep_news_banned += 1; }
-                // Count Codex activity from streaming progress
-                if progress.contains("searching:") || progress.contains("web search") { web_searches += 1; }
-                if progress.contains("analyzing data") || progress.contains("evaluating") || progress.contains("assessing") {
+                // Count tool calls from progress text (Codex + native patterns)
+                if progress.contains("persisting fundamentals") || progress.contains("persist_extracted_fundamentals") { fundamentals_persisted += 1; }
+                if progress.contains("sharing insights") || progress.contains("persist_shared_insights") { insights_persisted += 1; }
+                if progress.contains("caching deep news") || progress.contains("persist_deep_news") { deep_news_persisted += 1; }
+                if progress.contains("banning noise") || progress.contains("ban_deep_news") { deep_news_banned += 1; }
+                // Count activity from streaming progress
+                if progress.contains("searching:") || progress.contains("web search") || progress.contains("searching the web") { web_searches += 1; }
+                if progress.contains("analyzing data") || progress.contains("evaluating") || progress.contains("assessing") || progress.contains("thinking:") {
                     reasoning_steps += 1;
                 }
             }

@@ -436,10 +436,20 @@ fn call_responses_streamed(
                         if let Some(id) = resp_obj.get("id").and_then(|v| v.as_str()) {
                             response_id = id.to_string();
                         }
-                        // On completed, capture any output items from the full response
                         if event_type == "response.completed" {
                             if let Some(output) = resp_obj.get("output").and_then(|v| v.as_array()) {
                                 output_items = output.clone();
+                            }
+                            // Extract token usage and emit via progress callback
+                            if let Some(usage) = resp_obj.get("usage") {
+                                let total = usage.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let input = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let output_t = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                                if total > 0 {
+                                    if let Some(ref cb) = on_progress {
+                                        cb(0, 0, &format!("tokens:{total}:{input}:{output_t}"));
+                                    }
+                                }
                             }
                         }
                     }

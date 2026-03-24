@@ -607,6 +607,13 @@ impl McpBatchDispatchQueue {
 pub fn run_synthesis_turn(run_id: &str, data_dir: &str) -> Result<Value> {
     crate::run_state::set_native_run_stage(run_id, "llm_generating", None, None)?;
 
+    let is_native = crate::llm_backend::current_backend_name() != "codex";
+
+    if is_native {
+        return run_native_synthesis(run_id, data_dir);
+    }
+
+    // Codex backend: MCP tool-based synthesis (model calls validate_synthesis + finalize_report)
     let (relay_handle, relay_stop) = crate::mcp_progress_relay::start_relay(run_id, data_dir);
 
     let prompt = build_synthesis_prompt(run_id);
@@ -625,7 +632,6 @@ pub fn run_synthesis_turn(run_id: &str, data_dir: &str) -> Result<Value> {
 
     match result {
         Ok(_) => {
-            // Flush cache to disk before reading back (finalize_report may have evicted already)
             crate::run_state_cache::flush_now(run_id);
             let run_state = crate::load_run_by_id_direct(run_id)?;
             let status = run_state
@@ -641,45 +647,114 @@ pub fn run_synthesis_turn(run_id: &str, data_dir: &str) -> Result<Value> {
                     "run_id": run_id,
                 }))
             } else {
-                // Codex turn completed but finalize_report was never called.
-                // This happens when coverage is incomplete or Codex stops early.
-                // Mark as completed_degraded with partial data.
-                let reco_count = run_state
-                    .get("pending_recommandations")
-                    .and_then(|v| v.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0);
-
-                if reco_count > 0 {
-                    // We have recommendations — try to finalize with what we have
-                    crate::debug_log(&format!(
-                        "[mcp-synthesis] finalize_report not called, attempting with {reco_count} recommendations"
-                    ));
-                    // Use composed_payload if validate_synthesis was called, else minimal fallback
-                    let composed = run_state.get("composed_payload").cloned().unwrap_or(json!({}));
-                    let synthese = composed.get("synthese_marche")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| s.len() > 20)
-                        .unwrap_or("Synthese partielle — le rapport a ete compose a partir des recommandations disponibles.");
-                    let actions = composed.get("actions_immediates").cloned().unwrap_or(json!([]));
-                    let draft = serde_json::json!({
-                        "synthese_marche": synthese,
-                        "actions_immediates": actions,
-                        "prochaine_analyse": composed.get("prochaine_analyse").cloned().unwrap_or(json!("")),
-                        "opportunites_watchlist": composed.get("opportunites_watchlist").cloned().unwrap_or(json!("")),
-                        "llm_utilise": "codex-mcp-partial",
-                    });
-                    let _ = crate::report::persist_retry_global_synthesis(run_id, &draft);
-                    Ok(json!({
-                        "ok": true,
-                        "orchestration_status": "completed_degraded",
-                        "run_id": run_id,
-                    }))
-                } else {
-                    Err(anyhow::anyhow!("synthesis_incomplete:no_recommendations_and_finalize_not_called"))
-                }
+                // Fallback: finalize with composed_payload if available
+                codex_synthesis_fallback(run_id)
             }
         }
         Err(e) => Err(e),
+    }
+}
+
+/// Native backend synthesis: LLM returns JSON, we validate + finalize.
+fn run_native_synthesis(run_id: &str, data_dir: &str) -> Result<Value> {
+    crate::run_state_cache::flush_now(run_id);
+    let run_state = crate::load_run_by_id_direct(run_id)?;
+
+    // Use the same prompt as retry (data pre-injected, asks for JSON)
+    let prompt = crate::llm_prompts::build_report_prompt(&run_state);
+    crate::debug_log("[native-synthesis] generating synthesis via direct JSON...");
+
+    let prid = run_id.to_string();
+    let pdd = std::path::PathBuf::from(data_dir);
+    let cb: Option<crate::llm_backend::ProgressFn> = Some(Box::new(move |_bytes, _lines, label| {
+        let dominated = label.starts_with("writing (") || label.starts_with("round ");
+        if !dominated {
+            crate::mcp_progress_relay::write_progress_event(
+                &pdd, &prid, "__synthesis__", "generating", &label.replace('\u{2026}', "..."),
+            );
+        }
+    }));
+
+    let result = crate::llm_backend::run_prompt(&prompt, 300_000, cb)?;
+
+    // Extract synthesis JSON
+    let draft = if result.get("synthese_marche").is_some() {
+        result.clone()
+    } else if result.get("draft").is_some() {
+        result.get("draft").cloned().unwrap_or(result.clone())
+    } else {
+        result.clone()
+    };
+
+    let synthese = draft.get("synthese_marche")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+
+    if synthese.len() < 20 {
+        crate::debug_log(&format!("[native-synthesis] synthesis too short ({}), using fallback", synthese.len()));
+        return codex_synthesis_fallback(run_id);
+    }
+
+    crate::debug_log(&format!("[native-synthesis] got synthesis ({} chars), finalizing", synthese.len()));
+
+    // Validate + finalize
+    let dd = std::path::Path::new(data_dir);
+    let actions_str = serde_json::to_string(
+        draft.get("actions_immediates").unwrap_or(&json!([]))
+    ).unwrap_or_else(|_| "[]".to_string());
+
+    crate::mcp_server::dispatch_tool_direct(dd, "validate_synthesis", &json!({
+        "run_id": run_id,
+        "synthese_marche": synthese,
+        "actions_immediates": actions_str,
+        "prochaine_analyse": draft.get("prochaine_analyse").and_then(|v| v.as_str()).unwrap_or(""),
+        "opportunites_watchlist": draft.get("opportunites_watchlist").and_then(|v| v.as_str()).unwrap_or(""),
+    }));
+
+    // Finalize report
+    crate::mcp_server::dispatch_tool_direct(dd, "finalize_report", &json!({"run_id": run_id}));
+
+    Ok(json!({
+        "ok": true,
+        "orchestration_status": "completed",
+        "run_id": run_id,
+    }))
+}
+
+/// Codex fallback: finalize with composed_payload or hardcoded partial message.
+fn codex_synthesis_fallback(run_id: &str) -> Result<Value> {
+    crate::run_state_cache::flush_now(run_id);
+    let run_state = crate::load_run_by_id_direct(run_id)?;
+    let reco_count = run_state
+        .get("pending_recommandations")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+
+    if reco_count > 0 {
+        crate::debug_log(&format!(
+            "[synthesis-fallback] finalize_report not called, attempting with {reco_count} recommendations"
+        ));
+        let composed = run_state.get("composed_payload").cloned().unwrap_or(json!({}));
+        let synthese = composed.get("synthese_marche")
+            .and_then(|v| v.as_str())
+            .filter(|s| s.len() > 20)
+            .unwrap_or("Synthese partielle — le rapport a ete compose a partir des recommandations disponibles.");
+        let actions = composed.get("actions_immediates").cloned().unwrap_or(json!([]));
+        let draft = json!({
+            "synthese_marche": synthese,
+            "actions_immediates": actions,
+            "prochaine_analyse": composed.get("prochaine_analyse").cloned().unwrap_or(json!("")),
+            "opportunites_watchlist": composed.get("opportunites_watchlist").cloned().unwrap_or(json!("")),
+            "llm_utilise": "codex-mcp-partial",
+        });
+        let _ = crate::report::persist_retry_global_synthesis(run_id, &draft);
+        Ok(json!({
+            "ok": true,
+            "orchestration_status": "completed_degraded",
+            "run_id": run_id,
+        }))
+    } else {
+        Err(anyhow::anyhow!("synthesis_incomplete:no_recommendations_and_finalize_not_called"))
     }
 }

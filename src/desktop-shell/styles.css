@@ -1657,10 +1657,32 @@ main {
   white-space: pre-wrap;
 }
 .lm-reanalyse {
-  font-size: 0.74rem;
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  margin: 0.8rem 0 0;
+  padding: 0.6rem 0.8rem;
+  border-radius: 8px;
+  border: 1px solid rgba(140, 202, 230, 0.25);
+  background: rgba(140, 202, 230, 0.06);
+}
+.lm-reanalyse-icon {
+  font-size: 1.3rem;
+  line-height: 1;
+  flex-shrink: 0;
+}
+.lm-reanalyse-content {
+  font-size: 0.8rem;
+  color: rgba(255, 255, 255, 0.85);
+  line-height: 1.4;
+}
+.lm-reanalyse-content strong {
+  color: #8ecae6;
+}
+.lm-reanalyse-content p {
+  margin: 0.25rem 0 0;
+  font-size: 0.75rem;
   color: var(--sea-muted);
-  margin: 0.6rem 0 0;
-  font-style: italic;
 }
 .lm-section {
   margin-bottom: 1.2rem;

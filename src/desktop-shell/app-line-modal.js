@@ -263,7 +263,13 @@ export function initLineModal() {
     const reanalyseNode = document.getElementById("line-memory-reanalyse");
     if (reanalyseNode) {
       if (rec?.reanalyseAfter) {
-        reanalyseNode.textContent = `Next analysis: ${rec.reanalyseAfter}${rec.reanalyseReason ? ` — ${rec.reanalyseReason}` : ""}`;
+        reanalyseNode.innerHTML = `
+          <span class="lm-reanalyse-icon">\u{1F4C5}</span>
+          <div class="lm-reanalyse-content">
+            <strong>Next analysis: ${rec.reanalyseAfter}</strong>
+            ${rec.reanalyseReason ? `<p>${rec.reanalyseReason}</p>` : ""}
+          </div>
+        `;
         reanalyseNode.classList.remove("hidden");
       } else {
         reanalyseNode.classList.add("hidden");

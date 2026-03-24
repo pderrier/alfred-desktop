@@ -71,6 +71,8 @@ Produis un JSON de recommandation avec :
 Appelle `validate_recommendation(run_id="{run_id}", recommendation=...)`.
 Si ok=false, corrige les issues et re-appelle jusqu'a ok=true.
 
+IMPORTANT: Produis UNE SEULE recommandation pour la ligne {line_type}:{ticker}. Ne cree aucune autre recommandation.
+
 BUDGET WEB: maximum 1 recherche web, uniquement si deep_news_quality_score < 30.
 Si tu fais une recherche web et lis un article, appelle `persist_deep_news`.
 Si un article est du bruit, appelle `ban_deep_news`.

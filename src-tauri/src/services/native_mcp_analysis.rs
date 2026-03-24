@@ -60,7 +60,7 @@ Produis un JSON de recommandation avec :
 - analyse_technique, analyse_fondamentale, analyse_sentiment
 - raisons_principales: 3-5 raisons (array)
 - risques, catalyseurs, badges_keywords: arrays
-- action_recommandee: instruction CHIFFREE (nb titres, montant EUR, prix)
+- action_recommandee: instruction CHIFFREE (nb titres, montant EUR, prix). Pour les lignes watchlist (non detenues), indiquer le prix d'entree ideal et le montant suggere.
 - deep_news_summary: synthese 100-500 chars des actualites cles (OBLIGATOIRE si news disponibles)
 - deep_news_quality_score: 0-100
 - deep_news_relevance: high|medium|low

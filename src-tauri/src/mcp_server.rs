@@ -584,6 +584,21 @@ fn tool_validate_recommendation(data_dir: &Path, params: &Value) -> Result<Value
         }));
     }
 
+    let line_id = as_text(rec.get("line_id"));
+    let is_watchlist = line_id.starts_with("watchlist:");
+
+    // Track validation attempts per line — accept with warnings after max retries
+    static ATTEMPT_COUNTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u32>>> = std::sync::OnceLock::new();
+    let attempts = {
+        let map = ATTEMPT_COUNTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let mut guard = map.lock().unwrap_or_else(|p| p.into_inner());
+        let key = format!("{run_id}:{line_id}");
+        let count = guard.entry(key).or_insert(0);
+        *count += 1;
+        *count
+    };
+    const MAX_VALIDATION_RETRIES: u32 = 2;
+
     let mut issues: Vec<String> = Vec::new();
 
     // synthese >= 80 chars
@@ -626,8 +641,8 @@ fn tool_validate_recommendation(data_dir: &Path, params: &Value) -> Result<Value
         issues.push("raisons_principales_insufficient".to_string());
     }
 
-    // action_recommandee non-empty
-    if as_text(rec.get("action_recommandee")).is_empty() {
+    // action_recommandee non-empty (relaxed for watchlist — no position to size an order for)
+    if !is_watchlist && as_text(rec.get("action_recommandee")).is_empty() {
         issues.push("action_recommandee_empty".to_string());
     }
 
@@ -654,26 +669,33 @@ fn tool_validate_recommendation(data_dir: &Path, params: &Value) -> Result<Value
     }
 
     // line_id format: {type}:{ticker}
-    let line_id = as_text(rec.get("line_id"));
     if line_id.is_empty() || !line_id.contains(':') {
         issues.push("invalid_line_id_format".to_string());
     }
 
     if !issues.is_empty() {
-        // Progress: repairing (Codex will fix and re-call)
-        if !ticker_for_progress.is_empty() {
-            append_progress(data_dir, &run_id, &json!({
-                "type": "line_progress",
-                "ticker": ticker_for_progress,
-                "status": "repairing",
-                "progress": format!("fixing: {}", issues.join(", ")),
+        if attempts > MAX_VALIDATION_RETRIES {
+            // Max retries exceeded — accept with warnings to avoid burning tokens
+            log(&format!("validation: accepting {} after {attempts} attempts (issues: {})", line_id, issues.join(", ")));
+            // Fall through to storage below
+        } else {
+            // Reject — model will retry
+            if !ticker_for_progress.is_empty() {
+                append_progress(data_dir, &run_id, &json!({
+                    "type": "line_progress",
+                    "ticker": ticker_for_progress,
+                    "status": "repairing",
+                    "progress": format!("fixing: {}", issues.join(", ")),
+                }));
+            }
+            return Ok(json!({
+                "ok": false,
+                "stored": false,
+                "issues": issues,
+                "attempt": attempts,
+                "max_retries": MAX_VALIDATION_RETRIES,
             }));
         }
-        return Ok(json!({
-            "ok": false,
-            "stored": false,
-            "issues": issues,
-        }));
     }
 
     // Valid — persist to run_state.pending_recommandations (dedup by line_id)

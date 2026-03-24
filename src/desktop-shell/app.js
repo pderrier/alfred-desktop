@@ -715,11 +715,13 @@ initShellLayout({
         renderMainPanel(model, latestDashboardPayload);
         renderStatusPill(null, latestFinarySessionPayload, latestDashboardPayload.snapshot.latest_run_summary);
         clearRunPipelineBar();
-        // Show retry synthesis only when relevant for this run
+        // Show retry synthesis when synthesis is missing, degraded, or too short
         const runStatus = runData.orchestration?.status || "";
         const recoCount = (runData.pending_recommandations || []).length;
+        const syntheseLen = (runData.composed_payload?.synthese_marche || "").length;
         const canRetry = runStatus === "completed_degraded" ||
-          (runStatus === "failed" && recoCount > 0);
+          (runStatus === "failed" && recoCount > 0) ||
+          (runStatus === "completed" && recoCount > 0 && syntheseLen < 200);
         setRetrySynthesisVisible(canRetry);
       }
     } catch (err) {

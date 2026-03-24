@@ -538,9 +538,18 @@ pub fn run_synthesis_turn(run_id: &str, data_dir: &str) -> Result<Value> {
                     crate::debug_log(&format!(
                         "[mcp-synthesis] finalize_report not called, attempting with {reco_count} recommendations"
                     ));
+                    // Use composed_payload if validate_synthesis was called, else minimal fallback
+                    let composed = run_state.get("composed_payload").cloned().unwrap_or(json!({}));
+                    let synthese = composed.get("synthese_marche")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| s.len() > 20)
+                        .unwrap_or("Synthese partielle — le rapport a ete compose a partir des recommandations disponibles.");
+                    let actions = composed.get("actions_immediates").cloned().unwrap_or(json!([]));
                     let draft = serde_json::json!({
-                        "synthese_marche": "Synthese partielle — certaines lignes n'ont pas pu etre analysees.",
-                        "actions_immediates": [],
+                        "synthese_marche": synthese,
+                        "actions_immediates": actions,
+                        "prochaine_analyse": composed.get("prochaine_analyse").cloned().unwrap_or(json!("")),
+                        "opportunites_watchlist": composed.get("opportunites_watchlist").cloned().unwrap_or(json!("")),
                         "llm_utilise": "codex-mcp-partial",
                     });
                     let _ = crate::report::persist_retry_global_synthesis(run_id, &draft);

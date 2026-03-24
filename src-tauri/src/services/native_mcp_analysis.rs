@@ -368,9 +368,14 @@ impl McpBatchDispatchQueue {
                                 return;
                             }
                             if !tk2.is_empty() {
-                                crate::mcp_progress_relay::write_progress_event(
-                                    &pdd2, &prid, &tk2, "analyzing", &label.replace('\u{2026}', "..."),
-                                );
+                                // Only show meaningful progress — skip noisy output streaming
+                                let dominated = label.starts_with("writing (")
+                                    || label.starts_with("round ");
+                                if !dominated {
+                                    crate::mcp_progress_relay::write_progress_event(
+                                        &pdd2, &prid, &tk2, "analyzing", &label.replace('\u{2026}', "..."),
+                                    );
+                                }
                             }
                         }));
 

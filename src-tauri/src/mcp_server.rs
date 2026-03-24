@@ -110,6 +110,18 @@ fn save_run_state(data_dir: &Path, run_id: &str, state: &Value) -> Result<()> {
     write_json(&path, state)
 }
 
+/// Load run state, apply a mutation, save — with global lock to prevent concurrent corruption.
+fn patch_run_state<F>(data_dir: &Path, run_id: &str, mutator: F) -> Result<Value>
+where
+    F: FnOnce(&mut Value),
+{
+    let _lock = crate::helpers::run_state_update_lock();
+    let mut state = load_run_state(data_dir, run_id)?;
+    mutator(&mut state);
+    save_run_state(data_dir, run_id, &state)?;
+    Ok(state)
+}
+
 fn line_memory_path(data_dir: &Path) -> PathBuf {
     data_dir.join("runtime-state").join("line-memory.json")
 }
@@ -714,25 +726,22 @@ fn tool_validate_recommendation(data_dir: &Path, params: &Value) -> Result<Value
     }
 
     // Valid — persist to run_state.pending_recommandations (dedup by line_id)
-    let mut run_state = load_run_state(data_dir, &run_id)?;
-    let pending = run_state
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("run_state_not_object"))?
-        .entry("pending_recommandations")
-        .or_insert_with(|| json!([]));
-
-    if let Some(arr) = pending.as_array_mut() {
-        // Remove existing entry with same line_id (dedup)
-        arr.retain(|r| as_text(r.get("line_id")) != line_id);
-        arr.push(rec.clone());
-    }
-
-    // Update timestamp
-    if let Some(obj) = run_state.as_object_mut() {
-        obj.insert("updated_at".to_string(), json!(now_iso()));
-    }
-
-    save_run_state(data_dir, &run_id, &run_state)?;
+    let lid = line_id.clone();
+    let rec_clone = rec.clone();
+    let run_state = patch_run_state(data_dir, &run_id, |state| {
+        let pending = state
+            .as_object_mut()
+            .unwrap()
+            .entry("pending_recommandations")
+            .or_insert_with(|| json!([]));
+        if let Some(arr) = pending.as_array_mut() {
+            arr.retain(|r| as_text(r.get("line_id")) != lid);
+            arr.push(rec_clone);
+        }
+        if let Some(obj) = state.as_object_mut() {
+            obj.insert("updated_at".to_string(), json!(now_iso()));
+        }
+    })?;
 
     // Count progress from run_state
     let completed = run_state.get("pending_recommandations")
@@ -839,20 +848,18 @@ fn tool_validate_synthesis(data_dir: &Path, params: &Value) -> Result<Value> {
     }
 
     // Valid — store in run_state.composed_payload
-    let mut run_state = load_run_state(data_dir, &run_id)?;
     let composed = json!({
         "synthese_marche": synthese_marche,
         "actions_immediates": actions,
         "prochaine_analyse": prochaine_analyse,
         "opportunites_watchlist": opportunites_watchlist,
     });
-
-    if let Some(obj) = run_state.as_object_mut() {
-        obj.insert("composed_payload".to_string(), composed);
-        obj.insert("updated_at".to_string(), json!(now_iso()));
-    }
-
-    save_run_state(data_dir, &run_id, &run_state)?;
+    patch_run_state(data_dir, &run_id, |state| {
+        if let Some(obj) = state.as_object_mut() {
+            obj.insert("composed_payload".to_string(), composed.clone());
+            obj.insert("updated_at".to_string(), json!(now_iso()));
+        }
+    })?;
 
     append_progress(
         data_dir,

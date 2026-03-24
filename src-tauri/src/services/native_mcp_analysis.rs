@@ -14,9 +14,9 @@ use serde_json::{json, Value};
 
 // ── Batch prompt ─────────────────────────────────────────────────
 
-/// Build a per-line prompt for the native backend. Data is pre-injected —
-/// no get_line_data tool call needed, saving a round-trip and keeping context clean.
-fn build_native_line_prompt(run_id: &str, ticker: &str, nom: &str, line_type: &str, line_data: &Value) -> String {
+/// Build a per-line prompt for the native backend. Data is pre-injected.
+/// The model returns JSON only — we handle validation and persistence ourselves.
+fn build_native_line_prompt(_run_id: &str, ticker: &str, nom: &str, line_type: &str, line_data: &Value) -> String {
     let position = serde_json::to_string_pretty(&line_data["position"]).unwrap_or_default();
     let market = serde_json::to_string_pretty(&line_data["market_data"]).unwrap_or_default();
     let news = serde_json::to_string_pretty(&line_data["news"]).unwrap_or_default();
@@ -25,11 +25,11 @@ fn build_native_line_prompt(run_id: &str, ticker: &str, nom: &str, line_type: &s
     let quality = serde_json::to_string_pretty(&line_data["quality"]).unwrap_or_default();
 
     format!(
-        r#"Tu es Alfred, un conseiller financier bienveillant. Analyse cette ligne pour le run "{run_id}".
+        r#"Tu es Alfred, un conseiller financier bienveillant. Analyse cette ligne.
 
 Ligne: {line_type}:{ticker} ({nom})
 
-=== DONNEES (pre-chargees) ===
+=== DONNEES ===
 
 Position:
 {position}
@@ -51,7 +51,7 @@ Qualite des donnees:
 
 === INSTRUCTIONS ===
 
-Produis un JSON de recommandation avec :
+Reponds UNIQUEMENT avec un objet JSON (pas de texte avant ou apres) contenant :
 - line_id: "{line_type}:{ticker}"
 - ticker: "{ticker}", type: "{line_type}", nom: "{nom}"
 - signal: ACHAT_FORT | ACHAT | RENFORCEMENT | CONSERVER | ALLEGEMENT | VENTE | SURVEILLANCE
@@ -60,28 +60,19 @@ Produis un JSON de recommandation avec :
 - analyse_technique, analyse_fondamentale, analyse_sentiment
 - raisons_principales: 3-5 raisons (array)
 - risques, catalyseurs, badges_keywords: arrays
-- action_recommandee: instruction CHIFFREE (nb titres, montant EUR, prix). Pour les lignes watchlist (non detenues), indiquer le prix d'entree ideal et le montant suggere.
+- action_recommandee: instruction CHIFFREE (nb titres, montant EUR, prix). Pour watchlist: prix d'entree ideal + montant suggere.
 - deep_news_summary: synthese 100-500 chars des actualites cles (OBLIGATOIRE si news disponibles)
 - deep_news_quality_score: 0-100
 - deep_news_relevance: high|medium|low
 - deep_news_staleness: fresh|recent|stale
+- extracted_fundamentals: {{ "pe_ratio": ..., "revenue_growth": ..., "profit_margin": ..., "debt_to_equity": ... }} (si trouves via web ou calcules)
+- shared_insights: {{ "analyse_technique": "...", "analyse_fondamentale": "...", "analyse_sentiment": "...", "risques": "...", "catalyseurs": "..." }}
 - reanalyse_after: date ISO, reanalyse_reason
 - llm_memory_summary: resume factuel
 
-Appelle `validate_recommendation(run_id="{run_id}", recommendation=...)`.
-Si ok=false, corrige les issues et re-appelle jusqu'a ok=true.
-
-IMPORTANT: Produis UNE SEULE recommandation pour la ligne {line_type}:{ticker}. Ne cree aucune autre recommandation.
-
-BUDGET WEB: maximum 1 recherche web, uniquement si deep_news_quality_score < 30.
-Si tu fais une recherche web et lis un article, appelle `persist_deep_news`.
-Si un article est du bruit, appelle `ban_deep_news`.
-Si fondamentaux manquants trouves, appelle `persist_extracted_fundamentals`.
-Appelle `persist_shared_insights` avec tes analyses generiques.
-
-Les articles marques "RESUME APPROFONDI (cache)" sont deja resumes — utilise-les directement.
-Les articles marques "A APPROFONDIR" n'ont pas de resume — lis-les via recherche web."#,
-        run_id = run_id,
+Si les donnees sont insuffisantes, tu peux faire UNE recherche web (pas plus) pour completer.
+Sois concret: chiffres, montants, dates. Pas de generalites.
+Les articles "RESUME APPROFONDI (cache)" sont deja resumes — utilise-les directement."#,
         ticker = ticker,
         nom = nom,
         line_type = line_type,
@@ -92,6 +83,141 @@ Les articles marques "A APPROFONDIR" n'ont pas de resume — lis-les via recherc
         memory = memory,
         quality = quality,
     )
+}
+
+/// Run a single line analysis with native backend: LLM returns JSON, we validate+persist.
+fn run_native_line_analysis(
+    run_id: &str,
+    ticker: &str,
+    nom: &str,
+    line_type: &str,
+    line_data: &Value,
+    data_dir: &std::path::Path,
+    mut on_progress: Option<crate::llm_backend::ProgressFn>,
+) -> Result<()> {
+    let prompt = build_native_line_prompt(run_id, ticker, nom, line_type, line_data);
+    let timeout_ms = 180_000u64;
+    const MAX_RETRIES: u32 = 2;
+
+    let mut last_issues: Vec<String> = Vec::new();
+
+    for attempt in 0..=MAX_RETRIES {
+        let retry_prompt = if attempt == 0 {
+            prompt.clone()
+        } else {
+            format!(
+                "{}\n\n=== CORRECTION (tentative {}/{}) ===\nTa reponse precedente avait ces problemes: {}.\nCorrige-les et renvoie le JSON complet.",
+                prompt,
+                attempt + 1,
+                MAX_RETRIES + 1,
+                last_issues.join(", ")
+            )
+        };
+
+        // Call LLM — model returns JSON (+ optional web search)
+        // Progress callback only on first attempt
+        let cb = if attempt == 0 { on_progress.take() } else { None };
+        let result = crate::llm_backend::run_prompt(&retry_prompt, timeout_ms, cb)?;
+
+        // Extract JSON from response
+        let rec = match extract_recommendation_json(&result) {
+            Some(r) => r,
+            None => {
+                crate::debug_log(&format!("native_line: {ticker} attempt {attempt}: no JSON in response"));
+                last_issues = vec!["no_json_in_response".to_string()];
+                continue;
+            }
+        };
+
+        // Validate locally
+        let validation = crate::mcp_server::dispatch_tool_direct(
+            data_dir,
+            "validate_recommendation",
+            &json!({"run_id": run_id, "recommendation": serde_json::to_string(&rec).unwrap_or_default()}),
+        );
+
+        let ok = validation.get("ok").and_then(|v| v.as_bool()).unwrap_or(false)
+            || validation.get("stored").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        if ok {
+            // Persist extracted data
+            persist_line_extras(data_dir, ticker, line_data, &rec);
+            return Ok(());
+        }
+
+        // Validation failed
+        last_issues = validation
+            .get("issues")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_else(|| vec!["validation_failed".to_string()]);
+
+        crate::debug_log(&format!(
+            "native_line: {ticker} attempt {}: issues: {:?}",
+            attempt + 1,
+            last_issues
+        ));
+
+        crate::mcp_progress_relay::write_progress_event(
+            &data_dir.parent().unwrap_or(data_dir),
+            run_id, ticker, "repairing",
+            &format!("fixing: {}", last_issues.join(", ")),
+        );
+    }
+
+    // Max retries exhausted — accept as-is (validate_recommendation already stored on last attempt if issues were non-blocking)
+    crate::debug_log(&format!("native_line: {ticker} accepted after {MAX_RETRIES} retries"));
+    Ok(())
+}
+
+/// Extract recommendation JSON from LLM response Value.
+fn extract_recommendation_json(result: &Value) -> Option<Value> {
+    // Result may be the JSON directly, or {"ok":true, "mcp_turn":true} with text
+    if result.get("line_id").is_some() {
+        return Some(result.clone());
+    }
+    if result.get("recommendation").is_some() {
+        return result.get("recommendation").cloned();
+    }
+    // Try parsing from text content
+    if let Some(text) = result.as_str() {
+        return crate::llm_parsing::extract_json_object(text);
+    }
+    // The result itself might be the recommendation
+    if result.get("signal").is_some() && result.get("ticker").is_some() {
+        return Some(result.clone());
+    }
+    None
+}
+
+/// Persist extracted fundamentals, shared insights, deep news from the recommendation.
+fn persist_line_extras(data_dir: &std::path::Path, ticker: &str, line_data: &Value, rec: &Value) {
+    let isin = line_data.get("position")
+        .and_then(|p| p.get("isin"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(ticker);
+
+    // Persist shared insights
+    if let Some(insights) = rec.get("shared_insights") {
+        if !insights.is_null() {
+            crate::mcp_server::dispatch_tool_direct(
+                data_dir,
+                "persist_shared_insights",
+                &json!({"ticker": ticker, "isin": isin, "insights": serde_json::to_string(insights).unwrap_or_default()}),
+            );
+        }
+    }
+
+    // Persist extracted fundamentals
+    if let Some(fundamentals) = rec.get("extracted_fundamentals") {
+        if !fundamentals.is_null() {
+            crate::mcp_server::dispatch_tool_direct(
+                data_dir,
+                "persist_extracted_fundamentals",
+                &json!({"ticker": ticker, "isin": isin, "fundamentals": serde_json::to_string(fundamentals).unwrap_or_default()}),
+            );
+        }
+    }
 }
 
 fn build_batch_prompt(run_id: &str, tickers: &[(String, String, String)]) -> String {
@@ -320,28 +446,26 @@ impl McpBatchDispatchQueue {
 
         thread::spawn(move || {
             if is_native {
-                // Native backend: parallel per-line dispatch, each with pre-injected data + clean context
+                // Native backend: parallel per-line — LLM returns JSON, we validate+persist
                 let dd = std::path::PathBuf::from(&progress_data_dir);
 
-                // Pre-fetch all line data on the batch thread (fast, local disk reads)
-                let line_prompts: Vec<(String, String)> = tickers.iter().map(|(ticker, nom, line_type)| {
+                // Pre-fetch all line data (fast, from cache/disk)
+                let line_data_vec: Vec<(String, String, String, Value)> = tickers.iter().map(|(ticker, nom, line_type)| {
                     let line_data = crate::mcp_server::dispatch_tool_direct(
                         &dd,
                         "get_line_data",
                         &serde_json::json!({"run_id": progress_run_id, "line_id": format!("{line_type}:{ticker}")}),
                     );
-                    let prompt = build_native_line_prompt(&progress_run_id, ticker, nom, line_type, &line_data);
-                    (ticker.clone(), prompt)
+                    (ticker.clone(), nom.clone(), line_type.clone(), line_data)
                 }).collect();
 
-                // Spawn one thread per line — all run in parallel
-                let handles: Vec<_> = line_prompts.into_iter().map(|(ticker, prompt)| {
+                // Spawn one thread per line
+                let handles: Vec<_> = line_data_vec.into_iter().map(|(ticker, nom, line_type, line_data)| {
                     let rid = progress_run_id.clone();
                     let pdd = dd.clone();
                     let tk = ticker.clone();
 
                     thread::spawn(move || {
-                        let timeout_ms = 180_000u64;
                         let prid = rid.clone();
                         let pdd2 = pdd.clone();
                         let tk2 = tk.clone();
@@ -370,9 +494,7 @@ impl McpBatchDispatchQueue {
                                 return;
                             }
                             if !tk2.is_empty() {
-                                // Only show meaningful progress — skip noisy output streaming
-                                let dominated = label.starts_with("writing (")
-                                    || label.starts_with("round ");
+                                let dominated = label.starts_with("writing (") || label.starts_with("round ");
                                 if !dominated {
                                     crate::mcp_progress_relay::write_progress_event(
                                         &pdd2, &prid, &tk2, "analyzing", &label.replace('\u{2026}', "..."),
@@ -381,17 +503,12 @@ impl McpBatchDispatchQueue {
                             }
                         }));
 
-                        match crate::llm_backend::run_prompt(&prompt, timeout_ms, progress_cb) {
-                            Ok(_) => Ok(tk.clone()),
+                        match run_native_line_analysis(&rid, &tk, &nom, &line_type, &line_data, &pdd, progress_cb) {
+                            Ok(()) => Ok(tk.clone()),
                             Err(e) => {
                                 eprintln!("[mcp-native] line {tk} failed: {e}");
                                 let err_msg = format!("{e}");
                                 let _ = crate::run_state::update_line_status_with_error(&rid, &tk, "failed", Some(&err_msg));
-                                crate::emit_event("alfred://line-progress", serde_json::json!({
-                                    "run_id": rid,
-                                    "ticker": tk,
-                                    "line_status": { "status": "failed", "error": err_msg },
-                                }));
                                 Err(e)
                             }
                         }

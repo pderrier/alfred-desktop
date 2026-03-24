@@ -756,8 +756,7 @@ fn run_native_synthesis(run_id: &str, data_dir: &str) -> Result<Value> {
         ));
     }
 
-    // Should not reach here (last attempt always accepts), but just in case
-    codex_synthesis_fallback(run_id)
+    unreachable!("last attempt always accepts")
 }
 
 /// Codex fallback: finalize with composed_payload or hardcoded partial message.

@@ -37,7 +37,7 @@ pub fn run_retry_global_synthesis(run_id: String) -> Result<serde_json::Value> {
         }));
     }
 
-    // Codex backend: old path
+    // Codex backend: generate draft via LLM + persist
     let run_state = run_state::load_run_by_id(&safe_run_id)?;
     let generated_draft = report::generate_draft_via_litellm(&run_state, &safe_run_id)?;
     let result = report::persist_retry_global_synthesis(&safe_run_id, &generated_draft)?;

@@ -881,9 +881,63 @@ pub fn discover_running_stage(
         let collection_progress = orchestration
             .and_then(|obj| obj.get("collection_progress"))
             .cloned();
-        let line_progress = orchestration
-            .and_then(|obj| obj.get("line_progress"))
-            .cloned();
+        // Compute line_progress from actual line_status counts (not stale orchestration field)
+        let line_progress = {
+            let ls = payload.get("line_status").and_then(|v| v.as_object());
+            let cached = crate::run_state_cache::read_cached_line_status(
+                &payload_run_id.clone().unwrap_or_default(),
+            );
+            let cached_obj = cached.as_ref().and_then(|v| v.as_object());
+
+            // Merge disk + cache statuses
+            let mut done_count = 0u64;
+            let mut total_count = 0u64;
+            let count_from = |map: &serde_json::Map<String, serde_json::Value>| -> (u64, u64) {
+                let mut done = 0u64;
+                let total = map.len() as u64;
+                for (_, v) in map {
+                    let s = v.as_str()
+                        .or_else(|| v.get("status").and_then(|s| s.as_str()))
+                        .unwrap_or("");
+                    if s == "done" || s == "completed" || s == "failed" || s == "aborted" {
+                        done += 1;
+                    }
+                }
+                (done, total)
+            };
+            if let Some(disk) = ls {
+                let (d, t) = count_from(disk);
+                done_count = d;
+                total_count = t;
+            }
+            if let Some(cache) = cached_obj {
+                // Cache may have more recent statuses
+                for (ticker, v) in cache {
+                    let s = v.as_str()
+                        .or_else(|| v.get("status").and_then(|s| s.as_str()))
+                        .unwrap_or("");
+                    if s == "done" || s == "completed" || s == "failed" || s == "aborted" {
+                        // Only count if not already counted from disk
+                        if ls.map(|m| !m.contains_key(ticker) || {
+                            let ds = m.get(ticker).and_then(|dv| dv.as_str()
+                                .or_else(|| dv.get("status").and_then(|x| x.as_str())))
+                                .unwrap_or("");
+                            ds != "done" && ds != "completed" && ds != "failed" && ds != "aborted"
+                        }).unwrap_or(true) {
+                            done_count += 1;
+                        }
+                    }
+                    if ls.map(|m| !m.contains_key(ticker)).unwrap_or(true) {
+                        total_count += 1;
+                    }
+                }
+            }
+            if total_count > 0 {
+                Some(json!({"completed": done_count, "total": total_count}))
+            } else {
+                orchestration.and_then(|obj| obj.get("line_progress")).cloned()
+            }
+        };
         let error_code = orchestration
             .and_then(|obj| obj.get("error_code"))
             .and_then(|v| v.as_str())

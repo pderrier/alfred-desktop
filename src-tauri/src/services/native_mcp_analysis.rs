@@ -655,70 +655,109 @@ pub fn run_synthesis_turn(run_id: &str, data_dir: &str) -> Result<Value> {
     }
 }
 
-/// Native backend synthesis: LLM returns JSON, we validate + finalize.
+/// Native backend synthesis: LLM returns JSON, we validate (with retry) + finalize.
 fn run_native_synthesis(run_id: &str, data_dir: &str) -> Result<Value> {
     crate::run_state_cache::flush_now(run_id);
     let run_state = crate::load_run_by_id_direct(run_id)?;
-
-    // Use the same prompt as retry (data pre-injected, asks for JSON)
     let prompt = crate::llm_prompts::build_report_prompt(&run_state);
+    let dd = std::path::Path::new(data_dir);
+
     crate::debug_log("[native-synthesis] generating synthesis via direct JSON...");
 
-    let prid = run_id.to_string();
-    let pdd = std::path::PathBuf::from(data_dir);
-    let cb: Option<crate::llm_backend::ProgressFn> = Some(Box::new(move |_bytes, _lines, label| {
-        let dominated = label.starts_with("writing (") || label.starts_with("round ");
-        if !dominated {
-            crate::mcp_progress_relay::write_progress_event(
-                &pdd, &prid, "__synthesis__", "generating", &label.replace('\u{2026}', "..."),
-            );
+    const MAX_RETRIES: u32 = 2;
+    let mut last_issues: Vec<String> = Vec::new();
+
+    for attempt in 0..=MAX_RETRIES {
+        let retry_prompt = if attempt == 0 {
+            prompt.clone()
+        } else {
+            format!(
+                "{}\n\n=== CORRECTION (tentative {}/{}) ===\nTa synthese precedente avait ces problemes: {}.\nCorrige-les et renvoie le JSON complet.",
+                prompt,
+                attempt + 1,
+                MAX_RETRIES + 1,
+                last_issues.join(", ")
+            )
+        };
+
+        let prid = run_id.to_string();
+        let pdd = std::path::PathBuf::from(data_dir);
+        let cb: Option<crate::llm_backend::ProgressFn> = if attempt == 0 {
+            Some(Box::new(move |_bytes, _lines, label| {
+                let dominated = label.starts_with("writing (") || label.starts_with("round ");
+                if !dominated {
+                    crate::mcp_progress_relay::write_progress_event(
+                        &pdd, &prid, "__synthesis__", "generating", &label.replace('\u{2026}', "..."),
+                    );
+                }
+            }))
+        } else {
+            None
+        };
+
+        let result = crate::llm_backend::run_prompt(&retry_prompt, 300_000, cb)?;
+
+        // Extract synthesis JSON
+        let draft = if result.get("synthese_marche").is_some() {
+            result.clone()
+        } else if result.get("draft").is_some() {
+            result.get("draft").cloned().unwrap_or(result.clone())
+        } else {
+            result.clone()
+        };
+
+        let synthese = draft.get("synthese_marche")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+
+        if synthese.len() < 20 {
+            crate::debug_log(&format!("[native-synthesis] attempt {}: no synthese_marche in response", attempt + 1));
+            last_issues = vec!["synthese_marche_missing_or_empty".to_string()];
+            continue;
         }
-    }));
 
-    let result = crate::llm_backend::run_prompt(&prompt, 300_000, cb)?;
+        // Validate
+        let actions_str = serde_json::to_string(
+            draft.get("actions_immediates").unwrap_or(&json!([]))
+        ).unwrap_or_else(|_| "[]".to_string());
 
-    // Extract synthesis JSON
-    let draft = if result.get("synthese_marche").is_some() {
-        result.clone()
-    } else if result.get("draft").is_some() {
-        result.get("draft").cloned().unwrap_or(result.clone())
-    } else {
-        result.clone()
-    };
+        let validation = crate::mcp_server::dispatch_tool_direct(dd, "validate_synthesis", &json!({
+            "run_id": run_id,
+            "synthese_marche": synthese,
+            "actions_immediates": actions_str,
+            "prochaine_analyse": draft.get("prochaine_analyse").and_then(|v| v.as_str()).unwrap_or(""),
+            "opportunites_watchlist": draft.get("opportunites_watchlist").and_then(|v| v.as_str()).unwrap_or(""),
+        }));
 
-    let synthese = draft.get("synthese_marche")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
+        let valid = validation.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        if valid || attempt == MAX_RETRIES {
+            if !valid {
+                crate::debug_log(&format!("[native-synthesis] accepting after {MAX_RETRIES} retries despite issues"));
+            }
+            crate::debug_log(&format!("[native-synthesis] synthesis ({} chars), finalizing", synthese.len()));
+            crate::mcp_server::dispatch_tool_direct(dd, "finalize_report", &json!({"run_id": run_id}));
+            return Ok(json!({
+                "ok": true,
+                "orchestration_status": "completed",
+                "run_id": run_id,
+            }));
+        }
 
-    if synthese.len() < 20 {
-        crate::debug_log(&format!("[native-synthesis] synthesis too short ({}), using fallback", synthese.len()));
-        return codex_synthesis_fallback(run_id);
+        // Validation failed — collect issues for retry prompt
+        last_issues = validation
+            .get("issues")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_else(|| vec!["validation_failed".to_string()]);
+
+        crate::debug_log(&format!(
+            "[native-synthesis] attempt {}: issues: {:?}",
+            attempt + 1, last_issues
+        ));
     }
 
-    crate::debug_log(&format!("[native-synthesis] got synthesis ({} chars), finalizing", synthese.len()));
-
-    // Validate + finalize
-    let dd = std::path::Path::new(data_dir);
-    let actions_str = serde_json::to_string(
-        draft.get("actions_immediates").unwrap_or(&json!([]))
-    ).unwrap_or_else(|_| "[]".to_string());
-
-    crate::mcp_server::dispatch_tool_direct(dd, "validate_synthesis", &json!({
-        "run_id": run_id,
-        "synthese_marche": synthese,
-        "actions_immediates": actions_str,
-        "prochaine_analyse": draft.get("prochaine_analyse").and_then(|v| v.as_str()).unwrap_or(""),
-        "opportunites_watchlist": draft.get("opportunites_watchlist").and_then(|v| v.as_str()).unwrap_or(""),
-    }));
-
-    // Finalize report
-    crate::mcp_server::dispatch_tool_direct(dd, "finalize_report", &json!({"run_id": run_id}));
-
-    Ok(json!({
-        "ok": true,
-        "orchestration_status": "completed",
-        "run_id": run_id,
-    }))
+    // Should not reach here (last attempt always accepts), but just in case
+    codex_synthesis_fallback(run_id)
 }
 
 /// Codex fallback: finalize with composed_payload or hardcoded partial message.

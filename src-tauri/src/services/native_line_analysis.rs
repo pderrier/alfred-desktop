@@ -1,16 +1,14 @@
 use anyhow::{anyhow, Result};
 use serde_json::Value;
 
-use crate::{now_iso_string, patch_run_state_direct_with};
+use crate::now_iso_string;
 
 pub(crate) fn persist_native_collection_state(run_id: &str, collection_state: &Value) -> Result<()> {
     let collection_object = collection_state
         .as_object()
         .ok_or_else(|| anyhow!("native_collection_state_invalid"))?;
-    // Evict from cache first — collection writes directly to disk,
-    // cache must reload fresh data on next access (MCP tool calls)
-    crate::run_state_cache::evict(run_id);
-    patch_run_state_direct_with(run_id, |run_state| {
+    let data_dir = crate::paths::default_data_dir();
+    crate::run_state_cache::patch(&data_dir, run_id, |run_state| {
         if let Some(object) = run_state.as_object_mut() {
             for key in [
                 "portfolio",

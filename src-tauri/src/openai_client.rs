@@ -406,6 +406,7 @@ fn call_responses_streamed(
 
         // Accumulate streamed text deltas per output item index
         let mut text_bufs: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+        let mut reasoning_buf = String::new();
         // Accumulate function_call argument deltas per output item index
         let mut fn_arg_bufs: std::collections::HashMap<u64, (String, String, String)> =
             std::collections::HashMap::new(); // index → (call_id, name, args_buf)
@@ -467,22 +468,32 @@ fn call_responses_streamed(
                     }
                 }
 
-                // Text deltas for progress display
+                // Text deltas — accumulate silently (final JSON output, not useful for progress)
                 "response.output_text.delta" => {
                     if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
                         let idx = event.get("output_index").and_then(|v| v.as_u64()).unwrap_or(0);
-                        text_bufs.entry(idx).or_default().push_str(delta);
-                        if let Some(ref cb) = on_progress {
-                            cb(0, 0, delta);
+                        let buf = text_bufs.entry(idx).or_default();
+                        buf.push_str(delta);
+                        // Show a periodic "writing..." indicator (every ~500 chars)
+                        if buf.len() % 500 < delta.len() {
+                            if let Some(ref cb) = on_progress {
+                                cb(0, 0, &format!("writing ({:.1}kB)\u{2026}", buf.len() as f64 / 1024.0));
+                            }
                         }
                     }
                 }
 
-                // Reasoning tokens (o-series models) — stream to UI
+                // Reasoning tokens (o-series models) — periodic summary, not every token
                 "response.reasoning.delta" => {
                     if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
-                        if let Some(ref cb) = on_progress {
-                            cb(0, 0, &format!("thinking: {delta}"));
+                        reasoning_buf.push_str(delta);
+                        // Show thinking indicator every ~200 chars
+                        if reasoning_buf.len() % 200 < delta.len() {
+                            if let Some(ref cb) = on_progress {
+                                // Show last ~60 chars of reasoning as preview
+                                let preview: String = reasoning_buf.chars().rev().take(60).collect::<String>().chars().rev().collect();
+                                cb(0, 0, &format!("thinking: {preview}\u{2026}"));
+                            }
                         }
                     }
                 }

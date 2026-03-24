@@ -21,6 +21,23 @@ pub fn run_retry_global_synthesis(run_id: String) -> Result<serde_json::Value> {
     if safe_run_id.is_empty() {
         return Err(anyhow!("run_id_required"));
     }
+
+    let is_native = crate::llm_backend::current_backend_name() != "codex";
+    if is_native {
+        // Native backend: use direct synthesis (same as run_synthesis_turn)
+        let data_dir = crate::paths::resolve_runtime_state_dir()
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| ".".to_string());
+        let result = crate::native_mcp_analysis::run_synthesis_turn(&safe_run_id, &data_dir)?;
+        return Ok(json!({
+            "ok": true,
+            "action": "analysis:retry-global-synthesis-local",
+            "result": result
+        }));
+    }
+
+    // Codex backend: old path
     let run_state = run_state::load_run_by_id(&safe_run_id)?;
     let generated_draft = report::generate_draft_via_litellm(&run_state, &safe_run_id)?;
     let result = report::persist_retry_global_synthesis(&safe_run_id, &generated_draft)?;

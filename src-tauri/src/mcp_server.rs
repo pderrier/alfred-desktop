@@ -58,6 +58,31 @@ fn append_progress(data_dir: &Path, run_id: &str, event: &Value) {
     }
 }
 
+/// Merge new recommendation into existing: new values win UNLESS they are empty/null
+/// and the existing value is non-empty. Prevents overwriting good data with blanks.
+fn merge_recommendation(existing: &Value, new: &Value) -> Value {
+    let mut merged = existing.clone();
+    if let (Some(base), Some(update)) = (merged.as_object_mut(), new.as_object()) {
+        for (key, new_val) in update {
+            let is_empty = new_val.is_null()
+                || (new_val.is_string() && new_val.as_str().unwrap_or_default().trim().is_empty())
+                || (new_val.is_array() && new_val.as_array().unwrap().is_empty());
+            let existing_val = base.get(key);
+            let existing_has_value = existing_val.is_some_and(|v| {
+                !v.is_null()
+                    && !(v.is_string() && v.as_str().unwrap_or_default().trim().is_empty())
+                    && !(v.is_array() && v.as_array().unwrap().is_empty())
+            });
+            // Only skip if new is empty AND existing has real data
+            if is_empty && existing_has_value {
+                continue;
+            }
+            base.insert(key.clone(), new_val.clone());
+        }
+    }
+    merged
+}
+
 // ── Run state (via in-memory cache) ──────────────────────────────────────────
 
 fn load_run_state(data_dir: &Path, run_id: &str) -> Result<Value> {
@@ -599,84 +624,63 @@ fn tool_validate_recommendation(data_dir: &Path, params: &Value) -> Result<Value
     };
     const MAX_VALIDATION_RETRIES: u32 = 2;
 
-    let mut issues: Vec<String> = Vec::new();
+    let mut hard_issues: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
 
-    // synthese >= 80 chars
+    // ── Hard blockers (reject + retry) ──
     let synthese = as_text(rec.get("synthese"));
     if synthese.chars().count() < 80 {
-        issues.push("synthese_too_short".to_string());
+        hard_issues.push("synthese_too_short".to_string());
     }
 
-    // conviction in {faible, moderee, forte} (accent-insensitive)
     let conviction = as_text(rec.get("conviction"))
         .to_lowercase()
         .replace('é', "e")
         .replace('è', "e");
     if !["faible", "moderee", "forte"].contains(&conviction.as_str()) {
-        issues.push("invalid_conviction".to_string());
+        hard_issues.push("invalid_conviction".to_string());
     }
 
-    // analyse_technique non-empty
-    if as_text(rec.get("analyse_technique")).is_empty() {
-        issues.push("analyse_technique_empty".to_string());
-    }
-
-    // analyse_fondamentale non-empty
-    if as_text(rec.get("analyse_fondamentale")).is_empty() {
-        issues.push("analyse_fondamentale_empty".to_string());
-    }
-
-    // analyse_sentiment non-empty
-    if as_text(rec.get("analyse_sentiment")).is_empty() {
-        issues.push("analyse_sentiment_empty".to_string());
-    }
-
-    // raisons_principales >= 2 items
-    let raisons = rec
-        .get("raisons_principales")
-        .and_then(|v| v.as_array())
-        .map(|a| a.len())
-        .unwrap_or(0);
-    if raisons < 2 {
-        issues.push("raisons_principales_insufficient".to_string());
-    }
-
-    // action_recommandee non-empty (relaxed for watchlist — no position to size an order for)
-    if !is_watchlist && as_text(rec.get("action_recommandee")).is_empty() {
-        issues.push("action_recommandee_empty".to_string());
-    }
-
-    // deep_news_summary — warning only (not a hard failure)
-    let deep_news_empty = as_text(rec.get("deep_news_summary")).is_empty();
-    if deep_news_empty {
-        // Append as warning but don't block storage
-        log("warning: deep_news_summary is empty");
-    }
-
-    // signal validation
     let signal = as_text(rec.get("signal")).to_ascii_uppercase();
     let valid_signals = [
-        "ACHAT_FORT",
-        "ACHAT",
-        "RENFORCEMENT",
-        "CONSERVER",
-        "ALLEGEMENT",
-        "VENTE",
-        "SURVEILLANCE",
+        "ACHAT_FORT", "ACHAT", "RENFORCEMENT", "CONSERVER",
+        "ALLEGEMENT", "VENTE", "SURVEILLANCE",
     ];
     if !valid_signals.contains(&signal.as_str()) {
-        issues.push("invalid_signal".to_string());
+        hard_issues.push("invalid_signal".to_string());
     }
 
-    // line_id format: {type}:{ticker}
     if line_id.is_empty() || !line_id.contains(':') {
-        issues.push("invalid_line_id_format".to_string());
+        hard_issues.push("invalid_line_id_format".to_string());
     }
 
-    if !issues.is_empty() {
+    // ── Soft warnings (store anyway, reported but don't block) ──
+    if as_text(rec.get("analyse_technique")).is_empty() {
+        warnings.push("analyse_technique_empty".to_string());
+    }
+    if as_text(rec.get("analyse_fondamentale")).is_empty() {
+        warnings.push("analyse_fondamentale_empty".to_string());
+    }
+    if as_text(rec.get("analyse_sentiment")).is_empty() {
+        warnings.push("analyse_sentiment_empty".to_string());
+    }
+    let raisons = rec.get("raisons_principales")
+        .and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+    if raisons < 2 {
+        warnings.push("raisons_principales_insufficient".to_string());
+    }
+    if as_text(rec.get("action_recommandee")).is_empty() {
+        warnings.push("action_recommandee_empty".to_string());
+    }
+    if as_text(rec.get("deep_news_summary")).is_empty() {
+        warnings.push("deep_news_summary_empty".to_string());
+    }
+
+    // Only reject on hard issues (or accept after max retries)
+    let issues: Vec<String> = hard_issues.iter().chain(warnings.iter()).cloned().collect();
+    if !hard_issues.is_empty() {
         if attempts > MAX_VALIDATION_RETRIES {
-            // Max retries exceeded — accept with warnings to avoid burning tokens
-            log(&format!("validation: accepting {} after {attempts} attempts (issues: {})", line_id, issues.join(", ")));
+            log(&format!("validation: accepting {} after {attempts} attempts (hard issues: {})", line_id, hard_issues.join(", ")));
             // Fall through to storage below
         } else {
             // Reject — model will retry
@@ -708,8 +712,15 @@ fn tool_validate_recommendation(data_dir: &Path, params: &Value) -> Result<Value
             .entry("pending_recommandations")
             .or_insert_with(|| json!([]));
         if let Some(arr) = pending.as_array_mut() {
+            // Find existing rec — merge (never overwrite non-empty with empty)
+            let existing = arr.iter().find(|r| as_text(r.get("line_id")) == lid).cloned();
             arr.retain(|r| as_text(r.get("line_id")) != lid);
-            arr.push(rec_clone);
+            let merged = if let Some(prev) = existing {
+                merge_recommendation(&prev, &rec_clone)
+            } else {
+                rec_clone
+            };
+            arr.push(merged);
         }
         if let Some(obj) = state.as_object_mut() {
             obj.insert("updated_at".to_string(), json!(now_iso()));
@@ -764,11 +775,11 @@ fn tool_validate_recommendation(data_dir: &Path, params: &Value) -> Result<Value
         "stored": true,
         "issues": [],
     });
-    if deep_news_empty {
+    if !warnings.is_empty() {
         result
             .as_object_mut()
             .unwrap()
-            .insert("warnings".to_string(), json!(["deep_news_summary_empty"]));
+            .insert("warnings".to_string(), json!(warnings));
     }
     Ok(result)
 }

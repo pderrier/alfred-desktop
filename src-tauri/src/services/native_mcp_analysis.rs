@@ -100,6 +100,7 @@ fn run_native_line_analysis(
     const MAX_RETRIES: u32 = 2;
 
     let mut last_issues: Vec<String> = Vec::new();
+    let mut best_rec: Option<Value> = None;
 
     for attempt in 0..=MAX_RETRIES {
         let retry_prompt = if attempt == 0 {
@@ -121,7 +122,10 @@ fn run_native_line_analysis(
 
         // Extract JSON from response
         let rec = match extract_recommendation_json(&result) {
-            Some(r) => r,
+            Some(r) => {
+                best_rec = Some(r.clone());
+                r
+            }
             None => {
                 crate::debug_log(&format!("native_line: {ticker} attempt {attempt}: no JSON in response"));
                 last_issues = vec!["no_json_in_response".to_string()];
@@ -165,8 +169,20 @@ fn run_native_line_analysis(
         );
     }
 
-    // Max retries exhausted — accept as-is (validate_recommendation already stored on last attempt if issues were non-blocking)
-    crate::debug_log(&format!("native_line: {ticker} accepted after {MAX_RETRIES} retries"));
+    // Max retries exhausted — force-store best available recommendation
+    if let Some(rec) = best_rec {
+        crate::debug_log(&format!("native_line: {ticker} force-storing best rec after {MAX_RETRIES} retries"));
+        // Call validate with high attempt count to trigger accept-with-warnings
+        crate::mcp_server::dispatch_tool_direct(
+            data_dir,
+            "validate_recommendation",
+            &json!({"run_id": run_id, "recommendation": serde_json::to_string(&rec).unwrap_or_default()}),
+        );
+        persist_line_extras(data_dir, ticker, line_data, &rec);
+    } else {
+        crate::debug_log(&format!("native_line: {ticker} no valid JSON after {MAX_RETRIES} retries"));
+        let _ = crate::run_state::update_line_status_with_error(run_id, ticker, "failed", Some("no_valid_recommendation"));
+    }
     Ok(())
 }
 

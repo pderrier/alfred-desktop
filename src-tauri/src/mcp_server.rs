@@ -705,24 +705,37 @@ fn tool_validate_recommendation(data_dir: &Path, params: &Value) -> Result<Value
         pos_count + wl_count
     };
 
-    // Write progress event
+    // Emit progress — both JSONL (for relay) and direct Tauri event (immediate UI update)
     let ticker_part = line_id.split(':').last().unwrap_or_default();
+    let conviction_text = as_text(rec.get("conviction"));
+    let synthese_short: String = synthese.chars().take(120).collect();
+
     append_progress(
         data_dir,
         &run_id,
         &json!({
             "type": "line_done",
             "ticker": ticker_part,
-            "recommendation": {
-                "signal": signal,
-                "conviction": as_text(rec.get("conviction")),
-                "synthese": synthese.chars().take(120).collect::<String>(),
-            },
+            "recommendation": { "signal": signal, "conviction": conviction_text, "synthese": synthese_short },
             "completed": completed,
             "total": total,
             "at": now_iso(),
         }),
     );
+
+    // Direct push — ensures UI updates even if relay hasn't picked up JSONL yet
+    crate::run_state_cache::cache_line_status(&run_id, ticker_part, json!({"status": "done"}));
+    crate::emit_event("alfred://line-progress", json!({
+        "run_id": run_id,
+        "ticker": ticker_part,
+        "line_status": {"status": "done"},
+    }));
+    crate::emit_event("alfred://line-done", json!({
+        "run_id": run_id,
+        "ticker": ticker_part,
+        "recommendation": { "signal": signal, "conviction": conviction_text, "synthese": synthese_short },
+        "line_progress": { "completed": completed, "total": total },
+    }));
 
     let mut result = json!({
         "ok": true,

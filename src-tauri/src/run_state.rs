@@ -649,13 +649,18 @@ pub fn update_line_status_with_progress(run_id: &str, ticker: &str, status: &str
 }
 
 pub fn update_line_status_with_error(run_id: &str, ticker: &str, status: &str, error: Option<&str>) -> Result<()> {
-    // Write to in-memory cache only — flushed to disk periodically
     let value = if let Some(err_msg) = error {
         json!({ "status": status, "error": err_msg })
     } else {
         json!(status)
     };
-    crate::run_state_cache::cache_line_status(run_id, ticker, value);
+    crate::run_state_cache::cache_line_status(run_id, ticker, value.clone());
+    // Push to frontend immediately
+    crate::emit_event("alfred://line-progress", json!({
+        "run_id": run_id,
+        "ticker": ticker,
+        "line_status": value,
+    }));
     Ok(())
 }
 

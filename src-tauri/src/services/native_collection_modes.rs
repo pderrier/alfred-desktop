@@ -123,9 +123,25 @@ pub(crate) fn execute_refresh_synthesis_mode(
             kept_recs.push(rec.clone());
         }
     }
+    // Also re-analyze positions that have NO recommendation at all (previous run failed for them)
+    let rec_tickers: std::collections::HashSet<String> = prev_recs
+        .iter()
+        .map(|r| as_text(r.get("ticker")).to_uppercase())
+        .collect();
+    let pos_tickers: Vec<String> = positions
+        .iter()
+        .map(|p| as_text(p.get("ticker")).to_uppercase())
+        .filter(|t| !t.is_empty())
+        .collect();
+    for t in &pos_tickers {
+        if !rec_tickers.contains(t) && !expired_tickers.iter().any(|e| e.to_uppercase() == *t) {
+            expired_tickers.push(t.clone());
+        }
+    }
+
     if !expired_tickers.is_empty() {
         eprintln!(
-            "[refresh_synthesis] {} stale recommendations will be re-analyzed (reanalyse_after <= {today}): {:?}",
+            "[refresh_synthesis] {} tickers to re-analyze (stale or missing recommendation): {:?}",
             expired_tickers.len(),
             expired_tickers
         );

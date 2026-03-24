@@ -79,9 +79,13 @@ pub fn request_cancellation(operation_id: &str) -> Result<serde_json::Value> {
                         }));
                         // Mark all in-progress lines as aborted
                         if let Some(line_status) = obj.get_mut("line_status").and_then(|v| v.as_object_mut()) {
+                            let active = ["analyzing", "repairing", "pending", "collecting"];
                             for (_ticker, status) in line_status.iter_mut() {
-                                let s = status.as_str().unwrap_or_default();
-                                if s == "analyzing" || s == "repairing" || s == "pending" {
+                                // Status can be a string or {"status": "...", "progress": "..."}
+                                let s = status.as_str()
+                                    .or_else(|| status.get("status").and_then(|v| v.as_str()))
+                                    .unwrap_or_default();
+                                if active.contains(&s) {
                                     *status = json!("aborted");
                                 }
                             }

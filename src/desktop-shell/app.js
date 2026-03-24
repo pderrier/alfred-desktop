@@ -164,7 +164,7 @@ const runOperations = createRunOperationsController({
         }
       }
     }
-    if (event?.type === "run.completed" || event?.type === "run.failed") {
+    if (event?.type === "run.completed" || event?.type === "run.failed" || event?.type === "run.aborted") {
       activeRunRefresh = false;
       activeRunId = null;
       lastDoneCount = 0;

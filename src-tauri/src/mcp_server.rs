@@ -44,37 +44,6 @@ fn read_json(path: &Path) -> Result<Value> {
     serde_json::from_str(&raw).map_err(|e| anyhow!("parse_failed:{}:{e}", path.display()))
 }
 
-fn write_json(path: &Path, payload: &Value) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let lock_path = path.with_extension("lock");
-    // Simple lock: try create_new, retry a few times
-    let mut locked = false;
-    for attempt in 0..50 {
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-        {
-            Ok(f) => {
-                drop(f);
-                locked = true;
-                break;
-            }
-            Err(_) => {
-                std::thread::sleep(Duration::from_millis(10 + attempt * 5));
-            }
-        }
-    }
-    let serialized = serde_json::to_string_pretty(payload)?;
-    let result = fs::write(path, serialized);
-    if locked {
-        let _ = fs::remove_file(&lock_path);
-    }
-    result.map_err(|e| anyhow!("write_failed:{}:{e}", path.display()))
-}
-
 /// Append a JSONL line to a progress file.
 fn append_progress(data_dir: &Path, run_id: &str, event: &Value) {
     let path = data_dir
@@ -89,37 +58,19 @@ fn append_progress(data_dir: &Path, run_id: &str, event: &Value) {
     }
 }
 
-// ── Run state paths ─────────────────────────────────────────────────────────
-
-fn run_state_path(data_dir: &Path, run_id: &str) -> PathBuf {
-    data_dir
-        .join("runtime-state")
-        .join(format!("{}.json", run_id))
-}
+// ── Run state (via in-memory cache) ──────────────────────────────────────────
 
 fn load_run_state(data_dir: &Path, run_id: &str) -> Result<Value> {
-    let path = run_state_path(data_dir, run_id);
-    if !path.exists() {
-        return Err(anyhow!("run_not_found:{run_id}"));
-    }
-    read_json(&path)
+    // Use in-memory cache — no disk I/O after first load
+    crate::run_state_cache::load(data_dir, run_id)
 }
 
-fn save_run_state(data_dir: &Path, run_id: &str, state: &Value) -> Result<()> {
-    let path = run_state_path(data_dir, run_id);
-    write_json(&path, state)
-}
-
-/// Load run state, apply a mutation, save — with global lock to prevent concurrent corruption.
+/// Mutate run state in the cache. No disk I/O — flushed by background thread.
 fn patch_run_state<F>(data_dir: &Path, run_id: &str, mutator: F) -> Result<Value>
 where
     F: FnOnce(&mut Value),
 {
-    let _lock = crate::helpers::run_state_update_lock();
-    let mut state = load_run_state(data_dir, run_id)?;
-    mutator(&mut state);
-    save_run_state(data_dir, run_id, &state)?;
-    Ok(state)
+    crate::run_state_cache::patch(data_dir, run_id, mutator)
 }
 
 fn line_memory_path(data_dir: &Path) -> PathBuf {
@@ -953,9 +904,15 @@ fn tool_finalize_report(data_dir: &Path, params: &Value) -> Result<Value> {
         "llm_utilise": "codex-mcp",
     });
 
+    // Flush cache to disk before report finalization — report module reads from disk
+    crate::run_state_cache::flush_now(&run_id);
+
     // Delegate to the same function the legacy path uses — ensures identical format,
     // validation, composed_payload writing, report artifacts, orchestration status.
     let result = crate::report::persist_retry_global_synthesis(&run_id, &draft)?;
+
+    // Evict from cache — run is done, disk is the source of truth now
+    crate::run_state_cache::evict(&run_id);
 
     // Write progress event
     append_progress(

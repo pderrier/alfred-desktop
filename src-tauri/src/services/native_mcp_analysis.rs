@@ -501,7 +501,8 @@ pub fn run_synthesis_turn(run_id: &str, data_dir: &str) -> Result<Value> {
 
     match result {
         Ok(_) => {
-            // Read back run_state to check if finalize_report was called
+            // Flush cache to disk before reading back (finalize_report may have evicted already)
+            crate::run_state_cache::flush_now(run_id);
             let run_state = crate::load_run_by_id_direct(run_id)?;
             let status = run_state
                 .get("orchestration")

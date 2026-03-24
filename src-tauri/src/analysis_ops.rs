@@ -66,6 +66,8 @@ pub fn request_cancellation(operation_id: &str) -> Result<serde_json::Value> {
     if let Ok(ops) = ops_store().lock() {
         if let Some(record) = ops.get(safe_id) {
             if let Some(run_id) = record.run_id.as_ref() {
+                // Flush cache before patching (abort may race with tool writes)
+                crate::run_state_cache::flush_now(run_id);
                 let _ = run_state::patch_run_state_with(run_id, |state| {
                     if let Some(obj) = state.as_object_mut() {
                         obj.insert("orchestration".to_string(), json!({
@@ -86,6 +88,7 @@ pub fn request_cancellation(operation_id: &str) -> Result<serde_json::Value> {
                         }
                     }
                 });
+                crate::run_state_cache::evict(run_id);
             }
         }
     }

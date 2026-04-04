@@ -45,8 +45,10 @@ body {
   position: fixed;
   inset: 0;
   z-index: 100;
-  display: grid;
-  place-items: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow-y: auto;
   background: #000000;
   transition: opacity 0.5s ease-out;
 }
@@ -56,11 +58,36 @@ body {
   pointer-events: none;
 }
 
+.splash-close-btn {
+  position: absolute;
+  top: 0.5rem;
+  right: 0.5rem;
+  z-index: 101;
+  width: 2rem;
+  height: 2rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.35);
+  font-size: 0.9rem;
+  cursor: pointer;
+  border-radius: 4px;
+  -webkit-app-region: no-drag;
+  transition: color 0.15s, background 0.15s;
+}
+.splash-close-btn:hover {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.1);
+}
+
 .splash-content {
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 1.8rem;
+  padding: 2rem 1rem;
   animation: splash-appear 0.6s ease-out;
 }
 
@@ -70,7 +97,7 @@ body {
 }
 
 .splash-image {
-  width: 380px;
+  width: min(380px, 60vw);
   height: auto;
   margin-bottom: -0.5rem;
 }
@@ -202,6 +229,12 @@ body {
 }
 .splash-backend-option input[type="radio"] {
   accent-color: #2f8f5d;
+}
+
+@media (max-height: 700px) {
+  .splash-content { gap: 1rem; padding: 1.5rem 1rem; }
+  .splash-image { width: min(280px, 50vw); }
+  .splash-setup { gap: 0.4rem; }
 }
 
 /* ── Top bar ───────────────────────────────────────────────────── */

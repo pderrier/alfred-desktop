@@ -306,22 +306,17 @@ impl AppServerClient {
         let bin = resolve_codex_binary()?;
         let bin_str = bin.to_string_lossy().to_string();
 
-        let (cmd_path, args) = if cfg!(windows) && !bin_str.contains("cmd.exe") {
-            (
-                "cmd.exe".to_string(),
-                vec!["/d".into(), "/s".into(), "/c".into(), bin_str, "app-server".into()],
-            )
-        } else {
-            (bin_str, vec!["app-server".to_string()])
-        };
-
         // MCP server config written to data-dir/.codex/config.toml by ensure_mcp_config().
         // The app-server picks it up automatically — no -c flags needed on spawn.
+        //
+        // On Windows, Rust's Command automatically wraps .cmd/.bat files with
+        // cmd.exe /c using correct quoting. Manual cmd.exe wrapping with /s
+        // strips quotes and breaks paths with spaces (e.g. "C:\Program Files\...").
 
-        crate::debug_log(&format!("codex app-server: spawning {cmd_path} {}", args.join(" ")));
+        crate::debug_log(&format!("codex app-server: spawning {} app-server", bin_str));
 
-        let mut cmd = Command::new(&cmd_path);
-        cmd.args(&args)
+        let mut cmd = Command::new(bin.as_os_str());
+        cmd.arg("app-server")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

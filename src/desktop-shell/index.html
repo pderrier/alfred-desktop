@@ -39,6 +39,7 @@
 
     <!-- ── Splash screen ─────────────────────────────────────────── -->
     <div id="splash-screen" class="splash-screen">
+      <button id="splash-close" class="splash-close-btn" type="button" title="Close">&#10005;</button>
       <div class="splash-content">
         <img class="splash-image" src="/desktop-shell/alfred-splash.png" alt="Alfred" />
         <div class="splash-text">
@@ -577,9 +578,10 @@
           var el = document.getElementById(id);
           if (el) el.addEventListener('click', fn);
         };
-        on('win-minimize', function () { win.minimize(); });
-        on('win-maximize', function () { win.toggleMaximize(); });
-        on('win-close',    function () { win.close(); });
+        on('win-minimize',  function () { win.minimize(); });
+        on('win-maximize',  function () { win.toggleMaximize(); });
+        on('win-close',     function () { win.close(); });
+        on('splash-close',  function () { win.close(); });
       });
     </script>
     <script type="module" src="/desktop-shell/app.js"></script>

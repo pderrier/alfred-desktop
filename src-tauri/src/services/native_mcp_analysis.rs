@@ -366,32 +366,39 @@ Regles :
 
 fn build_synthesis_prompt(run_id: &str) -> String {
     format!(
-        r#"Tu es Alfred, un gestionnaire de portefeuille qui explique a un investisseur particulier non-expert.
+        r#"Tu es Alfred, un gestionnaire de portefeuille qui conseille un investisseur particulier.
 Tu dois produire la synthese globale du portefeuille pour le run "{run_id}".
 
 WORKFLOW STRICT — suis ces etapes dans l'ordre :
 
-1. Appelle `get_run_context(run_id="{run_id}")` pour obtenir le resume du portefeuille
-   et la liste des lignes analysees.
+1. Appelle `get_run_context(run_id="{run_id}")` pour obtenir le resume du portefeuille.
 
 2. Appelle `check_coverage(run_id="{run_id}")` pour verifier la couverture.
-   Si des lignes manquent, note-les mais continue avec les recommandations disponibles.
-   Une synthese partielle est mieux que pas de synthese.
+   Si des lignes manquent, continue avec ce qui est disponible.
 
 3. Genere la synthese avec ces 4 champs :
 
    synthese_marche (minimum 300 caracteres):
-   - Raconte l'histoire du portefeuille: posture (offensive/defensive/neutre)
-   - Points forts (lignes performantes, fondamentaux solides)
-   - Points faibles (risques, lignes en difficulte)
-   - Orientation: que faire dans les prochains jours/semaines
-   - Ecarts a la strategie (si l'investisseur a des directives)
-   - Utilise des chiffres concrets (valeurs, %, montants)
+   IMPORTANT — ne repete PAS les donnees ligne par ligne (l'utilisateur les voit
+   deja dans le detail de chaque position). Concentre-toi sur :
+   - La NARRATIVE : quel est le fil conducteur du portefeuille ? Quel profil de
+     risque se dessine ? Est-ce coherent avec la strategie annoncee ?
+   - Les DECISIONS A PRENDRE : quels arbitrages concrets, dans quel ordre, et
+     pourquoi maintenant plutot que dans un mois ?
+   - Les RISQUES CROISES : correlations entre lignes, exposition sectorielle ou
+     geographique desequilibree, impact d'un scenario macro (hausse des taux,
+     recession, change EUR/USD).
+   - Le TON : parle comme un conseiller bienveillant a un particulier, pas a un pro.
+     Pas de jargon financier inutile. Sois direct et opinione, pas descriptif.
+     Exemple : "Vous avez trop mise sur la tech US sans protection. Avant
+     de renforcer NVDA, securisez vos gains sur VZ et vendez les lignes
+     qui ne bougent plus — ca libere du cash pour de vraies opportunites."
 
-   actions_immediates (JSON array, 0-5 actions):
+   actions_immediates (JSON array, 1-5 actions):
    CHAQUE signal ACHAT/VENTE/RENFORCEMENT/ALLEGEMENT des recommandations DOIT
-   avoir une action ici (sauf si >5, alors prioriser les plus urgentes).
+   avoir une action ici (sauf si >5, priorise les plus urgentes).
    Ne PAS inclure CONSERVER/SURVEILLANCE.
+   OBLIGATOIRE si des recommandations ont un signal actionnable.
    Schema strict par action:
    {{
      "ticker": "MC",
@@ -415,15 +422,13 @@ WORKFLOW STRICT — suis ces etapes dans l'ordre :
 4. Appelle `validate_synthesis(run_id="{run_id}",
      synthese_marche="...", actions_immediates=[...],
      prochaine_analyse="...", opportunites_watchlist="...")`.
-   Si ok=false, corrige les issues listees et re-appelle jusqu'a ok=true.
+   Si ok=false, corrige les issues et re-appelle jusqu'a ok=true.
 
 5. Appelle `finalize_report(run_id="{run_id}")` pour composer et persister le rapport.
 
-REGLES:
-- Ne saute AUCUNE etape. Chaque outil doit etre appele.
-- Si check_coverage echoue, ne continue PAS — signale le probleme.
-- Sois concret: chiffres, montants, dates. Pas de generalites.
-- Ne presente PAS les watchlist comme deja detenues."#,
+CRITIQUE — si tu ne fais pas les etapes 4 ET 5, le rapport est PERDU.
+Le travail d'analyse de toutes les lignes sera gache. Tu DOIS appeler
+validate_synthesis puis finalize_report. Pas d'exception."#,
         run_id = run_id,
     )
 }
@@ -875,7 +880,46 @@ fn codex_synthesis_fallback(run_id: &str) -> Result<Value> {
             .and_then(|v| v.as_str())
             .filter(|s| s.len() > 20)
             .unwrap_or("Synthese partielle — le rapport a ete compose a partir des recommandations disponibles.");
-        let actions = composed.get("actions_immediates").cloned().unwrap_or(json!([]));
+        let mut actions = composed.get("actions_immediates").cloned().unwrap_or(json!([]));
+
+        // If actions_immediates is empty, derive from per-line recommendations
+        if actions.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+            let recs = run_state.get("pending_recommandations")
+                .and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let mut derived: Vec<Value> = recs.iter()
+                .filter(|r| {
+                    let sig = r.get("signal").and_then(|v| v.as_str()).unwrap_or("");
+                    matches!(sig, "ACHAT_FORT" | "ACHAT" | "VENTE" | "ALLEGEMENT" | "RENFORCEMENT")
+                })
+                .map(|r| {
+                    let ticker = r.get("ticker").and_then(|v| v.as_str()).unwrap_or("");
+                    let signal = r.get("signal").and_then(|v| v.as_str()).unwrap_or("");
+                    let action = r.get("action_recommandee").and_then(|v| v.as_str()).unwrap_or(signal);
+                    let rationale = r.get("synthese").and_then(|v| v.as_str())
+                        .map(|s| s.chars().take(120).collect::<String>())
+                        .unwrap_or_default();
+                    json!({
+                        "ticker": ticker,
+                        "action": action,
+                        "rationale": rationale,
+                        "priority": signal,
+                    })
+                })
+                .collect();
+            derived.truncate(5);
+            if !derived.is_empty() {
+                // Assign unique priorities 1..N
+                for (i, a) in derived.iter_mut().enumerate() {
+                    if let Some(obj) = a.as_object_mut() {
+                        obj.insert("priority".to_string(), json!(i + 1));
+                    }
+                }
+                actions = json!(derived);
+                crate::debug_log(&format!(
+                    "[synthesis-fallback] derived {} actions from per-line recommendations", derived.len()
+                ));
+            }
+        }
         let draft = json!({
             "synthese_marche": synthese,
             "actions_immediates": actions,

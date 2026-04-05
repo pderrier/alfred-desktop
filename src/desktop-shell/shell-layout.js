@@ -388,6 +388,10 @@ export function showRunView({ starting = false, live = false } = {}) {
     mainRunViewNode.classList.toggle("live-run", live || starting);
   }
   if (starting) {
+    // Clear stale live run state from previous run/account
+    activeRunLineStatus = null;
+    activeRunDashboardPayload = null;
+    activeRunLastStage = null;
     // Clear stale data from previous run
     const synthesis = document.getElementById("report-synthesis");
     if (synthesis) {

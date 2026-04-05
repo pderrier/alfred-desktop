@@ -53,7 +53,8 @@ pub(crate) fn build_report_prompt(run_state: &Value) -> String {
     };
 
     format!(
-        r#"Tu es un gestionnaire de portefeuille qui explique a un investisseur particulier non-expert.
+        r#"Tu es un conseiller financier bienveillant qui parle a un investisseur particulier.
+Pas de jargon technique — explique simplement, comme a un ami.
 
 RESUME DU PORTEFEUILLE:
 - Valeur totale: {total_value:.0}€
@@ -69,33 +70,37 @@ RECOMMANDATIONS PAR LIGNE:
 Produis un JSON avec exactement ces champs:
 
 {{
-  "synthese_marche": "string (minimum 300 caracteres) — raconte l'histoire du portefeuille: points forts, points faibles, risques, orientation. Utilise des chiffres concrets.",
-  "actions_immediates": [
-    {{
-      "ticker": "MC",
-      "action": "ACHAT|VENTE|RENFORCEMENT|ALLEGEMENT",
-      "order_type": "MARKET|LIMIT",
-      "limit_price": null,
-      "quantity": 3,
-      "estimated_amount_eur": 2400.0,
-      "priority": 1,
-      "rationale": "phrase courte et concrete"
-    }}
-  ],
-  "prochaine_analyse": "string — quand relancer l'analyse + catalyseurs attendus",
-  "opportunites_watchlist": "string — resume des meilleures opportunites watchlist (si pertinent, sinon vide)",
+  "synthese_marche": "string (minimum 300 caracteres)",
+  "actions_immediates": [action objects],
+  "prochaine_analyse": "string",
+  "opportunites_watchlist": "string",
   "recommandations": []
 }}
 
+synthese_marche — IMPORTANT, ne repete PAS les donnees par ligne (l'utilisateur
+les voit deja). Concentre-toi sur :
+- La NARRATIVE : quel profil se dessine ? Est-ce coherent avec la strategie ?
+- Les DECISIONS A PRENDRE : quels arbitrages, dans quel ordre, pourquoi maintenant ?
+- Les RISQUES CROISES : correlations, desequilibres sectoriels/geographiques
+- Le TON : direct, opinione, bienveillant. Comme un conseiller, pas un analyste.
+  Exemple : "Vous avez trop mise sur la tech sans filet. Securisez vos gains
+  et liberez du cash pour de vraies opportunites."
+
+actions_immediates — schema par action:
+  {{ "ticker": "MC", "action": "ACHAT|VENTE|RENFORCEMENT|ALLEGEMENT",
+     "order_type": "MARKET|LIMIT", "limit_price": null,
+     "quantity": 3, "estimated_amount_eur": 2400.0,
+     "priority": 1, "rationale": "phrase courte" }}
+
 Regles strictes:
-- CHAQUE signal ACHAT/VENTE/RENFORCEMENT/ALLEGEMENT DOIT avoir une action dans actions_immediates
+- CHAQUE signal ACHAT/VENTE/RENFORCEMENT/ALLEGEMENT DOIT avoir une action
 - Ne PAS inclure CONSERVER/SURVEILLANCE dans actions_immediates
 - Chaque action DOIT etre chiffree (quantity > 0, estimated_amount_eur > 0)
 - Maximum 5 actions, priorites 1-5 uniques
-- Pour LIMIT: renseigner limit_price > 0. Pour MARKET: limit_price = null
+- Pour LIMIT: limit_price > 0. Pour MARKET: limit_price = null
 - Si liquidites = 0: uniquement VENTE/ALLEGEMENT (ou 0 action)
 - Ne presente PAS les watchlist comme deja detenues
-- Si ecart entre execution et strategie, le mentionner explicitement dans synthese_marche
+- Si ecart strategie, le dire clairement dans synthese_marche
 
 Reponds uniquement en JSON valide."#,
         total_value = portfolio.get("valeur_totale").and_then(|v| v.as_f64()).unwrap_or(0.0),

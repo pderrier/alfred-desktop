@@ -407,14 +407,13 @@ impl AppServerClient {
                     let server = msg.pointer("/params/serverName")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    let approved = server == "alfred-mcp";
+                    let action = if server == "alfred-mcp" { "accept" } else { "decline" };
                     crate::debug_log(&format!(
-                        "codex app-server: {} elicitation for '{server}' id={req_id}",
-                        if approved { "auto-approving" } else { "denying" }
+                        "codex app-server: {action} elicitation for '{server}' id={req_id}"
                     ));
                     let _ = self.write_message(&json!({
                         "id": req_id,
-                        "result": { "approved": approved }
+                        "result": { "action": action }
                     }));
                 }
                 let params = msg.get("params").cloned().unwrap_or(json!({}));

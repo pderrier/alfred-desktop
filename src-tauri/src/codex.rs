@@ -169,75 +169,42 @@ pub fn ensure_codex_available() -> Result<Value> {
     }))
 }
 
-/// Write MCP server config to the user's Codex config so the app-server
-/// discovers alfred-mcp tools. Called lazily before the first analysis.
+/// Remove legacy [mcp_servers.alfred-mcp] from the user's global config.toml.
+/// MCP config is now passed via -c flags at app-server spawn time (with auto_approve).
+/// The global section (without auto_approve) would override the -c flags.
 pub fn ensure_mcp_config() {
     static DONE: std::sync::Once = std::sync::Once::new();
     DONE.call_once(|| {
-        let self_binary = match std::env::current_exe() {
-            Ok(p) if p.exists() => p.to_string_lossy().to_string(),
-            _ => {
-                crate::debug_log("[mcp] current_exe not found, skipping MCP config");
-                return;
-            }
+        let home = match std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+            Ok(h) => h,
+            Err(_) => return,
         };
-        let data_dir = crate::resolve_runtime_state_dir()
-            .parent()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| ".".to_string());
-
-        // Write to ~/.codex/config.toml (user-level)
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_else(|_| ".".to_string());
-        let config_dir = std::path::Path::new(&home).join(".codex");
-        let config_path = config_dir.join("config.toml");
-
-        crate::debug_log(&format!("[mcp] ensuring MCP config in {}", config_path.display()));
-
-        let escaped_binary = self_binary.replace('\\', "\\\\");
-        let escaped_data_dir = data_dir.replace('\\', "\\\\");
-        let mcp_block = format!(
-            "[mcp_servers.alfred-mcp]\ncommand = \"{escaped_binary}\"\nargs = [\"--mcp-server\", \"--data-dir\", \"{escaped_data_dir}\"]\n"
-        );
-
-        // Read existing config
-        let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
-
-        let new_config = if existing.contains("[mcp_servers.alfred-mcp]") {
-            // Section exists — replace it (binary path may have changed)
-            let mut result = String::new();
-            let mut skip = false;
-            for line in existing.lines() {
-                if line.trim() == "[mcp_servers.alfred-mcp]" {
-                    skip = true;
-                    continue;
-                }
-                if skip && line.starts_with('[') {
-                    // Next section — stop skipping
-                    skip = false;
-                }
-                if !skip {
-                    result.push_str(line);
-                    result.push('\n');
-                }
-            }
-            result.push('\n');
-            result.push_str(&mcp_block);
-            crate::debug_log("[mcp] updating alfred-mcp config (path may have changed)");
-            result
-        } else {
-            // Section doesn't exist — append
-            let mut result = existing;
-            result.push_str("\n");
-            result.push_str(&mcp_block);
-            crate::debug_log("[mcp] adding alfred-mcp config to config.toml");
-            result
+        let config_path = std::path::Path::new(&home).join(".codex").join("config.toml");
+        let existing = match std::fs::read_to_string(&config_path) {
+            Ok(s) if s.contains("[mcp_servers.alfred-mcp]") => s,
+            _ => return,
         };
 
-        match std::fs::write(&config_path, &new_config) {
-            Ok(_) => crate::debug_log(&format!("[mcp] config.toml updated: command={escaped_binary}")),
-            Err(e) => crate::debug_log(&format!("[mcp] failed to write config.toml: {e}")),
+        // Strip the [mcp_servers.alfred-mcp] section
+        let mut result = String::new();
+        let mut skip = false;
+        for line in existing.lines() {
+            if line.trim() == "[mcp_servers.alfred-mcp]" {
+                skip = true;
+                continue;
+            }
+            if skip && line.starts_with('[') {
+                skip = false;
+            }
+            if !skip {
+                result.push_str(line);
+                result.push('\n');
+            }
+        }
+
+        match std::fs::write(&config_path, result.trim_end()) {
+            Ok(_) => crate::debug_log("[mcp] removed legacy alfred-mcp section from global config"),
+            Err(e) => crate::debug_log(&format!("[mcp] failed to clean global config: {e}")),
         }
     });
 }
@@ -565,6 +532,10 @@ fn ensure_slot(slot_idx: usize) -> Result<()> {
         }
         crate::debug_log(&format!("codex app-server[{slot_idx}]: process died, restarting"));
     }
+
+    // Clean legacy global config before first spawn so it doesn't
+    // override the -c flags (which include auto_approve).
+    ensure_mcp_config();
 
     let mut client = AppServerClient::spawn()?;
     client.initialize()?;

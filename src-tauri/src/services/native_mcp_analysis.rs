@@ -410,6 +410,7 @@ WORKFLOW STRICT — suis ces etapes dans l'ordre :
    Schema strict par action:
    {{
      "ticker": "MC",
+     "nom": "LVMH",
      "action": "ACHAT|VENTE|RENFORCEMENT|ALLEGEMENT",
      "order_type": "MARKET|LIMIT",
      "limit_price": null,

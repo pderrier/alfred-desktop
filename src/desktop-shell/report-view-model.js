@@ -380,6 +380,16 @@ export function buildReportViewModel(dashboardPayload) {
   const actionsNow = Array.isArray(effectiveActions)
     ? effectiveActions.map(normalizeActionItem).filter((a) => !NON_ACTIONABLE.has((a.action || "").toUpperCase()))
     : [];
+  // Enrich action names from recommendations or positions
+  const positions = latestRun?.portfolio?.positions || [];
+  for (const action of actionsNow) {
+    if (action.nom) continue;
+    const upper = (action.ticker || "").toUpperCase();
+    const rec = effectiveRecommendations.find((r) => (r.ticker || "").toUpperCase() === upper);
+    if (rec?.nom) { action.nom = rec.nom; continue; }
+    const pos = positions.find((p) => (p.ticker || "").toUpperCase() === upper);
+    if (pos?.nom) { action.nom = pos.nom; }
+  }
   const hasPartialArtifacts =
     !effectiveArtifactReport &&
     (effectiveRecommendations.length > 0 ||

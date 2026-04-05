@@ -91,7 +91,8 @@ les voit deja). Concentre-toi sur :
   et liberez du cash pour de vraies opportunites."
 
 actions_immediates — schema par action:
-  {{ "ticker": "MC", "action": "ACHAT|VENTE|RENFORCEMENT|ALLEGEMENT",
+  {{ "ticker": "MC", "nom": "LVMH",
+     "action": "ACHAT|VENTE|RENFORCEMENT|ALLEGEMENT",
      "order_type": "MARKET|LIMIT", "limit_price": null,
      "quantity": 3, "estimated_amount_eur": 2400.0,
      "priority": 1, "rationale": "phrase courte" }}

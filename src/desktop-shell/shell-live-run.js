@@ -33,29 +33,75 @@ export function isActiveRunInProgress() { return activeRunInProgress; }
 
 // ── Live positions ───────────────────────────────────────────────
 
+/// Look up position name from live run context.
+function findPositionName(ticker) {
+  const upper = ticker.toUpperCase();
+  const pos = liveRunContext.positions.find(
+    (p) => (p.ticker || "").toUpperCase() === upper
+  );
+  return pos?.nom || "";
+}
+
+/// Check if a ticker is a watchlist item (not in portfolio positions).
+function isWatchlistTicker(ticker) {
+  const upper = ticker.toUpperCase();
+  return !liveRunContext.positions.some(
+    (p) => (p.ticker || "").toUpperCase() === upper
+  );
+}
+
+function buildLiveRow(ticker, lineStatus) {
+  const status = parseLineStatus(lineStatus);
+  const rowClass = lineRowClass(status);
+  const name = findPositionName(ticker);
+  const isWl = isWatchlistTicker(ticker);
+  const tr = document.createElement("tr");
+  tr.className = `pos-main-row ${rowClass}${isWl ? " pos-watchlist-row" : ""}`;
+  tr.dataset.ticker = ticker.toUpperCase();
+  tr.dataset.watchlist = isWl ? "1" : "";
+  tr.innerHTML = `
+    <td><strong>${escapeHtml(ticker)}</strong></td>
+    <td>${escapeHtml(name)}</td><td></td><td></td><td></td><td></td><td></td>
+    <td>${renderLiveStatusChip(lineStatus)}</td>
+    <td></td>
+  `;
+  return tr;
+}
+
+function ensureWatchlistSeparator() {
+  if (!positionsTbodyNode) return;
+  if (positionsTbodyNode.querySelector(".watchlist-separator-row")) return;
+  const wlRows = positionsTbodyNode.querySelectorAll("tr[data-watchlist='1']");
+  if (wlRows.length === 0) return;
+  const sep = document.createElement("tr");
+  sep.className = "watchlist-separator-row";
+  sep.innerHTML = `<td colspan="9" class="watchlist-separator-cell"><span class="watchlist-badge">Watchlist</span></td>`;
+  wlRows[0].insertAdjacentElement("beforebegin", sep);
+}
+
 export function renderLivePositions(lineStatus, dashboardPayload) {
   if (!positionsTbodyNode || !lineStatus) return;
 
   const tickers = Object.keys(lineStatus).filter((t) => t !== "__synthesis__");
   if (tickers.length === 0) return;
 
+  // Split into positions and watchlist
+  const posTickers = tickers.filter((t) => !isWatchlistTicker(t));
+  const wlTickers = tickers.filter((t) => isWatchlistTicker(t));
+
   // Bootstrap rows from line_status keys when the table is empty
   const existingRows = positionsTbodyNode.querySelectorAll("tr.pos-main-row[data-ticker]");
   if (existingRows.length === 0) {
     if (positionsEmptyNode) positionsEmptyNode.classList.add("hidden");
-    for (const ticker of tickers) {
-      const status = parseLineStatus(lineStatus[ticker]);
-      const rowClass = lineRowClass(status);
-      const tr = document.createElement("tr");
-      tr.className = `pos-main-row ${rowClass}`;
-      tr.dataset.ticker = ticker.toUpperCase();
-      tr.innerHTML = `
-        <td><strong>${escapeHtml(ticker)}</strong></td>
-        <td></td><td></td><td></td><td></td><td></td><td></td>
-        <td>${renderLiveStatusChip(lineStatus[ticker])}</td>
-        <td></td>
-      `;
-      positionsTbodyNode.appendChild(tr);
+    // Positions first, then watchlist
+    for (const ticker of posTickers) {
+      positionsTbodyNode.appendChild(buildLiveRow(ticker, lineStatus[ticker]));
+    }
+    if (wlTickers.length > 0) {
+      for (const ticker of wlTickers) {
+        positionsTbodyNode.appendChild(buildLiveRow(ticker, lineStatus[ticker]));
+      }
+      ensureWatchlistSeparator();
     }
     updateProgressCounter(lineStatus, tickers);
     return;
@@ -76,31 +122,31 @@ export function renderLivePositions(lineStatus, dashboardPayload) {
     if (signalCell) {
       signalCell.innerHTML = renderLiveStatusChip(raw);
     }
-    // Show progress detail in the second cell (name column) for active lines
+    // Show name in name cell
+    const nameCell = row.querySelector("td:nth-child(2)");
+    if (nameCell && !nameCell.textContent.trim()) {
+      const name = findPositionName(ticker);
+      if (name) nameCell.textContent = name;
+    }
+    // Show progress in sub-row (same row used for recommendation summary when done)
     const progressMsg = typeof raw === "object" ? (raw?.progress || "") : "";
-    const detailCell = row.querySelector("td:nth-child(2)");
-    if (detailCell && (status === "analyzing" || status === "repairing") && progressMsg) {
-      detailCell.innerHTML = `<span class="live-progress-detail">${escapeHtml(progressMsg)}</span>`;
-    } else if (detailCell && status === "done") {
-      detailCell.textContent = ""; // clear progress on completion
+    if ((status === "analyzing" || status === "repairing" || status === "collecting") && progressMsg) {
+      let subRow = positionsTbodyNode.querySelector(`tr.pos-sub-row[data-ticker="${ticker.toUpperCase()}"]`);
+      if (!subRow) {
+        subRow = document.createElement("tr");
+        subRow.className = "pos-sub-row";
+        subRow.dataset.ticker = ticker.toUpperCase();
+        row.insertAdjacentElement("afterend", subRow);
+      }
+      subRow.innerHTML = `<td colspan="9" class="pos-rec-row"><span class="live-progress-detail">${escapeHtml(progressMsg)}</span></td>`;
     }
   }
   // Add rows for tickers not yet in the table
   for (const ticker of tickers) {
     if (existingTickerSet.has(ticker.toUpperCase()) || existingTickerSet.has(ticker)) continue;
-    const status = parseLineStatus(lineStatus[ticker]);
-    const rowClass = lineRowClass(status);
-    const tr = document.createElement("tr");
-    tr.className = `pos-main-row ${rowClass}`;
-    tr.dataset.ticker = ticker.toUpperCase();
-    tr.innerHTML = `
-      <td><strong>${escapeHtml(ticker)}</strong></td>
-      <td></td><td></td><td></td><td></td><td></td><td></td>
-      <td>${renderLiveStatusChip(lineStatus[ticker])}</td>
-      <td></td>
-    `;
-    positionsTbodyNode.appendChild(tr);
+    positionsTbodyNode.appendChild(buildLiveRow(ticker, lineStatus[ticker]));
   }
+  ensureWatchlistSeparator();
 
   updateProgressCounter(lineStatus, tickers);
   updateSynthesisCardDuringRun(lineStatus, tickers);
@@ -171,16 +217,21 @@ export function updateSingleLineProgress(ticker, lineStatus) {
     const conviction = escapeHtml(rec.conviction || "");
     const summary = escapeHtml(truncate(rec.synthese || rec.summary || "", 120));
     subRow.innerHTML = `<td colspan="9" class="pos-rec-row">${signal} \u00b7 ${conviction} \u00b7 ${summary}</td>`;
-    // Clear progress detail
-    const detailCell = row.querySelector("td:nth-child(2)");
-    if (detailCell) detailCell.textContent = "";
+    // Restore name in name cell
+    const nameCell2 = row.querySelector("td:nth-child(2)");
+    if (nameCell2) nameCell2.textContent = pos?.nom || "";
   } else {
     if (signalCell) signalCell.innerHTML = renderLiveStatusChip(lineStatus);
-    const detailCell = row.querySelector("td:nth-child(2)");
-    if (detailCell && (status === "analyzing" || status === "repairing") && progressMsg) {
-      detailCell.innerHTML = `<span class="live-progress-detail">${escapeHtml(progressMsg)}</span>`;
-    } else if (detailCell && status === "done") {
-      detailCell.textContent = "";
+    // Show progress in sub-row
+    if ((status === "analyzing" || status === "repairing" || status === "collecting") && progressMsg) {
+      let subRow = positionsTbodyNode.querySelector(`tr.pos-sub-row[data-ticker="${upperTicker}"]`);
+      if (!subRow) {
+        subRow = document.createElement("tr");
+        subRow.className = "pos-sub-row";
+        subRow.dataset.ticker = upperTicker;
+        row.insertAdjacentElement("afterend", subRow);
+      }
+      subRow.innerHTML = `<td colspan="9" class="pos-rec-row"><span class="live-progress-detail">${escapeHtml(progressMsg)}</span></td>`;
     }
   }
 }

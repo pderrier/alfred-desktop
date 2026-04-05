@@ -122,7 +122,11 @@ pub fn cleanup_orphaned_runs() {
     let index = crate::run_index::load_index();
     let orphan_ids: Vec<String> = index
         .iter()
-        .filter(|entry| entry.get("status").and_then(|v| v.as_str()) == Some("running"))
+        .filter(|entry| {
+            let status = entry.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            // Catch explicitly "running" AND missing/empty status (never set)
+            status == "running" || status.is_empty()
+        })
         .filter_map(|entry| entry.get("run_id").and_then(|v| v.as_str()).map(String::from))
         .collect();
 
@@ -142,10 +146,15 @@ pub fn cleanup_orphaned_runs() {
             Err(_) => continue,
         };
         if let Some(object) = payload.as_object_mut() {
-            if let Some(orch) = object.get_mut("orchestration").and_then(|v| v.as_object_mut()) {
-                orch.insert("status".to_string(), json!("aborted"));
-                orch.insert("error_code".to_string(), json!("run_aborted"));
-                orch.insert("error_message".to_string(), json!("Run was interrupted and did not complete."));
+            let orch = object.entry("orchestration").or_insert_with(|| json!({}));
+            if let Some(orch_obj) = orch.as_object_mut() {
+                // Only patch if not already completed
+                let current = orch_obj.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                if current != "completed" && current != "completed_degraded" {
+                    orch_obj.insert("status".to_string(), json!("aborted"));
+                    orch_obj.insert("error_code".to_string(), json!("run_aborted"));
+                    orch_obj.insert("error_message".to_string(), json!("Run was interrupted and did not complete."));
+                }
             }
             if let Some(ls) = object.get_mut("line_status").and_then(|v| v.as_object_mut()) {
                 let active_statuses = ["collecting", "analyzing", "repairing", "waiting"];

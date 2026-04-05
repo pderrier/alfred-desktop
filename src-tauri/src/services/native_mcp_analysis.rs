@@ -928,9 +928,11 @@ fn codex_synthesis_fallback(run_id: &str) -> Result<Value> {
             "llm_utilise": "codex-mcp-partial",
         });
         let _ = crate::report::persist_retry_global_synthesis(run_id, &draft);
+        // Mark orchestration as completed so sidebar/UI stops showing "running"
+        let _ = crate::run_state::set_native_run_stage(run_id, "completed", None, None);
         Ok(json!({
             "ok": true,
-            "orchestration_status": "completed_degraded",
+            "orchestration_status": "completed",
             "run_id": run_id,
         }))
     } else {

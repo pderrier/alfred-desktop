@@ -301,7 +301,7 @@ impl AppServerClient {
             cmd.args(["-c", &format!(
                 "mcp_servers.alfred-mcp.args=['--mcp-server', '--data-dir', '{data_dir}']"
             )]);
-            cmd.args(["-c", "mcp_servers.alfred-mcp.auto_approve=['*']"]);
+            cmd.args(["-c", "mcp_servers.alfred-mcp.auto_approved=['*']"]);
         }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -395,7 +395,37 @@ impl AppServerClient {
         let msg: Value = serde_json::from_str(trimmed)
             .map_err(|e| anyhow!("codex_app_server_parse_failed:{e}:line={}", truncate(trimmed, 100)))?;
 
-        // Response: has "id" field
+        let has_method = msg.get("method").and_then(|v| v.as_str()).is_some();
+
+        // Server request: has both "method" and "id" (e.g. elicitation).
+        // Auto-approve alfred-mcp requests, deny others.
+        if has_method {
+            if let Some(id_val) = msg.get("id") {
+                let req_id = id_val.as_u64().unwrap_or(0);
+                let method = msg["method"].as_str().unwrap_or("");
+                if method == "mcpServer/elicitation/request" {
+                    let server = msg.pointer("/params/serverName")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let approved = server == "alfred-mcp";
+                    crate::debug_log(&format!(
+                        "codex app-server: {} elicitation for '{server}' id={req_id}",
+                        if approved { "auto-approving" } else { "denying" }
+                    ));
+                    let _ = self.write_message(&json!({
+                        "id": req_id,
+                        "result": { "approved": approved }
+                    }));
+                }
+                let params = msg.get("params").cloned().unwrap_or(json!({}));
+                return Ok(JsonRpcMessage::Notification {
+                    method: method.to_string(),
+                    params,
+                });
+            }
+        }
+
+        // Response: has "id" but no "method"
         if let Some(id_val) = msg.get("id") {
             let id = id_val.as_u64().unwrap_or(0);
             return Ok(JsonRpcMessage::Response {
@@ -405,7 +435,7 @@ impl AppServerClient {
             });
         }
 
-        // Notification: has "method" but no "id"
+        // Pure notification: has "method" but no "id"
         let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let params = msg.get("params").cloned().unwrap_or(json!({}));
         Ok(JsonRpcMessage::Notification { method, params })

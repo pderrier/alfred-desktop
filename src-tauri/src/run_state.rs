@@ -98,11 +98,11 @@ pub fn load_run_by_id(run_id: &str) -> Result<serde_json::Value> {
     if safe_run_id.is_empty() {
         return Err(anyhow!("run_id_required"));
     }
-    let path = resolve_runtime_state_dir().join(format!("{safe_run_id}.json"));
-    if !path.exists() {
-        return Err(anyhow!("run_not_found"));
-    }
-    read_json_file(&path)
+    let data_dir = resolve_runtime_state_dir()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| resolve_runtime_state_dir());
+    crate::run_state_cache::load(&data_dir, safe_run_id)
 }
 
 /// Mark any orphaned "running" runs as "aborted". Called once at app startup.

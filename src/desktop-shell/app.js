@@ -325,11 +325,24 @@ function renderActionsNow(items = []) {
     if (typeof action.quantity === "number" && Number.isFinite(action.quantity) && action.quantity > 0) metrics.push(`${action.quantity} titres`);
     if (typeof action.estimatedAmountEur === "number" && Number.isFinite(action.estimatedAmountEur) && action.estimatedAmountEur > 0) metrics.push(`~${formatCurrency(action.estimatedAmountEur)}`);
     if (typeof action.priceLimit === "number" && Number.isFinite(action.priceLimit) && action.priceLimit > 0) metrics.push(`prix cible ${formatCurrency(action.priceLimit)}`);
+    const rationale = action.rationale || "";
+    const shortRationale = rationale.length > 200 ? rationale.slice(0, 200) + "\u2026" : rationale;
+    const hasMore = rationale.length > 200;
     card.innerHTML = `
       <p class="action-header">${action.priority}. ${nameHtml}</p>
       <p class="action-detail"><span class="action-signal-badge">${escapeHtml(action.action)}</span> <span class="action-order-type">${orderLabel}</span>${metrics.length > 0 ? ` · ${metrics.join(" · ")}` : ""}</p>
-      <p class="action-rationale">${escapeHtml(action.rationale)}</p>
+      <p class="action-rationale">${escapeHtml(shortRationale)}${hasMore ? ` <a href="#" class="action-expand">voir plus</a>` : ""}</p>
     `;
+    if (hasMore) {
+      const expandLink = card.querySelector(".action-expand");
+      const rationaleNode = card.querySelector(".action-rationale");
+      if (expandLink && rationaleNode) {
+        expandLink.addEventListener("click", (e) => {
+          e.preventDefault();
+          rationaleNode.textContent = rationale;
+        });
+      }
+    }
     actionsNowNode.appendChild(card);
   }
 }

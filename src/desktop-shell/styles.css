@@ -1385,6 +1385,13 @@ main {
   font-size: 0.85rem;
   line-height: 1.45;
 }
+.action-expand {
+  color: var(--sea-link, #5ba3d9);
+  font-size: 0.78rem;
+  text-decoration: none;
+  cursor: pointer;
+}
+.action-expand:hover { text-decoration: underline; }
 
 /* ── Signal badges ─────────────────────────────────────────────── */
 

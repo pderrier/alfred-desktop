@@ -910,7 +910,8 @@ pub fn run_codex_prompt_with_progress(
                                 if let Some(text) =
                                     params.get("item").and_then(|i| i.get("text")).and_then(|v| v.as_str())
                                 {
-                                    if agent_text.is_empty() {
+                                    // Keep the last (longest) agent message — the final answer
+                                    if text.len() > agent_text.len() {
                                         agent_text = text.to_string();
                                     }
                                 }
@@ -970,7 +971,7 @@ pub fn run_codex_prompt_with_progress(
         match extract_json_from_output(&agent_text) {
             Some(json) => Ok(json),
             None if agent_text.is_empty() => Ok(json!({"ok": true, "mcp_turn": true})),
-            None => Ok(json!({"ok": true, "mcp_turn": true, "agent_text_chars": agent_text.len()})),
+            None => Ok(json!({"ok": true, "mcp_turn": true, "agent_text": agent_text})),
         }
     })
 }

@@ -733,7 +733,7 @@ pub fn run_synthesis_turn(run_id: &str, data_dir: &str) -> Result<Value> {
     merge_mcp_results(run_id, data_dir);
 
     match result {
-        Ok(_) => {
+        Ok(turn_result) => {
             crate::run_state_cache::flush_now(run_id);
             let run_state = crate::load_run_by_id_direct(run_id)?;
             let status = run_state
@@ -749,8 +749,8 @@ pub fn run_synthesis_turn(run_id: &str, data_dir: &str) -> Result<Value> {
                     "run_id": run_id,
                 }))
             } else {
-                // Fallback: finalize with composed_payload if available
-                codex_synthesis_fallback(run_id)
+                // Model didn't call finalize_report — extract from turn output
+                codex_synthesis_fallback(run_id, &turn_result)
             }
         }
         Err(e) => Err(e),
@@ -861,8 +861,9 @@ fn run_native_synthesis(run_id: &str, data_dir: &str) -> Result<Value> {
     unreachable!("last attempt always accepts")
 }
 
-/// Codex fallback: finalize with composed_payload or hardcoded partial message.
-fn codex_synthesis_fallback(run_id: &str) -> Result<Value> {
+/// Codex fallback: model didn't call finalize_report — extract synthesis from
+/// the turn output (agent text or composed_payload) and persist directly.
+fn codex_synthesis_fallback(run_id: &str, turn_result: &Value) -> Result<Value> {
     crate::run_state_cache::flush_now(run_id);
     let run_state = crate::load_run_by_id_direct(run_id)?;
     let reco_count = run_state
@@ -875,7 +876,24 @@ fn codex_synthesis_fallback(run_id: &str) -> Result<Value> {
         crate::debug_log(&format!(
             "[synthesis-fallback] finalize_report not called, attempting with {reco_count} recommendations"
         ));
-        let composed = run_state.get("composed_payload").cloned().unwrap_or(json!({}));
+
+        // Try to extract synthesis from the model's text output first
+        let agent_text = turn_result.get("agent_text")
+            .or_else(|| turn_result.get("text"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let extracted = if !agent_text.is_empty() {
+            crate::llm_parsing::extract_json_object(agent_text)
+        } else {
+            None
+        };
+
+        // Priority: extracted from agent text > composed_payload from MCP tool > empty
+        let composed = extracted.as_ref()
+            .or_else(|| run_state.get("composed_payload"))
+            .cloned()
+            .unwrap_or(json!({}));
+
         let synthese = composed.get("synthese_marche")
             .and_then(|v| v.as_str())
             .filter(|s| s.len() > 20)

@@ -104,6 +104,7 @@ export function renderLivePositions(lineStatus, dashboardPayload) {
 
   updateProgressCounter(lineStatus, tickers);
   updateSynthesisCardDuringRun(lineStatus, tickers);
+  updatePipelineFromLineStatus(lineStatus);
 }
 
 /// Update a single line's progress in-place (called from Tauri event, no polling).
@@ -210,6 +211,33 @@ const PIPELINE_STEPS = [
 
 const STEP_ORDER = Object.fromEntries(PIPELINE_STEPS.map((s, i) => [s.key, i]));
 let pipelineHighWaterMark = -1;
+let pipelineActiveKeys = new Set();
+
+/// Derive active pipeline stages from actual line statuses.
+function deriveActiveStages(lineStatus) {
+  const stages = new Set();
+  if (!lineStatus) return stages;
+  for (const [ticker, raw] of Object.entries(lineStatus)) {
+    if (ticker === "__synthesis__") {
+      const s = typeof raw === "object" ? raw?.status : raw;
+      if (s === "generating") stages.add("synthesis");
+      continue;
+    }
+    const s = typeof raw === "object" ? raw?.status : raw;
+    if (s === "waiting" || s === "collecting") stages.add("collecting");
+    else if (s === "analyzing" || s === "repairing") stages.add("analyzing");
+  }
+  return stages;
+}
+
+/// Update pipeline bar from line statuses (called after renderLivePositions).
+export function updatePipelineFromLineStatus(lineStatus) {
+  const derived = deriveActiveStages(lineStatus);
+  if (derived.size > 0) {
+    pipelineActiveKeys = derived;
+    renderPipelineBarInner();
+  }
+}
 
 export function renderPipelineBar(stage) {
   if (!runPipelineBarNode) return;
@@ -228,34 +256,38 @@ export function renderPipelineBar(stage) {
     completed_degraded: "done",
     failed: "done"
   };
-  let activeKey = stageMap[String(stage || "").trim().toLowerCase()] || "collecting";
+  const key = stageMap[String(stage || "").trim().toLowerCase()] || "collecting";
+  pipelineActiveKeys = new Set([key]);
+  renderPipelineBarInner();
+}
 
-  // Pipeline is monotonic — never go backwards (watchlist re-emits collecting_data)
-  const activeIdx = STEP_ORDER[activeKey] ?? 0;
-  if (activeIdx < pipelineHighWaterMark && activeKey !== "done") {
-    activeKey = PIPELINE_STEPS[pipelineHighWaterMark]?.key || activeKey;
-  } else {
-    pipelineHighWaterMark = activeIdx;
+function renderPipelineBarInner() {
+  if (!runPipelineBarNode) return;
+  // Find highest active key for monotonic progress
+  let highestActive = 0;
+  for (const key of pipelineActiveKeys) {
+    highestActive = Math.max(highestActive, STEP_ORDER[key] ?? 0);
   }
-  const isFailed = String(stage || "").includes("failed");
-  let reachedActive = false;
+  if (highestActive > pipelineHighWaterMark) pipelineHighWaterMark = highestActive;
+
+  const isFailed = pipelineActiveKeys.has("failed");
+  const isDone = pipelineActiveKeys.has("done");
   const parts = [];
   for (let i = 0; i < PIPELINE_STEPS.length; i++) {
     const step = PIPELINE_STEPS[i];
     let cls = "run-pipeline-step";
     let icon = "";
-    if (step.key === activeKey && !reachedActive) {
-      if (activeKey === "done") {
-        cls += isFailed ? " step-failed" : " step-done";
-        icon = isFailed ? "\u2717 " : "\u2713 ";
-      } else {
-        cls += " step-active";
-        icon = `<span class="pipeline-spinner"></span>`;
-      }
-      reachedActive = true;
-    } else if (!reachedActive) {
-      cls += " step-done";
-      icon = "\u2713 ";
+    const isActive = pipelineActiveKeys.has(step.key);
+    if (step.key === "done" && isDone) {
+      cls += isFailed ? " step-failed" : " step-done";
+      icon = isFailed ? "\u2717 " : "\u2713 ";
+    } else if (isActive) {
+      cls += " step-active";
+      icon = `<span class="pipeline-spinner"></span>`;
+    } else if (i <= pipelineHighWaterMark && !isDone) {
+      // Past steps that are no longer active
+      cls += (STEP_ORDER[step.key] < highestActive && !isActive) ? " step-done" : "";
+      if (cls.includes("step-done")) icon = "\u2713 ";
     }
     parts.push(`<span class="${cls}">${icon}${escapeHtml(step.label)}</span>`);
     if (i < PIPELINE_STEPS.length - 1) {
@@ -268,6 +300,7 @@ export function renderPipelineBar(stage) {
 
 export function clearRunPipelineBar() {
   pipelineHighWaterMark = -1;
+  pipelineActiveKeys = new Set();
   if (runPipelineBarNode) {
     runPipelineBarNode.innerHTML = "";
     runPipelineBarNode.classList.add("hidden");

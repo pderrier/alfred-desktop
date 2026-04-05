@@ -14,7 +14,7 @@ use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -265,6 +265,7 @@ pub struct AppServerClient {
     child: Child,
     stdin: BufWriter<ChildStdin>,
     stdout: BufReader<ChildStdout>,
+    stderr: Option<ChildStderr>,
     next_id: AtomicU64,
     initialized: bool,
     /// Active thread ID (set after `thread/start`).
@@ -327,11 +328,13 @@ impl AppServerClient {
         let mut cmd = Command::new(bin.as_os_str());
         cmd.arg("app-server");
         if !self_binary.is_empty() {
-            cmd.args(["-c", &format!("mcp_servers.alfred-mcp.command=\"{}\"", self_binary)]);
+            // Use TOML single-quoted (literal) strings to avoid escaping issues
+            // with backslashes and spaces in Windows paths.
+            cmd.args(["-c", &format!("mcp_servers.alfred-mcp.command='{self_binary}'")]);
             cmd.args(["-c", &format!(
-                "mcp_servers.alfred-mcp.args=[\"--mcp-server\", \"--data-dir\", \"{}\"]", data_dir
+                "mcp_servers.alfred-mcp.args=['--mcp-server', '--data-dir', '{data_dir}']"
             )]);
-            cmd.args(["-c", "mcp_servers.alfred-mcp.auto_approve=[\"*\"]"]);
+            cmd.args(["-c", "mcp_servers.alfred-mcp.auto_approve=['*']"]);
         }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -348,11 +351,13 @@ impl AppServerClient {
             .stdout
             .take()
             .ok_or_else(|| anyhow!("codex_app_server_stdout_unavailable"))?;
+        let stderr = child.stderr.take();
 
         Ok(Self {
             child,
             stdin: BufWriter::new(stdin),
             stdout: BufReader::new(stdout),
+            stderr,
             next_id: AtomicU64::new(0),
             initialized: false,
             active_thread_id: None,
@@ -403,6 +408,15 @@ impl AppServerClient {
             .read_line(&mut line)
             .map_err(|e| anyhow!("codex_app_server_read_failed:{e}"))?;
         if bytes_read == 0 {
+            // Capture stderr to understand why the process died
+            if let Some(ref mut stderr) = self.stderr {
+                let mut err = String::new();
+                let _ = std::io::Read::read_to_string(stderr, &mut err);
+                let err = err.trim();
+                if !err.is_empty() {
+                    crate::debug_log(&format!("codex app-server stderr: {}", truncate(err, 500)));
+                }
+            }
             return Err(anyhow!("codex_app_server_eof:process exited"));
         }
         let trimmed = line.trim();

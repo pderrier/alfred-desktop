@@ -197,7 +197,7 @@ pub fn ensure_mcp_config() {
         let escaped_binary = self_binary.replace('\\', "\\\\");
         let escaped_data_dir = data_dir.replace('\\', "\\\\");
         let mcp_block = format!(
-            "[mcp_servers.alfred-mcp]\ncommand = \"{escaped_binary}\"\nargs = [\"--mcp-server\", \"--data-dir\", \"{escaped_data_dir}\"]\nauto_approve = [\"*\"]\n"
+            "[mcp_servers.alfred-mcp]\ncommand = \"{escaped_binary}\"\nargs = [\"--mcp-server\", \"--data-dir\", \"{escaped_data_dir}\"]\n"
         );
 
         // Read existing config
@@ -306,9 +306,17 @@ impl AppServerClient {
         let bin = resolve_codex_binary()?;
         let bin_str = bin.to_string_lossy().to_string();
 
-        // MCP server config written to data-dir/.codex/config.toml by ensure_mcp_config().
-        // The app-server picks it up automatically — no -c flags needed on spawn.
-        //
+        // Build MCP server config as -c flags so the app-server discovers
+        // alfred-mcp tools without polluting the user's global config.toml.
+        let self_binary = std::env::current_exe()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let data_dir = crate::resolve_runtime_state_dir()
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| ".".to_string());
+
         // On Windows, Rust's Command automatically wraps .cmd/.bat files with
         // cmd.exe /c using correct quoting. Manual cmd.exe wrapping with /s
         // strips quotes and breaks paths with spaces (e.g. "C:\Program Files\...").
@@ -316,8 +324,15 @@ impl AppServerClient {
         crate::debug_log(&format!("codex app-server: spawning {} app-server", bin_str));
 
         let mut cmd = Command::new(bin.as_os_str());
-        cmd.arg("app-server")
-            .stdin(Stdio::piped())
+        cmd.arg("app-server");
+        if !self_binary.is_empty() {
+            cmd.args(["-c", &format!("mcp_servers.alfred-mcp.command=\"{}\"", self_binary)]);
+            cmd.args(["-c", &format!(
+                "mcp_servers.alfred-mcp.args=[\"--mcp-server\", \"--data-dir\", \"{}\"]", data_dir
+            )]);
+            cmd.args(["-c", "mcp_servers.alfred-mcp.auto_approve=[\"*\"]"]);
+        }
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         prepare_codex_cmd(&mut cmd);

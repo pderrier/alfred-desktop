@@ -177,21 +177,36 @@ pub fn cleanup_orphaned_runs() {
 /// Load pending_recommandations + line_status from the most recent completed run
 /// (excluding current_run_id). Used by refresh_synthesis and retry_failed modes.
 pub fn load_previous_run_data(current_run_id: &str) -> (Vec<serde_json::Value>, serde_json::Value) {
-    let runs = load_run_history(5).unwrap_or_default();
+    // Find the current run's account to filter by
+    let current_account = load_run_by_id(current_run_id).ok()
+        .and_then(|r| r.get("account").and_then(|v| v.as_str()).map(String::from))
+        .unwrap_or_default();
+
+    let runs = load_run_history(20).unwrap_or_default();
     for run_summary in &runs {
         let rid = run_summary.get("run_id").and_then(|v| v.as_str()).unwrap_or_default();
         if rid == current_run_id || rid.is_empty() { continue; }
+        // Filter by same account
+        let summary_account = run_summary.get("account").and_then(|v| v.as_str()).unwrap_or("");
+        if !current_account.is_empty() && summary_account != current_account { continue; }
         if let Ok(full_run) = load_run_by_id(rid) {
             let recs = full_run.get("pending_recommandations")
                 .and_then(|v| v.as_array())
                 .cloned()
                 .unwrap_or_default();
             if !recs.is_empty() {
+                crate::debug_log(&format!(
+                    "[load_previous] found {} recs from run {rid} (account={summary_account})",
+                    recs.len()
+                ));
                 let line_status = full_run.get("line_status").cloned().unwrap_or_else(|| json!({}));
                 return (recs, line_status);
             }
         }
     }
+    crate::debug_log(&format!(
+        "[load_previous] no previous run with recs found for account={current_account}"
+    ));
     (Vec::new(), json!({}))
 }
 

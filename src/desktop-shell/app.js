@@ -587,6 +587,7 @@ const bootstrap = initBootstrap({
   refreshFinarySessionStatus: () => refreshFinarySessionStatus(),
   refreshWizardSourcePolicy: (sp) => refreshWizardSourcePolicy(sp),
   refreshHealthPill,
+  refreshAccountStatus,
   getLatestFinarySessionPayload: () => latestFinarySessionPayload,
 });
 

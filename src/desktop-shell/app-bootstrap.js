@@ -15,6 +15,7 @@ export function initBootstrap(deps) {
     refreshFinarySessionStatus,
     refreshWizardSourcePolicy,
     refreshHealthPill,
+    refreshAccountStatus,
     getLatestFinarySessionPayload,
     dismissSplash: externalDismissSplash,
   } = deps;
@@ -37,8 +38,9 @@ export function initBootstrap(deps) {
         }, 600);
       });
     });
-    // Trigger background health check to update status pill
+    // Sync auth state (pills, wizard) so the main app reflects splash choices
     refreshHealthPill();
+    refreshAccountStatus();
     if (externalDismissSplash) externalDismissSplash();
   }
 

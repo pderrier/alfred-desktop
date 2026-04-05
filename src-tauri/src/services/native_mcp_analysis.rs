@@ -931,14 +931,20 @@ fn codex_synthesis_fallback(run_id: &str, turn_result: &Value) -> Result<Value> 
                 })
                 .map(|r| {
                     let ticker = r.get("ticker").and_then(|v| v.as_str()).unwrap_or("");
+                    let nom = r.get("nom").and_then(|v| v.as_str()).unwrap_or("");
                     let signal = r.get("signal").and_then(|v| v.as_str()).unwrap_or("");
-                    let action = r.get("action_recommandee").and_then(|v| v.as_str()).unwrap_or(signal);
-                    let rationale = r.get("synthese").and_then(|v| v.as_str())
-                        .map(|s| s.chars().take(120).collect::<String>())
-                        .unwrap_or_default();
+                    let action_text = r.get("action_recommandee").and_then(|v| v.as_str()).unwrap_or("");
+                    let rationale = if !action_text.is_empty() {
+                        action_text.chars().take(200).collect::<String>()
+                    } else {
+                        r.get("synthese").and_then(|v| v.as_str())
+                            .map(|s| s.chars().take(120).collect::<String>())
+                            .unwrap_or_default()
+                    };
                     json!({
                         "ticker": ticker,
-                        "action": action,
+                        "nom": nom,
+                        "action": signal,
                         "rationale": rationale,
                         "priority": signal,
                     })

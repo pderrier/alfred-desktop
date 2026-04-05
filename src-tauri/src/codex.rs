@@ -197,7 +197,7 @@ pub fn ensure_mcp_config() {
         let escaped_binary = self_binary.replace('\\', "\\\\");
         let escaped_data_dir = data_dir.replace('\\', "\\\\");
         let mcp_block = format!(
-            "[mcp_servers.alfred-mcp]\ncommand = \"{escaped_binary}\"\nargs = [\"--mcp-server\", \"--data-dir\", \"{escaped_data_dir}\"]\n"
+            "[mcp_servers.alfred-mcp]\ncommand = \"{escaped_binary}\"\nargs = [\"--mcp-server\", \"--data-dir\", \"{escaped_data_dir}\"]\nauto_approve = [\"*\"]\n"
         );
 
         // Read existing config

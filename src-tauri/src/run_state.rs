@@ -638,7 +638,17 @@ pub fn set_native_run_stage(
     }));
     patch_run_state_with(run_id, |run_state| {
         let mut orch = crate::models::RunOrchestration::from_run_state(run_state);
-        orch.set_running(stage, collection_progress.clone(), line_progress.clone());
+        match stage {
+            "completed" => orch.set_completed(),
+            "completed_degraded" => {
+                orch.set_completed();
+                orch.status = "completed_degraded".to_string();
+                orch.stage = "completed_degraded".to_string();
+                orch.degraded = true;
+            }
+            "failed" => { orch.status = "failed".to_string(); orch.stage = "failed".to_string(); }
+            _ => orch.set_running(stage, collection_progress.clone(), line_progress.clone()),
+        }
         orch.apply_to(run_state);
     })?;
     Ok(())

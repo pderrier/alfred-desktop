@@ -966,6 +966,13 @@ fn codex_synthesis_fallback(run_id: &str, turn_result: &Value) -> Result<Value> 
             "llm_utilise": "codex-mcp-partial",
         });
         let _ = crate::report::persist_retry_global_synthesis(run_id, &draft);
+        // Update composed_payload in run state so UI picks up the derived actions
+        let draft_clone = draft.clone();
+        let _ = crate::run_state::patch_run_state_with(run_id, |rs| {
+            if let Some(obj) = rs.as_object_mut() {
+                obj.insert("composed_payload".to_string(), draft_clone);
+            }
+        });
         // Mark orchestration as completed so sidebar/UI stops showing "running"
         let _ = crate::run_state::set_native_run_stage(run_id, "completed", None, None);
         Ok(json!({

@@ -130,10 +130,12 @@ const runOperations = createRunOperationsController({
     if (event?.type === "run.started" || event?.type === "run.accepted") {
       activeRunRefresh = true;
       lastDoneCount = 0;
-      // Clear stale run data BEFORE rendering — prevents flash of previous account's positions
+      // Clear ALL stale run data — prevents showing previous account's positions/actions/synthesis
       if (latestDashboardPayload?.snapshot) {
         latestDashboardPayload.snapshot.latest_run = null;
         latestDashboardPayload.snapshot.latest_run_summary = null;
+        latestDashboardPayload.snapshot.latest_report = null;
+        latestDashboardPayload.snapshot.latest_report_summary = null;
       }
       syncAutoRefreshPolicy();
       setStopAnalysisVisible(true);

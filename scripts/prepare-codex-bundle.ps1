@@ -1,7 +1,8 @@
 <#
 .SYNOPSIS
-    Downloads portable Node.js and installs @openai/codex into src-tauri/codex-runtime/.
-    Run this BEFORE `cargo tauri build` so the installer bundles codex + node.
+    Downloads portable Node.js, installs @openai/codex, then extracts only the
+    native binary + rg into src-tauri/codex-runtime/.  The JS wrapper / Node
+    runtime are NOT shipped — Alfred invokes the native codex.exe directly.
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts/prepare-codex-bundle.ps1
 #>
@@ -18,6 +19,7 @@ function JP { param([string]$a, [string]$b) Join-Path $a $b }
 $ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $TauriDir    = JP (JP $ScriptDir "..") "src-tauri"
 $OutDir      = JP $TauriDir "codex-runtime"
+$StageDir    = JP $env:TEMP "codex-stage"
 $NodeDirName = "node-$NodeVersion-win-$Arch"
 $NodeUrl     = "https://nodejs.org/dist/$NodeVersion/$NodeDirName.zip"
 $ZipPath     = JP $env:TEMP "$NodeDirName.zip"
@@ -26,14 +28,14 @@ Write-Host "=== Prepare Codex Bundle ===" -ForegroundColor Cyan
 Write-Host "Node version : $NodeVersion ($Arch)"
 Write-Host "Output dir   : $OutDir"
 
-# Clean previous bundle
-if (Test-Path $OutDir) {
-    Write-Host "Removing previous codex-runtime..."
-    Remove-Item -Recurse -Force $OutDir
+# Clean previous bundle and staging area
+foreach ($d in @($OutDir, $StageDir)) {
+    if (Test-Path $d) { Remove-Item -Recurse -Force $d }
 }
+New-Item -ItemType Directory -Force $StageDir | Out-Null
 New-Item -ItemType Directory -Force $OutDir | Out-Null
 
-# ── 1. Download Node.js portable ──────────────────────────────────
+# ── 1. Download Node.js portable (needed to run npm) ─────────────
 if (-not (Test-Path $ZipPath)) {
     Write-Host "Downloading Node.js from $NodeUrl ..."
     Invoke-WebRequest -Uri $NodeUrl -OutFile $ZipPath -UseBasicParsing
@@ -41,58 +43,55 @@ if (-not (Test-Path $ZipPath)) {
     Write-Host "Using cached Node.js zip at $ZipPath"
 }
 
-# ── 2. Extract ────────────────────────────────────────────────────
-Write-Host "Extracting Node.js..."
-Expand-Archive -Path $ZipPath -DestinationPath $OutDir -Force
+# ── 2. Extract Node.js to staging dir ────────────────────────────
+Write-Host "Extracting Node.js to staging dir..."
+Expand-Archive -Path $ZipPath -DestinationPath $StageDir -Force
 
-# The zip extracts to codex-runtime/node-vXX-win-x64/. Flatten one level.
-$Nested = JP $OutDir $NodeDirName
+$Nested = JP $StageDir $NodeDirName
 if (Test-Path $Nested) {
-    Get-ChildItem -Path $Nested | Move-Item -Destination $OutDir -Force
+    Get-ChildItem -Path $Nested | Move-Item -Destination $StageDir -Force
     Remove-Item -Recurse -Force $Nested
 }
 
-# Verify node.exe
-$NodeExe = JP $OutDir "node.exe"
+$NodeExe = JP $StageDir "node.exe"
 if (-not (Test-Path $NodeExe)) {
     throw "node.exe not found at $NodeExe after extraction"
 }
-Write-Host "node.exe OK: $NodeExe"
 
-# ── 3. Install @openai/codex using the portable npm ──────────────
-$NpmCmd = JP $OutDir "npm.cmd"
+# ── 3. Install @openai/codex via npm (in staging dir) ────────────
+$NpmCmd = JP $StageDir "npm.cmd"
 Write-Host "Installing @openai/codex via portable npm..."
+& $NpmCmd install -g "@openai/codex" --prefix="$StageDir" 2>&1 | Write-Host
 
-# Set prefix to the codex-runtime dir so codex.cmd lands there
-& $NpmCmd install -g "@openai/codex" --prefix="$OutDir" 2>&1 | Write-Host
+# ── 4. Locate native binary and copy to output ──────────────────
+$VendorDir = JP (JP (JP (JP (JP (JP (JP (JP $StageDir "node_modules") "@openai") "codex") "node_modules") "@openai") "codex-win32-x64") "vendor") "x86_64-pc-windows-msvc"
+$NativeBin = JP (JP $VendorDir "codex") "codex.exe"
+if (-not (Test-Path $NativeBin)) {
+    throw "Native codex.exe not found at $NativeBin"
+}
 
-$CodexCmd = JP $OutDir "codex.cmd"
-if (-not (Test-Path $CodexCmd)) {
-    throw "codex.cmd not found at $CodexCmd after npm install"
+# Copy native binary
+Copy-Item $NativeBin -Destination $OutDir
+Write-Host "codex.exe OK" -ForegroundColor Green
+
+# Copy rg.exe from vendor path/ dir
+$RgBin = JP (JP $VendorDir "path") "rg.exe"
+if (Test-Path $RgBin) {
+    # Put rg in a path/ subdir matching the vendor layout
+    $PathDir = JP $OutDir "path"
+    New-Item -ItemType Directory -Force $PathDir | Out-Null
+    Copy-Item $RgBin -Destination $PathDir
+    Write-Host "rg.exe OK" -ForegroundColor Green
+} else {
+    Write-Host "WARNING: rg.exe not found at $RgBin" -ForegroundColor Yellow
 }
 
 # Verify version
-$CodexJs = JP (JP (JP (JP (JP $OutDir "node_modules") "@openai") "codex") "bin") "codex.js"
-$ver = & $NodeExe $CodexJs --version 2>&1
+$ver = & (JP $OutDir "codex.exe") --version 2>&1
 Write-Host "codex version: $ver" -ForegroundColor Green
 
-# ── 4. Trim unnecessary files to reduce bundle size ───────────────
-Write-Host "Trimming unnecessary files..."
-$Removals = @(
-    "include",          # C headers
-    "share",            # docs
-    "CHANGELOG.md",
-    "README.md",
-    "LICENSE"
-)
-foreach ($item in $Removals) {
-    $p = JP $OutDir $item
-    if (Test-Path $p) { Remove-Item -Recurse -Force $p }
-}
-
-# Remove npm cache
-$NpmCache = JP (JP $OutDir "node_modules") ".cache"
-if (Test-Path $NpmCache) { Remove-Item -Recurse -Force $NpmCache }
+# ── 5. Clean up staging dir ──────────────────────────────────────
+Remove-Item -Recurse -Force $StageDir
 
 $Size = (Get-ChildItem -Recurse $OutDir | Measure-Object -Property Length -Sum).Sum / 1MB
 Write-Host ("Bundle size: {0:N1} MB" -f $Size) -ForegroundColor Cyan

@@ -51,12 +51,17 @@ fn bundled_codex_dir() -> Option<PathBuf> {
 }
 
 /// Prepare a Command for codex execution: hide console on Windows and
-/// prepend the bundled codex-runtime dir to PATH (so codex.cmd finds node.exe).
+/// prepend the bundled codex-runtime dir + path/ subdir (rg.exe) to PATH.
 fn prepare_codex_cmd(cmd: &mut Command) {
     if let Some(dir) = bundled_codex_dir() {
         let sep = if cfg!(windows) { ";" } else { ":" };
         let current = env::var("PATH").unwrap_or_default();
-        cmd.env("PATH", format!("{}{sep}{current}", dir.display()));
+        let tools_path = dir.join("path");
+        if tools_path.exists() {
+            cmd.env("PATH", format!("{}{sep}{}{sep}{current}", dir.display(), tools_path.display()));
+        } else {
+            cmd.env("PATH", format!("{}{sep}{current}", dir.display()));
+        }
     }
     hide_console_window(cmd);
 }
@@ -71,9 +76,10 @@ fn resolve_codex_binary() -> Result<PathBuf> {
     }
 
     // 1. Check bundled codex-runtime (shipped with installer)
+    //    Contains the native codex.exe directly (no node.js / cmd.exe wrapper).
     if let Some(bundle_dir) = bundled_codex_dir() {
         let candidates: &[&str] = if cfg!(windows) {
-            &["codex.cmd", "codex.exe", "codex"]
+            &["codex.exe", "codex.cmd", "codex"]
         } else {
             &["codex"]
         };
@@ -86,14 +92,12 @@ fn resolve_codex_binary() -> Result<PathBuf> {
         }
     }
 
+    // Fallback candidates for system-level installs (node.js-based)
+    let system_cmd = if cfg!(windows) { "codex.cmd" } else { "codex" };
+
     // 2. Check legacy install dir (%APPDATA%/alfred/bin)
     let install_dir = codex_install_dir();
-    let candidates: &[&str] = if cfg!(windows) {
-        &["codex.cmd", "codex.exe", "codex"]
-    } else {
-        &["codex"]
-    };
-    for name in candidates {
+    for name in &[system_cmd, "codex.exe", "codex"] {
         let path = install_dir.join(name);
         if path.exists() {
             return Ok(path);
@@ -101,16 +105,15 @@ fn resolve_codex_binary() -> Result<PathBuf> {
     }
 
     // 3. Check system PATH
-    let cmd_name = if cfg!(windows) { "codex.cmd" } else { "codex" };
-    let mut check = Command::new(cmd_name);
+    let mut check = Command::new(system_cmd);
     check.arg("--version").stdout(Stdio::null()).stderr(Stdio::null());
     hide_console_window(&mut check);
     if check.status().is_ok() {
-        return Ok(PathBuf::from(cmd_name));
+        return Ok(PathBuf::from(system_cmd));
     }
 
     // 4. Fallback — try npm auto-install (requires Node.js on the system)
-    match auto_install_codex() {
+    match auto_install_codex(system_cmd) {
         Ok(path) => Ok(path),
         Err(e) => Err(anyhow!(
             "codex_not_found:codex-runtime bundle missing and npm auto-install failed: {e}. \
@@ -119,7 +122,7 @@ fn resolve_codex_binary() -> Result<PathBuf> {
     }
 }
 
-fn auto_install_codex() -> Result<PathBuf> {
+fn auto_install_codex(system_cmd: &str) -> Result<PathBuf> {
     let install_dir = codex_install_dir();
     fs::create_dir_all(&install_dir)?;
 
@@ -129,16 +132,14 @@ fn auto_install_codex() -> Result<PathBuf> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     hide_console_window(&mut npm);
-    let npm_result = npm.status();
 
-    if let Ok(status) = npm_result {
+    if let Ok(status) = npm.status() {
         if status.success() {
-            let cmd_name = if cfg!(windows) { "codex.cmd" } else { "codex" };
-            let mut verify = Command::new(cmd_name);
+            let mut verify = Command::new(system_cmd);
             verify.arg("--version").stdout(Stdio::null()).stderr(Stdio::null());
             hide_console_window(&mut verify);
             if verify.status().is_ok() {
-                return Ok(PathBuf::from(cmd_name));
+                return Ok(PathBuf::from(system_cmd));
             }
         }
     }

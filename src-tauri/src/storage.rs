@@ -11,10 +11,22 @@ use anyhow::{anyhow, Result};
 static FILE_WRITE_SEQ: AtomicU64 = AtomicU64::new(1);
 
 pub fn read_json_file(path: &PathBuf) -> Result<serde_json::Value> {
-    let raw = fs::read_to_string(path)?;
-    let parsed = serde_json::from_str::<serde_json::Value>(&raw)
-        .map_err(|error| anyhow!("invalid_json:{error}"))?;
-    Ok(parsed)
+    // Retry on parse failure — on Windows, a concurrent write (rename) can
+    // leave the file momentarily incomplete or with trailing bytes.
+    let mut last_err = None;
+    for attempt in 0..3 {
+        if attempt > 0 {
+            thread::sleep(Duration::from_millis(50 * attempt as u64));
+        }
+        match fs::read_to_string(path) {
+            Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+                Ok(parsed) => return Ok(parsed),
+                Err(e) => last_err = Some(e.to_string()),
+            },
+            Err(e) => last_err = Some(e.to_string()),
+        }
+    }
+    Err(anyhow!("invalid_json:{}", last_err.unwrap_or_default()))
 }
 
 pub fn write_json_file(path: &PathBuf, payload: &serde_json::Value) -> Result<()> {

@@ -396,13 +396,16 @@ export function buildReportViewModel(dashboardPayload) {
       actionsNow.length > 0 ||
       Boolean(asText(currentRunPayload.synthese_marche)) ||
       (Array.isArray(latestRun?.portfolio?.positions) && latestRun.portfolio.positions.length > 0));
-  const artifactState = hasPartialArtifacts
-    ? runStatus === "completed_degraded"
-      ? "degraded"
-      : "partial"
-    : effectiveArtifactReport
-      ? "final"
-      : "empty";
+  const isRunCompleted = runStatus === "completed" || runStatus === "completed_degraded";
+  const artifactState = latestRunIsAuthoritative && isRunCompleted
+    ? "final"
+    : hasPartialArtifacts
+      ? runStatus === "completed_degraded"
+        ? "degraded"
+        : "partial"
+      : effectiveArtifactReport
+        ? "final"
+        : "empty";
   const fallbackSynthesis =
     asText(currentRunPayload.synthese_marche) ||
     (effectiveRecommendations.length > 0

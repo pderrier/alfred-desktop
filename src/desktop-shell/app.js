@@ -315,16 +315,19 @@ function renderActionsNow(items = []) {
   for (const action of actionable.slice(0, 5)) {
     const card = document.createElement("article");
     card.className = `action-card ${recommendationActionClass(action.action)}`;
+    const displayName = action.nom || action.ticker || "";
+    const tickerLabel = action.ticker ? `<span class="action-ticker">${escapeHtml(action.ticker)}</span>` : "";
+    const nameHtml = displayName
+      ? `${escapeHtml(displayName)}${action.nom && action.ticker ? " " + tickerLabel : ""}`
+      : tickerLabel;
+    const orderLabel = action.orderType === "LIMIT" ? "LIMIT" : "MARKET";
     const metrics = [];
     if (typeof action.quantity === "number" && Number.isFinite(action.quantity) && action.quantity > 0) metrics.push(`${action.quantity} titres`);
     if (typeof action.estimatedAmountEur === "number" && Number.isFinite(action.estimatedAmountEur) && action.estimatedAmountEur > 0) metrics.push(`~${formatCurrency(action.estimatedAmountEur)}`);
     if (typeof action.priceLimit === "number" && Number.isFinite(action.priceLimit) && action.priceLimit > 0) metrics.push(`prix cible ${formatCurrency(action.priceLimit)}`);
-    const orderLabel = action.orderType === "LIMIT" ? "Ordre LIMIT" : "Au marché";
-    const displayName = action.nom || action.ticker || "";
-    const tickerLabel = action.nom && action.ticker ? ` <span class="action-ticker">${escapeHtml(action.ticker)}</span>` : "";
     card.innerHTML = `
-      <p class="action-title">${action.priority}. ${action.action} ${escapeHtml(displayName)}${tickerLabel} · ${orderLabel}</p>
-      ${metrics.length > 0 ? `<p class="action-metrics">${metrics.join(" · ")}</p>` : ""}
+      <p class="action-header">${action.priority}. ${nameHtml}</p>
+      <p class="action-detail"><span class="action-signal-badge">${escapeHtml(action.action)}</span> <span class="action-order-type">${orderLabel}</span>${metrics.length > 0 ? ` · ${metrics.join(" · ")}` : ""}</p>
       <p class="action-rationale">${escapeHtml(action.rationale)}</p>
     `;
     actionsNowNode.appendChild(card);

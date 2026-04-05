@@ -120,7 +120,11 @@ export function renderLivePositions(lineStatus, dashboardPayload) {
     row.classList.add(lineRowClass(status));
     const signalCell = row.querySelector("td:nth-child(8)");
     if (signalCell) {
-      signalCell.innerHTML = renderLiveStatusChip(raw);
+      // Don't overwrite signal badge with "Done" chip if line already completed
+      const hasSignalBadge = signalCell.querySelector(".signal-badge");
+      if (!(status === "done" && hasSignalBadge)) {
+        signalCell.innerHTML = renderLiveStatusChip(raw);
+      }
     }
     // Show name in name cell
     const nameCell = row.querySelector("td:nth-child(2)");

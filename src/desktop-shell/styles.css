@@ -1341,7 +1341,7 @@ main {
   white-space: nowrap;
 }
 
-.action-title {
+.action-header {
   margin: 0;
   font-size: 0.96rem;
   font-weight: 700;
@@ -1352,11 +1352,38 @@ main {
   color: var(--sea-muted);
   margin-left: 0.15rem;
 }
-
-.action-rationale {
-  margin: 0.3rem 0 0;
+.action-detail {
+  margin: 0.25rem 0 0;
+  font-size: 0.82rem;
+  color: var(--sea-ink);
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+.action-signal-badge {
+  display: inline-block;
+  padding: 0.1rem 0.4rem;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-strong);
+}
+.tone-buy .action-signal-badge { background: rgba(46, 204, 113, 0.2); color: #6bcf8e; }
+.tone-sell .action-signal-badge { background: rgba(240, 138, 119, 0.2); color: #f08a77; }
+.action-order-type {
+  font-size: 0.72rem;
   color: var(--sea-muted);
-  font-size: 0.88rem;
+  font-weight: 500;
+}
+.action-rationale {
+  margin: 0.35rem 0 0;
+  color: var(--sea-muted);
+  font-size: 0.85rem;
+  line-height: 1.45;
 }
 
 /* ── Signal badges ─────────────────────────────────────────────── */

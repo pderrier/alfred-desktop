@@ -21,9 +21,15 @@ fn merge_mcp_results(run_id: &str, data_dir: &str) {
         .join("runtime-state")
         .join(format!("{run_id}_mcp_results.jsonl"));
 
-    let content = match std::fs::read_to_string(&results_path) {
+    // Atomic read: rename to .merging to prevent concurrent MCP writes from being lost
+    let merging_path = results_path.with_extension("merging");
+    if std::fs::rename(&results_path, &merging_path).is_err() {
+        return; // No sidecar or already being merged
+    }
+
+    let content = match std::fs::read_to_string(&merging_path) {
         Ok(c) if !c.trim().is_empty() => c,
-        _ => return,
+        _ => { let _ = std::fs::remove_file(&merging_path); return; }
     };
 
     let data_path = std::path::Path::new(data_dir);
@@ -88,8 +94,8 @@ fn merge_mcp_results(run_id: &str, data_dir: &str) {
             "[mcp-merge] merged {merged_count} results from sidecar for {run_id}"
         ));
         crate::run_state_cache::flush_now(run_id);
-        // Clear the sidecar after successful merge
-        let _ = std::fs::remove_file(&results_path);
+        // Clear the merged file (new results go to a fresh sidecar)
+        let _ = std::fs::remove_file(&merging_path);
     }
 }
 

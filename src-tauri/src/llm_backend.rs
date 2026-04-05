@@ -58,16 +58,6 @@ pub fn run_prompt(
     }
 }
 
-/// Ensure the selected backend is ready (binary exists / API key valid).
-/// Called from the splash screen on startup.
-pub fn ensure_backend_available() -> Result<Value> {
-    let backend = resolve_backend();
-    match backend.as_str() {
-        "native" | "openai" => crate::openai_client::validate_api_key(),
-        _ => crate::codex::ensure_codex_available(),
-    }
-}
-
 /// Get current backend name for UI display.
 pub fn current_backend_name() -> String {
     resolve_backend()

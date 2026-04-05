@@ -48,10 +48,18 @@ fn merge_mcp_results(run_id: &str, data_dir: &str) {
                             .entry("pending_recommandations")
                             .or_insert_with(|| json!([]));
                         if let Some(arr) = pending.as_array_mut() {
+                            let existing = arr.iter().find(|r| {
+                                r.get("line_id").and_then(|v| v.as_str()).unwrap_or("") == lid
+                            }).cloned();
                             arr.retain(|r| {
                                 r.get("line_id").and_then(|v| v.as_str()).unwrap_or("") != lid
                             });
-                            arr.push(rec_clone.clone());
+                            let merged = if let Some(prev) = existing {
+                                crate::mcp_server::merge_recommendation(&prev, &rec_clone)
+                            } else {
+                                rec_clone.clone()
+                            };
+                            arr.push(merged);
                         }
                     });
                     // Update line_status to done

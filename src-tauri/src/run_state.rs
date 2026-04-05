@@ -5,7 +5,7 @@ use serde_json::json;
 
 use crate::helpers::{
     new_run_id, now_iso_string, parse_timestamp_millis, read_json_env_override,
-    run_state_update_lock, safe_portfolio_source, safe_trimmed_option,
+    safe_portfolio_source, safe_trimmed_option,
 };
 use crate::local_http::{parse_http_url, request_http_json};
 use crate::paths::{

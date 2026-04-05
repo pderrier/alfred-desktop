@@ -7,11 +7,11 @@
 //! Self-contained: no imports from Tauri-dependent modules.
 
 use std::collections::HashSet;
-use std::env;
+
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
@@ -75,20 +75,19 @@ fn append_mcp_result(data_dir: &Path, run_id: &str, result: &Value) {
 
 /// Merge new recommendation into existing: new values win UNLESS they are empty/null
 /// and the existing value is non-empty. Prevents overwriting good data with blanks.
-fn merge_recommendation(existing: &Value, new: &Value) -> Value {
+/// Merge two recommendations: never overwrite non-empty with empty.
+pub fn merge_recommendation(existing: &Value, new: &Value) -> Value {
     let mut merged = existing.clone();
     if let (Some(base), Some(update)) = (merged.as_object_mut(), new.as_object()) {
         for (key, new_val) in update {
             let is_empty = new_val.is_null()
                 || (new_val.is_string() && new_val.as_str().unwrap_or_default().trim().is_empty())
                 || (new_val.is_array() && new_val.as_array().unwrap().is_empty());
-            let existing_val = base.get(key);
-            let existing_has_value = existing_val.is_some_and(|v| {
+            let existing_has_value = base.get(key).is_some_and(|v| {
                 !v.is_null()
                     && !(v.is_string() && v.as_str().unwrap_or_default().trim().is_empty())
                     && !(v.is_array() && v.as_array().unwrap().is_empty())
             });
-            // Only skip if new is empty AND existing has real data
             if is_empty && existing_has_value {
                 continue;
             }
@@ -201,49 +200,14 @@ fn derive_expected_line_ids(run_state: &Value) -> Vec<String> {
     ids
 }
 
-// ── Alfred API client (fire-and-forget, self-contained) ─────────────────────
+// ── Alfred API client (delegates to alfred_api_client with HMAC auth) ───────
 
-const DEFAULT_API_URL: &str = "https://vps-c5793aab.vps.ovh.net/alfred/api";
-
-fn api_url() -> Option<String> {
-    let enabled = env::var("ALFRED_API_ENABLED")
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(true);
-    if !enabled {
-        return None;
-    }
-    Some(
-        env::var("ALFRED_API_URL")
-            .unwrap_or_else(|_| DEFAULT_API_URL.to_string())
-            .trim_end_matches('/')
-            .to_string(),
-    )
-}
-
-// Delegate to alfred_api_client (HMAC-signed requests).
 fn api_persist_extracted_fundamentals(ticker: &str, isin: &str, extracted: &Value) {
     crate::alfred_api_client::persist_extracted_fundamentals(ticker, isin, extracted);
 }
 
 fn api_persist_shared_insights(ticker: &str, isin: &str, insights: &Value) {
     crate::alfred_api_client::persist_shared_insights(ticker, isin, insights);
-}
-
-// Kept for backward compat — but no longer used directly.
-fn _api_persist_shared_insights_legacy(ticker: &str, isin: &str, insights: &Value) {
-    let base = match api_url() { Some(u) => u, None => return };
-    let url = format!("{base}/api/insights");
-    let body = json!({ "ticker": ticker, "isin": isin, "insights": insights });
-    match ureq::post(&url)
-        .set("Content-Type", "application/json")
-        .timeout(Duration::from_secs(5))
-        .send_string(&serde_json::to_string(&body).unwrap_or_default())
-    {
-        Ok(_) => log(&format!("api: persisted shared insights for {ticker}")),
-        Err(e) => log(&format!(
-            "api: failed to persist shared insights for {ticker}: {e}"
-        )),
-    }
 }
 
 // ── JSON-RPC 2.0 helpers ────────────────────────────────────────────────────
@@ -654,7 +618,7 @@ fn tool_validate_recommendation(data_dir: &Path, params: &Value) -> Result<Value
     }
 
     let line_id = as_text(rec.get("line_id"));
-    let is_watchlist = line_id.starts_with("watchlist:");
+    let _is_watchlist = line_id.starts_with("watchlist:");
 
     // Track validation attempts per line — accept with warnings after max retries
     static ATTEMPT_COUNTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u32>>> = std::sync::OnceLock::new();

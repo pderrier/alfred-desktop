@@ -510,7 +510,16 @@ fn main() {
                     .unwrap_or(std::path::Path::new("."))
                     .to_path_buf()
             });
-        if let Err(error) = mcp_server::run_stdio_server(data_dir) {
+        let tool_filter: Option<Vec<String>> = args
+            .windows(2)
+            .find(|w| w[0] == "--tools")
+            .map(|w| w[1].split(',').map(|s| s.trim().to_string()).collect());
+        let server_result = if let Some(filter) = tool_filter {
+            mcp_server::run_stdio_server_filtered(data_dir, filter)
+        } else {
+            mcp_server::run_stdio_server(data_dir)
+        };
+        if let Err(error) = server_result {
             eprintln!("mcp_server_failed:{error}");
             std::process::exit(1);
         }

@@ -438,7 +438,9 @@ WORKFLOW STRICT — suis ces etapes dans l'ordre :
 5. Appelle `finalize_report(run_id="{run_id}")` pour composer et persister le rapport.
 
 REGLES:
-- Ne saute AUCUNE etape. Chaque outil doit etre appele.
+- Ne saute AUCUNE etape (get_run_context, check_coverage, validate_synthesis, finalize_report).
+- N'appelle PAS get_line_data ni validate_recommendation — les analyses par ligne
+  sont deja faites. Tu SYNTHETISES, tu ne re-analyses pas.
 - Sois concret: chiffres, montants, dates. Pas de generalites.
 - Ne presente PAS les watchlist comme deja detenues.
 
@@ -734,13 +736,15 @@ pub fn run_synthesis_turn(run_id: &str, data_dir: &str) -> Result<Value> {
     let prompt = build_synthesis_prompt(run_id);
     let pdd = std::path::PathBuf::from(data_dir);
     let prid = run_id.to_string();
-    let synthesis_cb: Option<crate::llm_backend::ProgressFn> = Some(Box::new(move |_bytes, _lines, label| {
+    // Use dedicated app-server with only synthesis tools — prevents model from
+    // re-analyzing individual lines via get_line_data/validate_recommendation.
+    let synthesis_progress: Option<crate::codex::CodexProgressFn> = Some(Box::new(move |_bytes, _lines, label| {
         let progress_text = label.replace('\u{2026}', "...");
         crate::mcp_progress_relay::write_progress_event(
             &pdd, &prid, "__synthesis__", "generating", &progress_text,
         );
     }));
-    let result = crate::llm_backend::run_prompt(&prompt, 300_000, synthesis_cb);
+    let result = crate::codex::run_synthesis_prompt(&prompt, synthesis_progress);
 
     relay_stop.store(true, Ordering::Relaxed);
     let _ = relay_handle.join();

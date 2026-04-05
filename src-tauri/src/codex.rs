@@ -272,11 +272,13 @@ impl AppServerClient {
     /// When `ALFRED_MCP_ENABLED=1`, passes MCP server config so Codex
     /// can call alfred-mcp tools during turns.
     fn spawn() -> Result<Self> {
+        Self::spawn_with_tools(None)
+    }
+
+    fn spawn_with_tools(tool_filter: Option<&[&str]>) -> Result<Self> {
         let bin = resolve_codex_binary()?;
         let bin_str = bin.to_string_lossy().to_string();
 
-        // Build MCP server config as -c flags so the app-server discovers
-        // alfred-mcp tools without polluting the user's global config.toml.
         let self_binary = std::env::current_exe()
             .ok()
             .map(|p| p.to_string_lossy().to_string())
@@ -286,10 +288,6 @@ impl AppServerClient {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| ".".to_string());
 
-        // On Windows, Rust's Command automatically wraps .cmd/.bat files with
-        // cmd.exe /c using correct quoting. Manual cmd.exe wrapping with /s
-        // strips quotes and breaks paths with spaces (e.g. "C:\Program Files\...").
-
         crate::debug_log(&format!("codex app-server: spawning {} app-server", bin_str));
 
         let mut cmd = Command::new(bin.as_os_str());
@@ -297,10 +295,14 @@ impl AppServerClient {
         if !self_binary.is_empty() {
             // Use TOML single-quoted (literal) strings to avoid escaping issues
             // with backslashes and spaces in Windows paths.
+            let tools_arg = if let Some(filter) = tool_filter {
+                format!("'--mcp-server', '--data-dir', '{data_dir}', '--tools', '{}'",
+                    filter.join(","))
+            } else {
+                format!("'--mcp-server', '--data-dir', '{data_dir}'")
+            };
             cmd.args(["-c", &format!("mcp_servers.alfred-mcp.command='{self_binary}'")]);
-            cmd.args(["-c", &format!(
-                "mcp_servers.alfred-mcp.args=['--mcp-server', '--data-dir', '{data_dir}']"
-            )]);
+            cmd.args(["-c", &format!("mcp_servers.alfred-mcp.args=[{tools_arg}]")]);
             cmd.args(["-c", "mcp_servers.alfred-mcp.auto_approved=['*']"]);
         }
         cmd.stdin(Stdio::piped())
@@ -974,6 +976,102 @@ pub fn run_codex_prompt_with_progress(
             None => Ok(json!({"ok": true, "mcp_turn": true, "agent_text": agent_text})),
         }
     })
+}
+
+/// Run a synthesis prompt with a dedicated app-server that only exposes
+/// the 4 synthesis tools (get_run_context, check_coverage, validate_synthesis,
+/// finalize_report). Prevents the model from re-analyzing individual lines.
+pub fn run_synthesis_prompt(
+    prompt: &str,
+    on_progress: Option<CodexProgressFn>,
+) -> Result<Value> {
+    const SYNTHESIS_TOOLS: &[&str] = &[
+        "get_run_context", "check_coverage", "validate_synthesis", "finalize_report",
+    ];
+    let mut client = AppServerClient::spawn_with_tools(Some(SYNTHESIS_TOOLS))?;
+    client.initialize()?;
+    if let Ok(model) = resolve_best_model(&mut client) {
+        client.best_model = Some(model);
+    }
+
+    let model = client.best_model.clone().unwrap_or_else(|| "gpt-5.4".to_string());
+    let id = client.send_request("thread/start", json!({"model": model, "approvalPolicy": "never"}))?;
+    let resp = client.recv_response(id, |_, _| {})?;
+    let thread_id = resp.get("thread").and_then(|t| t.get("id")).and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("codex_synthesis_no_thread_id"))?.to_string();
+    client.active_thread_id = Some(thread_id.clone());
+
+    let turn_req_id = client.send_request("turn/start", json!({
+        "threadId": thread_id,
+        "input": [{"type": "text", "text": prompt}],
+    }))?;
+
+    let mut agent_text = String::new();
+    let mut bytes_received = 0usize;
+    loop {
+        let msg = client.recv()?;
+        match msg {
+            JsonRpcMessage::Response { id, .. } if id == turn_req_id => {}
+            JsonRpcMessage::Response { .. } => {}
+            JsonRpcMessage::Notification { ref method, ref params } => {
+                match method.as_str() {
+                    "item/agentMessage/delta" => {
+                        if let Some(delta) = params.get("delta").and_then(|v| v.as_str()) {
+                            agent_text.push_str(delta);
+                            bytes_received += delta.len();
+                            if let Some(ref cb) = on_progress {
+                                cb(bytes_received, 0, "writing recommendation\u{2026}");
+                            }
+                        }
+                    }
+                    "item/completed" => {
+                        if let Some("agentMessage") = params.get("item").and_then(|i| i.get("type")).and_then(|v| v.as_str()) {
+                            if let Some(text) = params.get("item").and_then(|i| i.get("text")).and_then(|v| v.as_str()) {
+                                if text.len() > agent_text.len() { agent_text = text.to_string(); }
+                            }
+                        }
+                    }
+                    "item/started" => {
+                        let item_type = params.get("item").and_then(|i| i.get("type")).and_then(|v| v.as_str()).unwrap_or("");
+                        if let Some(ref cb) = on_progress {
+                            let label = match item_type {
+                                "reasoning" => "analyzing data\u{2026}".to_string(),
+                                "mcpToolCall" => {
+                                    let tool = params.get("item").and_then(|i| i.get("tool")).and_then(|v| v.as_str()).unwrap_or("tool");
+                                    format!("calling {tool}\u{2026}")
+                                }
+                                _ => String::new(),
+                            };
+                            if !label.is_empty() { cb(bytes_received, 0, &label); }
+                        }
+                    }
+                    "turn/completed" => {
+                        let status = params.get("turn").and_then(|t| t.get("status")).and_then(|v| v.as_str()).unwrap_or("unknown");
+                        if status == "failed" {
+                            let err = params.get("turn").and_then(|t| t.get("error")).cloned().unwrap_or(json!({"message": "synthesis turn failed"}));
+                            return Err(map_rpc_error(&err));
+                        }
+                        break;
+                    }
+                    "thread/tokenUsage/updated" => {
+                        if let Some(ref cb) = on_progress {
+                            let total = params.pointer("/tokenUsage/total/totalTokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let input = params.pointer("/tokenUsage/total/inputTokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let output = params.pointer("/tokenUsage/total/outputTokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                            cb(bytes_received, 0, &format!("tokens:{total}:{input}:{output}"));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    match extract_json_from_output(&agent_text) {
+        Some(json) => Ok(json),
+        None if agent_text.is_empty() => Ok(json!({"ok": true, "mcp_turn": true})),
+        None => Ok(json!({"ok": true, "mcp_turn": true, "agent_text": agent_text})),
+    }
 }
 
 /// Interrupt all active turns across all pool slots.

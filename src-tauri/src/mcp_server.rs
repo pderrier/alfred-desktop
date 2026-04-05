@@ -1207,7 +1207,7 @@ pub fn tool_definitions_openai() -> Vec<Value> {
 
 // ── MCP Request Handler ─────────────────────────────────────────────────────
 
-fn handle_request(data_dir: &Path, msg: &Value) -> Option<Value> {
+fn handle_request(data_dir: &Path, msg: &Value, tool_filter: Option<&[String]>) -> Option<Value> {
     let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("");
     let id = msg.get("id").cloned().unwrap_or(Value::Null);
     let params = msg.get("params").cloned().unwrap_or(json!({}));
@@ -1238,10 +1238,21 @@ fn handle_request(data_dir: &Path, msg: &Value) -> Option<Value> {
 
         "tools/list" => {
             log("tools/list");
+            let all = tool_definitions();
+            let filtered = if let Some(filter) = tool_filter {
+                all.as_array()
+                    .map(|arr| arr.iter()
+                        .filter(|t| t.get("name").and_then(|v| v.as_str()).map(|n| filter.iter().any(|f| f == n)).unwrap_or(false))
+                        .cloned().collect::<Vec<_>>())
+                    .map(|v| json!(v))
+                    .unwrap_or(all)
+            } else {
+                all
+            };
             Some(rpc_ok(
                 &id,
                 json!({
-                    "tools": tool_definitions(),
+                    "tools": filtered,
                 }),
             ))
         }
@@ -1249,6 +1260,16 @@ fn handle_request(data_dir: &Path, msg: &Value) -> Option<Value> {
         "tools/call" => {
             let tool_name = as_text(params.get("name"));
             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+            // Reject tools not in the filter
+            if let Some(filter) = tool_filter {
+                if !filter.iter().any(|f| f == &tool_name) {
+                    log(&format!("tools/call: {tool_name} REJECTED (not in filter)"));
+                    return Some(rpc_ok(&id, json!({
+                        "content": [{"type": "text", "text": format!("Tool '{tool_name}' not available in this turn.")}],
+                        "isError": true
+                    })));
+                }
+            }
             log(&format!("tools/call: {tool_name}"));
             let result = dispatch_tool(data_dir, &tool_name, &arguments);
             Some(rpc_ok(&id, result))
@@ -1271,7 +1292,15 @@ fn handle_request(data_dir: &Path, msg: &Value) -> Option<Value> {
 
 /// Run the MCP stdio server. Blocks until stdin is closed.
 pub fn run_stdio_server(data_dir: PathBuf) -> anyhow::Result<()> {
-    log(&format!("starting MCP server, data_dir={}", data_dir.display()));
+    run_stdio_server_with_filter(data_dir, None)
+}
+
+pub fn run_stdio_server_filtered(data_dir: PathBuf, allowed_tools: Vec<String>) -> anyhow::Result<()> {
+    run_stdio_server_with_filter(data_dir, Some(allowed_tools))
+}
+
+fn run_stdio_server_with_filter(data_dir: PathBuf, tool_filter: Option<Vec<String>>) -> anyhow::Result<()> {
+    log(&format!("starting MCP server, data_dir={}, filter={:?}", data_dir.display(), tool_filter));
 
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -1302,7 +1331,7 @@ pub fn run_stdio_server(data_dir: PathBuf) -> anyhow::Result<()> {
             }
         };
 
-        if let Some(response) = handle_request(&data_dir, &msg) {
+        if let Some(response) = handle_request(&data_dir, &msg, tool_filter.as_deref()) {
             let response_str = serde_json::to_string(&response).unwrap_or_default();
             let _ = writeln!(stdout_lock, "{}", response_str);
             let _ = stdout_lock.flush();

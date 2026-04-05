@@ -12,6 +12,79 @@ use std::thread;
 use anyhow::Result;
 use serde_json::{json, Value};
 
+// ── MCP results sidecar merge ───────────────────────────────────
+
+/// Merge MCP results from the sidecar JSONL file into the run state.
+/// Called by the main process after batches complete — single writer.
+fn merge_mcp_results(run_id: &str, data_dir: &str) {
+    let results_path = std::path::Path::new(data_dir)
+        .join("runtime-state")
+        .join(format!("{run_id}_mcp_results.jsonl"));
+
+    let content = match std::fs::read_to_string(&results_path) {
+        Ok(c) if !c.trim().is_empty() => c,
+        _ => return,
+    };
+
+    let data_path = std::path::Path::new(data_dir);
+    let mut merged_count = 0;
+
+    for line in content.lines() {
+        let entry: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match entry_type {
+            "recommendation" => {
+                let line_id = entry.get("line_id").and_then(|v| v.as_str()).unwrap_or("");
+                let rec = entry.get("recommendation").cloned().unwrap_or(json!({}));
+                if !line_id.is_empty() {
+                    let lid = line_id.to_string();
+                    let rec_clone = rec.clone();
+                    let _ = crate::run_state_cache::patch(data_path, run_id, |state| {
+                        let pending = state.as_object_mut().unwrap()
+                            .entry("pending_recommandations")
+                            .or_insert_with(|| json!([]));
+                        if let Some(arr) = pending.as_array_mut() {
+                            arr.retain(|r| {
+                                r.get("line_id").and_then(|v| v.as_str()).unwrap_or("") != lid
+                            });
+                            arr.push(rec_clone.clone());
+                        }
+                    });
+                    // Update line_status to done
+                    let ticker = line_id.split(':').last().unwrap_or("");
+                    if !ticker.is_empty() {
+                        crate::run_state_cache::cache_line_status(run_id, ticker, json!({"status": "done"}));
+                    }
+                    merged_count += 1;
+                }
+            }
+            "synthesis" => {
+                let composed = entry.get("composed_payload").cloned().unwrap_or(json!({}));
+                let _ = crate::run_state_cache::patch(data_path, run_id, |state| {
+                    if let Some(obj) = state.as_object_mut() {
+                        obj.insert("composed_payload".to_string(), composed.clone());
+                    }
+                });
+                merged_count += 1;
+            }
+            _ => {}
+        }
+    }
+
+    if merged_count > 0 {
+        crate::debug_log(&format!(
+            "[mcp-merge] merged {merged_count} results from sidecar for {run_id}"
+        ));
+        crate::run_state_cache::flush_now(run_id);
+        // Clear the sidecar after successful merge
+        let _ = std::fs::remove_file(&results_path);
+    }
+}
+
 // ── Batch prompt ─────────────────────────────────────────────────
 
 /// Build a per-line prompt for the native backend. Data is pre-injected.
@@ -417,14 +490,19 @@ impl McpBatchDispatchQueue {
                 Ok(Ok(tickers)) => {
                     self.completed_tickers.extend(tickers);
                     self.active_batches -= 1;
+                    // Merge MCP results after each batch completes
+                    merge_mcp_results(&self.run_id, &self.data_dir);
                 }
                 Ok(Err(e)) => {
                     eprintln!("[mcp-batch] batch failed: {e}");
                     self.active_batches -= 1;
+                    merge_mcp_results(&self.run_id, &self.data_dir);
                 }
                 Err(_) => break,
             }
         }
+        // Final merge in case any results arrived after last batch
+        merge_mcp_results(&self.run_id, &self.data_dir);
         for flag in &self.relay_stop_flags {
             flag.store(true, Ordering::Relaxed);
         }
@@ -645,6 +723,9 @@ pub fn run_synthesis_turn(run_id: &str, data_dir: &str) -> Result<Value> {
 
     relay_stop.store(true, Ordering::Relaxed);
     let _ = relay_handle.join();
+
+    // Merge synthesis results from MCP sidecar
+    merge_mcp_results(run_id, data_dir);
 
     match result {
         Ok(_) => {

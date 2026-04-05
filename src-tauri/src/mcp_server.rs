@@ -58,6 +58,21 @@ fn append_progress(data_dir: &Path, run_id: &str, event: &Value) {
     }
 }
 
+/// Append a result entry to the MCP results sidecar file.
+/// The main process merges these into the run state after each batch.
+fn append_mcp_result(data_dir: &Path, run_id: &str, result: &Value) {
+    let path = data_dir
+        .join("runtime-state")
+        .join(format!("{run_id}_mcp_results.jsonl"));
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let line = serde_json::to_string(result).unwrap_or_default();
+        let _ = writeln!(f, "{}", line);
+    }
+}
+
 /// Merge new recommendation into existing: new values win UNLESS they are empty/null
 /// and the existing value is non-empty. Prevents overwriting good data with blanks.
 fn merge_recommendation(existing: &Value, new: &Value) -> Value {
@@ -86,17 +101,46 @@ fn merge_recommendation(existing: &Value, new: &Value) -> Value {
 // ── Run state (via in-memory cache) ──────────────────────────────────────────
 
 fn load_run_state(data_dir: &Path, run_id: &str) -> Result<Value> {
-    // Use in-memory cache — no disk I/O after first load
-    crate::run_state_cache::load(data_dir, run_id)
+    let mut state = crate::run_state_cache::load(data_dir, run_id)?;
+
+    // Overlay sidecar results so tools like finalize_report see recommendations
+    let results_path = data_dir.join("runtime-state").join(format!("{run_id}_mcp_results.jsonl"));
+    if let Ok(content) = std::fs::read_to_string(&results_path) {
+        for line in content.lines() {
+            let entry: Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            match entry_type {
+                "recommendation" => {
+                    let line_id = entry.get("line_id").and_then(|v| v.as_str()).unwrap_or("");
+                    let rec = entry.get("recommendation").cloned().unwrap_or(json!({}));
+                    if !line_id.is_empty() {
+                        let pending = state.as_object_mut().unwrap()
+                            .entry("pending_recommandations")
+                            .or_insert_with(|| json!([]));
+                        if let Some(arr) = pending.as_array_mut() {
+                            let lid = line_id.to_string();
+                            arr.retain(|r| r.get("line_id").and_then(|v| v.as_str()).unwrap_or("") != lid);
+                            arr.push(rec);
+                        }
+                    }
+                }
+                "synthesis" => {
+                    if let Some(obj) = state.as_object_mut() {
+                        if let Some(cp) = entry.get("composed_payload") {
+                            obj.insert("composed_payload".to_string(), cp.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(state)
 }
 
-/// Mutate run state in the cache. No disk I/O — flushed by background thread.
-fn patch_run_state<F>(data_dir: &Path, run_id: &str, mutator: F) -> Result<Value>
-where
-    F: FnOnce(&mut Value),
-{
-    crate::run_state_cache::patch(data_dir, run_id, mutator)
-}
 
 fn line_memory_path(data_dir: &Path) -> PathBuf {
     data_dir.join("runtime-state").join("line-memory.json")
@@ -702,34 +746,20 @@ fn tool_validate_recommendation(data_dir: &Path, params: &Value) -> Result<Value
         }
     }
 
-    // Valid — persist to run_state.pending_recommandations (dedup by line_id)
-    let lid = line_id.clone();
-    let rec_clone = rec.clone();
-    let run_state = patch_run_state(data_dir, &run_id, |state| {
-        let pending = state
-            .as_object_mut()
-            .unwrap()
-            .entry("pending_recommandations")
-            .or_insert_with(|| json!([]));
-        if let Some(arr) = pending.as_array_mut() {
-            // Find existing rec — merge (never overwrite non-empty with empty)
-            let existing = arr.iter().find(|r| as_text(r.get("line_id")) == lid).cloned();
-            arr.retain(|r| as_text(r.get("line_id")) != lid);
-            let merged = if let Some(prev) = existing {
-                merge_recommendation(&prev, &rec_clone)
-            } else {
-                rec_clone
-            };
-            arr.push(merged);
-        }
-        if let Some(obj) = state.as_object_mut() {
-            obj.insert("updated_at".to_string(), json!(now_iso()));
-        }
-    })?;
+    // Valid — write to sidecar file (main process merges after each batch)
+    append_mcp_result(data_dir, &run_id, &json!({
+        "type": "recommendation",
+        "line_id": line_id,
+        "recommendation": rec,
+        "at": now_iso(),
+    }));
 
-    // Count progress from run_state
-    let completed = run_state.get("pending_recommandations")
-        .and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+    // Count progress from sidecar file
+    let results_path = data_dir.join("runtime-state").join(format!("{run_id}_mcp_results.jsonl"));
+    let completed = std::fs::read_to_string(&results_path).ok()
+        .map(|s| s.lines().filter(|l| l.contains("\"recommendation\"")).count())
+        .unwrap_or(0);
+    let run_state = load_run_state(data_dir, &run_id)?;
     let total = {
         let pos_count = run_state.get("portfolio")
             .and_then(|p| p.get("positions")).and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
@@ -756,8 +786,7 @@ fn tool_validate_recommendation(data_dir: &Path, params: &Value) -> Result<Value
         }),
     );
 
-    // Direct push — ensures UI updates even if relay hasn't picked up JSONL yet
-    crate::run_state_cache::cache_line_status(&run_id, ticker_part, json!({"status": "done"}));
+    // Emit events for UI — the main process will merge results from the sidecar
     crate::emit_event("alfred://line-progress", json!({
         "run_id": run_id,
         "ticker": ticker_part,
@@ -844,19 +873,18 @@ fn tool_validate_synthesis(data_dir: &Path, params: &Value) -> Result<Value> {
         }));
     }
 
-    // Valid — store in run_state.composed_payload
+    // Valid — write to sidecar file (main process merges after batch)
     let composed = json!({
         "synthese_marche": synthese_marche,
         "actions_immediates": actions,
         "prochaine_analyse": prochaine_analyse,
         "opportunites_watchlist": opportunites_watchlist,
     });
-    patch_run_state(data_dir, &run_id, |state| {
-        if let Some(obj) = state.as_object_mut() {
-            obj.insert("composed_payload".to_string(), composed.clone());
-            obj.insert("updated_at".to_string(), json!(now_iso()));
-        }
-    })?;
+    append_mcp_result(data_dir, &run_id, &json!({
+        "type": "synthesis",
+        "composed_payload": composed,
+        "at": now_iso(),
+    }));
 
     append_progress(
         data_dir,

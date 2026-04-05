@@ -851,6 +851,27 @@ fn tool_validate_synthesis(data_dir: &Path, params: &Value) -> Result<Value> {
         }
     }
 
+    // Cross-check: actions must be consistent with per-line signals
+    let run_state = load_run_state(data_dir, &run_id)?;
+    let recs = run_state.get("pending_recommandations")
+        .and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let actionable_signals = ["ACHAT_FORT", "ACHAT", "VENTE", "ALLEGEMENT", "RENFORCEMENT"];
+    for (i, action) in actions.iter().enumerate() {
+        let action_ticker = as_text(action.get("ticker")).to_uppercase();
+        if action_ticker.is_empty() { continue; }
+        let line_rec = recs.iter().find(|r|
+            as_text(r.get("ticker")).to_uppercase() == action_ticker
+        );
+        if let Some(rec) = line_rec {
+            let line_signal = as_text(rec.get("signal")).to_uppercase();
+            if !actionable_signals.contains(&line_signal.as_str()) {
+                issues.push(format!(
+                    "action_{i}_{action_ticker}_conflicts_with_line_signal_{line_signal}"
+                ));
+            }
+        }
+    }
+
     // Priorities 1-5, unique
     let priorities: Vec<u64> = actions
         .iter()

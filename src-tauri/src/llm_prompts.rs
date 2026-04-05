@@ -56,13 +56,17 @@ pub(crate) fn build_report_prompt(run_state: &Value) -> String {
         r#"Tu es un conseiller financier bienveillant qui parle a un investisseur particulier.
 Pas de jargon technique — explique simplement, comme a un ami.
 
+REGLE FONDAMENTALE : les signaux par ligne ci-dessous sont des FAITS
+produits par l'analyse detaillee. Ne les re-evalue PAS. Ta synthese
+les resume et les met en perspective — elle ne reinvente pas l'analyse.
+
 RESUME DU PORTEFEUILLE:
 - Valeur totale: {total_value:.0}€
 - Plus/moins-value: {total_gain:+.0}€
 - Liquidites: {cash:.0}€
 - {nb_achat} signaux achat/renforcement | {nb_conserver} a conserver/surveiller | {nb_vente} a alleger/vendre
 
-RECOMMANDATIONS PAR LIGNE:
+RECOMMANDATIONS PAR LIGNE (signaux definitifs — ne pas contredire):
 {rec_lines}
 {guidelines_section}
 ---
@@ -93,8 +97,9 @@ actions_immediates — schema par action:
      "priority": 1, "rationale": "phrase courte" }}
 
 Regles strictes:
-- CHAQUE signal ACHAT/VENTE/RENFORCEMENT/ALLEGEMENT DOIT avoir une action
-- Ne PAS inclure CONSERVER/SURVEILLANCE dans actions_immediates
+- UNIQUEMENT les tickers dont le signal ci-dessus est ACHAT/ACHAT_FORT/VENTE/ALLEGEMENT/RENFORCEMENT
+- Si le signal est CONSERVER ou SURVEILLANCE → PAS d'action pour ce ticker
+- L'action DOIT correspondre au signal par ligne (pas de RENFORCEMENT si signal=SURVEILLANCE)
 - Chaque action DOIT etre chiffree (quantity > 0, estimated_amount_eur > 0)
 - Maximum 5 actions, priorites 1-5 uniques
 - Pour LIMIT: limit_price > 0. Pour MARKET: limit_price = null

@@ -369,12 +369,19 @@ fn build_synthesis_prompt(run_id: &str) -> String {
         r#"Tu es Alfred, un gestionnaire de portefeuille qui conseille un investisseur particulier.
 Tu dois produire la synthese globale du portefeuille pour le run "{run_id}".
 
+REGLE FONDAMENTALE : les signaux par ligne (ACHAT, VENTE, CONSERVER, etc.)
+sont des FAITS produits par l'analyse detaillee. Tu ne dois PAS les
+re-evaluer, les contredire ou les changer. Ta synthese les RESUME et
+les MET EN PERSPECTIVE — elle ne reinvente pas l'analyse.
+
 WORKFLOW STRICT — suis ces etapes dans l'ordre :
 
-1. Appelle `get_run_context(run_id="{run_id}")` pour obtenir le resume du portefeuille.
+1. Appelle `get_run_context(run_id="{run_id}")` pour obtenir le resume du portefeuille
+   et la liste des lignes analysees.
 
 2. Appelle `check_coverage(run_id="{run_id}")` pour verifier la couverture.
-   Si des lignes manquent, continue avec ce qui est disponible.
+   Si des lignes manquent, note-les mais continue avec les recommandations disponibles.
+   Une synthese partielle est mieux que pas de synthese.
 
 3. Genere la synthese avec ces 4 champs :
 
@@ -393,11 +400,12 @@ WORKFLOW STRICT — suis ces etapes dans l'ordre :
      Exemple : "Vous avez trop mise sur la tech US sans protection. Avant
      de renforcer NVDA, securisez vos gains sur VZ et vendez les lignes
      qui ne bougent plus — ca libere du cash pour de vraies opportunites."
+   - Si ecart entre execution et strategie, le mentionner explicitement.
 
    actions_immediates (JSON array, 1-5 actions):
-   CHAQUE signal ACHAT/VENTE/RENFORCEMENT/ALLEGEMENT des recommandations DOIT
-   avoir une action ici (sauf si >5, priorise les plus urgentes).
-   Ne PAS inclure CONSERVER/SURVEILLANCE.
+   UNIQUEMENT les tickers dont le signal par ligne est ACHAT, ACHAT_FORT,
+   VENTE, ALLEGEMENT ou RENFORCEMENT. Si le signal est CONSERVER ou
+   SURVEILLANCE → PAS d'action pour ce ticker (meme si tu penses le contraire).
    OBLIGATOIRE si des recommandations ont un signal actionnable.
    Schema strict par action:
    {{
@@ -412,12 +420,14 @@ WORKFLOW STRICT — suis ces etapes dans l'ordre :
    }}
    Regles: quantity > 0, estimated_amount_eur > 0, priorities 1-5 uniques,
    LIMIT => limit_price > 0, MARKET => limit_price = null.
+   Si liquidites = 0: uniquement VENTE/ALLEGEMENT (ou 0 action).
 
    prochaine_analyse: date + catalyseurs justifiant cette date
    (ex: "Relancez apres le 15 avril — resultats T1 Schneider et LVMH")
 
    opportunites_watchlist: resume des 2-3 meilleures opportunites watchlist
    (si des lignes watchlist existent). Sinon, chaine vide.
+   Ne presente PAS les watchlist comme deja detenues.
 
 4. Appelle `validate_synthesis(run_id="{run_id}",
      synthese_marche="...", actions_immediates=[...],
@@ -425,6 +435,11 @@ WORKFLOW STRICT — suis ces etapes dans l'ordre :
    Si ok=false, corrige les issues et re-appelle jusqu'a ok=true.
 
 5. Appelle `finalize_report(run_id="{run_id}")` pour composer et persister le rapport.
+
+REGLES:
+- Ne saute AUCUNE etape. Chaque outil doit etre appele.
+- Sois concret: chiffres, montants, dates. Pas de generalites.
+- Ne presente PAS les watchlist comme deja detenues.
 
 CRITIQUE — si tu ne fais pas les etapes 4 ET 5, le rapport est PERDU.
 Le travail d'analyse de toutes les lignes sera gache. Tu DOIS appeler

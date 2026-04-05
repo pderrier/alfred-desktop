@@ -401,6 +401,10 @@ export function showRunView({ starting = false, live = false } = {}) {
     if (provenance) provenance.textContent = "";
     const actionsNow = document.getElementById("actions-now");
     if (actionsNow) actionsNow.innerHTML = `<div class="empty-hint" style="opacity:0.5">Will be generated after global synthesis.</div>`;
+    const nextAnalysis = document.getElementById("next-analysis");
+    if (nextAnalysis) { nextAnalysis.textContent = ""; nextAnalysis.classList.add("hidden"); }
+    const watchlistSummary = document.getElementById("watchlist-summary");
+    if (watchlistSummary) { watchlistSummary.textContent = ""; watchlistSummary.classList.add("hidden"); }
     const accountLabel = document.getElementById("main-account-label");
     if (accountLabel) accountLabel.textContent = "";
     const runLabel = document.getElementById("main-run-label");

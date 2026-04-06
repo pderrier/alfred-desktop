@@ -480,6 +480,106 @@ fn cap_news_articles(news: &Value, max: usize) -> Value {
     result
 }
 
+/// Extract recent transactions and orders for a specific ticker from the run snapshot.
+/// Only includes transactions belonging to the account being analyzed.
+/// Returns a compact array of {date, action, amount, name} — max 10 items, newest first.
+fn build_line_activity(run_state: &Value, ticker: &str, isin: &str) -> Value {
+    let mut items: Vec<Value> = Vec::new();
+    let ticker_lower = ticker.to_lowercase();
+    let isin_lower = isin.to_lowercase();
+
+    // The account being analyzed (e.g. "Plan Epargne en Action")
+    let run_account = run_state.get("account").and_then(|v| v.as_str()).unwrap_or("");
+    let run_account_lower = run_account.to_lowercase();
+
+    // Transactions are at top-level run_state.transactions (Finary format)
+    if let Some(txs) = run_state.get("transactions").and_then(|v| v.as_array()) {
+        for tx in txs {
+            // Filter by account: transaction.account.display_name or .name must match run account
+            let tx_account = tx.get("account")
+                .and_then(|a| a.get("display_name").or(a.get("name")))
+                .and_then(|v| v.as_str()).unwrap_or("");
+            if !run_account_lower.is_empty() && !tx_account.to_lowercase().contains(&run_account_lower) {
+                continue;
+            }
+
+            let name = tx.get("name").or(tx.get("display_name"))
+                .and_then(|v| v.as_str()).unwrap_or("");
+            let simplified = tx.get("simplified_name").and_then(|v| v.as_str()).unwrap_or("");
+            let name_lower = format!("{name} {simplified}").to_lowercase();
+
+            // Match by ticker or ISIN in the transaction name
+            let matches = (!ticker_lower.is_empty() && name_lower.contains(&ticker_lower))
+                || (!isin_lower.is_empty() && name_lower.contains(&isin_lower))
+                || name_lower.split(&['-', ' ', ','][..])
+                    .any(|part| {
+                        let p = part.trim();
+                        (!ticker_lower.is_empty() && p == ticker_lower)
+                            || (!isin_lower.is_empty() && p == isin_lower)
+                    });
+
+            if matches {
+                let date = tx.get("display_date").or(tx.get("date"))
+                    .and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let value = tx.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let action = if value > 0.0 { "vente" } else { "achat" };
+                items.push(json!({
+                    "date": date,
+                    "action": action,
+                    "amount_eur": value.abs(),
+                    "name": truncate_activity_name(name, 60),
+                }));
+            }
+        }
+    }
+
+    // Also check run_state.orders (securities orders from Finary)
+    if let Some(orders) = run_state.get("orders").and_then(|v| v.as_array()) {
+        for order in orders {
+            // Filter by account
+            let order_account = order.get("account")
+                .and_then(|a| a.get("display_name").or(a.get("name")))
+                .and_then(|v| v.as_str()).unwrap_or("");
+            if !run_account_lower.is_empty() && !order_account.to_lowercase().contains(&run_account_lower) {
+                continue;
+            }
+
+            let security_name = order.get("security")
+                .and_then(|s| s.get("name").or(s.get("symbol")))
+                .and_then(|v| v.as_str()).unwrap_or("");
+            let security_lower = security_name.to_lowercase();
+            if security_lower.contains(&ticker_lower) || security_lower.contains(&isin_lower) {
+                let date = order.get("date").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let side = order.get("side").and_then(|v| v.as_str()).unwrap_or("buy");
+                let quantity = order.get("quantity").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let price = order.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                items.push(json!({
+                    "date": date,
+                    "action": side,
+                    "quantity": quantity,
+                    "price": price,
+                    "amount_eur": quantity * price,
+                    "name": truncate_activity_name(security_name, 60),
+                }));
+            }
+        }
+    }
+
+    // Sort by date descending, cap at 10
+    items.sort_by(|a, b| {
+        let da = a.get("date").and_then(|v| v.as_str()).unwrap_or("");
+        let db = b.get("date").and_then(|v| v.as_str()).unwrap_or("");
+        db.cmp(da)
+    });
+    items.truncate(10);
+
+    json!(items)
+}
+
+fn truncate_activity_name(s: &str, max: usize) -> String {
+    if s.len() <= max { s.to_string() } else { format!("{}…", &s[..max]) }
+}
+
 fn tool_get_line_data(data_dir: &Path, params: &Value) -> Result<Value> {
     let run_id = as_text(params.get("run_id"));
     let line_id = as_text(params.get("line_id"));
@@ -594,6 +694,9 @@ fn tool_get_line_data(data_dir: &Path, params: &Value) -> Result<Value> {
         .cloned()
         .unwrap_or(Value::Null);
 
+    // Recent transactions/orders for this ticker (from snapshot)
+    let activity = build_line_activity(&run_state, &ticker, isin);
+
     // Write progress event — "collecting context" step
     append_progress(
         data_dir,
@@ -621,6 +724,7 @@ fn tool_get_line_data(data_dir: &Path, params: &Value) -> Result<Value> {
             "sector_analysis": sector_analysis,
             "cot": cot_data,
         },
+        "activity": activity,
         "line_memory": line_memory,
         "quality": quality,
     }))

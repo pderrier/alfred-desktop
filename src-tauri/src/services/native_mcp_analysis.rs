@@ -111,6 +111,25 @@ fn build_native_line_prompt(_run_id: &str, ticker: &str, nom: &str, line_type: &
     let memory = serde_json::to_string_pretty(&line_data["line_memory"]).unwrap_or_default();
     let quality = serde_json::to_string_pretty(&line_data["quality"]).unwrap_or_default();
 
+    // Build activity section (recent transactions/orders for this ticker)
+    let activity_section = {
+        let items = line_data.get("activity").and_then(|v| v.as_array());
+        match items {
+            Some(arr) if !arr.is_empty() => {
+                let mut lines = vec!["\nHistorique des operations recentes:".to_string()];
+                for item in arr.iter().take(10) {
+                    let date = item.get("date").and_then(|v| v.as_str()).unwrap_or("?");
+                    let action = item.get("action").and_then(|v| v.as_str()).unwrap_or("?");
+                    let amount = item.get("amount_eur").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    lines.push(format!("- {date}: {action} — {amount:.0}€ ({name})"));
+                }
+                lines.join("\n")
+            }
+            _ => String::new(),
+        }
+    };
+
     // Build sector COT section (human-readable, not raw JSON)
     let sector_section = {
         let sc = &line_data["sector_cot"];
@@ -157,6 +176,7 @@ Actualites:
 Insights partages:
 {insights}
 {sector_section}
+{activity_section}
 
 Memoire precedente:
 {memory}

@@ -146,6 +146,7 @@ pub(crate) fn build_line_analysis_prompt(
     let section_shared = build_shared_insights_section(line_context.get("shared_insights"));
     let section_memory = build_memory_section(line_context.get("line_memory"));
     let section_sector_cot = build_sector_cot_section(line_context.get("sector_cot"));
+    let section_activity = build_activity_section(line_context.get("activity"));
     let section_data_quality = build_data_quality_section(line_context.get("market"));
 
     let guidelines_section = if guidelines.is_empty() {
@@ -166,6 +167,7 @@ VALEUR ANALYSEE: {nom} ({ticker})
 {section_news}
 {section_shared}
 {section_sector_cot}
+{section_activity}
 {section_memory}
 
 CONTEXTE PORTEFEUILLE:
@@ -483,6 +485,29 @@ fn build_shared_insights_section(insights: Option<&Value>) -> String {
     }
 
     if lines.len() == 1 { return String::new(); }
+    lines.join("\n")
+}
+
+fn build_activity_section(activity: Option<&Value>) -> String {
+    let arr = match activity {
+        Some(Value::Array(a)) if !a.is_empty() => a,
+        _ => return String::new(),
+    };
+
+    let mut lines = vec!["HISTORIQUE DES OPERATIONS RECENTES:".to_string()];
+    for item in arr.iter().take(10) {
+        let date = item.get("date").and_then(|v| v.as_str()).unwrap_or("?");
+        let action = item.get("action").and_then(|v| v.as_str()).unwrap_or("?");
+        let amount = item.get("amount_eur").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let qty_str = item.get("quantity")
+            .and_then(|v| v.as_f64())
+            .map(|q| format!(" x{q:.0}"))
+            .unwrap_or_default();
+        lines.push(format!("- {date}: {action}{qty_str} — {amount:.0}€ ({name})"));
+    }
+
+    lines.push("\nConsigne: tiens compte de l'historique des operations pour evaluer le timing et la conviction de l'investisseur.".to_string());
     lines.join("\n")
 }
 

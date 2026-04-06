@@ -126,7 +126,10 @@ pub(crate) fn persist_shared_insights_if_present(recommendation: &Value, line_co
         .and_then(|r| r.get("isin"))
         .and_then(|v| v.as_str())
         .unwrap_or(ticker);
-    crate::alfred_api_client::persist_shared_insights(ticker, isin, &Value::Object(insights));
+    // Extract sector from line_context if available (set by get_line_data)
+    let sector = line_context.get("sector").and_then(|v| v.as_str());
+    let sector_analysis = recommendation.get("sector_analysis").and_then(|v| v.as_str());
+    crate::alfred_api_client::persist_shared_insights(ticker, isin, &Value::Object(insights), sector, sector_analysis);
 }
 
 /// Persist the deep news summary to the per-URL API cache.

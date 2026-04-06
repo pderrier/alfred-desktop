@@ -150,10 +150,28 @@ pub fn remote_fetch_insights(ticker: &str, isin: &str) -> Result<Value> {
     api_get(&format!("/api/insights?ticker={}&isin={}", urlenc(ticker), urlenc(isin)), TIMEOUT_SECS)
 }
 
+/// Fetch sector classification for a ticker from the API.
+pub fn remote_fetch_sector(ticker: &str, name: &str, isin: &str) -> Result<Value> {
+    api_get(&format!("/api/sector?ticker={}&name={}&isin={}", urlenc(ticker), urlenc(name), urlenc(isin)), TIMEOUT_SECS)
+}
+
+/// Fetch COT data for a ticker from the API.
+pub fn remote_fetch_cot(ticker: &str, isin: &str) -> Result<Value> {
+    api_get(&format!("/api/cot?ticker={}&isin={}", urlenc(ticker), urlenc(isin)), TIMEOUT_SECS)
+}
+
 /// Persist shared insights (generic analysis) back to the API for other users.
-pub fn persist_shared_insights(ticker: &str, isin: &str, insights: &Value) {
+/// Optionally includes sector classification and sector analysis memo.
+pub fn persist_shared_insights(ticker: &str, isin: &str, insights: &Value, sector: Option<&str>, sector_analysis: Option<&str>) {
     if !insights.is_object() || insights.as_object().map(|o| o.is_empty()).unwrap_or(true) { return; }
-    api_post("/api/insights", &serde_json::json!({ "ticker": ticker, "isin": isin, "insights": insights }));
+    let mut body = serde_json::json!({ "ticker": ticker, "isin": isin, "insights": insights });
+    if let Some(s) = sector {
+        body["sector"] = serde_json::json!(s);
+    }
+    if let Some(sa) = sector_analysis {
+        body["sector_analysis"] = serde_json::json!(sa);
+    }
+    api_post("/api/insights", &body);
     crate::debug_log(&format!("alfred-api: persisted shared insights for {ticker}"));
 }
 

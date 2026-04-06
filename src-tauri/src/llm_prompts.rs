@@ -145,6 +145,7 @@ pub(crate) fn build_line_analysis_prompt(
     let section_news = build_news_section(line_context.get("news"));
     let section_shared = build_shared_insights_section(line_context.get("shared_insights"));
     let section_memory = build_memory_section(line_context.get("line_memory"));
+    let section_sector_cot = build_sector_cot_section(line_context.get("sector_cot"));
     let section_data_quality = build_data_quality_section(line_context.get("market"));
 
     let guidelines_section = if guidelines.is_empty() {
@@ -164,6 +165,7 @@ VALEUR ANALYSEE: {nom} ({ticker})
 {section_data_quality}
 {section_news}
 {section_shared}
+{section_sector_cot}
 {section_memory}
 
 CONTEXTE PORTEFEUILLE:
@@ -199,7 +201,8 @@ Produis ton analyse en JSON UNIQUEMENT avec cette structure exacte:
     "deep_news_summary": "synthese 100-500 chars des actualites les plus impactantes pour cet investissement",
     "deep_news_quality_score": 75,
     "deep_news_relevance": "high|medium|low",
-    "deep_news_staleness": "fresh|recent|stale"{extracted_fundamentals_field}
+    "deep_news_staleness": "fresh|recent|stale",
+    "sector_analysis": "2-3 phrases sur le positionnement sectoriel (COT, tendances, risques macro)"{extracted_fundamentals_field}
   }}
 }}
 
@@ -480,6 +483,47 @@ fn build_shared_insights_section(insights: Option<&Value>) -> String {
     }
 
     if lines.len() == 1 { return String::new(); }
+    lines.join("\n")
+}
+
+fn build_sector_cot_section(sector_cot: Option<&Value>) -> String {
+    let data = match sector_cot {
+        Some(v) if v.is_object() => v,
+        _ => return String::new(),
+    };
+
+    let sector = data.get("sector").and_then(|v| v.as_str()).unwrap_or("");
+    if sector.is_empty() { return String::new(); }
+
+    let sector_upper = sector.to_uppercase().replace('_', " ");
+    let mut lines = vec![format!("POSITIONNEMENT SECTORIEL ({sector_upper}):")];
+
+    // COT contracts
+    if let Some(cot_obj) = data.get("cot") {
+        let contracts = cot_obj.get("contracts").and_then(|v| v.as_array());
+        if let Some(contracts) = contracts {
+            for item in contracts {
+                let contract = item.get("contract").and_then(|v| v.as_str()).unwrap_or("?");
+                let net = item.get("noncomm_net").and_then(|v| v.as_i64()).unwrap_or(0);
+                let change = item.get("change_noncomm_net").and_then(|v| v.as_i64()).unwrap_or(0);
+                let sentiment = item.get("sentiment").and_then(|v| v.as_str()).unwrap_or("?");
+                let sign = if change >= 0 { "+" } else { "" };
+                lines.push(format!(
+                    "- {contract}: net speculateurs = {net} ({sign}{change}), sentiment = {sentiment}"
+                ));
+            }
+        }
+    }
+
+    // Sector analysis memo (from previous analyses)
+    if let Some(analysis) = data.get("sector_analysis").and_then(|v| v.as_str()) {
+        if !analysis.is_empty() {
+            lines.push(format!("- Memo sectoriel precedent: {}", truncate_str(analysis, 400)));
+        }
+    }
+
+    if lines.len() == 1 { return String::new(); }
+    lines.push("\nConsigne: integre le positionnement COT dans ton analyse de sentiment. Un COT tres haussier/baissier sur les futures du secteur est un signal macro a mentionner.".to_string());
     lines.join("\n")
 }
 

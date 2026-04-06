@@ -35,6 +35,26 @@ pub fn fetch_shared_insights(ticker: &str, isin: &str) -> Result<Value> {
     }
 }
 
+pub fn fetch_sector(ticker: &str, name: &str, isin: &str) -> Result<Value> {
+    match crate::alfred_api_client::remote_fetch_sector(ticker, name, isin) {
+        Ok(resp) => Ok(resp),
+        Err(e) => {
+            crate::debug_log(&format!("enrichment sector unavailable for {ticker}: {e}"));
+            Ok(json!({ "ok": true, "sector": null }))
+        }
+    }
+}
+
+pub fn fetch_cot(ticker: &str, isin: &str) -> Result<Value> {
+    match crate::alfred_api_client::remote_fetch_cot(ticker, isin) {
+        Ok(resp) => Ok(resp),
+        Err(e) => {
+            crate::debug_log(&format!("enrichment COT unavailable for {ticker}: {e}"));
+            Ok(json!({ "ok": true, "cot": null }))
+        }
+    }
+}
+
 pub fn fetch_news(ticker: &str, name: &str, isin: &str) -> Result<Value> {
     match crate::alfred_api_client::remote_fetch_news(ticker, name, isin) {
         Ok(resp) => {

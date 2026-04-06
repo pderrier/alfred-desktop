@@ -206,8 +206,8 @@ fn api_persist_extracted_fundamentals(ticker: &str, isin: &str, extracted: &Valu
     crate::alfred_api_client::persist_extracted_fundamentals(ticker, isin, extracted);
 }
 
-fn api_persist_shared_insights(ticker: &str, isin: &str, insights: &Value) {
-    crate::alfred_api_client::persist_shared_insights(ticker, isin, insights);
+fn api_persist_shared_insights(ticker: &str, isin: &str, insights: &Value, sector: Option<&str>, sector_analysis: Option<&str>) {
+    crate::alfred_api_client::persist_shared_insights(ticker, isin, insights, sector, sector_analysis);
 }
 
 // ── JSON-RPC 2.0 helpers ────────────────────────────────────────────────────
@@ -322,13 +322,15 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "persist_shared_insights",
-            "description": "Persist shared analysis insights to the Alfred API cache.",
+            "description": "Persist shared analysis insights to the Alfred API cache. Optionally includes sector classification and sector analysis memo.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "ticker": { "type": "string" },
                     "isin": { "type": "string" },
-                    "insights": { "type": "string", "description": "JSON string of insights object" }
+                    "insights": { "type": "string", "description": "JSON string of insights object" },
+                    "sector": { "type": "string", "description": "GICS sector slug (e.g. energy, tech, financials)" },
+                    "sector_analysis": { "type": "string", "description": "2-3 phrases sur le positionnement sectoriel (COT, tendances macro)" }
                 },
                 "required": ["ticker", "isin", "insights"]
             }
@@ -553,6 +555,24 @@ fn tool_get_line_data(data_dir: &Path, params: &Value) -> Result<Value> {
         .and_then(|r| r.get("insights").cloned())
         .unwrap_or(Value::Null);
 
+    // Sector classification + COT positioning
+    let name = position_row.get("nom").and_then(|v| v.as_str()).unwrap_or("");
+    let sector_resp = crate::enrichment::fetch_sector(&ticker, name, isin).ok();
+    let sector_slug = sector_resp.as_ref()
+        .and_then(|r| r.get("sector").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    let sector_analysis = sector_resp.as_ref()
+        .and_then(|r| r.get("sector_analysis").cloned())
+        .unwrap_or(Value::Null);
+    let cot_data = if !sector_slug.is_empty() {
+        crate::enrichment::fetch_cot(&ticker, isin)
+            .ok()
+            .and_then(|r| r.get("cot").cloned())
+            .unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+
     // Line memory (cross-run)
     let line_memory = {
         let mem_path = line_memory_path(data_dir);
@@ -591,10 +611,16 @@ fn tool_get_line_data(data_dir: &Path, params: &Value) -> Result<Value> {
         "line_id": line_id,
         "line_type": line_type,
         "ticker": ticker,
+        "sector": sector_slug,
         "position": position_row,
         "market_data": market_data,
         "news": news,
         "shared_insights": shared_insights,
+        "sector_cot": {
+            "sector": sector_slug,
+            "sector_analysis": sector_analysis,
+            "cot": cot_data,
+        },
         "line_memory": line_memory,
         "quality": quality,
     }))
@@ -1033,7 +1059,10 @@ fn tool_persist_shared_insights(data_dir: &Path, params: &Value) -> Result<Value
         }));
     }
 
-    api_persist_shared_insights(&ticker, &isin, &insights);
+    // Extract optional sector fields from params
+    let sector = params.get("sector").and_then(|v| v.as_str());
+    let sector_analysis = params.get("sector_analysis").and_then(|v| v.as_str());
+    api_persist_shared_insights(&ticker, &isin, &insights, sector, sector_analysis);
 
     Ok(json!({ "ok": true }))
 }

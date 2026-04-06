@@ -73,13 +73,63 @@ pub fn generate_line_analysis(
     agent_guidelines: Option<&str>,
     validation_context: Option<&Value>,
 ) -> Result<Value> {
+    // Enrich line_context with sector + COT data if not already present
+    let enriched_context = enrich_line_context_with_sector(line_context);
+    let ctx = &enriched_context;
+
     let mode = resolve_generation_mode();
     match mode.as_str() {
-        "live" => generate_line_live(line_context, run_state, agent_guidelines, validation_context),
-        "codex_proxy" => generate_line_codex(line_context, run_state, agent_guidelines, validation_context),
-        "mock_cache" | "mock_past" => generate_line_from_cache(line_context),
-        _ => generate_line_codex(line_context, run_state, agent_guidelines, validation_context),
+        "live" => generate_line_live(ctx, run_state, agent_guidelines, validation_context),
+        "codex_proxy" => generate_line_codex(ctx, run_state, agent_guidelines, validation_context),
+        "mock_cache" | "mock_past" => generate_line_from_cache(ctx),
+        _ => generate_line_codex(ctx, run_state, agent_guidelines, validation_context),
     }
+}
+
+/// Inject sector_cot into line_context if missing (for JS-originating contexts).
+fn enrich_line_context_with_sector(line_context: &Value) -> Value {
+    // Skip if already enriched
+    if line_context.get("sector_cot").is_some() {
+        return line_context.clone();
+    }
+
+    let ticker = line_context.get("ticker").and_then(|v| v.as_str()).unwrap_or("");
+    let isin = line_context
+        .get("row").and_then(|r| r.get("isin")).and_then(|v| v.as_str())
+        .or_else(|| line_context.get("isin").and_then(|v| v.as_str()))
+        .unwrap_or(ticker);
+    let name = line_context.get("nom").and_then(|v| v.as_str()).unwrap_or("");
+
+    if ticker.is_empty() && isin.is_empty() {
+        return line_context.clone();
+    }
+
+    let sector_resp = crate::enrichment::fetch_sector(ticker, name, isin).ok();
+    let sector_slug = sector_resp.as_ref()
+        .and_then(|r| r.get("sector").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    let sector_analysis = sector_resp.as_ref()
+        .and_then(|r| r.get("sector_analysis").cloned())
+        .unwrap_or(Value::Null);
+    let cot_data = if !sector_slug.is_empty() {
+        crate::enrichment::fetch_cot(ticker, isin)
+            .ok()
+            .and_then(|r| r.get("cot").cloned())
+            .unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+
+    let mut enriched = line_context.clone();
+    if let Some(obj) = enriched.as_object_mut() {
+        obj.insert("sector".to_string(), serde_json::json!(sector_slug));
+        obj.insert("sector_cot".to_string(), serde_json::json!({
+            "sector": sector_slug,
+            "sector_analysis": sector_analysis,
+            "cot": cot_data,
+        }));
+    }
+    enriched
 }
 
 fn update_synthesis_progress(run_id: &str, progress: &str) {

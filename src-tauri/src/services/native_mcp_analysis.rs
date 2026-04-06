@@ -111,6 +111,33 @@ fn build_native_line_prompt(_run_id: &str, ticker: &str, nom: &str, line_type: &
     let memory = serde_json::to_string_pretty(&line_data["line_memory"]).unwrap_or_default();
     let quality = serde_json::to_string_pretty(&line_data["quality"]).unwrap_or_default();
 
+    // Build sector COT section (human-readable, not raw JSON)
+    let sector_section = {
+        let sc = &line_data["sector_cot"];
+        let sector = sc.get("sector").and_then(|v| v.as_str()).unwrap_or("");
+        if sector.is_empty() {
+            String::new()
+        } else {
+            let mut lines = vec![format!("\nPositionnement sectoriel ({}):", sector.to_uppercase())];
+            if let Some(cot_obj) = sc.get("cot") {
+                if let Some(contracts) = cot_obj.get("contracts").and_then(|v| v.as_array()) {
+                    for item in contracts {
+                        let c = item.get("contract").and_then(|v| v.as_str()).unwrap_or("?");
+                        let net = item.get("noncomm_net").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let chg = item.get("change_noncomm_net").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let sent = item.get("sentiment").and_then(|v| v.as_str()).unwrap_or("?");
+                        let sign = if chg >= 0 { "+" } else { "" };
+                        lines.push(format!("- {c}: net speculateurs = {net} ({sign}{chg}), sentiment = {sent}"));
+                    }
+                }
+            }
+            if let Some(sa) = sc.get("sector_analysis").and_then(|v| v.as_str()) {
+                if !sa.is_empty() { lines.push(format!("- Memo sectoriel: {sa}")); }
+            }
+            lines.join("\n")
+        }
+    };
+
     format!(
         r#"Tu es Alfred, un conseiller financier bienveillant. Analyse cette ligne.
 
@@ -129,6 +156,7 @@ Actualites:
 
 Insights partages:
 {insights}
+{sector_section}
 
 Memoire precedente:
 {memory}
@@ -300,13 +328,24 @@ fn persist_line_extras(data_dir: &std::path::Path, ticker: &str, line_data: &Val
         .and_then(|v| v.as_str())
         .unwrap_or(ticker);
 
-    // Persist shared insights
+    // Persist shared insights (with optional sector analysis)
     if let Some(insights) = rec.get("shared_insights") {
         if !insights.is_null() {
+            let mut params = json!({
+                "ticker": ticker,
+                "isin": isin,
+                "insights": serde_json::to_string(insights).unwrap_or_default(),
+            });
+            if let Some(sector) = rec.get("sector").and_then(|v| v.as_str()) {
+                params["sector"] = json!(sector);
+            }
+            if let Some(sa) = rec.get("sector_analysis").and_then(|v| v.as_str()) {
+                params["sector_analysis"] = json!(sa);
+            }
             crate::mcp_server::dispatch_tool_direct(
                 data_dir,
                 "persist_shared_insights",
-                &json!({"ticker": ticker, "isin": isin, "insights": serde_json::to_string(insights).unwrap_or_default()}),
+                &params,
             );
         }
     }
@@ -354,6 +393,7 @@ Pour CHAQUE ligne ci-dessus :
    - deep_news_staleness: fresh|recent|stale
    - reanalyse_after: date ISO, reanalyse_reason
    - llm_memory_summary: resume factuel
+   - sector_analysis: 2-3 phrases sur le positionnement sectoriel (COT, tendances macro)
 3. Appelle `validate_recommendation(run_id="{run_id}", recommendation=...)`.
    Si ok=false, corrige les issues et re-appelle jusqu'a ok=true.
 4. BUDGET WEB: maximum 1 recherche web par ligne. Utilise-la uniquement si

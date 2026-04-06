@@ -5,6 +5,66 @@
 
 use serde_json::{json, Value};
 
+// ── Previous syntheses loader ───────────────────────────────────
+
+/// Load the last N global syntheses from report history for narrative continuity.
+pub(crate) fn load_previous_syntheses(limit: usize) -> Vec<(String, String)> {
+    let history_dir = crate::paths::resolve_report_history_dir();
+    if !history_dir.exists() { return Vec::new(); }
+
+    let mut entries: Vec<(String, String, String)> = Vec::new(); // (date, run_id, synthese)
+
+    if let Ok(dir) = std::fs::read_dir(&history_dir) {
+        for entry in dir.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") { continue; }
+            let filename = entry.file_name().to_string_lossy().to_string();
+            // Extract date from filename: "20260406_224820_runid.json"
+            let date = filename.get(..8).unwrap_or("?").to_string();
+
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if let Ok(artifact) = serde_json::from_str::<Value>(&text) {
+                    let synthese = artifact.get("payload")
+                        .and_then(|p| p.get("synthese_marche"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if !synthese.is_empty() {
+                        entries.push((filename.clone(), date, synthese.to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort by filename desc (most recent first), deduplicate by date prefix
+    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut seen_dates = std::collections::HashSet::new();
+    entries.into_iter()
+        .filter(|(_, date, _)| seen_dates.insert(date.clone()))
+        .take(limit)
+        .map(|(_, date, synthese)| (date, synthese))
+        .collect()
+}
+
+/// Public version for use by native_mcp_analysis synthesis prompt.
+pub(crate) fn build_previous_syntheses_section_public() -> String {
+    build_previous_syntheses_section()
+}
+
+fn build_previous_syntheses_section() -> String {
+    let prev = load_previous_syntheses(2);
+    if prev.is_empty() { return String::new(); }
+
+    let mut lines = vec!["\nSYNTHESES PRECEDENTES (pour continuite narrative — ne pas repeter, mais faire evoluer):".to_string()];
+    for (date, synthese) in &prev {
+        let formatted_date = format!("{}-{}-{}", &date[..4], &date[4..6], &date[6..8]);
+        let truncated = if synthese.len() > 600 { format!("{}…", &synthese[..600]) } else { synthese.clone() };
+        lines.push(format!("[{formatted_date}] {truncated}"));
+    }
+    lines.push("\nConsigne: construis sur ces analyses precedentes. Identifie ce qui a CHANGE (nouvelles positions, evolution des signaux, performances). Evite de repeter les memes observations — fais progresser le narratif.".to_string());
+    lines.join("\n")
+}
+
 // ── Report synthesis prompt ──────────────────────────────────────
 
 pub(crate) fn build_report_prompt(run_state: &Value) -> String {
@@ -52,6 +112,8 @@ pub(crate) fn build_report_prompt(run_state: &Value) -> String {
         format!("\nDIRECTIVES INVESTISSEUR:\n{guidelines}\n")
     };
 
+    let previous_syntheses = build_previous_syntheses_section();
+
     format!(
         r#"Tu es un conseiller financier bienveillant qui parle a un investisseur particulier.
 Pas de jargon technique — explique simplement, comme a un ami.
@@ -68,7 +130,7 @@ RESUME DU PORTEFEUILLE:
 
 RECOMMANDATIONS PAR LIGNE (signaux definitifs — ne pas contredire):
 {rec_lines}
-{guidelines_section}
+{guidelines_section}{previous_syntheses}
 ---
 
 Produis un JSON avec exactement ces champs:
@@ -507,7 +569,7 @@ fn build_activity_section(activity: Option<&Value>) -> String {
         lines.push(format!("- {date}: {action}{qty_str} — {amount:.0}€ ({name})"));
     }
 
-    lines.push("\nConsigne: tiens compte de l'historique des operations pour evaluer le timing et la conviction de l'investisseur.".to_string());
+    lines.push("\nConsigne: analyse les decisions passees (bon timing? prix moyen d'achat vs cours actuel? renforcements/allegements pertinents?). Commente les bonnes et mauvaises decisions, et utilise-les pour calibrer ta recommandation.".to_string());
     lines.join("\n")
 }
 
@@ -592,7 +654,7 @@ fn build_memory_section(memory: Option<&Value>) -> String {
         if !items.is_empty() { lines.push(format!("- Historique cle: {}", items.join("; "))); }
     }
 
-    lines.push("\nConsigne: utilise l'historique pour ajuster ta decision. Si tu changes de signal, explique pourquoi.".to_string());
+    lines.push("\nConsigne: construis un NARRATIF progressif — ne repete pas les memes observations. Identifie ce qui a CHANGE depuis la derniere analyse (prix, fondamentaux, actualites). Si tu changes de signal, explique le declencheur. Si tu confirmes, dis pourquoi la these tient toujours malgre l'evolution du marche.".to_string());
 
     if lines.len() == 1 { lines.push("- Premiere analyse".to_string()); }
     lines.join("\n")

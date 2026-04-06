@@ -431,7 +431,8 @@ Regles :
 - Toujours appeler validate_recommendation — ne presume pas que ton output est valide.
 - Sois concret sur les chiffres.
 - Les articles marques "RESUME APPROFONDI (cache)" sont deja resumes — utilise-les directement.
-- Les articles marques "A APPROFONDIR" n'ont pas de resume — lis-les via recherche web."#,
+- Les articles marques "A APPROFONDIR" n'ont pas de resume — lis-les via recherche web.
+- Si `activity` contient des operations recentes, commente les decisions passees (timing, prix d'achat vs cours actuel, renforcements pertinents ou non). Utilise-les pour calibrer ta recommandation."#,
         count = tickers.len(),
         run_id = run_id,
         lines_list = lines_list,
@@ -439,6 +440,8 @@ Regles :
 }
 
 fn build_synthesis_prompt(run_id: &str) -> String {
+    let previous_syntheses = crate::llm_prompts::build_previous_syntheses_section_public();
+
     format!(
         r#"Tu es Alfred, un gestionnaire de portefeuille qui conseille un investisseur particulier.
 Tu dois produire la synthese globale du portefeuille pour le run "{run_id}".
@@ -510,6 +513,8 @@ WORKFLOW STRICT — suis ces etapes dans l'ordre :
    Si ok=false, corrige les issues et re-appelle jusqu'a ok=true.
 
 5. Appelle `finalize_report(run_id="{run_id}")` pour composer et persister le rapport.
+
+{previous_syntheses}
 
 REGLES:
 - Ne saute AUCUNE etape (get_run_context, check_coverage, validate_synthesis, finalize_report).

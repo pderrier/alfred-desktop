@@ -482,11 +482,18 @@ fn cap_news_articles(news: &Value, max: usize) -> Value {
 
 /// Extract recent transactions and orders for a specific ticker from the run snapshot.
 /// Only includes transactions belonging to the account being analyzed.
+/// Matches by ticker, ISIN, or position name (e.g. ticker=ALSTI, name="STIF SA" matches "ACHAT COMPTANT - STIF").
 /// Returns a compact array of {date, action, amount, name} — max 10 items, newest first.
-fn build_line_activity(run_state: &Value, ticker: &str, isin: &str) -> Value {
+fn build_line_activity(run_state: &Value, ticker: &str, isin: &str, position_name: &str) -> Value {
     let mut items: Vec<Value> = Vec::new();
     let ticker_lower = ticker.to_lowercase();
     let isin_lower = isin.to_lowercase();
+    // Extract significant words from position name (>= 3 chars) for fuzzy matching
+    let name_words: Vec<String> = position_name.to_lowercase()
+        .split_whitespace()
+        .filter(|w| w.len() >= 3 && !["sa", "se", "nv", "plc", "inc", "spa", "group", "groupe"].contains(w))
+        .map(String::from)
+        .collect();
 
     // The account being analyzed (e.g. "Plan Epargne en Action")
     let run_account = run_state.get("account").and_then(|v| v.as_str()).unwrap_or("");
@@ -508,9 +515,14 @@ fn build_line_activity(run_state: &Value, ticker: &str, isin: &str) -> Value {
             let simplified = tx.get("simplified_name").and_then(|v| v.as_str()).unwrap_or("");
             let name_lower = format!("{name} {simplified}").to_lowercase();
 
-            // Match by ticker or ISIN in the transaction name
+            // Match by ticker, ISIN, or position name words in the transaction name
             let matches = (!ticker_lower.is_empty() && name_lower.contains(&ticker_lower))
                 || (!isin_lower.is_empty() && name_lower.contains(&isin_lower))
+                || name_words.iter().any(|w| {
+                    // Check if a name word appears as a distinct token in the transaction
+                    name_lower.split(&['-', ' ', ',', '(', ')'][..])
+                        .any(|part| part.trim() == w.as_str())
+                })
                 || name_lower.split(&['-', ' ', ','][..])
                     .any(|part| {
                         let p = part.trim();
@@ -695,7 +707,8 @@ fn tool_get_line_data(data_dir: &Path, params: &Value) -> Result<Value> {
         .unwrap_or(Value::Null);
 
     // Recent transactions/orders for this ticker (from snapshot)
-    let activity = build_line_activity(&run_state, &ticker, isin);
+    let position_name = position_row.get("nom").and_then(|v| v.as_str()).unwrap_or("");
+    let activity = build_line_activity(&run_state, &ticker, isin, position_name);
 
     // Write progress event — "collecting context" step
     append_progress(

@@ -772,11 +772,52 @@ impl McpBatchDispatchQueue {
                     );
                 }));
 
-                let result = crate::llm_backend::run_prompt(&prompt, timeout_ms, progress_cb);
-                let _ = tx.send(match result {
-                    Ok(_) => Ok(batch_tickers),
-                    Err(e) => {
-                        eprintln!("[mcp-batch] turn failed: {e}");
+                // Retry transient errors (capacity, stream disconnect, network) with backoff
+                const MAX_BATCH_RETRIES: u32 = 2;
+                let mut progress_cb = progress_cb; // make mutable for .take()
+                let mut last_err = None;
+                for attempt in 0..=MAX_BATCH_RETRIES {
+                    if attempt > 0 {
+                        let backoff_secs = 10 * attempt as u64;
+                        eprintln!("[mcp-batch] retry {attempt}/{MAX_BATCH_RETRIES} in {backoff_secs}s");
+                        for t in &batch_tickers {
+                            let _ = crate::run_state::update_line_status_with_progress(
+                                &progress_run_id, t, "analyzing",
+                                &format!("retry {attempt}/{MAX_BATCH_RETRIES}\u{2026}"),
+                            );
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(backoff_secs));
+                    }
+
+                    // Progress callback is consumed on first attempt only
+                    let cb = if attempt == 0 { progress_cb.take() } else { None };
+                    let result = crate::llm_backend::run_prompt(&prompt, timeout_ms, cb);
+
+                    match result {
+                        Ok(_) => { last_err = None; break; }
+                        Err(e) => {
+                            let msg = format!("{e}");
+                            let is_transient = msg.contains("at capacity")
+                                || msg.contains("stream disconnected")
+                                || msg.contains("systemError")
+                                || msg.contains("os error 10060")
+                                || msg.contains("connection")
+                                || msg.contains("Network Error");
+                            if is_transient && attempt < MAX_BATCH_RETRIES {
+                                eprintln!("[mcp-batch] transient error (attempt {attempt}): {msg}");
+                                last_err = Some(e);
+                                continue;
+                            }
+                            last_err = Some(e);
+                            break;
+                        }
+                    }
+                }
+
+                let _ = tx.send(match last_err {
+                    None => Ok(batch_tickers),
+                    Some(e) => {
+                        eprintln!("[mcp-batch] batch failed after retries: {e}");
                         let err_msg = format!("{e}");
                         for t in &batch_tickers {
                             let _ = crate::run_state::update_line_status_with_error(&progress_run_id, t, "failed", Some(&err_msg));
@@ -823,7 +864,42 @@ pub fn run_synthesis_turn(run_id: &str, data_dir: &str) -> Result<Value> {
             &pdd, &prid, "__synthesis__", "generating", &progress_text,
         );
     }));
-    let result = crate::codex::run_synthesis_prompt(&prompt, synthesis_progress);
+    // Retry transient errors for synthesis too
+    const MAX_SYNTH_RETRIES: u32 = 2;
+    let mut synthesis_progress = synthesis_progress;
+    let mut last_result = None;
+    for attempt in 0..=MAX_SYNTH_RETRIES {
+        if attempt > 0 {
+            let backoff_secs = 15 * attempt as u64;
+            eprintln!("[mcp-synthesis] retry {attempt}/{MAX_SYNTH_RETRIES} in {backoff_secs}s");
+            crate::mcp_progress_relay::write_progress_event(
+                &std::path::PathBuf::from(data_dir), run_id,
+                "__synthesis__", "generating",
+                &format!("retry {attempt}/{MAX_SYNTH_RETRIES}…"),
+            );
+            std::thread::sleep(std::time::Duration::from_secs(backoff_secs));
+        }
+
+        let cb = if attempt == 0 { synthesis_progress.take() } else { None };
+        match crate::codex::run_synthesis_prompt(&prompt, cb) {
+            Ok(v) => { last_result = Some(Ok(v)); break; }
+            Err(e) => {
+                let msg = format!("{e}");
+                let is_transient = msg.contains("at capacity")
+                    || msg.contains("stream disconnected")
+                    || msg.contains("systemError")
+                    || msg.contains("os error")
+                    || msg.contains("Network Error");
+                if is_transient && attempt < MAX_SYNTH_RETRIES {
+                    eprintln!("[mcp-synthesis] transient error (attempt {attempt}): {msg}");
+                    last_result = Some(Err(e));
+                    continue;
+                }
+                last_result = Some(Err(e));
+                break;
+            }
+        }
+    }
 
     relay_stop.store(true, Ordering::Relaxed);
     let _ = relay_handle.join();
@@ -831,7 +907,7 @@ pub fn run_synthesis_turn(run_id: &str, data_dir: &str) -> Result<Value> {
     // Merge synthesis results from MCP sidecar
     merge_mcp_results(run_id, data_dir);
 
-    match result {
+    match last_result.unwrap_or_else(|| Err(anyhow::anyhow!("synthesis_no_result"))) {
         Ok(turn_result) => {
             crate::run_state_cache::flush_now(run_id);
             let run_state = crate::load_run_by_id_direct(run_id)?;

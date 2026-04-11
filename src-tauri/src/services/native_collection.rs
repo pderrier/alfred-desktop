@@ -618,15 +618,14 @@ fn fetch_finary_snapshot(run_id: &str, _request_fn: HttpRequestFn) -> Result<Val
             let corr_id = acct.get("correlation_id").and_then(|v| v.as_i64());
             let inst = acct.get("institution").and_then(|v| v.get("name")).and_then(|v| v.as_str()).unwrap_or("?");
             let slug = acct.get("slug").and_then(|v| v.as_str()).unwrap_or("?");
-            let acct_id = acct.get("id").and_then(|v| v.as_i64());
-            let manual = acct.get("manual").and_then(|v| v.as_bool());
+            let acct_id = acct.get("id");
+            let manual = acct.get("manual");
+            let inst_conn = acct.get("institution_connection");
+            let provider_conn = acct.get("provider_connection");
+            let bank = acct.get("bank");
             let acct_type = acct.get("account_type").and_then(|v| v.as_str())
                 .or_else(|| acct.get("type").and_then(|v| v.as_str()))
                 .unwrap_or("?");
-            // Dump ALL top-level keys (excluding securities/fiats arrays)
-            let keys: Vec<String> = acct.as_object()
-                .map(|o| o.keys().filter(|k| *k != "securities" && *k != "fiats").cloned().collect())
-                .unwrap_or_default();
             let fiat_details: Vec<String> = fiats.iter().map(|f| {
                 let cv = f.get("current_value").and_then(|v| v.as_f64());
                 let amt = f.get("amount").and_then(|v| v.as_f64());
@@ -637,8 +636,17 @@ fn fetch_finary_snapshot(run_id: &str, _request_fn: HttpRequestFn) -> Result<Val
                 format!("{fname}({currency}) id={fid:?}: cv={cv:?} amt={amt:?} qty={qty:?}")
             }).collect();
             crate::debug_log(&format!(
-                "finary_cash_raw: '{}' id={:?} conn={:?} corr={:?} inst='{}' slug='{}' type='{}' manual={:?} secs={} fiats={} keys={:?}",
-                name, acct_id, conn_id, corr_id, inst, slug, acct_type, manual, secs, fiats.len(), keys
+                "finary_cash_raw: '{}' id={} conn={} corr={} inst='{}' slug='{}' type='{}' manual={} inst_conn={} provider_conn={} bank={} secs={} fiats={}",
+                name,
+                acct_id.map(|v| v.to_string()).unwrap_or("MISSING".into()),
+                conn_id.map(|v| v.to_string()).unwrap_or_else(|| acct.get("connection_id").map(|v| v.to_string()).unwrap_or("MISSING".into())),
+                corr_id.map(|v| v.to_string()).unwrap_or_else(|| acct.get("correlation_id").map(|v| v.to_string()).unwrap_or("MISSING".into())),
+                inst, slug, acct_type,
+                manual.map(|v| v.to_string()).unwrap_or("MISSING".into()),
+                inst_conn.map(|v| v.to_string()).unwrap_or("MISSING".into()),
+                provider_conn.map(|v| v.to_string()).unwrap_or("MISSING".into()),
+                bank.map(|v| v.to_string()).unwrap_or("MISSING".into()),
+                secs, fiats.len()
             ));
             for fd in &fiat_details {
                 crate::debug_log(&format!("finary_cash_fiat:   {}", fd));

@@ -115,7 +115,7 @@ export function openChatWizard(config) {
         const doneBtn = document.createElement("button");
         doneBtn.className = "cw-done-btn cmd-btn";
         doneBtn.textContent = "Done \u2014 save insights";
-        doneBtn.addEventListener("click", () => finish(returnHistoryOnClose ? history : history));
+        doneBtn.addEventListener("click", () => finish(history));
         actionsDiv.appendChild(doneBtn);
       }
       actionsDiv.style.display = "flex";

@@ -417,11 +417,10 @@ function renderActionsNow(items = [], recommendations = []) {
         });
         // Action chats are ticker-scoped — offer Save to Memory with LLM pre-fill
         if (ticker) {
-          const rec = recommendations.find((r) => r.ticker === ticker);
-          if (rec) {
-            const prefill = await synthesizeChatForMemory(ticker, name, chatResult);
-            showSaveToMemoryPanel(rec, prefill);
-          }
+          const rec = recommendations.find((r) => r.ticker === ticker)
+            || { ticker, name, details: {}, lineMemory: {} };
+          const prefill = await synthesizeChatForMemory(ticker, name, chatResult);
+          showSaveToMemoryPanel(rec, prefill);
         }
       });
     }

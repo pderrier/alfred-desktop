@@ -409,21 +409,27 @@ function renderActionsNow(items = [], recommendations = []) {
         const ticker = action.ticker || "";
         const name = action.nom || "";
         const label = name ? `${name} (${ticker})` : ticker;
-        const chatResult = await openChatWizard({
+        let doneHandled = false;
+        const rec = ticker
+          ? (recommendations.find((r) => r.ticker === ticker) || { ticker, name, details: {}, lineMemory: {} })
+          : null;
+        await openChatWizard({
           title: `Ask about ${action.action} ${ticker || name}`,
           systemContext: buildActionContext(action, recommendations),
           initialMessage: `This is the ${action.action} recommendation for ${label} (priority ${action.priority || "N/A"}). What would you like to know?`,
           returnHistoryOnClose: true,
+          onDone: async (history) => {
+            if (!rec) return;
+            doneHandled = true;
+            const hadConversation = history.some((m) => m.role === "user");
+            const prefill = hadConversation
+              ? await synthesizeChatForMemoryWithUI(ticker, name, history)
+              : null;
+            showSaveToMemoryPanel(rec, prefill);
+          },
         });
-        // Action chats are ticker-scoped — synthesize with loading UI, then save panel
-        if (ticker) {
-          const rec = recommendations.find((r) => r.ticker === ticker)
-            || { ticker, name, details: {}, lineMemory: {} };
-          const hadConversation = Array.isArray(chatResult) && chatResult.some((m) => m.role === "user");
-          const prefill = hadConversation
-            ? await synthesizeChatForMemoryWithUI(ticker, name, chatResult)
-            : null;
-          showSaveToMemoryPanel(rec, prefill);
+        if (!doneHandled && rec) {
+          showSaveToMemoryPanel(rec, null);
         }
       });
     }

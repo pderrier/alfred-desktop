@@ -27,7 +27,7 @@ import { escapeHtml } from "/desktop-shell/ui-display-utils.js";
  * @returns {Promise<any|null>} — resolves with result on confirm, null on cancel (or history if returnHistoryOnClose)
  */
 export function openChatWizard(config) {
-  const { title, systemContext, initialMessage, extractResult, returnHistoryOnClose } = config;
+  const { title, systemContext, initialMessage, extractResult, returnHistoryOnClose, onDone } = config;
 
   return new Promise((resolve) => {
     // ── State ───────────────────────────────────────────────
@@ -35,8 +35,15 @@ export function openChatWizard(config) {
     let sending = false;
     let resolved = false;
 
+    const jsLog = (msg) => window?.__TAURI__?.core?.invoke?.("js_log_local", { message: msg }).catch(() => {});
+
     function finish(value) {
-      if (resolved) return;
+      const vtype = Array.isArray(value) ? `array(${value.length})` : value === null ? "null" : typeof value;
+      jsLog(`chat-wizard finish: resolved=${resolved} value=${vtype}`);
+      if (resolved) {
+        jsLog(`chat-wizard finish: SKIPPED — already resolved`);
+        return;
+      }
       resolved = true;
       cleanup();
       resolve(value);
@@ -117,7 +124,16 @@ export function openChatWizard(config) {
         doneBtn.textContent = "Done \u2014 save insights";
         doneBtn.addEventListener("click", (e) => {
           e.stopPropagation();
-          finish(history);
+          jsLog(`chat-wizard: Done button clicked, history.length=${history.length} onDone=${!!onDone}`);
+          if (onDone) {
+            // Call onDone directly — don't go through finish/resolve/await chain
+            cleanup();
+            resolved = true;
+            onDone(history);
+            resolve(null); // resolve promise so await doesn't hang
+          } else {
+            finish(history);
+          }
         });
         actionsDiv.appendChild(doneBtn);
       }
@@ -191,9 +207,9 @@ export function openChatWizard(config) {
 
     const cancelValue = () => returnHistoryOnClose ? history : null;
 
-    closeBtn.addEventListener("click", () => finish(cancelValue()));
+    closeBtn.addEventListener("click", () => { jsLog("chat-wizard: X button clicked"); finish(cancelValue()); });
     overlay.addEventListener("click", (e) => {
-      if (e.target === overlay) finish(cancelValue());
+      if (e.target === overlay) { jsLog("chat-wizard: backdrop clicked"); finish(cancelValue()); }
     });
 
     confirmBtn.addEventListener("click", () => {

@@ -530,27 +530,26 @@ export function initLineModal() {
     const signal = rec.signal || "N/A";
     const conviction = rec.conviction || "N/A";
     const label = name ? `${name} (${ticker})` : ticker;
-    const chatResult = await openChatWizard({
+    let doneHandled = false;
+    await openChatWizard({
       title: `Ask about ${ticker}`,
       systemContext: buildPositionContext(rec),
       initialMessage: `I can answer questions about your ${label} position. The current recommendation is ${signal} (${conviction}). What would you like to know?`,
       returnHistoryOnClose: true,
+      onDone: async (history) => {
+        // Called directly from Done button — bypasses promise chain
+        doneHandled = true;
+        const hadConversation = history.some((m) => m.role === "user");
+        const prefill = hadConversation
+          ? await synthesizeChatForMemoryWithUI(ticker, name, history)
+          : null;
+        showSaveToMemoryPanel(rec, prefill);
+      },
     });
-    // Show save panel with loading state while LLM synthesizes
-    const jsLog = (msg) => window?.__TAURI__?.core?.invoke?.("js_log_local", { message: msg }).catch(() => {});
-    const hadConversation = Array.isArray(chatResult) && chatResult.some((m) => m.role === "user");
-    jsLog(`ask-about: chatResult isArray=${Array.isArray(chatResult)} length=${chatResult?.length} hadConversation=${hadConversation}`);
-    let prefill = null;
-    if (hadConversation) {
-      try {
-        prefill = await synthesizeChatForMemoryWithUI(ticker, name, chatResult);
-        jsLog(`ask-about: synthesis done, prefill=${!!prefill}`);
-      } catch (err) {
-        jsLog(`ask-about: synthesis error: ${err?.message || err}`);
-      }
+    // If closed via X/backdrop (onDone not called), still show save panel
+    if (!doneHandled) {
+      showSaveToMemoryPanel(rec, null);
     }
-    jsLog(`ask-about: calling showSaveToMemoryPanel rec=${!!rec} ticker=${rec?.ticker}`);
-    showSaveToMemoryPanel(rec, prefill);
   });
 
   function setVisible(visible) {

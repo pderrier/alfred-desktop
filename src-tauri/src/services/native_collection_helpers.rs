@@ -172,7 +172,7 @@ pub(crate) fn normalize_finary_snapshot(snapshot: &Value) -> Value {
             })
         })
         .collect::<Vec<_>>();
-    json!({
+    let mut result = json!({
         "portfolio_source": "finary",
         "positions": positions,
         "accounts": snapshot.get("accounts").cloned().unwrap_or_else(|| json!([])),
@@ -181,7 +181,15 @@ pub(crate) fn normalize_finary_snapshot(snapshot: &Value) -> Value {
         "valeur_totale": to_number(snapshot.get("total_value").or_else(|| snapshot.get("valeur_totale"))),
         "plus_value_totale": to_number(snapshot.get("total_gain").or_else(|| snapshot.get("plus_value_totale"))),
         "liquidites": to_number(snapshot.get("cash").or_else(|| snapshot.get("liquidites")))
-    })
+    });
+    // Preserve ambiguous cash groups through normalization so the wizard can trigger
+    if let Some(groups) = snapshot.get("ambiguous_cash_groups") {
+        result.as_object_mut().unwrap().insert(
+            "ambiguous_cash_groups".to_string(),
+            groups.clone(),
+        );
+    }
+    result
 }
 
 pub(crate) fn normalize_csv_snapshot(snapshot: &Value) -> Value {

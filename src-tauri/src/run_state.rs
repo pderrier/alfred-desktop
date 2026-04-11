@@ -419,12 +419,27 @@ fn load_latest_finary_snapshot_meta() -> serde_json::Value {
         })
         .map(serde_json::Value::Array)
         .unwrap_or_else(|| json!([]));
-    json!({
+    // Forward ambiguous_cash_groups so the dashboard can trigger the cash matching wizard
+    let ambiguous_cash_groups = entry
+        .and_then(|v| v.get("snapshot"))
+        .and_then(|v| v.get("ambiguous_cash_groups"))
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let mut meta = json!({
         "available": entry.is_some(),
         "saved_at": entry.and_then(|v| v.get("saved_at")).cloned().unwrap_or(serde_json::Value::Null),
         "positions_count": positions_count,
         "accounts": accounts
-    })
+    });
+    if let Some(arr) = ambiguous_cash_groups.as_array() {
+        if !arr.is_empty() {
+            meta.as_object_mut().unwrap().insert(
+                "ambiguous_cash_groups".to_string(),
+                ambiguous_cash_groups,
+            );
+        }
+    }
+    meta
 }
 
 fn compact_audit_event(event: &serde_json::Value) -> serde_json::Value {

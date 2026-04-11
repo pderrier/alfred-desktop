@@ -339,8 +339,8 @@ USER_NOTE: ...`;
       userMessage: prompt,
     });
     const response = result?.response || "";
-    const krMatch = response.match(/KEY_REASONING:\s*(.*?)(?:\n|$)/s);
-    const unMatch = response.match(/USER_NOTE:\s*(.*?)(?:\n|$)/s);
+    const krMatch = response.match(/KEY_REASONING:\s*([\s\S]*?)(?=\nUSER_NOTE:|$)/);
+    const unMatch = response.match(/USER_NOTE:\s*([\s\S]*?)$/);
     const keyReasoning = krMatch?.[1]?.trim() || "";
     const userNote = unMatch?.[1]?.trim() || "";
     return {

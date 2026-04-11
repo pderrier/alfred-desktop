@@ -957,7 +957,8 @@ fn derive_ticker_from_name(name: &str, isin: &str) -> String {
         .copied()
         .unwrap_or("UNKNOWN");
     if ticker.len() > 12 {
-        ticker[..12].to_string()
+        let mut e = 12; while !ticker.is_char_boundary(e) { e -= 1; }
+        ticker[..e].to_string()
     } else {
         ticker.to_string()
     }

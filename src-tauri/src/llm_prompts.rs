@@ -63,7 +63,11 @@ fn build_previous_syntheses_section(account: &str) -> String {
     let mut lines = vec!["\nSYNTHESES PRECEDENTES (pour continuite narrative — ne pas repeter, mais faire evoluer):".to_string()];
     for (date, synthese) in &prev {
         let formatted_date = format!("{}-{}-{}", &date[..4], &date[4..6], &date[6..8]);
-        let truncated = if synthese.len() > 600 { format!("{}…", &synthese[..600]) } else { synthese.clone() };
+        let truncated = if synthese.len() > 600 {
+            let mut end = 600;
+            while !synthese.is_char_boundary(end) { end -= 1; }
+            format!("{}…", &synthese[..end])
+        } else { synthese.clone() };
         lines.push(format!("[{formatted_date}] {truncated}"));
     }
     lines.push("\nConsigne: construis sur ces analyses precedentes. Identifie ce qui a CHANGE (nouvelles positions, evolution des signaux, performances). Evite de repeter les memes observations — fais progresser le narratif.".to_string());

@@ -131,7 +131,8 @@ fn call_via_backend(context: &str, history: &[Value], user_message: &str) -> Res
 
     let result = crate::llm_backend::run_prompt(&prompt, timeout_ms, None)?;
 
-    // Extract text from the response
+    // Extract text from the response — try multiple shapes:
+    // 1. OpenAI format: choices[0].message.content
     if let Some(text) = result.get("choices")
         .and_then(|c| c.as_array())
         .and_then(|arr| arr.first())
@@ -141,10 +142,14 @@ fn call_via_backend(context: &str, history: &[Value], user_message: &str) -> Res
     {
         return Ok(text.to_string());
     }
-    // llm_backend::run_prompt may return parsed JSON directly
+    // 2. Codex MCP turn wraps natural language in agent_text
+    if let Some(text) = result.get("agent_text").and_then(|v| v.as_str()) {
+        return Ok(text.to_string());
+    }
+    // 3. Plain string result
     if let Some(text) = result.as_str() {
         return Ok(text.to_string());
     }
-    // Return the raw JSON as string fallback
-    Ok(result.to_string())
+    // 4. Fallback — should not happen, but better than raw JSON
+    Err(anyhow!("chat_wizard_unexpected_response_shape"))
 }

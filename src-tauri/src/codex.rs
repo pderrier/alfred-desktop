@@ -900,7 +900,7 @@ pub fn run_codex_prompt_with_progress(
                                     if query.is_empty() {
                                         format!("web search ({search_count})\u{2026}")
                                     } else {
-                                        format!("searching: {}\u{2026}", if query.len() > 40 { &query[..40] } else { query })
+                                        format!("searching: {}\u{2026}", { let mut e = 40.min(query.len()); while !query.is_char_boundary(e) { e -= 1; } &query[..e] })
                                     }
                                 }
                                 // MCP tool calls — Codex calling our alfred-mcp tools
@@ -972,7 +972,7 @@ pub fn run_codex_prompt_with_progress(
                         "turn/plan/updated" => {
                             if let Some(explanation) = params.get("explanation").and_then(|v| v.as_str()) {
                                 if let Some(ref cb) = on_progress {
-                                    let short = if explanation.len() > 60 { &explanation[..60] } else { explanation };
+                                    let short = if explanation.len() > 60 { let mut e = 60; while !explanation.is_char_boundary(e) { e -= 1; } &explanation[..e] } else { explanation };
                                     cb(bytes_received, 0, &format!("planning: {short}\u{2026}"));
                                 }
                             }

@@ -647,13 +647,17 @@ fn fetch_finary_snapshot(run_id: &str, _request_fn: HttpRequestFn) -> Result<Val
     }
     let cash_result = build_cash_mapping(&holdings_accounts);
     let investment_name_to_cash = cash_result.mapping;
-    // Global cash = ALL fiats across ALL holdings accounts (not just matched ones)
+    // Global cash = ALL EUR fiats across ALL holdings accounts (skip non-EUR to avoid JPY/USD face values)
     let cash: f64 = holdings_accounts.iter().map(|acct| {
         acct.get("fiats")
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default()
             .iter()
+            .filter(|fiat| {
+                let code = fiat.get("currency").and_then(|v| v.get("code")).and_then(|v| v.as_str()).unwrap_or("EUR");
+                code == "EUR"
+            })
             .map(|fiat| {
                 fiat.get("current_value").or_else(|| fiat.get("amount")).or_else(|| fiat.get("quantity"))
                     .and_then(|v| v.as_f64()).unwrap_or(0.0)
@@ -789,6 +793,11 @@ fn build_cash_mapping(holdings_accounts: &[Value]) -> CashMappingResult {
             .cloned()
             .unwrap_or_default()
             .iter()
+            .filter(|fiat| {
+                // Only count EUR fiats — non-EUR values are in local currency, not converted
+                let code = fiat.get("currency").and_then(|v| v.get("code")).and_then(|v| v.as_str()).unwrap_or("EUR");
+                code == "EUR"
+            })
             .map(|fiat| {
                 fiat.get("current_value")
                     .or_else(|| fiat.get("amount"))
@@ -906,36 +915,38 @@ fn build_cash_mapping(holdings_accounts: &[Value]) -> CashMappingResult {
         }
     }
 
-    // Strategy 2: For investment accounts without connection_id, try institution name prefix
-    for inv in &investment_entries {
-        if result.contains_key(&inv.name) {
-            continue; // Already matched
-        }
-        if inv.connection_id.is_some() {
-            continue; // Had a connection_id but no cash match — skip prefix fallback
-        }
-        if inv.institution_name.is_empty() {
-            continue;
-        }
-        // Find unmatched cash accounts whose institution name starts with same prefix
-        let inv_prefix = inv.institution_name.split_whitespace().next().unwrap_or_default().to_lowercase();
-        let mut prefix_cash_sum = 0.0;
-        for (idx, ce) in cash_entries.iter().enumerate() {
-            if matched_cash_indices.contains(&idx) {
-                continue;
-            }
-            let ce_prefix = ce.institution_name.split_whitespace().next().unwrap_or_default().to_lowercase();
-            if !inv_prefix.is_empty() && inv_prefix == ce_prefix {
-                prefix_cash_sum += ce.fiats_sum;
-                matched_cash_indices.insert(idx);
-            }
-        }
-        if prefix_cash_sum > 0.0 {
-            result.insert(inv.name.clone(), prefix_cash_sum);
+    // Strategy 2: For unmatched accounts without connection_id, flag as ambiguous for wizard.
+    // Do NOT attempt heuristic matching — wrong matches are worse than no match.
+    {
+        let unmatched_invs: Vec<&HoldingsEntry> = investment_entries.iter()
+            .filter(|inv| !result.contains_key(&inv.name))
+            .copied()
+            .collect();
+        let unmatched_cash: Vec<(usize, &HoldingsEntry)> = cash_entries.iter().enumerate()
+            .filter(|(idx, _)| !matched_cash_indices.contains(idx))
+            .map(|(idx, e)| (idx, *e))
+            .collect();
+        if !unmatched_invs.is_empty() && !unmatched_cash.is_empty() {
+            let inv_json: Vec<Value> = unmatched_invs.iter().map(|e| json!({
+                "name": e.name,
+                "institution": e.institution_name,
+                "securities_count": e.securities_count,
+            })).collect();
+            let cash_json: Vec<Value> = unmatched_cash.iter().map(|(_, e)| json!({
+                "name": e.name,
+                "institution": e.institution_name,
+                "fiats_sum": e.fiats_sum,
+            })).collect();
             crate::debug_log(&format!(
-                "finary_cash_mapping: matched '{}' → cash {:.2} (institution prefix '{}')",
-                inv.name, prefix_cash_sum, inv_prefix
+                "finary_cash_mapping: {} unmatched investment + {} unmatched cash accounts — flagging for wizard",
+                unmatched_invs.len(), unmatched_cash.len()
             ));
+            ambiguous_groups.push(json!({
+                "connection_id": null,
+                "investment_accounts": inv_json,
+                "cash_accounts": cash_json,
+                "needs_confirmation": true,
+            }));
         }
     }
 

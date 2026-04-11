@@ -353,6 +353,7 @@ pub fn generate_draft_via_litellm(run_state: &serde_json::Value, run_id: &str) -
 
 fn save_report_artifact(
     run_id: &str,
+    account: &str,
     payload: &serde_json::Value,
 ) -> Result<(String, String, String, String)> {
     let saved_at = now_iso_string();
@@ -372,6 +373,7 @@ fn save_report_artifact(
     let history_path = history_dir.join(&history_filename);
     let artifact = json!({
         "run_id": run_id,
+        "account": account,
         "saved_at": saved_at,
         "payload": payload
     });
@@ -441,8 +443,9 @@ pub fn persist_retry_global_synthesis(run_id: &str, generated_draft: &serde_json
         "llm_utilise": generated_draft.get("llm_utilise").cloned().unwrap_or_else(|| json!("litellm")),
         "recommandations": pending_recommendations
     });
+    let account = run_state.get("account").and_then(|v| v.as_str()).unwrap_or("");
     let (saved_at, history_filename, latest_path_str, history_path_str) =
-        save_report_artifact(run_id, &payload)?;
+        save_report_artifact(run_id, account, &payload)?;
     if let Some(object) = run_state.as_object_mut() {
         object.insert("validation_corrections".to_string(), corrections.clone());
         object.insert("composed_payload".to_string(), payload.clone());

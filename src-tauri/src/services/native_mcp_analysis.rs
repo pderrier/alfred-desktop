@@ -440,7 +440,10 @@ Regles :
 }
 
 fn build_synthesis_prompt(run_id: &str) -> String {
-    let previous_syntheses = crate::llm_prompts::build_previous_syntheses_section_public();
+    let account = crate::load_run_by_id_direct(run_id).ok()
+        .and_then(|r| r.get("account").and_then(|v| v.as_str()).map(String::from))
+        .unwrap_or_default();
+    let previous_syntheses = crate::llm_prompts::build_previous_syntheses_section_public(&account);
 
     format!(
         r#"Tu es Alfred, un gestionnaire de portefeuille qui conseille un investisseur particulier.

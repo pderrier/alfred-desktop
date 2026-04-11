@@ -284,6 +284,7 @@ export function stashLiveRunState(lineStatus, dashboardPayload, stage) {
 
 export function restoreLiveRunView() {
   if (!isActiveRunInProgress()) return;
+  clearReportSections();
   showRunView();
   if (activeRunLineStatus) {
     renderLivePositions(activeRunLineStatus, activeRunDashboardPayload);
@@ -378,6 +379,29 @@ export function updateSnapshotTimestamp(finaryMeta) {
   popoverSnapshotTsNode.textContent = `Snapshot: ${ts ? new Date(ts).toLocaleString() : "none"}`;
 }
 
+/**
+ * Clear report sections to "pending" state — used when starting a new run
+ * or restoring a live run view to avoid showing stale completed-report data.
+ */
+function clearReportSections() {
+  const synthesis = document.getElementById("report-synthesis");
+  if (synthesis) {
+    synthesis.innerHTML = `<span class="synthesis-pending-label"><span class="pipeline-spinner"></span>Waiting for line analyses to complete\u2026</span>`;
+  }
+  const provenance = document.getElementById("report-provenance");
+  if (provenance) provenance.textContent = "";
+  const actionsNow = document.getElementById("actions-now");
+  if (actionsNow) actionsNow.innerHTML = `<div class="empty-hint" style="opacity:0.5">Will be generated after global synthesis.</div>`;
+  const nextAnalysis = document.getElementById("next-analysis");
+  if (nextAnalysis) { nextAnalysis.textContent = ""; nextAnalysis.classList.add("hidden"); }
+  const watchlistSummary = document.getElementById("watchlist-summary");
+  if (watchlistSummary) { watchlistSummary.textContent = ""; watchlistSummary.classList.add("hidden"); }
+  if (positionsTbodyNode) positionsTbodyNode.innerHTML = "";
+  if (positionsEmptyNode) positionsEmptyNode.classList.add("hidden");
+  if (overviewPanelNode) overviewPanelNode.classList.add("hidden");
+  if (reportSynthesisCardNode) reportSynthesisCardNode.classList.add("synthesis-pending");
+}
+
 export function showRunView({ starting = false, live = false } = {}) {
   const mainAccountView = document.getElementById("main-account-view");
   if (mainAccountView) mainAccountView.classList.add("hidden");
@@ -393,26 +417,11 @@ export function showRunView({ starting = false, live = false } = {}) {
     activeRunDashboardPayload = null;
     activeRunLastStage = null;
     // Clear stale data from previous run
-    const synthesis = document.getElementById("report-synthesis");
-    if (synthesis) {
-      synthesis.innerHTML = `<span class="synthesis-pending-label"><span class="pipeline-spinner"></span>Waiting for line analyses to complete\u2026</span>`;
-    }
-    const provenance = document.getElementById("report-provenance");
-    if (provenance) provenance.textContent = "";
-    const actionsNow = document.getElementById("actions-now");
-    if (actionsNow) actionsNow.innerHTML = `<div class="empty-hint" style="opacity:0.5">Will be generated after global synthesis.</div>`;
-    const nextAnalysis = document.getElementById("next-analysis");
-    if (nextAnalysis) { nextAnalysis.textContent = ""; nextAnalysis.classList.add("hidden"); }
-    const watchlistSummary = document.getElementById("watchlist-summary");
-    if (watchlistSummary) { watchlistSummary.textContent = ""; watchlistSummary.classList.add("hidden"); }
+    clearReportSections();
     const accountLabel = document.getElementById("main-account-label");
     if (accountLabel) accountLabel.textContent = "";
     const runLabel = document.getElementById("main-run-label");
     if (runLabel) runLabel.textContent = "Analysis in progress\u2026";
-    if (positionsTbodyNode) positionsTbodyNode.innerHTML = "";
-    if (positionsEmptyNode) positionsEmptyNode.classList.add("hidden");
-    if (overviewPanelNode) overviewPanelNode.classList.add("hidden");
-    if (reportSynthesisCardNode) reportSynthesisCardNode.classList.add("synthesis-pending");
     if (positionsProgressNode) {
       positionsProgressNode.textContent = "Starting analysis\u2026";
       positionsProgressNode.classList.remove("hidden");

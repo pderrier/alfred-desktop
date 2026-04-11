@@ -8,10 +8,12 @@ use serde_json::{json, Value};
 // ── Previous syntheses loader ───────────────────────────────────
 
 /// Load the last N global syntheses from report history for narrative continuity.
-pub(crate) fn load_previous_syntheses(limit: usize) -> Vec<(String, String)> {
+/// When `account` is non-empty, only artifacts matching that account are included.
+pub(crate) fn load_previous_syntheses(limit: usize, account: &str) -> Vec<(String, String)> {
     let history_dir = crate::paths::resolve_report_history_dir();
     if !history_dir.exists() { return Vec::new(); }
 
+    let filter_active = !account.is_empty();
     let mut entries: Vec<(String, String, String)> = Vec::new(); // (date, run_id, synthese)
 
     if let Ok(dir) = std::fs::read_dir(&history_dir) {
@@ -19,11 +21,14 @@ pub(crate) fn load_previous_syntheses(limit: usize) -> Vec<(String, String)> {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") { continue; }
             let filename = entry.file_name().to_string_lossy().to_string();
-            // Extract date from filename: "20260406_224820_runid.json"
             let date = filename.get(..8).unwrap_or("?").to_string();
 
             if let Ok(text) = std::fs::read_to_string(&path) {
                 if let Ok(artifact) = serde_json::from_str::<Value>(&text) {
+                    if filter_active {
+                        let artifact_account = artifact.get("account").and_then(|v| v.as_str()).unwrap_or("");
+                        if artifact_account != account { continue; }
+                    }
                     let synthese = artifact.get("payload")
                         .and_then(|p| p.get("synthese_marche"))
                         .and_then(|v| v.as_str())
@@ -47,12 +52,12 @@ pub(crate) fn load_previous_syntheses(limit: usize) -> Vec<(String, String)> {
 }
 
 /// Public version for use by native_mcp_analysis synthesis prompt.
-pub(crate) fn build_previous_syntheses_section_public() -> String {
-    build_previous_syntheses_section()
+pub(crate) fn build_previous_syntheses_section_public(account: &str) -> String {
+    build_previous_syntheses_section(account)
 }
 
-fn build_previous_syntheses_section() -> String {
-    let prev = load_previous_syntheses(2);
+fn build_previous_syntheses_section(account: &str) -> String {
+    let prev = load_previous_syntheses(2, account);
     if prev.is_empty() { return String::new(); }
 
     let mut lines = vec!["\nSYNTHESES PRECEDENTES (pour continuite narrative — ne pas repeter, mais faire evoluer):".to_string()];
@@ -112,7 +117,8 @@ pub(crate) fn build_report_prompt(run_state: &Value) -> String {
         format!("\nDIRECTIVES INVESTISSEUR:\n{guidelines}\n")
     };
 
-    let previous_syntheses = build_previous_syntheses_section();
+    let account = run_state.get("account").and_then(|v| v.as_str()).unwrap_or("");
+    let previous_syntheses = build_previous_syntheses_section(account);
 
     format!(
         r#"Tu es un conseiller financier bienveillant qui parle a un investisseur particulier.

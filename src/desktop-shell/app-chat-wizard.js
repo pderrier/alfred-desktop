@@ -105,6 +105,22 @@ export function openChatWizard(config) {
       rejectBtn.style.display = "";
     }
 
+    function showDoneButton() {
+      const actionsDiv = overlay.querySelector(".cw-actions");
+      if (!actionsDiv) return;
+      // Hide confirm/reject, show a single "Done" button
+      confirmBtn.style.display = "none";
+      rejectBtn.style.display = "none";
+      if (!actionsDiv.querySelector(".cw-done-btn")) {
+        const doneBtn = document.createElement("button");
+        doneBtn.className = "cw-done-btn cmd-btn";
+        doneBtn.textContent = "Done \u2014 save insights";
+        doneBtn.addEventListener("click", () => finish(returnHistoryOnClose ? history : history));
+        actionsDiv.appendChild(doneBtn);
+      }
+      actionsDiv.style.display = "flex";
+    }
+
     function setInputEnabled(enabled) {
       inputEl.disabled = !enabled;
       sendBtn.disabled = !enabled;
@@ -138,9 +154,14 @@ export function openChatWizard(config) {
         addBubble("assistant", response);
         history.push({ role: "assistant", content: response });
 
-        // Show confirm/reject only for decision flows (extractResult provided)
-        if (extractResult && history.filter((m) => m.role === "assistant").length >= 2) {
-          showConfirmReject();
+        // Decision flows (extractResult): show Confirm/Reject
+        // Q&A flows: show "Done" button to proceed to save
+        if (history.filter((m) => m.role === "assistant").length >= 2) {
+          if (extractResult) {
+            showConfirmReject();
+          } else {
+            showDoneButton();
+          }
         }
       } catch (err) {
         addBubble("assistant", `Error: ${err?.message || err}`);

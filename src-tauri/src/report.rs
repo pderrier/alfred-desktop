@@ -398,8 +398,10 @@ pub fn persist_retry_global_synthesis(run_id: &str, generated_draft: &serde_json
     if pending_recommendations.is_empty() {
         return Err(anyhow!("global_synthesis_retry_not_available:{run_id}"));
     }
-    let synthese = safe_text(generated_draft.get("synthese_marche"));
-    let llm_actions = generated_draft
+    // generated_draft may wrap fields inside "draft" (from generate_draft_via_litellm)
+    let inner = generated_draft.get("draft").unwrap_or(generated_draft);
+    let synthese = safe_text(inner.get("synthese_marche"));
+    let llm_actions = inner
         .get("actions_immediates")
         .and_then(|v| v.as_array())
         .cloned()

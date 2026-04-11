@@ -458,10 +458,14 @@ export function showSaveToMemoryPanel(rec, prefill) {
 
   // Cancel: close without saving
   for (const btn of cancelBtns) btn.addEventListener("click", close);
-  // Delay backdrop click handler to prevent stale click events from closing immediately
-  setTimeout(() => {
-    overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
-  }, 200);
+  // Only allow backdrop dismiss after a mousedown+mouseup cycle on the overlay itself
+  // This prevents stale click events from prior overlays from closing this one
+  let backdropMouseDown = false;
+  overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) backdropMouseDown = true; });
+  overlay.addEventListener("mouseup", (e) => {
+    if (e.target === overlay && backdropMouseDown) close();
+    backdropMouseDown = false;
+  });
 
   // Confirm: collect fields and call Tauri command
   confirmBtn.addEventListener("click", async () => {

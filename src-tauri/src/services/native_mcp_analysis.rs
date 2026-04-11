@@ -521,6 +521,93 @@ fn sync_line_memory(run_id: &str, ticker: &str, rec: &Value, current_price: f64)
     }
 }
 
+// ── Chat-to-Memory: partial update of line memory fields ──────
+
+/// Update specific fields in the line-memory.json store for a given ticker.
+/// Only the fields that are `Some` are overwritten; others are left untouched.
+/// Called from the "Save to Memory" panel after a Position Chat session.
+pub fn update_line_memory_fields(
+    ticker: &str,
+    key_reasoning: Option<&str>,
+    user_note: Option<&str>,
+    news_themes: Option<Vec<String>>,
+) -> Result<()> {
+    let ticker = ticker.trim().to_uppercase();
+    if ticker.is_empty() {
+        return Err(anyhow::anyhow!("update_line_memory_fields: empty ticker"));
+    }
+
+    let path = crate::resolve_runtime_state_dir().join("line-memory.json");
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+    let mut store = if path.exists() {
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .unwrap_or_else(|| json!({
+                "by_ticker": {},
+                "global_deep_news_banned_urls": [],
+                "deep_news_rotation_cache": { "by_ticker": {} }
+            }))
+    } else {
+        json!({
+            "by_ticker": {},
+            "global_deep_news_banned_urls": [],
+            "deep_news_rotation_cache": { "by_ticker": {} }
+        })
+    };
+
+    // Ensure by_ticker exists
+    if !store.get("by_ticker").and_then(|v| v.as_object()).is_some() {
+        store["by_ticker"] = json!({});
+    }
+
+    let entry = store
+        .get_mut("by_ticker")
+        .and_then(|v| v.as_object_mut())
+        .and_then(|bt| bt.entry(&ticker).or_insert_with(|| json!({"schema_version": 2, "ticker": &ticker})).as_object_mut());
+
+    let entry = match entry {
+        Some(e) => e,
+        None => return Err(anyhow::anyhow!("update_line_memory_fields: failed to access ticker entry")),
+    };
+
+    if let Some(reasoning) = key_reasoning {
+        entry.insert("key_reasoning".to_string(), Value::String(reasoning.to_string()));
+    }
+
+    if let Some(note) = user_note {
+        // Merge into user_action — preserve `followed` and `date` if they exist
+        let mut action = entry.get("user_action")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        action.insert("note".to_string(), Value::String(note.to_string()));
+        if !action.contains_key("date") {
+            action.insert("date".to_string(), Value::String(now[..10].to_string()));
+        }
+        entry.insert("user_action".to_string(), Value::Object(action));
+    }
+
+    if let Some(themes) = news_themes {
+        let merged = merge_string_list(
+            themes.iter().map(|s| s.as_str()),
+            15,
+        );
+        entry.insert(
+            "news_themes".to_string(),
+            Value::Array(merged.into_iter().map(Value::String).collect()),
+        );
+    }
+
+    entry.insert("updated_at".to_string(), Value::String(now));
+
+    let pb = std::path::PathBuf::from(&path);
+    crate::storage::write_json_file(&pb, &store)?;
+    crate::debug_log(&format!("update_line_memory_fields: updated {ticker}"));
+    Ok(())
+}
+
 // ── V2 computation helpers ─────────────────────────────────────
 
 /// Extract first N sentences from text (split on `. ` or period at end).

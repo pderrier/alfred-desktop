@@ -304,6 +304,119 @@ function buildPositionContext(rec) {
   return `The user is inspecting their ${ticker}${name ? ` (${name})` : ""} position. Here is the full analysis context:\n\n${sections.join("\n")}\n\nYou are a portfolio analysis assistant. Answer questions about this position based on the context above. This is a read-only discussion — you cannot change recommendations or portfolio state. Be concise and specific.`;
 }
 
+// ── Save to Memory panel ────────────────────────────────────────
+
+/**
+ * Show an inline overlay panel where the user can persist insights
+ * from a chat drill-down back into line-memory.json.
+ * Fields: key_reasoning (textarea), user_note (textarea), news_themes (checkboxes).
+ * No LLM involvement — deterministic write via Tauri command.
+ */
+function showSaveToMemoryPanel(rec) {
+  if (!rec) return;
+  const ticker = rec.ticker || "";
+  const memory = rec.lineMemory || {};
+  const existingReasoning = memory.key_reasoning || "";
+  const existingThemes = Array.isArray(memory.news_themes) ? memory.news_themes : [];
+  // Merge run badges with existing themes for checkbox list
+  const analysis = rec.details?.analysis || {};
+  const runBadges = Array.isArray(analysis.badges_keywords) ? analysis.badges_keywords : [];
+  const allThemes = [...new Set([...existingThemes, ...runBadges])].filter(Boolean);
+
+  // Build overlay
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  overlay.style.zIndex = "10001"; // above chat wizard
+
+  const themesHtml = allThemes.length > 0
+    ? allThemes.map((t) => {
+        const checked = existingThemes.includes(t) ? "checked" : "";
+        const id = `stm-theme-${t.replace(/\W/g, "_")}`;
+        return `<label class="stm-theme-label" for="${id}">
+          <input type="checkbox" id="${id}" value="${escapeHtml(t)}" ${checked} class="stm-theme-cb" />
+          ${escapeHtml(t)}
+        </label>`;
+      }).join("")
+    : `<span class="stm-empty-hint">No themes available.</span>`;
+
+  overlay.innerHTML = `
+    <div class="modal-card" style="width:min(36rem,calc(100vw - 2rem));max-height:min(70vh,42rem);display:flex;flex-direction:column;padding:0">
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:1rem 1.2rem 0.6rem;border-bottom:1px solid rgba(73,100,126,0.3)">
+        <h3 style="margin:0;font-size:1rem;color:var(--sea-text,#e0e8f0)">Save to Memory \u2014 ${escapeHtml(ticker)}</h3>
+        <button class="stm-cancel-btn" style="background:none;border:none;color:var(--sea-muted,#8a9bb0);font-size:1.2rem;cursor:pointer;padding:0.2rem 0.4rem" title="Cancel">&times;</button>
+      </div>
+      <div style="flex:1;overflow-y:auto;padding:1rem 1.2rem;display:flex;flex-direction:column;gap:1rem">
+        <div>
+          <label style="display:block;font-size:0.8rem;color:var(--sea-muted,#8a9bb0);margin-bottom:0.3rem">Key Reasoning</label>
+          <textarea class="stm-key-reasoning" rows="4" style="width:100%;background:rgba(10,17,24,0.6);border:1px solid rgba(73,100,126,0.4);border-radius:8px;color:var(--sea-text,#e0e8f0);padding:0.5rem 0.7rem;font-size:0.85rem;resize:vertical;font-family:inherit">${escapeHtml(existingReasoning)}</textarea>
+        </div>
+        <div>
+          <label style="display:block;font-size:0.8rem;color:var(--sea-muted,#8a9bb0);margin-bottom:0.3rem">Personal Note</label>
+          <textarea class="stm-user-note" rows="3" placeholder="Any personal notes about this position\u2026" style="width:100%;background:rgba(10,17,24,0.6);border:1px solid rgba(73,100,126,0.4);border-radius:8px;color:var(--sea-text,#e0e8f0);padding:0.5rem 0.7rem;font-size:0.85rem;resize:vertical;font-family:inherit"></textarea>
+        </div>
+        <div>
+          <label style="display:block;font-size:0.8rem;color:var(--sea-muted,#8a9bb0);margin-bottom:0.3rem">News Themes</label>
+          <div class="stm-themes-grid" style="display:flex;flex-wrap:wrap;gap:0.4rem 0.8rem">${themesHtml}</div>
+        </div>
+      </div>
+      <div style="display:flex;gap:0.5rem;padding:0.8rem 1.2rem;border-top:1px solid rgba(73,100,126,0.3);justify-content:flex-end">
+        <button class="stm-cancel-btn ghost-btn" type="button">Cancel</button>
+        <button class="stm-confirm-btn cmd-btn" type="button">Save</button>
+      </div>
+    </div>
+  `;
+
+  document.body.appendChild(overlay);
+
+  const confirmBtn = overlay.querySelector(".stm-confirm-btn");
+  const cancelBtns = overlay.querySelectorAll(".stm-cancel-btn");
+  const reasoningEl = overlay.querySelector(".stm-key-reasoning");
+  const noteEl = overlay.querySelector(".stm-user-note");
+
+  function close() { overlay.remove(); }
+
+  // Cancel: close without saving
+  for (const btn of cancelBtns) btn.addEventListener("click", close);
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+
+  // Confirm: collect fields and call Tauri command
+  confirmBtn.addEventListener("click", async () => {
+    const keyReasoning = reasoningEl.value.trim() || null;
+    const userNote = noteEl.value.trim() || null;
+    const checkedThemes = [...overlay.querySelectorAll(".stm-theme-cb:checked")]
+      .map((cb) => cb.value);
+    const newsThemes = checkedThemes.length > 0 ? checkedThemes : null;
+
+    // Nothing to save
+    if (!keyReasoning && !userNote && !newsThemes) {
+      close();
+      return;
+    }
+
+    confirmBtn.disabled = true;
+    confirmBtn.textContent = "Saving\u2026";
+
+    try {
+      const invoke = window?.__TAURI__?.core?.invoke;
+      if (!invoke) throw new Error("Tauri not available");
+      await invoke("update_line_memory_local", {
+        ticker,
+        keyReasoning,
+        userNote,
+        newsThemes,
+      });
+      close();
+    } catch (err) {
+      confirmBtn.textContent = "Error \u2014 retry";
+      confirmBtn.disabled = false;
+      console.error("save_to_memory_failed", err);
+    }
+  });
+
+  // Focus the reasoning textarea
+  reasoningEl?.focus();
+}
+
 // ── Public API ───────────────────────────────────────────────────
 
 export function initLineModal() {
@@ -319,20 +432,22 @@ export function initLineModal() {
     document.getElementById("line-memory-news-detail")?.classList.toggle("hidden");
   });
 
-  // "Ask about this" chat button
+  // "Ask about this" chat button — opens chat wizard, then offers "Save to Memory"
   const askBtn = document.getElementById("line-memory-ask-btn");
-  askBtn?.addEventListener("click", () => {
+  askBtn?.addEventListener("click", async () => {
     if (!currentRec) return;
     const ticker = currentRec.ticker || "N/A";
     const name = currentRec.name || "";
     const signal = currentRec.signal || "N/A";
     const conviction = currentRec.conviction || "N/A";
     const label = name ? `${name} (${ticker})` : ticker;
-    openChatWizard({
+    const chatResult = await openChatWizard({
       title: `Ask about ${ticker}`,
       systemContext: buildPositionContext(currentRec),
       initialMessage: `I can answer questions about your ${label} position. The current recommendation is ${signal} (${conviction}). What would you like to know?`,
     });
+    // After chat closes, offer to save insights to memory (regardless of confirm/cancel — the conversation happened)
+    showSaveToMemoryPanel(currentRec);
   });
 
   function setVisible(visible) {

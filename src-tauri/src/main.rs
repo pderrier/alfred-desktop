@@ -444,6 +444,27 @@ async fn chat_wizard_send_local(
     .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn update_line_memory_local(
+    ticker: String,
+    key_reasoning: Option<String>,
+    user_note: Option<String>,
+    news_themes: Option<Vec<String>>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        native_mcp_analysis::update_line_memory_fields(
+            &ticker,
+            key_reasoning.as_deref(),
+            user_note.as_deref(),
+            news_themes,
+        )?;
+        Ok(serde_json::json!({"ok": true}))
+    })
+    .await
+    .map_err(|e| format!("update_line_memory_local_failed:join:{e}"))?
+    .map_err(|e: anyhow::Error| e.to_string())
+}
+
 fn run_tauri_app() -> anyhow::Result<()> {
     load_local_env();
 
@@ -504,7 +525,8 @@ fn run_tauri_app() -> anyhow::Result<()> {
             check_for_update_local,
             download_update_local,
             install_update_local,
-            chat_wizard_send_local
+            chat_wizard_send_local,
+            update_line_memory_local
         ])
         .run(tauri::generate_context!())
         .map_err(|e| anyhow!("tauri_app_launch_failed:{e}"))?;

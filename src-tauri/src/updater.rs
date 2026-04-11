@@ -15,14 +15,20 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-const UPDATE_MANIFEST_URL: &str =
-    "https://vps-c5793aab.vps.ovh.net/alfred/release/windows/update-manifest.json";
 const CHECK_TIMEOUT_SECS: u64 = 5;
 const DOWNLOAD_TIMEOUT_SECS: u64 = 600;
 
+fn platform_manifest_url() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "https://vps-c5793aab.vps.ovh.net/alfred/release/macos/update-manifest.json"
+    } else {
+        "https://vps-c5793aab.vps.ovh.net/alfred/release/windows/update-manifest.json"
+    }
+}
+
 fn manifest_url() -> String {
     env::var("ALFRED_UPDATE_URL")
-        .unwrap_or_else(|_| UPDATE_MANIFEST_URL.to_string())
+        .unwrap_or_else(|_| platform_manifest_url().to_string())
 }
 
 // ── Types ─────────────────────────────────────────────────────────
@@ -131,7 +137,12 @@ pub fn download_update(url: &str, expected_sha256: Option<&str>) -> Result<serde
 
     let tmp_dir = env::temp_dir();
     let partial_path = tmp_dir.join("alfred-update.partial");
-    let final_path = tmp_dir.join("alfred-update-setup.exe");
+    let final_name = if cfg!(target_os = "macos") {
+        "alfred-update.dmg"
+    } else {
+        "alfred-update-setup.exe"
+    };
+    let final_path = tmp_dir.join(final_name);
 
     let mut reader = resp.into_reader();
     let mut file = fs::File::create(&partial_path)?;
@@ -191,9 +202,19 @@ pub fn install_update(installer_path: &str) -> Result<serde_json::Value> {
 
     crate::debug_log(&format!("updater: launching installer {installer_path}"));
 
-    Command::new(path)
-        .spawn()
-        .map_err(|e| anyhow!("updater_installer_launch_failed:{e}"))?;
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(path)
+            .spawn()
+            .map_err(|e| anyhow!("updater_installer_launch_failed:{e}"))?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Command::new(path)
+            .spawn()
+            .map_err(|e| anyhow!("updater_installer_launch_failed:{e}"))?;
+    }
 
     // Exit so the installer can replace our binary
     std::process::exit(0);
@@ -223,7 +244,22 @@ fn sha256_file(path: &Path) -> Result<String> {
             Err(anyhow!("sha256_parse_failed:{stdout}"))
         }
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        let out = Command::new("shasum")
+            .args(["-a", "256"])
+            .arg(path)
+            .output()
+            .map_err(|e| anyhow!("shasum_failed:{e}"))?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let hash = stdout.split_whitespace().next().unwrap_or_default().to_string();
+        if hash.len() == 64 {
+            Ok(hash)
+        } else {
+            Err(anyhow!("sha256_parse_failed:{stdout}"))
+        }
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     {
         let out = Command::new("sha256sum")
             .arg(path)

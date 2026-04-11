@@ -26,11 +26,19 @@ pub fn default_data_dir() -> PathBuf {
             }
         }
     }
-    // Production: use %APPDATA%/alfred-desktop (Windows) or ~/.alfred-desktop (Unix).
-    // Avoids permission issues in Program Files.
-    if let Some(app_data) = env::var("APPDATA").ok().or_else(|| env::var("HOME").ok()) {
-        let dir = PathBuf::from(app_data).join("alfred-desktop");
-        return dir;
+    // Production: platform-conventional app data directory.
+    // Avoids permission issues in Program Files / .app bundles.
+    #[cfg(target_os = "windows")]
+    if let Ok(appdata) = env::var("APPDATA") {
+        return PathBuf::from(appdata).join("alfred-desktop");
+    }
+    #[cfg(target_os = "macos")]
+    if let Ok(home) = env::var("HOME") {
+        return PathBuf::from(home).join("Library/Application Support/alfred-desktop");
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    if let Ok(home) = env::var("HOME") {
+        return PathBuf::from(home).join(".alfred-desktop");
     }
     // Fallback: next to the executable
     env::current_exe()

@@ -12,6 +12,10 @@
 
 > Note: The installer is not code-signed yet. Windows SmartScreen may show a warning — click "More info" → "Run anyway" to proceed.
 
+**[macOS installer (DMG)](https://vps-c5793aab.vps.ovh.net/alfred/release/macos/latest)** — Alfred Desktop v0.1.0 for macOS 10.15+ (Apple Silicon)
+
+> Note: The DMG is not notarized yet. macOS Gatekeeper will block it — right-click → Open, or go to System Settings → Privacy & Security → Open Anyway.
+
 ## Features
 
 - **Portfolio sync** — connect Finary for automatic brokerage account sync, or import CSV exports
@@ -137,7 +141,7 @@ Set `ALFRED_API_URL` to your instance URL once deployed.
 
 ## Prerequisites
 
-**End users:** just install the MSI/NSIS package. If using the native backend, no additional dependencies — just your API key. If using Codex, it's bundled in the installer.
+**End users:** install the MSI/NSIS package (Windows) or DMG (macOS). If using the native backend, no additional dependencies — just your API key. If using Codex, it's bundled in the installer.
 
 **Developers:**
 - [Node.js](https://nodejs.org/) 18+ (for Tauri CLI and Codex bundling)
@@ -154,13 +158,12 @@ npm install
 npm run dev
 
 # Build for production (Windows)
-# 1. Bundle portable Node.js + codex into the installer
 powershell -ExecutionPolicy Bypass -File scripts/prepare-codex-bundle.ps1
-# 2. Build the MSI/NSIS installer
 npm run build:windows
 
-# Build for production (Linux / macOS)
-npm run build
+# Build for production (macOS)
+bash scripts/prepare-codex-bundle.sh
+npm run build:macos
 ```
 
 ## Configuration

@@ -1,0 +1,121 @@
+name: Build & Deploy macOS Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      mandatory:
+        description: 'Mark this release as a mandatory update'
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Bundle codex runtime
+        run: bash scripts/prepare-codex-bundle.sh
+
+      - name: Build Tauri app
+        env:
+          ALFRED_API_SECRET: ${{ secrets.ALFRED_API_SECRET }}
+        run: npm run build:macos
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: alfred-desktop-dmg
+          path: src-tauri/target/release/bundle/dmg/*.dmg
+          retention-days: 90
+
+  deploy:
+    needs: [build]
+    if: always() && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download DMG
+        uses: actions/download-artifact@v5
+        with:
+          name: alfred-desktop-dmg
+          path: release
+
+      - name: Deploy to VPS
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$VPS_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          for file in release/*; do
+            [ -f "$file" ] || continue
+            filename=$(basename "$file")
+            echo "Uploading $filename..."
+            scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$file" "${VPS_USER}@${VPS_HOST}:/tmp/$filename"
+            ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "${VPS_USER}@${VPS_HOST}" \
+              "sudo mkdir -p /opt/alfred/releases/macos && sudo mv '/tmp/$filename' '/opt/alfred/releases/macos/$filename'"
+            echo "Deployed: $filename"
+          done
+
+      - name: Generate and deploy update manifest
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          TAG="${GITHUB_REF_NAME:-v0.1.0}"
+          VERSION="${TAG#v}"
+          MANDATORY="${{ github.event.inputs.mandatory || 'false' }}"
+          BASE_URL="https://vps-c5793aab.vps.ovh.net/alfred/release/macos"
+
+          DMG_FILE=$(find release -name '*.dmg' -type f | head -1)
+          if [ -n "$DMG_FILE" ]; then
+            SHA256=$(sha256sum "$DMG_FILE" | cut -d' ' -f1)
+            DMG_NAME=$(basename "$DMG_FILE")
+          else
+            SHA256=""
+            DMG_NAME="Alfred-Desktop_${VERSION}_aarch64.dmg"
+          fi
+
+          cat > /tmp/update-manifest.json <<MANIFEST
+          {
+            "version": "${VERSION}",
+            "mandatory": ${MANDATORY},
+            "min_version": null,
+            "release_notes": null,
+            "installer_url": "${BASE_URL}/${DMG_NAME}",
+            "installer_sha256": "${SHA256}",
+            "published_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          MANIFEST
+
+          echo "Generated manifest:"
+          cat /tmp/update-manifest.json
+
+          scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            /tmp/update-manifest.json "${VPS_USER}@${VPS_HOST}:/tmp/update-manifest.json"
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "${VPS_USER}@${VPS_HOST}" \
+            "sudo mv /tmp/update-manifest.json /opt/alfred/releases/macos/update-manifest.json"
+          echo "Update manifest deployed"

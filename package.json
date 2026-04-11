@@ -7,6 +7,7 @@
     "dev": "node src-tauri/scripts/tauri-cli-runner.mjs dev",
     "build": "node src-tauri/scripts/tauri-cli-runner.mjs build",
     "build:windows": "node src-tauri/scripts/tauri-cli-runner.mjs build src-tauri/tauri.windows.conf.json",
+    "build:macos": "node src-tauri/scripts/tauri-cli-runner.mjs build src-tauri/tauri.macos.conf.json",
     "check": "cd src-tauri && cargo check",
     "test": "cd src-tauri && cargo test"
   },

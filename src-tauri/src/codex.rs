@@ -34,11 +34,19 @@ fn hide_console_window(_cmd: &mut Command) {}
 // ── Binary resolution ──────────────────────────────────────────────
 
 fn codex_install_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
     if let Ok(appdata) = env::var("APPDATA") {
-        PathBuf::from(appdata).join("alfred").join("bin")
-    } else {
-        PathBuf::from("data").join("bin")
+        return PathBuf::from(appdata).join("alfred").join("bin");
     }
+    #[cfg(target_os = "macos")]
+    if let Ok(home) = env::var("HOME") {
+        return PathBuf::from(home).join("Library/Application Support/alfred/bin");
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    if let Ok(home) = env::var("HOME") {
+        return PathBuf::from(home).join(".alfred/bin");
+    }
+    PathBuf::from("data").join("bin")
 }
 
 /// Directory containing the bundled Node.js + codex shipped with the installer.

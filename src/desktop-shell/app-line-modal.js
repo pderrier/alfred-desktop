@@ -301,7 +301,7 @@ export function buildPositionContext(rec) {
   const keyHistory = memory.llm_key_history || [];
   if (keyHistory.length > 0) sections.push(`History: ${keyHistory.slice(0, 5).join("; ")}`);
 
-  return `The user is inspecting their ${ticker}${name ? ` (${name})` : ""} position. Here is the full analysis context:\n\n${sections.join("\n")}\n\nYou are a portfolio analysis assistant. Answer questions about this position based on the context above. This is a read-only discussion — you cannot change recommendations or portfolio state. Be concise and specific.`;
+  return `The user is inspecting their ${ticker}${name ? ` (${name})` : ""} position. Here is the full analysis context:\n\n${sections.join("\n")}\n\nYou are a portfolio analysis assistant. Answer questions about this position based on the context above. This is a read-only discussion — you cannot change recommendations or portfolio state. Be concise and specific. Only answer questions related to the portfolio, positions, and financial analysis. Politely decline any off-topic requests.`;
 }
 
 // ── LLM chat synthesis for save pre-fill ────────────────────────

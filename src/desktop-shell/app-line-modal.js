@@ -307,6 +307,28 @@ export function buildPositionContext(rec) {
 // ── LLM chat synthesis for save pre-fill ────────────────────────
 
 /**
+ * Synthesize with a visible loading overlay so the user knows something is happening.
+ */
+export async function synthesizeChatForMemoryWithUI(ticker, name, chatHistory) {
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  overlay.style.zIndex = "10001";
+  overlay.innerHTML = `
+    <div class="modal-card" style="width:min(24rem,calc(100vw - 2rem));padding:2rem;text-align:center">
+      <div class="pipeline-spinner" style="margin:0 auto 1rem;width:1.5rem;height:1.5rem"></div>
+      <p style="color:var(--sea-text,#e0e8f0);font-size:0.9rem;margin:0">Summarizing conversation\u2026</p>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  try {
+    const result = await synthesizeChatForMemory(ticker, name, chatHistory);
+    return result;
+  } finally {
+    overlay.remove();
+  }
+}
+
+/**
  * Synthesize a chat conversation into key_reasoning + user_note via LLM.
  * Returns { keyReasoning, userNote } or null on failure.
  */
@@ -495,23 +517,24 @@ export function initLineModal() {
   const askBtn = document.getElementById("line-memory-ask-btn");
   askBtn?.addEventListener("click", async () => {
     if (!currentRec) return;
-    const ticker = currentRec.ticker || "N/A";
-    const name = currentRec.name || "";
-    const signal = currentRec.signal || "N/A";
-    const conviction = currentRec.conviction || "N/A";
+    const rec = currentRec; // capture at click time — may change during awaits
+    const ticker = rec.ticker || "N/A";
+    const name = rec.name || "";
+    const signal = rec.signal || "N/A";
+    const conviction = rec.conviction || "N/A";
     const label = name ? `${name} (${ticker})` : ticker;
     const chatResult = await openChatWizard({
       title: `Ask about ${ticker}`,
-      systemContext: buildPositionContext(currentRec),
+      systemContext: buildPositionContext(rec),
       initialMessage: `I can answer questions about your ${label} position. The current recommendation is ${signal} (${conviction}). What would you like to know?`,
       returnHistoryOnClose: true,
     });
-    // Synthesize chat into pre-fill values if a real conversation happened
-    console.log("[ask-about] chatResult:", chatResult?.length, "messages, currentRec:", !!currentRec);
-    const prefill = await synthesizeChatForMemory(ticker, name, chatResult);
-    console.log("[ask-about] prefill:", prefill);
-    showSaveToMemoryPanel(currentRec, prefill);
-    console.log("[ask-about] showSaveToMemoryPanel called");
+    // Show save panel with loading state while LLM synthesizes
+    const hadConversation = Array.isArray(chatResult) && chatResult.some((m) => m.role === "user");
+    const prefill = hadConversation
+      ? await synthesizeChatForMemoryWithUI(ticker, name, chatResult)
+      : null;
+    showSaveToMemoryPanel(rec, prefill);
   });
 
   function setVisible(visible) {

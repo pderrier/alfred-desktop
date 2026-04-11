@@ -10,7 +10,7 @@ import {
 } from "/desktop-shell/report-view-model.js";
 import { resolveShellIntentRoute } from "/desktop-shell/shell-intent-router.js";
 import { initWizard } from "/desktop-shell/app-wizard.js";
-import { initLineModal, buildPositionContext, showSaveToMemoryPanel, synthesizeChatForMemory } from "/desktop-shell/app-line-modal.js";
+import { initLineModal, buildPositionContext, showSaveToMemoryPanel, synthesizeChatForMemoryWithUI } from "/desktop-shell/app-line-modal.js";
 import { initBootstrap } from "/desktop-shell/app-bootstrap.js";
 import { initEvents } from "/desktop-shell/app-events.js";
 import { openChatWizard, openCashMatchingWizard } from "/desktop-shell/app-chat-wizard.js";
@@ -415,11 +415,14 @@ function renderActionsNow(items = [], recommendations = []) {
           initialMessage: `This is the ${action.action} recommendation for ${label} (priority ${action.priority || "N/A"}). What would you like to know?`,
           returnHistoryOnClose: true,
         });
-        // Action chats are ticker-scoped — offer Save to Memory with LLM pre-fill
+        // Action chats are ticker-scoped — synthesize with loading UI, then save panel
         if (ticker) {
           const rec = recommendations.find((r) => r.ticker === ticker)
             || { ticker, name, details: {}, lineMemory: {} };
-          const prefill = await synthesizeChatForMemory(ticker, name, chatResult);
+          const hadConversation = Array.isArray(chatResult) && chatResult.some((m) => m.role === "user");
+          const prefill = hadConversation
+            ? await synthesizeChatForMemoryWithUI(ticker, name, chatResult)
+            : null;
           showSaveToMemoryPanel(rec, prefill);
         }
       });

@@ -36,7 +36,6 @@ export function openChatWizard(config) {
     let resolved = false;
 
     function finish(value) {
-      console.log("[chat-wizard] finish called, resolved=", resolved, "value type=", Array.isArray(value) ? `array(${value.length})` : typeof value);
       if (resolved) return;
       resolved = true;
       cleanup();
@@ -118,7 +117,6 @@ export function openChatWizard(config) {
         doneBtn.textContent = "Done \u2014 save insights";
         doneBtn.addEventListener("click", (e) => {
           e.stopPropagation();
-          console.log("[chat-wizard] Done clicked, resolved=", resolved, "history.length=", history.length);
           finish(history);
         });
         actionsDiv.appendChild(doneBtn);

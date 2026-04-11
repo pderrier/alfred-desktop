@@ -57,9 +57,9 @@ export function openChatWizard(config) {
           <textarea class="cw-input" rows="2" placeholder="Type your reply..." style="flex:1;background:rgba(10,17,24,0.6);border:1px solid rgba(73,100,126,0.4);border-radius:8px;color:var(--sea-text,#e0e8f0);padding:0.5rem 0.7rem;font-size:0.85rem;resize:none;font-family:inherit"></textarea>
           <button class="cw-send-btn cmd-btn" style="white-space:nowrap;padding:0.5rem 1rem">Send</button>
         </div>
-        <div class="cw-actions" style="display:none;padding:0 1.2rem 1rem;display:flex;gap:0.5rem;justify-content:flex-end">
-          <button class="cw-confirm-btn cmd-btn" style="display:none">Confirm</button>
-          <button class="cw-reject-btn cmd-btn ghost-btn" style="display:none">Reject</button>
+        <div class="cw-actions" style="display:none;padding:0 1.2rem 1rem;gap:0.5rem;justify-content:flex-end">
+          <button class="cw-confirm-btn cmd-btn">Confirm</button>
+          <button class="cw-reject-btn cmd-btn ghost-btn">Reject</button>
         </div>
       </div>
     `;
@@ -98,6 +98,8 @@ export function openChatWizard(config) {
     }
 
     function showConfirmReject() {
+      const actionsDiv = overlay.querySelector(".cw-actions");
+      if (actionsDiv) actionsDiv.style.display = "flex";
       confirmBtn.style.display = "";
       rejectBtn.style.display = "";
     }

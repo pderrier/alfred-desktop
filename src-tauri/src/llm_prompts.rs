@@ -265,9 +265,6 @@ Produis ton analyse en JSON UNIQUEMENT avec cette structure exacte:
     "action_recommandee": "instruction CHIFFREE: nb titres, montant €, prix entree/sortie",
     "reanalyse_after": "YYYY-MM-DD",
     "reanalyse_reason": "prochain catalyseur",
-    "llm_memory_summary": "resume factuel pour la prochaine analyse (2-4 phrases)",
-    "llm_key_history": ["fait durable 1 (ex: marge record Q3)", "fait durable 2"],
-    "llm_strong_signals": ["signal fort 1 (ex: backlog 5 ans)", "signal fort 2"],
     "deep_news_summary": "synthese 100-500 chars des actualites les plus impactantes pour cet investissement",
     "deep_news_quality_score": 75,
     "deep_news_relevance": "high|medium|low",
@@ -626,41 +623,74 @@ fn build_memory_section(memory: Option<&Value>) -> String {
         _ => return "MEMOIRE LIGNE: premiere analyse (pas d'historique)".to_string(),
     };
 
+    // V2 detection: if schema_version == 2 or signal_history exists, use V2 rendering.
+    // Otherwise render nothing (fresh install / pre-V2 data is treated as first analysis).
+    let is_v2 = m.get("schema_version").and_then(|v| v.as_u64()).unwrap_or(0) == 2
+        || m.get("signal_history").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false);
+
+    if !is_v2 {
+        return "MEMOIRE LIGNE: premiere analyse (pas d'historique)".to_string();
+    }
+
     let mut lines = vec!["MEMOIRE LIGNE (historique persistant):".to_string()];
 
-    if let Some(signal) = m.get("signal").and_then(|v| v.as_str()) {
+    // Signal + price tracking
+    if let Some(pt) = m.get("price_tracking") {
+        let signal = pt.get("last_signal").and_then(|v| v.as_str()).unwrap_or("");
         let conviction = m.get("conviction").and_then(|v| v.as_str()).unwrap_or("");
-        lines.push(format!("- Signal precedent: {signal} (conviction: {conviction})"));
-    }
-    if let Some(summary) = m.get("llm_memory_summary").and_then(|v| v.as_str()) {
-        if !summary.is_empty() { lines.push(format!("- Synthese durable: {}", truncate_str(summary, 300))); }
-    }
-    if let Some(news_summary) = m.get("deep_news_summary").and_then(|v| v.as_str()) {
-        if !news_summary.is_empty() { lines.push(format!("- News precedentes: {}", truncate_str(news_summary, 200))); }
-    }
-    if let Some(action) = m.get("action_recommandee").and_then(|v| v.as_str()) {
-        if !action.is_empty() { lines.push(format!("- Action precedente: {action}")); }
-    }
-    if let Some(date) = m.get("analysis_date").or(m.get("updated_at")).and_then(|v| v.as_str()) {
-        lines.push(format!("- Date derniere analyse: {date}"));
-    }
-    if let Some(reanalyse) = m.get("reanalyse_after").and_then(|v| v.as_str()) {
-        if !reanalyse.is_empty() {
-            let reason = m.get("reanalyse_reason").and_then(|v| v.as_str()).unwrap_or("");
-            lines.push(format!("- Reanalyse prevue: {reanalyse} ({reason})"));
+        let date = pt.get("last_signal_date").and_then(|v| v.as_str()).unwrap_or("");
+        let price = pt.get("price_at_signal").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let ret = pt.get("return_since_signal_pct").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let accuracy = pt.get("signal_accuracy").and_then(|v| v.as_str()).unwrap_or("");
+        let accuracy_mark = match accuracy {
+            "correct" => " \u{2713} correct",
+            "incorrect" => " \u{2717} incorrect",
+            _ => "",
+        };
+        if !signal.is_empty() {
+            lines.push(format!(
+                "- Signal: {signal} ({conviction}) depuis {date} | prix: {price:.2}\u{20ac} | rendement: {ret:+.1}%{accuracy_mark}"
+            ));
         }
     }
-    // Strong signals and key history (from pea-agent pattern)
-    if let Some(arr) = m.get("llm_strong_signals").and_then(|v| v.as_array()) {
-        let items: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).take(5).collect();
-        if !items.is_empty() { lines.push(format!("- Signaux forts historiques: {}", items.join("; "))); }
-    }
-    if let Some(arr) = m.get("llm_key_history").and_then(|v| v.as_array()) {
-        let items: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).take(5).collect();
-        if !items.is_empty() { lines.push(format!("- Historique cle: {}", items.join("; "))); }
+
+    // Trend
+    if let Some(trend) = m.get("trend").and_then(|v| v.as_str()) {
+        if !trend.is_empty() {
+            lines.push(format!("- Tendance 3 analyses: {trend}"));
+        }
     }
 
-    lines.push("\nConsigne: construis un NARRATIF progressif — ne repete pas les memes observations. Identifie ce qui a CHANGE depuis la derniere analyse (prix, fondamentaux, actualites). Si tu changes de signal, explique le declencheur. Si tu confirmes, dis pourquoi la these tient toujours malgre l'evolution du marche.".to_string());
+    // News themes
+    if let Some(arr) = m.get("news_themes").and_then(|v| v.as_array()) {
+        let items: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).take(10).collect();
+        if !items.is_empty() {
+            lines.push(format!("- Themes: {}", items.join(", ")));
+        }
+    }
+
+    // Key reasoning
+    if let Some(reasoning) = m.get("key_reasoning").and_then(|v| v.as_str()) {
+        if !reasoning.is_empty() {
+            lines.push(format!("- These: {}", truncate_str(reasoning, 400)));
+        }
+    }
+
+    // User action (optional)
+    if let Some(ua) = m.get("user_action") {
+        if !ua.is_null() {
+            let followed = ua.get("followed").and_then(|v| v.as_bool());
+            let date = ua.get("date").and_then(|v| v.as_str()).unwrap_or("");
+            let note = ua.get("note").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(f) = followed {
+                let action_str = if f { "suivi" } else { "non suivi" };
+                let note_str = if note.is_empty() { String::new() } else { format!(" ({note})") };
+                lines.push(format!("- Action utilisateur: {action_str} {date}{note_str}"));
+            }
+        }
+    }
+
+    lines.push("\nConsigne: construis un NARRATIF progressif. Ce qui a CHANGE depuis la derniere analyse. Si tu changes de signal, explique le declencheur. Si tu confirmes, dis pourquoi la these tient malgre l'evolution du marche.".to_string());
 
     if lines.len() == 1 { lines.push("- Premiere analyse".to_string()); }
     lines.join("\n")

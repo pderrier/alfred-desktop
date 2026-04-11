@@ -100,7 +100,6 @@ use crate::storage::read_json_file;
                     "badges_keywords": ["stable", "fondamentaux"],
                     "action_recommandee": "Conserver, pas d'action immediate",
                     "deep_news_summary": "Pas d'actualite majeure recente.",
-                    "llm_memory_summary": format!("Mock: {ticker} analyse le {}", crate::now_iso_string()),
                     "reanalyse_after": "2026-04-22",
                     "reanalyse_reason": "prochain trimestre"
                 });
@@ -249,8 +248,7 @@ use crate::storage::read_json_file;
                     "action_recommandee": "Conserver",
                     "deep_news_summary": format!("{ticker}: live update"),
                     "deep_news_selected_url": format!("https://example.test/{}", ticker.to_lowercase()),
-                    "deep_news_seen_urls": [format!("https://example.test/{}", ticker.to_lowercase())],
-                    "llm_memory_summary": format!("Memo ligne {ticker}")
+                    "deep_news_seen_urls": [format!("https://example.test/{}", ticker.to_lowercase())]
                 },
                 "model": "codex"
             }));
@@ -406,8 +404,7 @@ use crate::storage::read_json_file;
                             "action_recommandee": "Conserver",
                             "deep_news_summary": "LVMH: live update",
                             "deep_news_selected_url": "https://example.test/mc",
-                            "deep_news_seen_urls": ["https://example.test/mc"],
-                            "llm_memory_summary": "Memo ligne mise a jour"
+                            "deep_news_seen_urls": ["https://example.test/mc"]
                         },
                         "model": "codex"
                     }));

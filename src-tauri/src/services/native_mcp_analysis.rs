@@ -72,8 +72,9 @@ fn merge_mcp_results(run_id: &str, data_dir: &str) {
                     let ticker = line_id.split(':').last().unwrap_or("");
                     if !ticker.is_empty() {
                         crate::run_state_cache::cache_line_status(run_id, ticker, json!({"status": "done"}));
-                        // Sync line memory for codex mode (fixes codex persist gap)
-                        sync_line_memory(run_id, ticker, &rec);
+                        // Sync line memory for codex mode (V2 schema)
+                        let price = extract_market_price_from_run_state(data_path, run_id, ticker);
+                        sync_line_memory(run_id, ticker, &rec, price);
                     }
                     merged_count += 1;
                 }
@@ -205,7 +206,6 @@ Reponds UNIQUEMENT avec un objet JSON (pas de texte avant ou apres) contenant :
 - extracted_fundamentals: {{ "pe_ratio": ..., "revenue_growth": ..., "profit_margin": ..., "debt_to_equity": ... }} (si trouves via web ou calcules)
 - shared_insights: {{ "analyse_technique": "...", "analyse_fondamentale": "...", "analyse_sentiment": "...", "risques": "...", "catalyseurs": "..." }}
 - reanalyse_after: date ISO, reanalyse_reason
-- llm_memory_summary: resume factuel
 
 Si les donnees sont insuffisantes, tu peux faire UNE recherche web (pas plus) pour completer.
 Sois concret: chiffres, montants, dates. Pas de generalites.
@@ -343,18 +343,19 @@ fn extract_recommendation_json(result: &Value) -> Option<Value> {
     None
 }
 
-// ── Line memory sync ────────────────────────────────────────────
+// ── Line memory sync (V2 schema) ────────────────────────────────
 
 /// Sync a validated recommendation into the persistent line-memory.json store.
-/// Schema: { "by_ticker": { "AAPL": {...} }, "global_deep_news_banned_urls": [], "deep_news_rotation_cache": {} }
-///
-/// This is the Rust port of the JS `applyRecommendationToStore` + `syncLineMemoryAfterRecommendation`.
-fn sync_line_memory(run_id: &str, ticker: &str, rec: &Value) {
+/// V2 schema — clean break from V1. Writes `schema_version: 2`,
+/// `signal_history`, `key_reasoning`, `news_themes`, `trend`, `price_tracking`.
+/// V1 fields (`llm_memory_summary`, `llm_strong_signals`, `llm_key_history`) are NOT written.
+fn sync_line_memory(run_id: &str, ticker: &str, rec: &Value, current_price: f64) {
     let ticker = ticker.trim().to_uppercase();
     if ticker.is_empty() { return; }
 
     let path = crate::resolve_runtime_state_dir().join("line-memory.json");
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let today = &now[..10]; // "YYYY-MM-DD"
 
     // Read existing store (or create empty)
     let mut store = if path.exists() {
@@ -391,34 +392,39 @@ fn sync_line_memory(run_id: &str, ticker: &str, rec: &Value) {
     let conviction = as_str(rec.get("conviction"));
     let synthese = as_str(rec.get("synthese"));
 
-    // Build llm_key_history: new entry + recommendation's + existing (max 20)
-    let key_history_entry = format!(
-        "{} {}{}",
-        &now[..10],
-        signal,
-        if conviction.is_empty() { String::new() } else { format!(" ({conviction})") }
-    );
-    let llm_key_history = merge_string_list(
-        std::iter::once(key_history_entry.as_str())
-            .chain(json_str_array(rec.get("llm_key_history")))
-            .chain(json_str_array(current.get("llm_key_history"))),
-        20,
+    // ── V2: signal_history (prepend, cap at 10) ────────────────────
+    let new_signal_entry = json!({
+        "date": today,
+        "signal": signal,
+        "conviction": conviction,
+        "price_at_signal": current_price,
+        "run_id": run_id,
+    });
+
+    let mut signal_history: Vec<Value> = vec![new_signal_entry];
+    if let Some(arr) = current.get("signal_history").and_then(|v| v.as_array()) {
+        for item in arr.iter().take(9) {
+            signal_history.push(item.clone());
+        }
+    }
+
+    // ── V2: key_reasoning (first 3 sentences of synthese) ──────────
+    let key_reasoning = extract_first_sentences(&synthese, 3);
+
+    // ── V2: news_themes (merge from badges_keywords, cap at 15) ────
+    let news_themes = merge_string_list(
+        json_str_array(rec.get("badges_keywords"))
+            .chain(json_str_array(current.get("news_themes"))),
+        15,
     );
 
-    // llm_strong_signals: recommendation's + badges_keywords + existing (max 12)
-    let llm_strong_signals = merge_string_list(
-        json_str_array(rec.get("llm_strong_signals"))
-            .chain(json_str_array(rec.get("badges_keywords")))
-            .chain(json_str_array(current.get("llm_strong_signals"))),
-        12,
-    );
+    // ── V2: trend (computed from last 3 signal_history entries) ─────
+    let trend = compute_trend(&signal_history);
 
-    // llm_memory_summary: prefer new, fall back to existing, then synthese
-    let llm_memory_summary = non_empty_str(rec.get("llm_memory_summary"))
-        .or_else(|| non_empty_str(current.get("llm_memory_summary")))
-        .unwrap_or_else(|| truncate(synthese.as_str(), 2400));
+    // ── V2: price_tracking (accuracy vs previous signal) ───────────
+    let price_tracking = compute_price_tracking(&current, current_price, &signal);
 
-    // Deep news fields
+    // ── Deep news fields (preserved across V1→V2) ──────────────────
     let deep_news_summary = non_empty_str(rec.get("deep_news_memory_summary"))
         .or_else(|| non_empty_str(rec.get("deep_news_summary")))
         .or_else(|| non_empty_str(current.get("deep_news_memory_summary")))
@@ -450,22 +456,23 @@ fn sync_line_memory(run_id: &str, ticker: &str, rec: &Value) {
                     arr.push(url_val);
                 }
             }
-            // Cap at 2000
             while arr.len() > 2000 { arr.remove(0); }
         }
     }
 
-    // Build the updated ticker entry
+    // Build the V2 ticker entry — NO V1 fields
     let entry = json!({
+        "schema_version": 2,
         "ticker": ticker,
         "updated_at": &now,
         "run_id_last_update": run_id,
         "signal": signal,
         "conviction": conviction,
-        "synthese": truncate(synthese.as_str(), 420),
-        "llm_memory_summary": truncate(&llm_memory_summary, 2400),
-        "llm_strong_signals": llm_strong_signals,
-        "llm_key_history": llm_key_history,
+        "signal_history": signal_history,
+        "key_reasoning": key_reasoning,
+        "price_tracking": price_tracking,
+        "news_themes": news_themes,
+        "trend": trend,
         "deep_news_memory_summary": truncate(&deep_news_summary, 2400),
         "deep_news_selected_url": non_empty_str(rec.get("deep_news_selected_url"))
             .or_else(|| non_empty_str(current.get("deep_news_selected_url")))
@@ -480,6 +487,8 @@ fn sync_line_memory(run_id: &str, ticker: &str, rec: &Value) {
         "deep_news_staleness": non_empty_str(rec.get("deep_news_staleness"))
             .or_else(|| non_empty_str(current.get("deep_news_staleness")))
             .unwrap_or_default(),
+        "deep_news_seen_urls": current.get("deep_news_seen_urls").cloned().unwrap_or(json!([])),
+        "deep_news_banned_urls": current.get("deep_news_banned_urls").cloned().unwrap_or(json!([])),
         "action_recommandee": non_empty_str(rec.get("action_recommandee"))
             .or_else(|| non_empty_str(current.get("action_recommandee")))
             .unwrap_or_default(),
@@ -494,6 +503,8 @@ fn sync_line_memory(run_id: &str, ticker: &str, rec: &Value) {
             "synthese": truncate(synthese.as_str(), 420),
         },
         "run_history": run_history,
+        // user_action preserved if it existed
+        "user_action": current.get("user_action").cloned().unwrap_or(Value::Null),
     });
 
     // Re-acquire by_ticker after store borrows
@@ -506,11 +517,150 @@ fn sync_line_memory(run_id: &str, ticker: &str, rec: &Value) {
     if let Err(e) = crate::storage::write_json_file(&pb, &store) {
         crate::debug_log(&format!("sync_line_memory: write failed for {ticker}: {e}"));
     } else {
-        crate::debug_log(&format!("sync_line_memory: updated {ticker} for run {run_id}"));
+        crate::debug_log(&format!("sync_line_memory: updated V2 for {ticker} run {run_id}"));
+    }
+}
+
+// ── V2 computation helpers ─────────────────────────────────────
+
+/// Extract first N sentences from text (split on `. ` or period at end).
+fn extract_first_sentences(text: &str, n: usize) -> String {
+    let mut sentences = Vec::new();
+    let mut remaining = text.trim();
+    for _ in 0..n {
+        if remaining.is_empty() { break; }
+        // Find the first sentence-ending punctuation followed by a space or end
+        let end = remaining.find(". ")
+            .map(|i| i + 1) // include the period
+            .or_else(|| remaining.find(".\n").map(|i| i + 1))
+            .unwrap_or(remaining.len());
+        let sentence = remaining[..end].trim();
+        if !sentence.is_empty() {
+            sentences.push(sentence.to_string());
+        }
+        remaining = remaining[end..].trim_start();
+    }
+    sentences.join(" ")
+}
+
+/// Compute trend from last 3 signal_history entries.
+/// - `upgrading`: signals move toward stronger buy
+/// - `downgrading`: signals move toward sell
+/// - `volatile`: alternates direction >= 2 times
+/// - `stable`: same signal repeated
+fn compute_trend(signal_history: &[Value]) -> &'static str {
+    if signal_history.len() < 2 { return "stable"; }
+
+    let signals: Vec<i8> = signal_history.iter()
+        .take(3)
+        .filter_map(|entry| entry.get("signal").and_then(|v| v.as_str()))
+        .map(signal_strength)
+        .collect();
+
+    if signals.len() < 2 { return "stable"; }
+
+    let mut ups = 0i32;
+    let mut downs = 0i32;
+    let mut direction_changes = 0i32;
+    let mut last_dir: i8 = 0;
+
+    for window in signals.windows(2) {
+        let diff = window[0] - window[1]; // newest - older: positive = upgrading
+        let dir = if diff > 0 { 1i8 } else if diff < 0 { -1 } else { 0 };
+        if dir > 0 { ups += 1; }
+        if dir < 0 { downs += 1; }
+        if last_dir != 0 && dir != 0 && dir != last_dir { direction_changes += 1; }
+        if dir != 0 { last_dir = dir; }
+    }
+
+    if direction_changes >= 2 { return "volatile"; }
+    if ups > 0 && downs == 0 { return "upgrading"; }
+    if downs > 0 && ups == 0 { return "downgrading"; }
+    if ups == 0 && downs == 0 { return "stable"; }
+    "volatile"
+}
+
+/// Map signal name to numeric strength for trend comparison.
+fn signal_strength(signal: &str) -> i8 {
+    match signal {
+        "VENTE" => 1,
+        "ALLEGEMENT" => 2,
+        "SURVEILLANCE" => 3,
+        "CONSERVER" => 4,
+        "RENFORCEMENT" => 5,
+        "ACHAT" => 6,
+        "ACHAT_FORT" => 7,
+        _ => 3, // unknown defaults to neutral
+    }
+}
+
+/// Returns true if this signal expects a positive price move.
+fn is_bullish_signal(signal: &str) -> bool {
+    matches!(signal, "ACHAT_FORT" | "ACHAT" | "RENFORCEMENT")
+}
+
+/// Compute price_tracking from previous signal data and current price.
+fn compute_price_tracking(current: &Value, current_price: f64, current_signal: &str) -> Value {
+    // Get the most recent signal_history entry from the PREVIOUS run
+    let prev_entry = current.get("signal_history")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first());
+
+    if let Some(prev) = prev_entry {
+        let prev_signal = prev.get("signal").and_then(|v| v.as_str()).unwrap_or("");
+        let prev_date = prev.get("date").and_then(|v| v.as_str()).unwrap_or("");
+        let price_at_signal = prev.get("price_at_signal").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+        let return_pct = if price_at_signal > 0.0 && current_price > 0.0 {
+            ((current_price - price_at_signal) / price_at_signal * 100.0 * 10.0).round() / 10.0
+        } else {
+            0.0
+        };
+
+        let accuracy = if price_at_signal > 0.0 && current_price > 0.0 {
+            let positive_return = return_pct > 0.0;
+            if is_bullish_signal(prev_signal) == positive_return { "correct" } else { "incorrect" }
+        } else {
+            "unknown"
+        };
+
+        json!({
+            "last_signal": prev_signal,
+            "last_signal_date": prev_date,
+            "price_at_signal": price_at_signal,
+            "current_price": current_price,
+            "return_since_signal_pct": return_pct,
+            "signal_accuracy": accuracy,
+        })
+    } else {
+        // First analysis — no previous signal to compare against
+        json!({
+            "last_signal": current_signal,
+            "last_signal_date": &chrono::Utc::now().format("%Y-%m-%d").to_string(),
+            "price_at_signal": current_price,
+            "current_price": current_price,
+            "return_since_signal_pct": 0.0,
+            "signal_accuracy": "first_analysis",
+        })
     }
 }
 
 // ── Line memory helpers ─────────────────────────────────────────
+
+/// Extract market price for a ticker from the cached run state.
+/// Used by codex path where line_data isn't directly available.
+fn extract_market_price_from_run_state(data_dir: &std::path::Path, run_id: &str, ticker: &str) -> f64 {
+    let ticker_upper = ticker.to_uppercase();
+    crate::run_state_cache::load(data_dir, run_id)
+        .ok()
+        .and_then(|state| {
+            state.get("market")
+                .and_then(|m| m.get(&ticker_upper))
+                .and_then(|md| md.get("price").or_else(|| md.get("last_price")).or_else(|| md.get("cours")))
+                .and_then(|v| v.as_f64())
+        })
+        .unwrap_or(0.0)
+}
 
 fn as_str(v: Option<&Value>) -> String {
     v.and_then(|v| v.as_str()).unwrap_or("").trim().to_string()
@@ -552,8 +702,13 @@ fn json_str_array(v: Option<&Value>) -> impl Iterator<Item = &str> {
 
 /// Persist extracted fundamentals, shared insights, deep news, and line memory from the recommendation.
 fn persist_line_extras(data_dir: &std::path::Path, run_id: &str, ticker: &str, line_data: &Value, rec: &Value) {
-    // Sync line memory (cross-run persistent state)
-    sync_line_memory(run_id, ticker, rec);
+    // Extract current market price for V2 signal tracking
+    let current_price = line_data.get("market_data")
+        .and_then(|m| m.get("price").or_else(|| m.get("last_price")).or_else(|| m.get("cours")))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    // Sync line memory (cross-run persistent state, V2 schema)
+    sync_line_memory(run_id, ticker, rec, current_price);
     let isin = line_data.get("position")
         .and_then(|p| p.get("isin"))
         .and_then(|v| v.as_str())
@@ -639,7 +794,6 @@ Pour CHAQUE ligne ci-dessus :
    - deep_news_relevance: high|medium|low
    - deep_news_staleness: fresh|recent|stale
    - reanalyse_after: date ISO, reanalyse_reason
-   - llm_memory_summary: resume factuel
    - sector_analysis: 2-3 phrases sur le positionnement sectoriel (COT, tendances macro)
 3. Appelle `validate_recommendation(run_id="{run_id}", recommendation=...)`.
    Si ok=false, corrige les issues et re-appelle jusqu'a ok=true.

@@ -288,9 +288,17 @@ pub(crate) fn build_memory_for_prompt(entry: Option<&Value>, global_banned_urls:
         .collect::<Vec<_>>();
     let selected_url = normalize_url(&as_text(entry.get("deep_news_selected_url")));
     Some(json!({
-        "llm_memory_summary": as_text(entry.get("llm_memory_summary")),
-        "llm_strong_signals": as_string_list(entry.get("llm_strong_signals"), 12, 220),
-        "llm_key_history": as_string_list(entry.get("llm_key_history"), 20, 220),
+        // V2 fields
+        "schema_version": entry.get("schema_version").and_then(|v| v.as_u64()).unwrap_or(0),
+        "signal": as_text(entry.get("signal")),
+        "conviction": as_text(entry.get("conviction")),
+        "signal_history": entry.get("signal_history").cloned().unwrap_or(json!([])),
+        "key_reasoning": as_text(entry.get("key_reasoning")),
+        "price_tracking": entry.get("price_tracking").cloned().unwrap_or(Value::Null),
+        "news_themes": entry.get("news_themes").cloned().unwrap_or(json!([])),
+        "trend": as_text(entry.get("trend")),
+        "user_action": entry.get("user_action").cloned().unwrap_or(Value::Null),
+        // Deep news fields (preserved)
         "deep_news_memory_summary": as_text(entry.get("deep_news_memory_summary")),
         "deep_news_selected_url": if !selected_url.is_empty() && !banned_set.contains(&selected_url) { Value::String(selected_url) } else { Value::String(String::new()) },
         "deep_news_seen_urls": deep_news_seen_urls,

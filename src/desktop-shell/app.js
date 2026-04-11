@@ -457,12 +457,25 @@ function injectSynthesisAskButton(synthCard, model) {
     const m = latestReportModel;
     if (!m) return;
     const account = m.account || "your";
+    let doneHandled = false;
+    const synthRec = { ticker: "_PORTFOLIO", name: account, details: {}, lineMemory: {} };
     await openChatWizard({
       title: "Ask about synthesis",
       systemContext: buildSynthesisContext(m),
       initialMessage: `This is the global synthesis for your ${account} portfolio. What would you like to explore?`,
+      returnHistoryOnClose: true,
+      onDone: async (history) => {
+        doneHandled = true;
+        const hadConversation = history.some((m) => m.role === "user");
+        const prefill = hadConversation
+          ? await synthesizeChatForMemoryWithUI("_PORTFOLIO", account, history)
+          : null;
+        showSaveToMemoryPanel(synthRec, prefill);
+      },
     });
-    // No Save to Memory for synthesis chat — not ticker-scoped
+    if (!doneHandled) {
+      showSaveToMemoryPanel(synthRec, null);
+    }
   });
   synthCard.appendChild(btn);
 }

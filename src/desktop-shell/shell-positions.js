@@ -24,8 +24,10 @@ export function renderPositionsTable(viewModel, dashboardPayload) {
 
   // During active run, if the user is viewing the active run (not browsing a different one),
   // push events exclusively manage positions — skip table rebuild to prevent flickering.
+  // Only skip when selectedRunId strictly equals the active run — the !selectedRunId fallback
+  // was too broad and prevented proper clearing when navigating between runs.
   const viewingActiveRun = isActiveRunInProgress() &&
-    (!viewModel?.selectedRunId || viewModel.selectedRunId === latestRun?.run_id);
+    viewModel?.selectedRunId && viewModel.selectedRunId === latestRun?.run_id;
   if (viewingActiveRun && latestRun?.orchestration?.status === "running") return;
   const positions = latestRun?.portfolio?.positions || [];
   const recommendations = viewModel?.recommendations || [];

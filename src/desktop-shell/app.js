@@ -60,6 +60,8 @@ import {
   clearRunPipelineBar,
   stashLiveRunState,
   setLiveRunContext,
+  setLiveRunActiveId,
+  setLiveRunViewingId,
   restoreLiveRunView,
   getSelectedAccount,
   getStashedLineStatus,
@@ -144,10 +146,12 @@ const runOperations = createRunOperationsController({
       showRunView({ starting: true, live: true });
       if (event?.run_id) {
         activeRunId = event.run_id;
+        setLiveRunActiveId(event.run_id);
       }
     }
     if (event?.type === "run.progress" && event?.run_id) {
       activeRunId = event.run_id;
+      setLiveRunActiveId(event.run_id);
     }
     if (event?.type === "run.progress") {
       if (event?.line_status) {
@@ -170,6 +174,8 @@ const runOperations = createRunOperationsController({
     if (event?.type === "run.completed" || event?.type === "run.failed" || event?.type === "run.aborted") {
       activeRunRefresh = false;
       activeRunId = null;
+      setLiveRunActiveId(null);
+      setLiveRunViewingId(null);
       lastDoneCount = 0;
       syncAutoRefreshPolicy();
       setStopAnalysisVisible(false);

@@ -27,9 +27,23 @@ const reportSynthesisCardNode = document.getElementById("report-synthesis-card")
 // ── State ────────────────────────────────────────────────────────
 
 let activeRunInProgress = false;
+let liveRunActiveId = null;   // run_id of the currently executing run
+let liveRunViewingId = null;  // run_id the user is currently viewing (null = active run)
 
 export function setActiveRunInProgress(active) { activeRunInProgress = active; }
 export function isActiveRunInProgress() { return activeRunInProgress; }
+
+export function setLiveRunActiveId(runId) { liveRunActiveId = runId; }
+export function getLiveRunActiveId() { return liveRunActiveId; }
+export function setLiveRunViewingId(runId) { liveRunViewingId = runId; }
+
+/// Returns true when the user is viewing a completed/different run, not the active one.
+function isViewingDifferentRun() {
+  if (!activeRunInProgress || !liveRunActiveId) return false;
+  // null viewingId means "following the active run"
+  if (liveRunViewingId == null) return false;
+  return liveRunViewingId !== liveRunActiveId;
+}
 
 // ── Live positions ───────────────────────────────────────────────
 
@@ -81,6 +95,8 @@ function ensureWatchlistSeparator() {
 
 export function renderLivePositions(lineStatus, dashboardPayload) {
   if (!positionsTbodyNode || !lineStatus) return;
+  // Don't mutate the positions table if the user is browsing a different run/account
+  if (isViewingDifferentRun()) return;
 
   const tickers = Object.keys(lineStatus).filter((t) => t !== "__synthesis__");
   if (tickers.length === 0) return;
@@ -160,6 +176,7 @@ export function renderLivePositions(lineStatus, dashboardPayload) {
 /// Update a single line's progress in-place (called from Tauri event, no polling).
 export function updateSingleLineProgress(ticker, lineStatus) {
   if (!positionsTbodyNode) return;
+  if (isViewingDifferentRun()) return;
   const upperTicker = ticker.toUpperCase();
   const row = positionsTbodyNode.querySelector(`tr[data-ticker="${upperTicker}"], tr[data-ticker="${ticker}"]`);
   if (!row) return;

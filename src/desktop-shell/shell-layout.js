@@ -16,10 +16,13 @@ import {
   setActiveRunInProgress,
   isActiveRunInProgress,
   setLiveRunContext,
+  setLiveRunActiveId,
+  getLiveRunActiveId,
+  setLiveRunViewingId,
 } from "/desktop-shell/shell-live-run.js";
 
 // Re-export for backward compat with app.js imports
-export { renderLivePositions, updateSingleLineProgress, renderTopBarProgress, renderPipelineBar, clearRunPipelineBar, setLiveRunContext };
+export { renderLivePositions, updateSingleLineProgress, renderTopBarProgress, renderPipelineBar, clearRunPipelineBar, setLiveRunContext, setLiveRunActiveId, setLiveRunViewingId };
 
 // ── DOM refs ──────────────────────────────────────────────────────
 
@@ -284,6 +287,8 @@ export function stashLiveRunState(lineStatus, dashboardPayload, stage) {
 
 export function restoreLiveRunView() {
   if (!isActiveRunInProgress()) return;
+  // Reset viewing to the active run so push events resume updating the table
+  setLiveRunViewingId(getLiveRunActiveId());
   clearReportSections();
   showRunView();
   if (activeRunLineStatus) {
@@ -416,6 +421,8 @@ export function showRunView({ starting = false, live = false } = {}) {
     activeRunLineStatus = null;
     activeRunDashboardPayload = null;
     activeRunLastStage = null;
+    // New run starting — user is viewing it (null = follow active run)
+    setLiveRunViewingId(null);
     // Clear stale data from previous run
     clearReportSections();
     const accountLabel = document.getElementById("main-account-label");
@@ -530,6 +537,8 @@ function showMainWelcome(show) {
 function selectRun(runId, account) {
   selectedRunId = runId;
   if (account) selectedAccount = account;
+  // Track which run the user is viewing so live push events don't mutate the wrong table
+  setLiveRunViewingId(runId);
   highlightSelectedRun();
   onRunSelected?.(runId);
 }
@@ -595,6 +604,8 @@ function renderAccountFolder(acct) {
     } else {
       selectedAccount = acct.name;
       selectedRunId = null;
+      // Mark that user navigated away from the active run
+      setLiveRunViewingId("__account_view__");
       highlightSelectedRun();
       // Highlight this folder
       document.querySelectorAll(".account-folder.is-selected").forEach((el) => el.classList.remove("is-selected"));

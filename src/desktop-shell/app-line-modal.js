@@ -3,6 +3,7 @@
  * Handles: modal open/close, position/market/news/analysis rendering, collection detail.
  */
 import { escapeHtml } from "/desktop-shell/ui-display-utils.js";
+import { openChatWizard } from "/desktop-shell/app-chat-wizard.js";
 
 // ── DOM nodes ────────────────────────────────────────────────────
 
@@ -236,9 +237,78 @@ function renderCollectionDetail(details) {
   panel.classList.add("hidden");
 }
 
+// ── Position chat context builder ────────────────────────────────
+
+function buildPositionContext(rec) {
+  const ticker = rec?.ticker || "N/A";
+  const name = rec?.name || "";
+  const signal = rec?.signal || "N/A";
+  const conviction = rec?.conviction || "N/A";
+  const summary = rec?.summary || "";
+  const details = rec?.details || {};
+  const memory = rec?.lineMemory || {};
+  const analysis = details.analysis || {};
+  const position = details.position || {};
+  const market = details.market || {};
+  const news = details.news || [];
+
+  const sections = [];
+  sections.push(`Position: ${ticker}${name ? ` (${name})` : ""}`);
+  sections.push(`Signal: ${signal} | Conviction: ${conviction}`);
+  if (summary) sections.push(`Recommendation: ${summary}`);
+
+  // Position metrics
+  const posMetrics = [];
+  if (position.quantite != null) posMetrics.push(`Qty: ${position.quantite}`);
+  if (position.poids_pct != null) posMetrics.push(`Weight: ${position.poids_pct}%`);
+  if (position.prix_actuel != null) posMetrics.push(`Price: ${position.prix_actuel}`);
+  if (position.plus_moins_value_pct != null) posMetrics.push(`P/L: ${position.plus_moins_value_pct}%`);
+  if (posMetrics.length > 0) sections.push(`Position: ${posMetrics.join(", ")}`);
+
+  // Market data
+  const mktMetrics = [];
+  if (market.prix_actuel != null) mktMetrics.push(`Price: ${market.prix_actuel}`);
+  if (market.pe_ratio != null) mktMetrics.push(`P/E: ${market.pe_ratio}`);
+  if (market.revenue_growth != null) mktMetrics.push(`Rev Growth: ${market.revenue_growth}%`);
+  if (market.profit_margin != null) mktMetrics.push(`Margin: ${market.profit_margin}%`);
+  if (market.debt_to_equity != null) mktMetrics.push(`D/E: ${market.debt_to_equity}`);
+  if (mktMetrics.length > 0) sections.push(`Market: ${mktMetrics.join(", ")}`);
+
+  // Analysis
+  if (analysis.analyse_technique) sections.push(`Technical: ${analysis.analyse_technique}`);
+  if (analysis.analyse_fondamentale) sections.push(`Fundamental: ${analysis.analyse_fondamentale}`);
+  if (analysis.analyse_sentiment) sections.push(`Sentiment: ${analysis.analyse_sentiment}`);
+  if (analysis.deep_news_summary) sections.push(`News analysis: ${analysis.deep_news_summary}`);
+
+  // Key reasons, risks, catalysts
+  const reasons = analysis.raisons_principales || [];
+  if (reasons.length > 0) sections.push(`Key reasons: ${reasons.slice(0, 5).join("; ")}`);
+  const risks = analysis.risques || [];
+  if (risks.length > 0) sections.push(`Risks: ${risks.slice(0, 5).join("; ")}`);
+  const catalysts = analysis.catalyseurs || [];
+  if (catalysts.length > 0) sections.push(`Catalysts: ${catalysts.slice(0, 5).join("; ")}`);
+
+  // News headlines (concise)
+  if (news.length > 0) {
+    const headlines = news.slice(0, 5).map((a) => a.title || "Untitled").join("; ");
+    sections.push(`Recent news: ${headlines}`);
+  }
+
+  // Line memory
+  if (memory.llm_memory_summary) sections.push(`Memory: ${memory.llm_memory_summary}`);
+  const signals = memory.llm_strong_signals || [];
+  if (signals.length > 0) sections.push(`Signals: ${signals.join(", ")}`);
+  const keyHistory = memory.llm_key_history || [];
+  if (keyHistory.length > 0) sections.push(`History: ${keyHistory.slice(0, 5).join("; ")}`);
+
+  return `The user is inspecting their ${ticker}${name ? ` (${name})` : ""} position. Here is the full analysis context:\n\n${sections.join("\n")}\n\nYou are a portfolio analysis assistant. Answer questions about this position based on the context above. This is a read-only discussion — you cannot change recommendations or portfolio state. Be concise and specific.`;
+}
+
 // ── Public API ───────────────────────────────────────────────────
 
 export function initLineModal() {
+  let currentRec = null;
+
   lineMemoryCloseBtn?.addEventListener("click", () => setVisible(false));
 
   // Detail panel toggle buttons
@@ -249,11 +319,28 @@ export function initLineModal() {
     document.getElementById("line-memory-news-detail")?.classList.toggle("hidden");
   });
 
+  // "Ask about this" chat button
+  const askBtn = document.getElementById("line-memory-ask-btn");
+  askBtn?.addEventListener("click", () => {
+    if (!currentRec) return;
+    const ticker = currentRec.ticker || "N/A";
+    const name = currentRec.name || "";
+    const signal = currentRec.signal || "N/A";
+    const conviction = currentRec.conviction || "N/A";
+    const label = name ? `${name} (${ticker})` : ticker;
+    openChatWizard({
+      title: `Ask about ${ticker}`,
+      systemContext: buildPositionContext(currentRec),
+      initialMessage: `I can answer questions about your ${label} position. The current recommendation is ${signal} (${conviction}). What would you like to know?`,
+    });
+  });
+
   function setVisible(visible) {
     lineMemoryModalNode?.classList.toggle("hidden", !visible);
   }
 
   function open(rec) {
+    currentRec = rec;
     const memory = rec?.lineMemory || {};
     const details = rec?.details || {};
     const ticker = rec?.ticker || "N/A";

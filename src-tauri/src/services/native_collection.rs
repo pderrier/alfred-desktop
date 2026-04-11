@@ -609,6 +609,25 @@ fn fetch_finary_snapshot(run_id: &str, _request_fn: HttpRequestFn) -> Result<Val
             "finary_cash: extracted {} holdings_accounts from accountsPayload",
             holdings_accounts.len()
         ));
+        // Dump raw holdings structure for cash debugging
+        for acct in &holdings_accounts {
+            let name = acct.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            let secs = acct.get("securities").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+            let fiats = acct.get("fiats").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let conn_id = acct.get("connection_id").and_then(|v| v.as_i64());
+            let fiat_details: Vec<String> = fiats.iter().map(|f| {
+                let cv = f.get("current_value").and_then(|v| v.as_f64());
+                let amt = f.get("amount").and_then(|v| v.as_f64());
+                let qty = f.get("quantity").and_then(|v| v.as_f64());
+                let fname = f.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let currency = f.get("currency").and_then(|v| v.get("code")).and_then(|v| v.as_str()).unwrap_or("?");
+                format!("{fname}({currency}): cv={cv:?} amt={amt:?} qty={qty:?}")
+            }).collect();
+            crate::debug_log(&format!(
+                "finary_cash_raw: '{}' conn={:?} secs={} fiats={} => {:?}",
+                name, conn_id, secs, fiats.len(), fiat_details
+            ));
+        }
     }
     let cash_result = build_cash_mapping(&holdings_accounts);
     let investment_name_to_cash = cash_result.mapping;

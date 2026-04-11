@@ -138,8 +138,8 @@ export function openChatWizard(config) {
         addBubble("assistant", response);
         history.push({ role: "assistant", content: response });
 
-        // Show confirm/reject after first assistant reply to a user message
-        if (history.filter((m) => m.role === "assistant").length >= 2) {
+        // Show confirm/reject only for decision flows (extractResult provided)
+        if (extractResult && history.filter((m) => m.role === "assistant").length >= 2) {
           showConfirmReject();
         }
       } catch (err) {

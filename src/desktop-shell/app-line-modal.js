@@ -537,10 +537,19 @@ export function initLineModal() {
       returnHistoryOnClose: true,
     });
     // Show save panel with loading state while LLM synthesizes
+    const jsLog = (msg) => window?.__TAURI__?.core?.invoke?.("js_log_local", { message: msg }).catch(() => {});
     const hadConversation = Array.isArray(chatResult) && chatResult.some((m) => m.role === "user");
-    const prefill = hadConversation
-      ? await synthesizeChatForMemoryWithUI(ticker, name, chatResult)
-      : null;
+    jsLog(`ask-about: chatResult isArray=${Array.isArray(chatResult)} length=${chatResult?.length} hadConversation=${hadConversation}`);
+    let prefill = null;
+    if (hadConversation) {
+      try {
+        prefill = await synthesizeChatForMemoryWithUI(ticker, name, chatResult);
+        jsLog(`ask-about: synthesis done, prefill=${!!prefill}`);
+      } catch (err) {
+        jsLog(`ask-about: synthesis error: ${err?.message || err}`);
+      }
+    }
+    jsLog(`ask-about: calling showSaveToMemoryPanel rec=${!!rec} ticker=${rec?.ticker}`);
     showSaveToMemoryPanel(rec, prefill);
   });
 

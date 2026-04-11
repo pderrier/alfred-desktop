@@ -431,6 +431,11 @@ async fn install_update_local(path: String) -> Result<serde_json::Value, String>
 }
 
 #[tauri::command]
+fn js_log_local(message: String) {
+    helpers::debug_log(&format!("[js] {message}"));
+}
+
+#[tauri::command]
 async fn chat_wizard_send_local(
     context: String,
     history: Vec<serde_json::Value>,
@@ -525,6 +530,7 @@ fn run_tauri_app() -> anyhow::Result<()> {
             check_for_update_local,
             download_update_local,
             install_update_local,
+            js_log_local,
             chat_wizard_send_local,
             update_line_memory_local
         ])

@@ -105,7 +105,7 @@ jobs:
             "mandatory": ${MANDATORY},
             "min_version": null,
             "release_notes": null,
-            "installer_url": "${BASE_URL}/${DMG_NAME}",
+            "installer_url": "${BASE_URL}/latest",
             "installer_sha256": "${SHA256}",
             "published_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           }

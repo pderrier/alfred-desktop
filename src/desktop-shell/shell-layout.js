@@ -405,6 +405,7 @@ function clearReportSections() {
   if (positionsEmptyNode) positionsEmptyNode.classList.add("hidden");
   if (overviewPanelNode) overviewPanelNode.classList.add("hidden");
   if (reportSynthesisCardNode) reportSynthesisCardNode.classList.add("synthesis-pending");
+  document.getElementById("report-synthesis-card")?.querySelector(".synthesis-ask-btn")?.remove();
 }
 
 export function showRunView({ starting = false, live = false } = {}) {

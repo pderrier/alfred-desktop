@@ -239,7 +239,7 @@ function renderCollectionDetail(details) {
 
 // ── Position chat context builder ────────────────────────────────
 
-function buildPositionContext(rec) {
+export function buildPositionContext(rec) {
   const ticker = rec?.ticker || "N/A";
   const name = rec?.name || "";
   const signal = rec?.signal || "N/A";
@@ -304,20 +304,79 @@ function buildPositionContext(rec) {
   return `The user is inspecting their ${ticker}${name ? ` (${name})` : ""} position. Here is the full analysis context:\n\n${sections.join("\n")}\n\nYou are a portfolio analysis assistant. Answer questions about this position based on the context above. This is a read-only discussion — you cannot change recommendations or portfolio state. Be concise and specific.`;
 }
 
+// ── LLM chat synthesis for save pre-fill ────────────────────────
+
+/**
+ * Synthesize a chat conversation into key_reasoning + user_note via LLM.
+ * Returns { keyReasoning, userNote } or null on failure.
+ */
+export async function synthesizeChatForMemory(ticker, name, chatHistory) {
+  if (!Array.isArray(chatHistory)) return null;
+  const userMessages = chatHistory.filter((m) => m.role === "user");
+  if (userMessages.length === 0) return null;
+
+  const formatted = chatHistory
+    .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.content}`)
+    .join("\n\n");
+
+  const prompt = `Given this conversation about ${ticker}${name ? ` (${name})` : ""}, extract:
+1. KEY_REASONING: The main analytical insight or thesis update (1-3 sentences)
+2. USER_NOTE: Any personal observation or decision the user expressed (1-2 sentences, or empty if none)
+
+Conversation:
+${formatted}
+
+Respond exactly as:
+KEY_REASONING: ...
+USER_NOTE: ...`;
+
+  try {
+    const invoke = window?.__TAURI__?.core?.invoke;
+    if (!invoke) return null;
+    const result = await invoke("chat_wizard_send_local", {
+      context: "You extract structured insights from portfolio analysis conversations. Be concise and faithful to what was discussed.",
+      history: [],
+      userMessage: prompt,
+    });
+    const response = result?.response || "";
+    const krMatch = response.match(/KEY_REASONING:\s*([\s\S]*?)(?=\nUSER_NOTE:|$)/);
+    const unMatch = response.match(/USER_NOTE:\s*([\s\S]*?)$/);
+    const keyReasoning = krMatch?.[1]?.trim() || "";
+    const userNote = unMatch?.[1]?.trim() || "";
+    return {
+      keyReasoning: keyReasoning && keyReasoning.toLowerCase() !== "empty" ? keyReasoning : "",
+      userNote: userNote && userNote.toLowerCase() !== "empty" ? userNote : "",
+    };
+  } catch (err) {
+    console.error("chat_synthesis_failed", err);
+    return null;
+  }
+}
+
 // ── Save to Memory panel ────────────────────────────────────────
 
 /**
  * Show an inline overlay panel where the user can persist insights
  * from a chat drill-down back into line-memory.json.
  * Fields: key_reasoning (textarea), user_note (textarea), news_themes (checkboxes).
- * No LLM involvement — deterministic write via Tauri command.
+ *
+ * @param {Object} rec — the recommendation / position record
+ * @param {Object} [prefill] — optional LLM-generated pre-fill values
+ * @param {string} [prefill.keyReasoning] — suggested key reasoning text
+ * @param {string} [prefill.userNote] — suggested personal note text
  */
-function showSaveToMemoryPanel(rec) {
+export function showSaveToMemoryPanel(rec, prefill) {
   if (!rec) return;
   const ticker = rec.ticker || "";
   const memory = rec.lineMemory || {};
   const existingReasoning = memory.key_reasoning || "";
   const existingThemes = Array.isArray(memory.news_themes) ? memory.news_themes : [];
+  // Merge existing reasoning with prefill if both present
+  const prefillReasoning = prefill?.keyReasoning || "";
+  const mergedReasoning = existingReasoning && prefillReasoning
+    ? `${existingReasoning}\n---\n${prefillReasoning}`
+    : prefillReasoning || existingReasoning;
+  const mergedNote = prefill?.userNote || "";
   // Merge run badges with existing themes for checkbox list
   const analysis = rec.details?.analysis || {};
   const runBadges = Array.isArray(analysis.badges_keywords) ? analysis.badges_keywords : [];
@@ -348,11 +407,11 @@ function showSaveToMemoryPanel(rec) {
       <div style="flex:1;overflow-y:auto;padding:1rem 1.2rem;display:flex;flex-direction:column;gap:1rem">
         <div>
           <label style="display:block;font-size:0.8rem;color:var(--sea-muted,#8a9bb0);margin-bottom:0.3rem">Key Reasoning</label>
-          <textarea class="stm-key-reasoning" rows="4" style="width:100%;background:rgba(10,17,24,0.6);border:1px solid rgba(73,100,126,0.4);border-radius:8px;color:var(--sea-text,#e0e8f0);padding:0.5rem 0.7rem;font-size:0.85rem;resize:vertical;font-family:inherit">${escapeHtml(existingReasoning)}</textarea>
+          <textarea class="stm-key-reasoning" rows="4" style="width:100%;background:rgba(10,17,24,0.6);border:1px solid rgba(73,100,126,0.4);border-radius:8px;color:var(--sea-text,#e0e8f0);padding:0.5rem 0.7rem;font-size:0.85rem;resize:vertical;font-family:inherit">${escapeHtml(mergedReasoning)}</textarea>
         </div>
         <div>
           <label style="display:block;font-size:0.8rem;color:var(--sea-muted,#8a9bb0);margin-bottom:0.3rem">Personal Note</label>
-          <textarea class="stm-user-note" rows="3" placeholder="Any personal notes about this position\u2026" style="width:100%;background:rgba(10,17,24,0.6);border:1px solid rgba(73,100,126,0.4);border-radius:8px;color:var(--sea-text,#e0e8f0);padding:0.5rem 0.7rem;font-size:0.85rem;resize:vertical;font-family:inherit"></textarea>
+          <textarea class="stm-user-note" rows="3" placeholder="Any personal notes about this position\u2026" style="width:100%;background:rgba(10,17,24,0.6);border:1px solid rgba(73,100,126,0.4);border-radius:8px;color:var(--sea-text,#e0e8f0);padding:0.5rem 0.7rem;font-size:0.85rem;resize:vertical;font-family:inherit">${escapeHtml(mergedNote)}</textarea>
         </div>
         <div>
           <label style="display:block;font-size:0.8rem;color:var(--sea-muted,#8a9bb0);margin-bottom:0.3rem">News Themes</label>
@@ -445,9 +504,11 @@ export function initLineModal() {
       title: `Ask about ${ticker}`,
       systemContext: buildPositionContext(currentRec),
       initialMessage: `I can answer questions about your ${label} position. The current recommendation is ${signal} (${conviction}). What would you like to know?`,
+      returnHistoryOnClose: true,
     });
-    // After chat closes, offer to save insights to memory (regardless of confirm/cancel — the conversation happened)
-    showSaveToMemoryPanel(currentRec);
+    // Synthesize chat into pre-fill values if a real conversation happened
+    const prefill = await synthesizeChatForMemory(ticker, name, chatResult);
+    showSaveToMemoryPanel(currentRec, prefill);
   });
 
   function setVisible(visible) {

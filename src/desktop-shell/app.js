@@ -10,10 +10,10 @@ import {
 } from "/desktop-shell/report-view-model.js";
 import { resolveShellIntentRoute } from "/desktop-shell/shell-intent-router.js";
 import { initWizard } from "/desktop-shell/app-wizard.js";
-import { initLineModal } from "/desktop-shell/app-line-modal.js";
+import { initLineModal, buildPositionContext, showSaveToMemoryPanel, synthesizeChatForMemory } from "/desktop-shell/app-line-modal.js";
 import { initBootstrap } from "/desktop-shell/app-bootstrap.js";
 import { initEvents } from "/desktop-shell/app-events.js";
-import { openCashMatchingWizard } from "/desktop-shell/app-chat-wizard.js";
+import { openChatWizard, openCashMatchingWizard } from "/desktop-shell/app-chat-wizard.js";
 import {
   resolveAgentGuidanceInputValue
 } from "/desktop-shell/agent-guidance-settings.js";
@@ -310,9 +310,58 @@ function displayError(error, context = "") {
   }
 }
 
+let latestReportModel = null;
+
 const NON_ACTIONABLE = new Set(["CONSERVER", "SURVEILLANCE", "HOLD", "WATCH", "MONITOR"]);
 
-function renderActionsNow(items = []) {
+// ── Chat context builders ───────────────────────────────────────
+
+function buildSynthesisContext(model) {
+  const sections = [];
+  if (model.account) sections.push(`Account: ${model.account}`);
+  sections.push(`Date: ${model.lastUpdate || "n/a"}`);
+  const metrics = [];
+  if (model.value != null) metrics.push(`Portfolio value: ${formatCurrency(model.value)}`);
+  if (model.gain != null) metrics.push(`Gain: ${formatCurrency(model.gain)}`);
+  if (model.cash != null) metrics.push(`Cash: ${formatCurrency(model.cash)}`);
+  if (metrics.length > 0) sections.push(metrics.join(" | "));
+  sections.push(`Positions: ${model.recommendations?.length || 0}`);
+  sections.push(`Synthesis: ${model.synthesis || "N/A"}`);
+  if (Array.isArray(model.actionsNow) && model.actionsNow.length > 0) {
+    const actionList = model.actionsNow
+      .slice(0, 10)
+      .map((a) => `${a.action} ${a.ticker || a.nom || "?"}`)
+      .join(", ");
+    sections.push(`Actions (${model.actionsNow.length}): ${actionList}`);
+  }
+  return `You are a senior portfolio analyst. The user wants to discuss the portfolio-level synthesis. Answer questions about strategy, macro context, or reasoning. Be concise.\n\n${sections.join("\n")}`;
+}
+
+function buildActionContext(action, recommendations) {
+  const sections = [];
+  const ticker = action.ticker || "";
+  const name = action.nom || "";
+  sections.push(`Action: ${action.action} ${name || ticker}`);
+  if (action.priority) sections.push(`Priority: ${action.priority}`);
+  if (action.rationale) sections.push(`Rationale: ${action.rationale}`);
+  if (typeof action.quantity === "number" && action.quantity > 0) sections.push(`Quantity: ${action.quantity}`);
+  if (typeof action.estimatedAmountEur === "number" && action.estimatedAmountEur > 0) sections.push(`Estimated amount: ${formatCurrency(action.estimatedAmountEur)}`);
+  if (action.orderType) sections.push(`Order type: ${action.orderType}`);
+  if (typeof action.priceLimit === "number" && action.priceLimit > 0) sections.push(`Price limit: ${formatCurrency(action.priceLimit)}`);
+
+  // If there's a matching recommendation, include full position context
+  if (ticker && Array.isArray(recommendations)) {
+    const rec = recommendations.find((r) => r.ticker === ticker);
+    if (rec) {
+      sections.push("\n--- Full position analysis ---");
+      sections.push(buildPositionContext(rec));
+    }
+  }
+
+  return `You are a portfolio analysis assistant. The user wants to understand this recommended action. Answer questions about rationale, risk, timing, or sizing. Be concise.\n\n${sections.join("\n")}`;
+}
+
+function renderActionsNow(items = [], recommendations = []) {
   if (!actionsNowNode) return;
   actionsNowNode.innerHTML = "";
   // Filter out non-actionable signals — only show buy/sell/reinforce/reduce
@@ -338,7 +387,7 @@ function renderActionsNow(items = []) {
     const shortRationale = rationale.length > 200 ? rationale.slice(0, 200) + "\u2026" : rationale;
     const hasMore = rationale.length > 200;
     card.innerHTML = `
-      <p class="action-header">${action.priority}. ${nameHtml}</p>
+      <p class="action-header">${action.priority}. ${nameHtml}<button class="ghost-btn action-ask-btn" style="margin-left:0.5rem;padding:0.15rem 0.5rem;font-size:0.7rem;vertical-align:middle" title="Ask about this action">Ask</button></p>
       <p class="action-detail"><span class="action-signal-badge">${escapeHtml(action.action)}</span> <span class="action-order-type">${orderLabel}</span>${metrics.length > 0 ? ` · ${metrics.join(" · ")}` : ""}</p>
       <p class="action-rationale">${escapeHtml(shortRationale)}${hasMore ? ` <a href="#" class="action-expand">voir plus</a>` : ""}</p>
     `;
@@ -352,14 +401,69 @@ function renderActionsNow(items = []) {
         });
       }
     }
+    // Wire up "Ask" button for this action
+    const askBtn = card.querySelector(".action-ask-btn");
+    if (askBtn) {
+      askBtn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const ticker = action.ticker || "";
+        const name = action.nom || "";
+        const label = name ? `${name} (${ticker})` : ticker;
+        const chatResult = await openChatWizard({
+          title: `Ask about ${action.action} ${ticker || name}`,
+          systemContext: buildActionContext(action, recommendations),
+          initialMessage: `This is the ${action.action} recommendation for ${label} (priority ${action.priority || "N/A"}). What would you like to know?`,
+          returnHistoryOnClose: true,
+        });
+        // Action chats are ticker-scoped — offer Save to Memory with LLM pre-fill
+        if (ticker) {
+          const rec = recommendations.find((r) => r.ticker === ticker);
+          if (rec) {
+            const prefill = await synthesizeChatForMemory(ticker, name, chatResult);
+            showSaveToMemoryPanel(rec, prefill);
+          }
+        }
+      });
+    }
     actionsNowNode.appendChild(card);
   }
+}
+
+// ── Synthesis "Ask" button ───────────────────────────────────────
+
+function injectSynthesisAskButton(synthCard, model) {
+  if (!synthCard) return;
+  // Remove any previous button
+  synthCard.querySelector(".synthesis-ask-btn")?.remove();
+  // Only show when synthesis is real (not pending placeholder or error)
+  const synthesis = model.synthesis || "";
+  const isPending = synthCard.classList.contains("synthesis-pending");
+  const isPlaceholder = synthesis === "No synthesis yet." || synthesis.startsWith("\u2717");
+  if (isPending || isPlaceholder || !synthesis) return;
+
+  const btn = document.createElement("button");
+  btn.className = "ghost-btn synthesis-ask-btn";
+  btn.style.cssText = "margin-top:0.5rem;padding:0.2rem 0.6rem;font-size:0.75rem";
+  btn.textContent = "Ask about this synthesis";
+  btn.addEventListener("click", async () => {
+    const m = latestReportModel;
+    if (!m) return;
+    const account = m.account || "your";
+    await openChatWizard({
+      title: "Ask about synthesis",
+      systemContext: buildSynthesisContext(m),
+      initialMessage: `This is the global synthesis for your ${account} portfolio. What would you like to explore?`,
+    });
+    // No Save to Memory for synthesis chat — not ticker-scoped
+  });
+  synthCard.appendChild(btn);
 }
 
 // ── Report rendering ─────────────────────────────────────────────
 
 function renderReport(payload) {
   const model = buildReportViewModel(payload);
+  latestReportModel = model;
   if (reportValueNode) reportValueNode.textContent = formatCurrency(model.value);
   if (reportGainNode) reportGainNode.textContent = formatCurrency(model.gain);
   if (reportCashNode) reportCashNode.textContent = formatCurrency(model.cash);
@@ -373,13 +477,15 @@ function renderReport(payload) {
     // Clear pending state when real report data arrives
     const synthCard = document.getElementById("report-synthesis-card");
     if (synthCard && model.synthesis) synthCard.classList.remove("synthesis-pending");
+    // Inject "Ask" button for synthesis (only when real synthesis is present)
+    injectSynthesisAskButton(synthCard, model);
   }
   if (reportProvenanceNode) {
     reportProvenanceNode.textContent = Array.isArray(model.provenanceSummary) && model.provenanceSummary.length > 0
       ? `Provenance: ${model.provenanceSummary.join(" · ")}`
       : "";
   }
-  renderActionsNow(model.actionsNow);
+  renderActionsNow(model.actionsNow, model.recommendations);
   // Watchlist opportunities summary
   const watchlistSummaryNode = document.getElementById("watchlist-summary");
   if (watchlistSummaryNode) {

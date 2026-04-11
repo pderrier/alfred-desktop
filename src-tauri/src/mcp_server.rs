@@ -685,13 +685,13 @@ fn tool_get_line_data(data_dir: &Path, params: &Value) -> Result<Value> {
         Value::Null
     };
 
-    // Line memory (cross-run)
+    // Line memory (cross-run) — schema: { "by_ticker": { "AAPL": {...} } }
     let line_memory = {
         let mem_path = line_memory_path(data_dir);
         if mem_path.exists() {
             read_json(&mem_path)
                 .ok()
-                .and_then(|mem| mem.get(&ticker).cloned())
+                .and_then(|mem| mem.get("by_ticker").and_then(|bt| bt.get(&ticker)).cloned())
                 .unwrap_or(Value::Null)
         } else {
             Value::Null

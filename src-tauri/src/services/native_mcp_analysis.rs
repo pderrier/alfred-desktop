@@ -72,6 +72,8 @@ fn merge_mcp_results(run_id: &str, data_dir: &str) {
                     let ticker = line_id.split(':').last().unwrap_or("");
                     if !ticker.is_empty() {
                         crate::run_state_cache::cache_line_status(run_id, ticker, json!({"status": "done"}));
+                        // Sync line memory for codex mode (fixes codex persist gap)
+                        sync_line_memory(run_id, ticker, &rec);
                     }
                     merged_count += 1;
                 }
@@ -279,8 +281,8 @@ fn run_native_line_analysis(
             || validation.get("stored").and_then(|v| v.as_bool()).unwrap_or(false);
 
         if ok {
-            // Persist extracted data
-            persist_line_extras(data_dir, ticker, line_data, &rec);
+            // Persist extracted data + line memory
+            persist_line_extras(data_dir, run_id, ticker, line_data, &rec);
             return Ok(());
         }
 
@@ -313,7 +315,7 @@ fn run_native_line_analysis(
             "validate_recommendation",
             &json!({"run_id": run_id, "recommendation": serde_json::to_string(&rec).unwrap_or_default()}),
         );
-        persist_line_extras(data_dir, ticker, line_data, &rec);
+        persist_line_extras(data_dir, run_id, ticker, line_data, &rec);
     } else {
         crate::debug_log(&format!("native_line: {ticker} no valid JSON after {MAX_RETRIES} retries"));
         let _ = crate::run_state::update_line_status_with_error(run_id, ticker, "failed", Some("no_valid_recommendation"));
@@ -341,8 +343,217 @@ fn extract_recommendation_json(result: &Value) -> Option<Value> {
     None
 }
 
-/// Persist extracted fundamentals, shared insights, deep news from the recommendation.
-fn persist_line_extras(data_dir: &std::path::Path, ticker: &str, line_data: &Value, rec: &Value) {
+// ── Line memory sync ────────────────────────────────────────────
+
+/// Sync a validated recommendation into the persistent line-memory.json store.
+/// Schema: { "by_ticker": { "AAPL": {...} }, "global_deep_news_banned_urls": [], "deep_news_rotation_cache": {} }
+///
+/// This is the Rust port of the JS `applyRecommendationToStore` + `syncLineMemoryAfterRecommendation`.
+fn sync_line_memory(run_id: &str, ticker: &str, rec: &Value) {
+    let ticker = ticker.trim().to_uppercase();
+    if ticker.is_empty() { return; }
+
+    let path = crate::resolve_runtime_state_dir().join("line-memory.json");
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+    // Read existing store (or create empty)
+    let mut store = if path.exists() {
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .unwrap_or_else(|| json!({
+                "by_ticker": {},
+                "global_deep_news_banned_urls": [],
+                "deep_news_rotation_cache": { "by_ticker": {} }
+            }))
+    } else {
+        json!({
+            "by_ticker": {},
+            "global_deep_news_banned_urls": [],
+            "deep_news_rotation_cache": { "by_ticker": {} }
+        })
+    };
+
+    let by_ticker = store.get_mut("by_ticker")
+        .and_then(|v| v.as_object_mut());
+    let by_ticker = match by_ticker {
+        Some(bt) => bt,
+        None => {
+            store["by_ticker"] = json!({});
+            store["by_ticker"].as_object_mut().unwrap()
+        }
+    };
+
+    let current = by_ticker.get(&ticker).cloned().unwrap_or(json!({}));
+
+    // Extract fields from recommendation
+    let signal = as_str(rec.get("signal"));
+    let conviction = as_str(rec.get("conviction"));
+    let synthese = as_str(rec.get("synthese"));
+
+    // Build llm_key_history: new entry + recommendation's + existing (max 20)
+    let key_history_entry = format!(
+        "{} {}{}",
+        &now[..10],
+        signal,
+        if conviction.is_empty() { String::new() } else { format!(" ({conviction})") }
+    );
+    let llm_key_history = merge_string_list(
+        std::iter::once(key_history_entry.as_str())
+            .chain(json_str_array(rec.get("llm_key_history")))
+            .chain(json_str_array(current.get("llm_key_history"))),
+        20,
+    );
+
+    // llm_strong_signals: recommendation's + badges_keywords + existing (max 12)
+    let llm_strong_signals = merge_string_list(
+        json_str_array(rec.get("llm_strong_signals"))
+            .chain(json_str_array(rec.get("badges_keywords")))
+            .chain(json_str_array(current.get("llm_strong_signals"))),
+        12,
+    );
+
+    // llm_memory_summary: prefer new, fall back to existing, then synthese
+    let llm_memory_summary = non_empty_str(rec.get("llm_memory_summary"))
+        .or_else(|| non_empty_str(current.get("llm_memory_summary")))
+        .unwrap_or_else(|| truncate(synthese.as_str(), 2400));
+
+    // Deep news fields
+    let deep_news_summary = non_empty_str(rec.get("deep_news_memory_summary"))
+        .or_else(|| non_empty_str(rec.get("deep_news_summary")))
+        .or_else(|| non_empty_str(current.get("deep_news_memory_summary")))
+        .unwrap_or_default();
+
+    // Run history: prepend this run (max 20)
+    let mut run_history: Vec<Value> = Vec::with_capacity(21);
+    run_history.push(json!({
+        "date": &now,
+        "signal": signal,
+        "conviction": conviction,
+        "synthese": truncate(synthese.as_str(), 420),
+    }));
+    if let Some(arr) = current.get("run_history").and_then(|v| v.as_array()) {
+        for item in arr.iter().take(19) {
+            run_history.push(item.clone());
+        }
+    }
+
+    // Merge deep news banned URLs into global list
+    let rec_banned = json_str_array(rec.get("deep_news_banned_urls")).collect::<Vec<_>>();
+    if !rec_banned.is_empty() {
+        let global = store.get_mut("global_deep_news_banned_urls")
+            .and_then(|v| v.as_array_mut());
+        if let Some(arr) = global {
+            for url in &rec_banned {
+                let url_val = Value::String(url.to_string());
+                if !arr.contains(&url_val) {
+                    arr.push(url_val);
+                }
+            }
+            // Cap at 2000
+            while arr.len() > 2000 { arr.remove(0); }
+        }
+    }
+
+    // Build the updated ticker entry
+    let entry = json!({
+        "ticker": ticker,
+        "updated_at": &now,
+        "run_id_last_update": run_id,
+        "signal": signal,
+        "conviction": conviction,
+        "synthese": truncate(synthese.as_str(), 420),
+        "llm_memory_summary": truncate(&llm_memory_summary, 2400),
+        "llm_strong_signals": llm_strong_signals,
+        "llm_key_history": llm_key_history,
+        "deep_news_memory_summary": truncate(&deep_news_summary, 2400),
+        "deep_news_selected_url": non_empty_str(rec.get("deep_news_selected_url"))
+            .or_else(|| non_empty_str(current.get("deep_news_selected_url")))
+            .unwrap_or_default(),
+        "deep_news_quality_score": rec.get("deep_news_quality_score")
+            .and_then(|v| v.as_u64())
+            .or_else(|| current.get("deep_news_quality_score").and_then(|v| v.as_u64()))
+            .unwrap_or(50),
+        "deep_news_relevance": non_empty_str(rec.get("deep_news_relevance"))
+            .or_else(|| non_empty_str(current.get("deep_news_relevance")))
+            .unwrap_or_default(),
+        "deep_news_staleness": non_empty_str(rec.get("deep_news_staleness"))
+            .or_else(|| non_empty_str(current.get("deep_news_staleness")))
+            .unwrap_or_default(),
+        "action_recommandee": non_empty_str(rec.get("action_recommandee"))
+            .or_else(|| non_empty_str(current.get("action_recommandee")))
+            .unwrap_or_default(),
+        "reanalyse_after": non_empty_str(rec.get("reanalyse_after"))
+            .unwrap_or_default(),
+        "reanalyse_reason": non_empty_str(rec.get("reanalyse_reason"))
+            .unwrap_or_default(),
+        "last_recommendation": {
+            "date": &now,
+            "signal": signal,
+            "conviction": conviction,
+            "synthese": truncate(synthese.as_str(), 420),
+        },
+        "run_history": run_history,
+    });
+
+    // Re-acquire by_ticker after store borrows
+    if let Some(bt) = store.get_mut("by_ticker").and_then(|v| v.as_object_mut()) {
+        bt.insert(ticker.clone(), entry);
+    }
+
+    // Atomic write
+    let pb = std::path::PathBuf::from(&path);
+    if let Err(e) = crate::storage::write_json_file(&pb, &store) {
+        crate::debug_log(&format!("sync_line_memory: write failed for {ticker}: {e}"));
+    } else {
+        crate::debug_log(&format!("sync_line_memory: updated {ticker} for run {run_id}"));
+    }
+}
+
+// ── Line memory helpers ─────────────────────────────────────────
+
+fn as_str(v: Option<&Value>) -> String {
+    v.and_then(|v| v.as_str()).unwrap_or("").trim().to_string()
+}
+
+fn non_empty_str(v: Option<&Value>) -> Option<String> {
+    v.and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max { s.to_string() } else { s[..max].to_string() }
+}
+
+/// Collect string items from a JSON array, deduplicating and capping at max_items.
+fn merge_string_list<'a>(items: impl Iterator<Item = &'a str>, max_items: usize) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::with_capacity(max_items);
+    for item in items {
+        let trimmed = item.trim();
+        if trimmed.is_empty() { continue; }
+        if seen.insert(trimmed.to_lowercase()) {
+            result.push(trimmed.to_string());
+            if result.len() >= max_items { break; }
+        }
+    }
+    result
+}
+
+/// Extract string items from a JSON array Value.
+fn json_str_array(v: Option<&Value>) -> impl Iterator<Item = &str> {
+    v.and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.as_str())
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// Persist extracted fundamentals, shared insights, deep news, and line memory from the recommendation.
+fn persist_line_extras(data_dir: &std::path::Path, run_id: &str, ticker: &str, line_data: &Value, rec: &Value) {
+    // Sync line memory (cross-run persistent state)
+    sync_line_memory(run_id, ticker, rec);
     let isin = line_data.get("position")
         .and_then(|p| p.get("isin"))
         .and_then(|v| v.as_str())
@@ -379,6 +590,22 @@ fn persist_line_extras(data_dir: &std::path::Path, ticker: &str, line_data: &Val
                 &json!({"ticker": ticker, "isin": isin, "fundamentals": serde_json::to_string(fundamentals).unwrap_or_default()}),
             );
         }
+    }
+
+    // Persist deep news summary to the per-URL API cache
+    let deep_news_summary = rec.get("deep_news_summary")
+        .or_else(|| rec.get("deep_news_memory_summary"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !deep_news_summary.is_empty() {
+        // Build a minimal line_context for persist_deep_news_if_present
+        let line_context = json!({
+            "ticker": ticker,
+            "row": { "isin": isin },
+            "news": line_data.get("news").cloned().unwrap_or(Value::Null),
+            "market": line_data.get("market_data").cloned().unwrap_or(Value::Null),
+        });
+        crate::llm_parsing::persist_deep_news_if_present(rec, &line_context);
     }
 }
 

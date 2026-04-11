@@ -14,7 +14,11 @@
 
 **[macOS installer (DMG)](https://vps-c5793aab.vps.ovh.net/alfred/release/macos/latest)** — Alfred Desktop v0.1.0 for macOS 10.15+ (Apple Silicon)
 
-> Note: The DMG is not notarized yet. macOS Gatekeeper will block it — right-click → Open, or go to System Settings → Privacy & Security → Open Anyway.
+> **Note: The DMG is not notarized yet.** macOS Gatekeeper will block the app on first launch. Three ways to bypass it:
+>
+> 1. **Right-click → Open** on the app in Finder, then click "Open" in the dialog. Simplest — works on most setups.
+> 2. **System Settings → Privacy & Security → Open Anyway** — after a blocked launch attempt, a button appears at the bottom of the Privacy & Security pane.
+> 3. **Terminal (power users):** `xattr -cr "/Applications/Alfred Desktop.app"` — strips the quarantine attribute entirely; no dialog needed after that.
 
 ## Features
 
@@ -141,7 +145,10 @@ Set `ALFRED_API_URL` to your instance URL once deployed.
 
 ## Prerequisites
 
-**End users:** install the MSI/NSIS package (Windows) or DMG (macOS). If using the native backend, no additional dependencies — just your API key. If using Codex, it's bundled in the installer.
+**End users:**
+- **Windows 10/11 (x64):** install the MSI package. SmartScreen may warn — click "More info" → "Run anyway".
+- **macOS 10.15+ (Apple Silicon / arm64):** mount the DMG, drag Alfred to Applications. Gatekeeper will block the first launch — see the note under the download link above for bypass instructions.
+- No additional dependencies in either case. The Codex CLI is bundled in the installer; for the native API backend, only your OpenAI API key is needed.
 
 **Developers:**
 - [Node.js](https://nodejs.org/) 18+ (for Tauri CLI and Codex bundling)

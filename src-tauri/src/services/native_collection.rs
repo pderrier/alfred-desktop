@@ -596,6 +596,20 @@ fn fetch_finary_snapshot(run_id: &str, _request_fn: HttpRequestFn) -> Result<Val
     }
     // Compute cash per investment account by matching via connection_id
     let holdings_accounts = extract_result_list(&holdings);
+    if holdings_accounts.is_empty() {
+        let keys: Vec<String> = holdings.as_object()
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default();
+        crate::debug_log(&format!(
+            "finary_cash: holdings_accounts empty after extract_result_list — accountsPayload keys: {:?}",
+            keys
+        ));
+    } else {
+        crate::debug_log(&format!(
+            "finary_cash: extracted {} holdings_accounts from accountsPayload",
+            holdings_accounts.len()
+        ));
+    }
     let cash_result = build_cash_mapping(&holdings_accounts);
     let investment_name_to_cash = cash_result.mapping;
     // Global cash = ALL fiats across ALL holdings accounts (not just matched ones)
@@ -679,6 +693,18 @@ struct CashMappingResult {
 /// are flagged for user confirmation in the snapshot.
 fn build_cash_mapping(holdings_accounts: &[Value]) -> CashMappingResult {
     use std::collections::HashMap;
+
+    crate::debug_log(&format!(
+        "finary_cash_mapping: build_cash_mapping called with {} holdings_accounts",
+        holdings_accounts.len()
+    ));
+    if holdings_accounts.is_empty() {
+        crate::debug_log("finary_cash_mapping: holdings_accounts is EMPTY — cash will be 0");
+        return CashMappingResult {
+            mapping: HashMap::new(),
+            ambiguous_groups: Vec::new(),
+        };
+    }
 
     struct HoldingsEntry {
         name: String,
@@ -899,6 +925,15 @@ fn build_cash_mapping(holdings_accounts: &[Value]) -> CashMappingResult {
         }
     }
 
+    if result.is_empty() {
+        crate::debug_log("finary_cash_mapping: mapping is EMPTY after processing — no cash matched to any investment account");
+    } else {
+        let total_cash: f64 = result.values().sum();
+        crate::debug_log(&format!(
+            "finary_cash_mapping: mapped {} accounts, total cash {:.2}",
+            result.len(), total_cash
+        ));
+    }
     CashMappingResult { mapping: result, ambiguous_groups }
 }
 

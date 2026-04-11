@@ -1510,14 +1510,44 @@ fn codex_synthesis_fallback(run_id: &str, turn_result: &Value) -> Result<Value> 
             "opportunites_watchlist": composed.get("opportunites_watchlist").cloned().unwrap_or(json!("")),
             "llm_utilise": "codex-mcp-partial",
         });
-        let _ = crate::report::persist_retry_global_synthesis(run_id, &draft);
-        // Update composed_payload in run state so UI picks up the derived actions
-        let draft_clone = draft.clone();
-        let _ = crate::run_state::patch_run_state_with(run_id, |rs| {
-            if let Some(obj) = rs.as_object_mut() {
-                obj.insert("composed_payload".to_string(), draft_clone);
+        // persist_retry_global_synthesis builds a full composed_payload (with
+        // portfolio KPIs: valeur_portefeuille, plus_value_totale, liquidites)
+        // and writes it to run_state + report artifacts.  If it succeeds we
+        // must NOT overwrite composed_payload — the persisted version is richer.
+        match crate::report::persist_retry_global_synthesis(run_id, &draft) {
+            Ok(result) => {
+                crate::debug_log(&format!(
+                    "[synthesis-fallback] persist_retry_global_synthesis succeeded for {run_id}"
+                ));
+                return Ok(result);
             }
-        });
+            Err(e) => {
+                // persist failed (e.g. no recommendations yet) — fall back to
+                // manual composed_payload, but include portfolio KPIs so UI
+                // doesn't show "—" for portfolio value.
+                crate::debug_log(&format!(
+                    "[synthesis-fallback] persist_retry_global_synthesis failed ({e}), building manual payload"
+                ));
+                let portfolio = run_state.get("portfolio").cloned().unwrap_or(json!({}));
+                let full_payload = json!({
+                    "date": chrono::Utc::now().to_rfc3339(),
+                    "valeur_portefeuille": portfolio.get("valeur_totale").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    "plus_value_totale": portfolio.get("plus_value_totale").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    "liquidites": portfolio.get("liquidites").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    "synthese_marche": synthese,
+                    "actions_immediates": actions,
+                    "prochaine_analyse": composed.get("prochaine_analyse").cloned().unwrap_or(json!("")),
+                    "opportunites_watchlist": composed.get("opportunites_watchlist").cloned().unwrap_or(json!("")),
+                    "llm_utilise": "codex-mcp-partial",
+                });
+                let payload_clone = full_payload.clone();
+                let _ = crate::run_state::patch_run_state_with(run_id, |rs| {
+                    if let Some(obj) = rs.as_object_mut() {
+                        obj.insert("composed_payload".to_string(), payload_clone);
+                    }
+                });
+            }
+        }
         // Mark orchestration as completed so sidebar/UI stops showing "running"
         let _ = crate::run_state::set_native_run_stage(run_id, "completed", None, None);
         Ok(json!({

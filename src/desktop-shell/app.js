@@ -13,6 +13,7 @@ import { initWizard } from "/desktop-shell/app-wizard.js";
 import { initLineModal } from "/desktop-shell/app-line-modal.js";
 import { initBootstrap } from "/desktop-shell/app-bootstrap.js";
 import { initEvents } from "/desktop-shell/app-events.js";
+import { openCashMatchingWizard } from "/desktop-shell/app-chat-wizard.js";
 import {
   resolveAgentGuidanceInputValue
 } from "/desktop-shell/agent-guidance-settings.js";
@@ -458,6 +459,80 @@ async function refreshDashboardInner() {
   const canRetry = snapshot.latest_run_summary?.status === "completed_degraded" ||
     (snapshot.latest_run_summary?.status === "failed" && (snapshot.latest_run_summary?.pending_recommendations_count || 0) > 0);
   setRetrySynthesisVisible(canRetry);
+
+  // Check for ambiguous cash account groups that need user confirmation
+  checkAmbiguousCashGroups(finaryMeta).catch(() => {});
+}
+
+/** Track whether we've already prompted for ambiguous cash groups this session */
+let cashWizardShownThisSession = false;
+
+async function checkAmbiguousCashGroups(finaryMeta) {
+  if (cashWizardShownThisSession) return;
+  const groups = Array.isArray(finaryMeta.ambiguous_cash_groups)
+    ? finaryMeta.ambiguous_cash_groups
+    : [];
+  if (groups.length === 0) return;
+
+  // Don't prompt if the user already has saved cash_account_links that cover all ambiguous accounts
+  const tauriInvoke = window?.__TAURI__?.core?.invoke;
+  if (!tauriInvoke) return;
+  try {
+    const prefs = await tauriInvoke("get_user_preferences_local") || {};
+    const savedLinks = prefs?.cash_account_links || {};
+    const allInvestmentNames = groups.flatMap((g) =>
+      (g.investment_accounts || []).map((a) => a.name)
+    );
+    const allCovered = allInvestmentNames.every((name) => savedLinks[name]);
+    if (allCovered) return; // User already confirmed all ambiguous mappings
+  } catch { /* proceed to show wizard */ }
+
+  cashWizardShownThisSession = true;
+
+  for (const group of groups) {
+    const investmentAccounts = group.investment_accounts || [];
+    const cashAccounts = group.cash_accounts || [];
+    if (investmentAccounts.length === 0 || cashAccounts.length === 0) continue;
+
+    // Build current heuristic mapping for display
+    const currentMapping = {};
+    for (let i = 0; i < investmentAccounts.length; i++) {
+      if (cashAccounts[i]) {
+        currentMapping[investmentAccounts[i].name] = cashAccounts[i].fiats_sum;
+      }
+    }
+
+    const result = await openCashMatchingWizard({
+      investmentAccounts,
+      cashAccounts,
+      currentMapping,
+    });
+
+    if (result) {
+      // Save confirmed mapping to user preferences
+      try {
+        const prefs = await tauriInvoke("get_user_preferences_local") || {};
+        if (!prefs.cash_account_links) prefs.cash_account_links = {};
+
+        if (result.confirmed) {
+          // User confirmed the heuristic — save inv_name → cash_name pairs
+          for (let i = 0; i < investmentAccounts.length; i++) {
+            if (cashAccounts[i]) {
+              prefs.cash_account_links[investmentAccounts[i].name] = cashAccounts[i].name;
+            }
+          }
+        } else {
+          // User provided explicit mapping: { inv_name: cash_name }
+          Object.assign(prefs.cash_account_links, result);
+        }
+
+        await tauriInvoke("save_user_preferences_local", { prefs });
+        showToast("Cash account mapping saved", "success");
+      } catch (err) {
+        showToast(`Failed to save mapping: ${err?.message || err}`, "error");
+      }
+    }
+  }
 }
 
 function syncAutoRefreshPolicy() {

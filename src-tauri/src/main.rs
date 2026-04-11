@@ -55,6 +55,7 @@ mod run_index;
 mod updater;
 mod llm_backend;
 mod openai_client;
+mod chat_wizard;
 #[path = "services/native_mcp_analysis.rs"]
 mod native_mcp_analysis;
 
@@ -429,6 +430,20 @@ async fn install_update_local(path: String) -> Result<serde_json::Value, String>
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn chat_wizard_send_local(
+    context: String,
+    history: Vec<serde_json::Value>,
+    user_message: String,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        chat_wizard::chat_wizard_send_impl(context, history, user_message)
+    })
+    .await
+    .map_err(|e| format!("chat_wizard_send_failed:join:{e}"))?
+    .map_err(|e| e.to_string())
+}
+
 fn run_tauri_app() -> anyhow::Result<()> {
     load_local_env();
 
@@ -488,7 +503,8 @@ fn run_tauri_app() -> anyhow::Result<()> {
             check_openai_api_key_local,
             check_for_update_local,
             download_update_local,
-            install_update_local
+            install_update_local,
+            chat_wizard_send_local
         ])
         .run(tauri::generate_context!())
         .map_err(|e| anyhow!("tauri_app_launch_failed:{e}"))?;

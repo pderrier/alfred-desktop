@@ -507,8 +507,11 @@ export function initLineModal() {
       returnHistoryOnClose: true,
     });
     // Synthesize chat into pre-fill values if a real conversation happened
+    console.log("[ask-about] chatResult:", chatResult?.length, "messages, currentRec:", !!currentRec);
     const prefill = await synthesizeChatForMemory(ticker, name, chatResult);
+    console.log("[ask-about] prefill:", prefill);
     showSaveToMemoryPanel(currentRec, prefill);
+    console.log("[ask-about] showSaveToMemoryPanel called");
   });
 
   function setVisible(visible) {

@@ -23,10 +23,11 @@ import { escapeHtml } from "/desktop-shell/ui-display-utils.js";
  * @param {string} config.systemContext — System prompt for the LLM
  * @param {string} config.initialMessage — First assistant message shown to user
  * @param {Function} [config.extractResult] — (history) => any — parse the final answer from conversation
- * @returns {Promise<any|null>} — resolves with result on confirm, null on cancel
+ * @param {boolean} [config.returnHistoryOnClose] — if true, return history array even on cancel/close (for post-chat LLM synthesis)
+ * @returns {Promise<any|null>} — resolves with result on confirm, null on cancel (or history if returnHistoryOnClose)
  */
 export function openChatWizard(config) {
-  const { title, systemContext, initialMessage, extractResult } = config;
+  const { title, systemContext, initialMessage, extractResult, returnHistoryOnClose } = config;
 
   return new Promise((resolve) => {
     // ── State ───────────────────────────────────────────────
@@ -164,9 +165,11 @@ export function openChatWizard(config) {
       }
     });
 
-    closeBtn.addEventListener("click", () => finish(null));
+    const cancelValue = () => returnHistoryOnClose ? history : null;
+
+    closeBtn.addEventListener("click", () => finish(cancelValue()));
     overlay.addEventListener("click", (e) => {
-      if (e.target === overlay) finish(null);
+      if (e.target === overlay) finish(cancelValue());
     });
 
     confirmBtn.addEventListener("click", () => {
@@ -174,7 +177,7 @@ export function openChatWizard(config) {
       finish(result);
     });
 
-    rejectBtn.addEventListener("click", () => finish(null));
+    rejectBtn.addEventListener("click", () => finish(cancelValue()));
 
     // ── Show initial message ────────────────────────────────
 

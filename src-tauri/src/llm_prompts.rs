@@ -949,3 +949,89 @@ Réponds UNIQUEMENT avec un JSON valide:
         samples = sample_lines.join("\n")
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// Write a mock report history artifact to a temp dir.
+    fn write_history_artifact(dir: &std::path::Path, filename: &str, account: &str, synthese: &str) {
+        let artifact = json!({
+            "account": account,
+            "payload": {
+                "synthese_marche": synthese
+            }
+        });
+        fs::write(
+            dir.join(filename),
+            serde_json::to_string(&artifact).unwrap(),
+        ).unwrap();
+    }
+
+    fn with_history_dir<F: FnOnce(&std::path::Path)>(f: F) {
+        // Serialize env-var mutation across all tests in this module.
+        let _guard = crate::helpers::test_env_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "alfred-history-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ALFRED_REPORT_HISTORY_DIR", dir.as_os_str());
+        f(&dir);
+        std::env::remove_var("ALFRED_REPORT_HISTORY_DIR");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_previous_syntheses_filters_by_account() {
+        with_history_dir(|dir| {
+            // 2 PEA entries, 1 CTO entry
+            write_history_artifact(dir, "20260401_run1.json", "PEA", "Synthese PEA premier");
+            write_history_artifact(dir, "20260402_run2.json", "PEA", "Synthese PEA second");
+            write_history_artifact(dir, "20260403_run3.json", "CTO", "Synthese CTO");
+
+            let result = load_previous_syntheses(2, "PEA");
+            assert_eq!(result.len(), 2, "should return 2 PEA entries");
+            for (_, synthese) in &result {
+                assert!(synthese.contains("PEA"), "synthese should be from PEA account");
+            }
+        });
+    }
+
+    #[test]
+    fn load_previous_syntheses_empty_account_returns_most_recent() {
+        with_history_dir(|dir| {
+            write_history_artifact(dir, "20260401_run1.json", "PEA", "PEA synthese");
+            write_history_artifact(dir, "20260402_run2.json", "CTO", "CTO synthese");
+            write_history_artifact(dir, "20260403_run3.json", "PEA", "PEA synthese 2");
+
+            let result = load_previous_syntheses(2, "");
+            assert_eq!(result.len(), 2, "empty account filter should return 2 most recent");
+            // Dates are sorted descending (most recent first)
+            assert!(result[0].0 >= result[1].0, "should be sorted most-recent-first");
+        });
+    }
+
+    #[test]
+    fn load_previous_syntheses_unknown_account_returns_empty() {
+        with_history_dir(|dir| {
+            write_history_artifact(dir, "20260401_run1.json", "PEA", "PEA synthese");
+
+            let result = load_previous_syntheses(2, "UNKNOWN");
+            assert!(result.is_empty(), "unknown account should return empty");
+        });
+    }
+
+    #[test]
+    fn load_previous_syntheses_nonexistent_dir_returns_empty() {
+        let _guard = crate::helpers::test_env_lock();
+        std::env::set_var("ALFRED_REPORT_HISTORY_DIR", "/tmp/nonexistent-dir-alfred-test-xyz");
+        let result = load_previous_syntheses(2, "PEA");
+        std::env::remove_var("ALFRED_REPORT_HISTORY_DIR");
+        assert!(result.is_empty(), "nonexistent dir should return empty");
+    }
+}

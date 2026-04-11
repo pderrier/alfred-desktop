@@ -14,6 +14,9 @@ use crate::storage::read_json_file;
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         let guard = crate::helpers::test_env_lock();
+        // Clear the run_state_cache so stale entries from previous tests (pointing to
+        // deleted temp dirs) don't bleed into the current test.
+        crate::run_state_cache::reset_cache();
         // Always use mock_cache mode in tests — never call real LLM APIs.
         std::env::set_var("LITELLM_GENERATION_MODE", "mock_cache");
         // Install Codex mock so MCP batch/synthesis turns don't hit real Codex.
@@ -912,6 +915,8 @@ use crate::storage::read_json_file;
             handle.join().expect("thread should finish");
         }
 
+        // Flush cache to disk before reading via load_run_by_id (which reads from disk).
+        crate::run_state_cache::flush_now(&run_id);
         let final_state =
             crate::run_state::load_run_by_id(&run_id).expect("final state should load");
         let count = final_state
@@ -1512,6 +1517,8 @@ use crate::storage::read_json_file;
         )
         .expect("native collection state should be persisted");
 
+        // Flush cache to disk before reading the file directly.
+        crate::run_state_cache::flush_now("run_native_collection_1");
         let persisted_run: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(state_dir.join("run_native_collection_1.json"))
                 .expect("run state should remain readable"),

@@ -7,7 +7,10 @@ pub(crate) fn persist_native_collection_state(run_id: &str, collection_state: &V
     let collection_object = collection_state
         .as_object()
         .ok_or_else(|| anyhow!("native_collection_state_invalid"))?;
-    let data_dir = crate::paths::default_data_dir();
+    let data_dir = crate::paths::resolve_runtime_state_dir()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(crate::paths::default_data_dir);
     crate::run_state_cache::patch(&data_dir, run_id, |run_state| {
         if let Some(object) = run_state.as_object_mut() {
             for key in [

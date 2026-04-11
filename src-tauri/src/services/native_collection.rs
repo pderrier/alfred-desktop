@@ -1766,3 +1766,92 @@ pub fn execute_native_local_analysis_workflow(
 ) -> Result<Value> {
     execute_native_local_analysis_workflow_with(options, llm_token, native_request_fn)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_account(name: &str, connection_id: Option<i64>, securities: usize, fiats_sum: f64, institution: &str) -> Value {
+        let securities_arr: Vec<Value> = (0..securities).map(|_| json!({"symbol": "X"})).collect();
+        let fiats_arr = if fiats_sum > 0.0 {
+            vec![json!({"current_value": fiats_sum})]
+        } else {
+            vec![]
+        };
+        let mut obj = json!({
+            "name": name,
+            "securities": securities_arr,
+            "fiats": fiats_arr,
+            "institution": { "name": institution }
+        });
+        if let Some(cid) = connection_id {
+            obj["connection_id"] = json!(cid);
+        }
+        obj
+    }
+
+    #[test]
+    fn build_cash_mapping_empty_returns_empty() {
+        let result = build_cash_mapping(&[]);
+        assert!(result.mapping.is_empty(), "empty holdings should produce empty mapping");
+        assert!(result.ambiguous_groups.is_empty());
+    }
+
+    #[test]
+    fn build_cash_mapping_1_investment_1_cash_same_connection_direct_match() {
+        let accounts = vec![
+            make_account("PEA", Some(101), 3, 0.0, "Bourso"),
+            make_account("Compte espèce PEA", Some(101), 0, 500.0, "Bourso"),
+        ];
+        let result = build_cash_mapping(&accounts);
+        assert_eq!(result.mapping.get("PEA").copied(), Some(500.0),
+            "1:1 connection group should auto-match");
+        assert!(result.ambiguous_groups.is_empty(), "1:1 should not be flagged ambiguous");
+    }
+
+    #[test]
+    fn build_cash_mapping_2_investments_2_cash_same_connection_flagged_ambiguous() {
+        let accounts = vec![
+            make_account("PEA", Some(200), 3, 0.0, "Bourso"),
+            make_account("CTO", Some(200), 2, 0.0, "Bourso"),
+            make_account("Cash PEA", Some(200), 0, 300.0, "Bourso"),
+            make_account("Cash CTO", Some(200), 0, 150.0, "Bourso"),
+        ];
+        let result = build_cash_mapping(&accounts);
+        // Ambiguous: 2 investments + 2 cash accounts in same connection — correlation heuristic used
+        assert_eq!(result.ambiguous_groups.len(), 1,
+            "N:M group should be recorded as ambiguous");
+        let group = &result.ambiguous_groups[0];
+        assert_eq!(group["connection_id"], 200);
+        assert!(group["needs_confirmation"].as_bool().unwrap_or(false));
+    }
+
+    #[test]
+    fn build_cash_mapping_no_connection_id_falls_through_to_institution_prefix() {
+        let accounts = vec![
+            make_account("PEA Boursorama", None, 3, 0.0, "Boursorama Banque"),
+            make_account("Livret Boursorama", None, 0, 750.0, "Boursorama Banque"),
+        ];
+        let result = build_cash_mapping(&accounts);
+        assert_eq!(result.mapping.get("PEA Boursorama").copied(), Some(750.0),
+            "institution prefix match should assign cash to investment");
+    }
+
+    #[test]
+    fn build_cash_mapping_investment_with_direct_fiats_adds_to_result() {
+        // An investment account that has both securities AND fiats (cash on the investment account itself)
+        let accounts = vec![
+            // Account with securities and fiats (investment account with embedded cash)
+            json!({
+                "name": "PEA avec espèces",
+                "securities": [{"symbol": "MC"}],
+                "fiats": [{"current_value": 200.0}],
+                "institution": {"name": "Bourso"}
+            }),
+        ];
+        let result = build_cash_mapping(&accounts);
+        // The investment account has direct fiats so it should appear in mapping
+        assert_eq!(result.mapping.get("PEA avec espèces").copied(), Some(200.0),
+            "investment with direct fiats should contribute cash from fiats field");
+    }
+}

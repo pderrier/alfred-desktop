@@ -299,8 +299,7 @@ export function createRunOperationsController({
           message: formatBridgeError(error),
           error_code: error?.code || null
         });
-        // Refresh sidebar so the failed run appears in the list
-        await refreshAfterRunSafe("failure_refresh");
+        // Do NOT refresh after failure — keep failure state visible to the user.
       } finally {
         activeOperationId = null;
         setBusy(false);

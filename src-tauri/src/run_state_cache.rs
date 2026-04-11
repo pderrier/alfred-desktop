@@ -222,3 +222,10 @@ pub fn should_flush() -> bool {
     }
 }
 
+/// Clear all in-memory cache entries. For test isolation only — do not call in production.
+#[cfg(test)]
+pub fn reset_cache() {
+    let mut guard = cache().lock().unwrap_or_else(|p| p.into_inner());
+    guard.entries.clear();
+}
+

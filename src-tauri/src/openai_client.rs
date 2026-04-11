@@ -557,6 +557,179 @@ fn call_responses_streamed(
     Err(last_err.unwrap_or_else(|| anyhow!("openai_api_retries_exhausted")))
 }
 
+// ── Native-OAuth mode ────────────────────────────────────────────
+//
+// Uses `codex::run_simple_prompt()` as the LLM transport (OAuth auth,
+// no API key) while keeping the native Rust tool-use loop.
+//
+// The app-server returns plain text, so we embed tool definitions in
+// the prompt and ask the model to respond with a structured protocol:
+//   - Final answer: return the analysis JSON directly
+//   - Tool call: return `<tool_call>{"name":"...","arguments":{...}}</tool_call>`
+//
+// The Rust loop parses tool calls, executes them via dispatch_tool_direct(),
+// feeds results back, and repeats until the model returns a final answer.
+
+/// Execute a prompt via the Codex app-server (OAuth) with a native tool-use loop.
+/// Same orchestration as `run_prompt()` but uses `codex::run_simple_prompt()`
+/// as the LLM transport instead of direct HTTP to api.openai.com.
+pub fn run_prompt_oauth(
+    prompt: &str,
+    timeout_ms: u64,
+    on_progress: Option<ProgressFn>,
+) -> Result<Value> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let dd = data_dir();
+    let tool_instructions = build_tool_instructions();
+
+    crate::debug_log(&format!(
+        "openai_client: native-oauth mode, timeout={timeout_ms}ms"
+    ));
+
+    // Build the initial prompt with tool instructions prepended
+    let mut conversation = format!(
+        "{tool_instructions}\n\n---\n\n{prompt}"
+    );
+
+    let mut round = 0;
+    loop {
+        round += 1;
+        if round > MAX_TOOL_ROUNDS {
+            return Err(anyhow!(
+                "openai_client:native_oauth:max_tool_rounds_exceeded:{MAX_TOOL_ROUNDS}"
+            ));
+        }
+        if Instant::now() > deadline {
+            return Err(anyhow!(
+                "openai_client:native_oauth:timeout_exceeded:{timeout_ms}ms"
+            ));
+        }
+
+        if let Some(ref cb) = on_progress {
+            cb(0, round, &format!("round {round}\u{2026}"));
+        }
+
+        // Call the app-server (OAuth, text-in/text-out).
+        // Progress forwarding: we pass None since the inner callback
+        // cannot share the outer Box<dyn Fn + Send>.
+        let response_text =
+            crate::codex::run_simple_prompt(&conversation, None)?;
+
+        crate::debug_log(&format!(
+            "openai_client: native-oauth round {round}, {} chars",
+            response_text.len()
+        ));
+
+        // Check for tool calls in the response
+        let tool_calls = parse_tool_calls(&response_text);
+
+        if tool_calls.is_empty() {
+            // No tool calls — this is the final answer
+            crate::debug_log(&format!(
+                "openai_client: native-oauth completed in {round} rounds, {} chars",
+                response_text.len()
+            ));
+            match extract_json_result(&response_text) {
+                Ok(v) => return Ok(v),
+                Err(_) => {
+                    return Ok(json!({
+                        "ok": true,
+                        "mcp_turn": true,
+                        "agent_text_chars": response_text.len()
+                    }))
+                }
+            }
+        }
+
+        // Execute tool calls and build context for next round
+        let mut tool_results = String::new();
+        for (name, arguments) in &tool_calls {
+            if let Some(ref cb) = on_progress {
+                cb(0, round, &format!("tool:{name}"));
+            }
+            crate::debug_log(&format!("openai_client: native-oauth calling tool {name}"));
+
+            let args: Value = serde_json::from_str(arguments).unwrap_or(json!({}));
+            let result = crate::mcp_server::dispatch_tool_direct(&dd, name, &args);
+            let result_str = if let Some(s) = result.as_str() {
+                s.to_string()
+            } else {
+                serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_string())
+            };
+
+            tool_results.push_str(&format!(
+                "\n<tool_result name=\"{name}\">\n{result_str}\n</tool_result>\n"
+            ));
+        }
+
+        // Append tool results to the conversation for the next round
+        conversation = format!(
+            "{conversation}\n\n[Assistant called tools]\n{tool_results}\n\n\
+             Continue with the analysis. If you need more data, call another tool. \
+             Otherwise, provide your final JSON response (no <tool_call> tags)."
+        );
+    }
+}
+
+/// Build a system instruction describing available tools for text-based
+/// tool calling. The model must use `<tool_call>...</tool_call>` tags.
+fn build_tool_instructions() -> String {
+    let tools = crate::mcp_server::tool_definitions_openai();
+    let mut desc = String::from(
+        "You have access to the following tools. To call a tool, respond ONLY with a \
+         <tool_call> XML tag containing a JSON object with \"name\" and \"arguments\" fields. \
+         Do NOT include any other text when making a tool call.\n\n\
+         Example: <tool_call>{\"name\":\"get_line_data\",\"arguments\":{\"ticker\":\"AAPL\"}}</tool_call>\n\n\
+         You may call multiple tools in one response by including multiple <tool_call> tags.\n\n\
+         Available tools:\n",
+    );
+    for tool in &tools {
+        let name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let description = tool.get("description").and_then(|v| v.as_str()).unwrap_or("");
+        let params = tool
+            .get("parameters")
+            .map(|v| serde_json::to_string(v).unwrap_or_default())
+            .unwrap_or_default();
+        desc.push_str(&format!("\n- **{name}**: {description}\n  Parameters: {params}\n"));
+    }
+    desc.push_str(
+        "\nWhen you have the final answer, respond with the JSON result directly \
+         (no <tool_call> tags). Do NOT wrap your final answer in any XML tags.",
+    );
+    desc
+}
+
+/// Parse `<tool_call>...</tool_call>` tags from model text.
+/// Returns a vec of (name, arguments_json_string) pairs.
+fn parse_tool_calls(text: &str) -> Vec<(String, String)> {
+    let mut calls = Vec::new();
+    let mut search_from = 0;
+    while let Some(start) = text[search_from..].find("<tool_call>") {
+        let abs_start = search_from + start + "<tool_call>".len();
+        if let Some(end) = text[abs_start..].find("</tool_call>") {
+            let inner = text[abs_start..abs_start + end].trim();
+            if let Ok(obj) = serde_json::from_str::<Value>(inner) {
+                let name = obj
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let args = obj
+                    .get("arguments")
+                    .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()))
+                    .unwrap_or_else(|| "{}".to_string());
+                if !name.is_empty() {
+                    calls.push((name, args));
+                }
+            }
+            search_from = abs_start + end + "</tool_call>".len();
+        } else {
+            break;
+        }
+    }
+    calls
+}
+
 // ── JSON extraction ───────────────────────────────────────────────
 
 /// Extract JSON from the model's final text output.

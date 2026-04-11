@@ -259,7 +259,7 @@ export function initBootstrap(deps) {
         }
       } catch { openaiOk = false; }
     } else {
-      // Codex backend — check session
+      // Codex or native-oauth backend — check session
       setSplashStatus("Checking OpenAI\u2026");
       try {
         const status = await bridge.getCodexSessionStatus();
@@ -330,7 +330,8 @@ export function initBootstrap(deps) {
       // Toggle native fields on radio change
       for (const radio of backendRadios) {
         radio.addEventListener("change", () => {
-          const isNative = document.querySelector('input[name="splash-backend"]:checked')?.value === "native";
+          const selected = document.querySelector('input[name="splash-backend"]:checked')?.value;
+          const isNative = selected === "native";
           splashNativeFields?.classList.toggle("hidden", !isNative);
           // Update OpenAI row label
           if (openaiBtn) openaiBtn.textContent = isNative ? "Validate" : "Connect";
@@ -413,9 +414,9 @@ export function initBootstrap(deps) {
         return;
       }
 
-      // Codex backend — save backend choice, then do OAuth login
+      // Codex or native-oauth backend — save backend choice, then do OAuth login
       if (tauriInvoke) {
-        try { await tauriInvoke("runtime_settings_update_local", { settings: { llm_backend: "codex" } }); } catch {}
+        try { await tauriInvoke("runtime_settings_update_local", { settings: { llm_backend: selectedBackend } }); } catch {}
       }
       this.disabled = true;
       this.textContent = "Signing in...";

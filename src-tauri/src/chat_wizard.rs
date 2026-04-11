@@ -35,6 +35,7 @@ pub fn chat_wizard_send_impl(
 
     let response_text = match backend.as_str() {
         "native" | "openai" => call_openai_chat(&messages)?,
+        "native-oauth" => call_via_app_server_chat(&context, &history, &user_message)?,
         _ => call_via_backend(&context, &history, &user_message)?,
     };
 
@@ -94,6 +95,23 @@ fn call_openai_chat(messages: &[Value]) -> Result<String> {
     }
 
     Ok(content)
+}
+
+/// Native-oauth chat: flatten conversation and send via app-server (no API key needed).
+fn call_via_app_server_chat(context: &str, history: &[Value], user_message: &str) -> Result<String> {
+    let mut prompt = format!("System: {context}\n\n");
+    for msg in history {
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+        let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        prompt.push_str(&format!("{role}: {content}\n\n"));
+    }
+    prompt.push_str(&format!("user: {user_message}\n\nassistant:"));
+
+    let text = crate::codex::run_simple_prompt(&prompt, None)?;
+    if text.trim().is_empty() {
+        return Err(anyhow!("chat_wizard_empty_response"));
+    }
+    Ok(text)
 }
 
 /// Fallback: flatten conversation into a single prompt for the codex backend.

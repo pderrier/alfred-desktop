@@ -343,6 +343,48 @@ impl AppServerClient {
         })
     }
 
+    /// Spawn an app-server with NO MCP tools configured.
+    /// Used by native-oauth mode where Rust handles tool calls directly
+    /// and the app-server is just an OAuth-authenticated LLM proxy.
+    fn spawn_no_tools() -> Result<Self> {
+        let bin = resolve_codex_binary()?;
+        let bin_str = bin.to_string_lossy().to_string();
+
+        crate::debug_log(&format!("codex app-server (no-tools): spawning {} app-server", bin_str));
+
+        let mut cmd = Command::new(bin.as_os_str());
+        cmd.arg("app-server");
+        // No -c flags for MCP servers — pure text proxy
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        prepare_codex_cmd(&mut cmd);
+        let mut child = cmd.spawn()
+            .map_err(|e| anyhow!("codex_app_server_spawn_failed:{e}"))?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("codex_app_server_stdin_unavailable"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("codex_app_server_stdout_unavailable"))?;
+        let stderr = child.stderr.take();
+
+        Ok(Self {
+            child,
+            stdin: BufWriter::new(stdin),
+            stdout: BufReader::new(stdout),
+            stderr,
+            next_id: AtomicU64::new(0),
+            initialized: false,
+            active_thread_id: None,
+            active_turn_id: None,
+            best_model: None,
+        })
+    }
+
     fn next_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
@@ -984,6 +1026,154 @@ pub fn run_codex_prompt_with_progress(
             None => Ok(json!({"ok": true, "mcp_turn": true, "agent_text": agent_text})),
         }
     })
+}
+
+/// Run a simple text-in/text-out prompt through the Codex app-server.
+/// No MCP tools configured — the app-server acts as a dumb LLM proxy.
+/// Used by native-oauth mode: Rust orchestrates tool calls, the app-server
+/// only provides OAuth-authenticated LLM generation.
+pub fn run_simple_prompt(
+    prompt: &str,
+    on_progress: Option<CodexProgressFn>,
+) -> Result<String> {
+    // Test mock hook
+    if let Some(slot) = CODEX_MOCK.get() {
+        if let Ok(guard) = slot.lock() {
+            if let Some(mock_fn) = *guard {
+                let result = mock_fn(prompt)?;
+                return Ok(result.as_str().unwrap_or("").to_string());
+            }
+        }
+    }
+
+    // Spawn a dedicated app-server with NO MCP tools.
+    let mut client = AppServerClient::spawn_no_tools()?;
+    client.initialize()?;
+    if let Ok(model) = resolve_best_model(&mut client) {
+        client.best_model = Some(model);
+    }
+
+    let model = client.best_model.clone().unwrap_or_else(|| "gpt-5.4".to_string());
+    let id = client.send_request(
+        "thread/start",
+        json!({"model": model, "approvalPolicy": "never"}),
+    )?;
+    let resp = client.recv_response(id, |_, _| {})?;
+    let thread_id = resp
+        .get("thread")
+        .and_then(|t| t.get("id"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("codex_simple_no_thread_id"))?
+        .to_string();
+    client.active_thread_id = Some(thread_id.clone());
+
+    let turn_req_id = client.send_request(
+        "turn/start",
+        json!({
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": prompt}],
+        }),
+    )?;
+
+    let mut agent_text = String::new();
+    let mut bytes_received = 0usize;
+    loop {
+        let msg = client.recv()?;
+        match msg {
+            JsonRpcMessage::Response { id, error, .. } if id == turn_req_id => {
+                if let Some(err) = error {
+                    return Err(map_rpc_error(&err));
+                }
+            }
+            JsonRpcMessage::Response { .. } => {}
+            JsonRpcMessage::Notification { ref method, ref params } => {
+                match method.as_str() {
+                    "item/agentMessage/delta" => {
+                        if let Some(delta) = params.get("delta").and_then(|v| v.as_str()) {
+                            agent_text.push_str(delta);
+                            bytes_received += delta.len();
+                            if bytes_received % 800 < delta.len() {
+                                if let Some(ref cb) = on_progress {
+                                    let kb = bytes_received as f64 / 1024.0;
+                                    cb(bytes_received, 0, &format!("writing ({kb:.1}kB)\u{2026}"));
+                                }
+                            }
+                        }
+                    }
+                    "item/completed" => {
+                        if let Some("agentMessage") =
+                            params.get("item").and_then(|i| i.get("type")).and_then(|v| v.as_str())
+                        {
+                            if let Some(text) =
+                                params.get("item").and_then(|i| i.get("text")).and_then(|v| v.as_str())
+                            {
+                                if text.len() > agent_text.len() {
+                                    agent_text = text.to_string();
+                                }
+                            }
+                        }
+                    }
+                    "item/started" => {
+                        let item_type = params
+                            .get("item")
+                            .and_then(|i| i.get("type"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if let Some(ref cb) = on_progress {
+                            let label = match item_type {
+                                "reasoning" => "thinking\u{2026}".to_string(),
+                                _ => String::new(),
+                            };
+                            if !label.is_empty() {
+                                cb(bytes_received, 0, &label);
+                            }
+                        }
+                    }
+                    "turn/completed" => {
+                        let status = params
+                            .get("turn")
+                            .and_then(|t| t.get("status"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        if status == "failed" {
+                            let err = params
+                                .get("turn")
+                                .and_then(|t| t.get("error"))
+                                .cloned()
+                                .unwrap_or(json!({"message": "simple prompt turn failed"}));
+                            return Err(map_rpc_error(&err));
+                        }
+                        if status == "interrupted" {
+                            return Err(anyhow!("codex_child_killed:process was cancelled"));
+                        }
+                        break;
+                    }
+                    "thread/tokenUsage/updated" => {
+                        if let Some(ref cb) = on_progress {
+                            let total = params.pointer("/tokenUsage/total/totalTokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let input = params.pointer("/tokenUsage/total/inputTokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let output = params.pointer("/tokenUsage/total/outputTokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                            if total > 0 {
+                                cb(bytes_received, 0, &format!("tokens:{total}:{input}:{output}"));
+                            }
+                        }
+                    }
+                    "account/rateLimits/updated" => {
+                        if let Some(ref cb) = on_progress {
+                            let used_pct = params.pointer("/rateLimits/primary/usedPercent").and_then(|v| v.as_u64()).unwrap_or(0);
+                            if used_pct > 0 {
+                                cb(bytes_received, 0, &format!("rate_limit:{used_pct}%"));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    crate::debug_log(&format!("codex simple_prompt: completed, {} chars", agent_text.len()));
+    Ok(agent_text)
 }
 
 /// Run a synthesis prompt with a dedicated app-server that only exposes

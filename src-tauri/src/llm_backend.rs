@@ -1,7 +1,7 @@
 //! LLM backend abstraction — dispatches between Codex app-server and native
 //! OpenAI API client. Both backends share the same prompts, tools, and parsing.
 //!
-//! Backend selection: runtime setting `llm_backend` ("codex" | "native").
+//! Backend selection: runtime setting `llm_backend` ("codex" | "native" | "native-oauth").
 //! Default: "codex" (preserves existing behavior + free tier).
 
 use anyhow::Result;
@@ -26,11 +26,17 @@ fn resolve_backend() -> String {
     if setting == 1 {
         return "native".to_string();
     }
+    if setting == 2 {
+        return "native-oauth".to_string();
+    }
     // Check string setting
     if let Ok(raw) = crate::runtime_settings::string_direct("llm_backend") {
         let t = raw.trim().to_lowercase();
         if t == "native" || t == "openai" {
             return "native".to_string();
+        }
+        if t == "native-oauth" {
+            return "native-oauth".to_string();
         }
     }
     "codex".to_string()
@@ -49,6 +55,9 @@ pub fn run_prompt(
     match backend.as_str() {
         "native" | "openai" => {
             crate::openai_client::run_prompt(prompt, timeout_ms, on_progress)
+        }
+        "native-oauth" => {
+            crate::openai_client::run_prompt_oauth(prompt, timeout_ms, on_progress)
         }
         _ => {
             // Codex backend — existing path

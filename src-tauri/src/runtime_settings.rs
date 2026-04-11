@@ -34,14 +34,14 @@ pub fn definitions_json() -> serde_json::Value {
         },
         "llm_backend": {
             "type": "enum",
-            "values": ["codex", "native"],
+            "values": ["codex", "native-oauth", "native"],
             "defaultValue": "codex",
             "section": "product",
             "restartRequired": false,
             "envName": "ALFRED_LLM_BACKEND",
             "label": "LLM backend",
-            "description": "Codex uses OpenAI OAuth (free tier). Native uses your own API key (pay-per-use, lighter install).",
-            "whyItMatters": "Codex is free for new OpenAI users. Native requires an API key but removes the Node.js dependency.",
+            "description": "Codex uses OpenAI OAuth with AI orchestration. Native+OAuth uses OAuth with optimized Rust orchestration (free, recommended). Native uses your own API key (pay-per-use).",
+            "whyItMatters": "Native+OAuth combines free OAuth auth with optimized local tool calls. Codex lets the AI orchestrate. Native requires a paid API key.",
             "resetLabel": "Use Codex (free tier)"
         },
         "openai_api_key": {
@@ -243,7 +243,7 @@ fn normalize_value(key: &str, value: &serde_json::Value) -> Result<serde_json::V
         }
         "llm_backend" => {
             let normalized = value.as_str().unwrap_or_default().trim();
-            if ["codex", "native"].contains(&normalized) {
+            if ["codex", "native", "native-oauth"].contains(&normalized) {
                 Ok(json!(normalized))
             } else {
                 Err(anyhow!("runtime_setting_invalid:{key}"))

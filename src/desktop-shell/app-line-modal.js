@@ -458,7 +458,10 @@ export function showSaveToMemoryPanel(rec, prefill) {
 
   // Cancel: close without saving
   for (const btn of cancelBtns) btn.addEventListener("click", close);
-  overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+  // Delay backdrop click handler to prevent stale click events from closing immediately
+  setTimeout(() => {
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+  }, 200);
 
   // Confirm: collect fields and call Tauri command
   confirmBtn.addEventListener("click", async () => {

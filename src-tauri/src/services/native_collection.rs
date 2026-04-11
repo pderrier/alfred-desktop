@@ -1085,6 +1085,10 @@ fn resolve_native_snapshot(
         .and_then(|value| value.get("run_on_latest_finary_snapshot"))
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
+    let force_refresh = options
+        .and_then(|value| value.get("force_finary_refresh"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
 
     if !run_on_latest {
         if let Some(entry) = latest_cached.as_ref() {
@@ -1095,7 +1099,8 @@ fn resolve_native_snapshot(
                 .map(|a| a.len())
                 .unwrap_or(0);
             // Only reuse same-day cache if it has positions — skip empty snapshots
-            if !saved_at.is_empty() && same_local_day(&saved_at) && cached_positions > 0 {
+            // force_finary_refresh bypasses same-day cache (user explicitly requested resync)
+            if !force_refresh && !saved_at.is_empty() && same_local_day(&saved_at) && cached_positions > 0 {
                 let snapshot = entry.get("snapshot").cloned().unwrap_or_else(|| json!({}));
                 return Ok((snapshot, "success".to_string(), json!({
                     "used_latest_snapshot": true,

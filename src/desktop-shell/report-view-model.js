@@ -572,6 +572,7 @@ export function buildRunAnalysisOptions({
     return {
       portfolio_source: "finary",
       account: accountName,
+      force_finary_refresh: true,
       agent_guidelines: guidance || null,
       run_mode: mode
     };

@@ -594,12 +594,13 @@ fn fetch_finary_snapshot(run_id: &str, _request_fn: HttpRequestFn) -> Result<Val
         entry.0 += pos.get("valeur_actuelle").and_then(|v| v.as_f64()).unwrap_or(0.0);
         entry.1 += pos.get("plus_moins_value").and_then(|v| v.as_f64()).unwrap_or(0.0);
     }
-    // Compute cash per account from holdings accounts
+    // Compute cash per investment account by matching via connection_id
     let holdings_accounts = extract_result_list(&holdings);
-    let mut cash_by_account: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
-    for acct in &holdings_accounts {
-        let acct_name = acct.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-        let acct_cash: f64 = acct.get("fiats")
+    let cash_result = build_cash_mapping(&holdings_accounts);
+    let investment_name_to_cash = cash_result.mapping;
+    // Global cash = ALL fiats across ALL holdings accounts (not just matched ones)
+    let cash: f64 = holdings_accounts.iter().map(|acct| {
+        acct.get("fiats")
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default()
@@ -608,17 +609,15 @@ fn fetch_finary_snapshot(run_id: &str, _request_fn: HttpRequestFn) -> Result<Val
                 fiat.get("current_value").or_else(|| fiat.get("amount")).or_else(|| fiat.get("quantity"))
                     .and_then(|v| v.as_f64()).unwrap_or(0.0)
             })
-            .sum();
-        *cash_by_account.entry(acct_name).or_insert(0.0) += acct_cash;
-    }
-    let cash: f64 = cash_by_account.values().sum();
+            .sum::<f64>()
+    }).sum();
 
     let snapshot_accounts: Vec<Value> = account_map.iter().map(|(name, (value, gain))| {
-        let acct_cash = cash_by_account.get(name).copied().unwrap_or(0.0);
+        let acct_cash = investment_name_to_cash.get(name).copied().unwrap_or(0.0);
         json!({ "name": name, "total_value": value, "total_gain": gain, "cash": acct_cash })
     }).collect();
 
-    let snapshot = json!({
+    let mut snapshot = json!({
         "run_id": run_id,
         "positions": positions,
         "accounts": snapshot_accounts,
@@ -628,6 +627,13 @@ fn fetch_finary_snapshot(run_id: &str, _request_fn: HttpRequestFn) -> Result<Val
         "total_gain": total_gain,
         "cash": cash
     });
+    // Include ambiguous cash groups that need user confirmation
+    if !cash_result.ambiguous_groups.is_empty() {
+        snapshot.as_object_mut().unwrap().insert(
+            "ambiguous_cash_groups".to_string(),
+            json!(cash_result.ambiguous_groups),
+        );
+    }
     Ok(snapshot)
 }
 
@@ -649,6 +655,251 @@ fn extract_result_list(payload: &Value) -> Vec<Value> {
         return arr.clone();
     }
     Vec::new()
+}
+
+/// Result of cash mapping — includes the amount mapping and any ambiguous groups
+/// that need user confirmation.
+struct CashMappingResult {
+    /// Investment account name → cash balance amount
+    mapping: std::collections::HashMap<String, f64>,
+    /// Ambiguous groups where heuristic matching was used and needs confirmation
+    ambiguous_groups: Vec<Value>,
+}
+
+/// Build a mapping from investment account name → associated cash balance.
+///
+/// Holdings accounts with securities are "investment" accounts; those with only
+/// fiats are "cash" accounts. We pair them via `connection_id` so that e.g.
+/// "Plan Epargne en Action" (securities) gets matched with "Compte espèce PEA"
+/// (fiats) when they share the same connection.
+///
+/// Before heuristic matching, checks user-preferences.json for persisted
+/// `cash_account_links` (investment_name → cash_name). Ambiguous groups
+/// (N:M within same connection) that aren't covered by saved preferences
+/// are flagged for user confirmation in the snapshot.
+fn build_cash_mapping(holdings_accounts: &[Value]) -> CashMappingResult {
+    use std::collections::HashMap;
+
+    struct HoldingsEntry {
+        name: String,
+        connection_id: Option<i64>,
+        correlation_id: Option<i64>,
+        institution_name: String,
+        securities_count: usize,
+        fiats_sum: f64,
+    }
+
+    // Load persisted cash account links from user preferences
+    let prefs = crate::runtime_settings::get_user_preferences();
+    let saved_links: HashMap<String, String> = prefs
+        .get("cash_account_links")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if !saved_links.is_empty() {
+        crate::debug_log(&format!(
+            "finary_cash_mapping: loaded {} persisted cash_account_links from preferences",
+            saved_links.len()
+        ));
+    }
+
+    // Parse all holdings accounts
+    let mut entries: Vec<HoldingsEntry> = Vec::new();
+    for acct in holdings_accounts {
+        let name = acct.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let connection_id = acct.get("connection_id").and_then(|v| v.as_i64());
+        let correlation_id = acct.get("correlation_id").and_then(|v| v.as_i64());
+        let institution_name = acct.get("institution")
+            .and_then(|v| v.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let securities_count = acct.get("securities")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let fiats_sum: f64 = acct.get("fiats")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|fiat| {
+                fiat.get("current_value")
+                    .or_else(|| fiat.get("amount"))
+                    .or_else(|| fiat.get("quantity"))
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0)
+            })
+            .sum();
+        entries.push(HoldingsEntry { name, connection_id, correlation_id, institution_name, securities_count, fiats_sum });
+    }
+
+    // Classify into investment vs cash accounts
+    let investment_entries: Vec<&HoldingsEntry> = entries.iter().filter(|e| e.securities_count > 0).collect();
+    let cash_entries: Vec<&HoldingsEntry> = entries.iter().filter(|e| e.fiats_sum > 0.0 && e.securities_count == 0).collect();
+
+    // Build name → entry lookup for saved links resolution
+    let cash_by_name: HashMap<&str, &HoldingsEntry> = cash_entries.iter()
+        .map(|e| (e.name.as_str(), *e))
+        .collect();
+
+    crate::debug_log(&format!(
+        "finary_cash_mapping: {} investment accounts, {} cash accounts out of {} total",
+        investment_entries.len(), cash_entries.len(), entries.len()
+    ));
+
+    let mut result: HashMap<String, f64> = HashMap::new();
+    let mut matched_cash_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut ambiguous_groups: Vec<Value> = Vec::new();
+
+    // Strategy 0: Apply persisted cash_account_links from user preferences
+    for inv in &investment_entries {
+        if let Some(cash_name) = saved_links.get(&inv.name) {
+            if let Some(cash_entry) = cash_by_name.get(cash_name.as_str()) {
+                result.insert(inv.name.clone(), cash_entry.fiats_sum);
+                // Mark the cash entry as matched
+                if let Some(idx) = cash_entries.iter().position(|e| e.name == cash_entry.name) {
+                    matched_cash_indices.insert(idx);
+                }
+                crate::debug_log(&format!(
+                    "finary_cash_mapping: matched '{}' → cash {:.2} (user preference → '{}')",
+                    inv.name, cash_entry.fiats_sum, cash_name
+                ));
+            }
+        }
+    }
+
+    // Strategy 1: Group by connection_id and match within each group
+    let mut inv_by_conn: HashMap<i64, Vec<&HoldingsEntry>> = HashMap::new();
+    let mut cash_by_conn: HashMap<i64, Vec<(usize, &HoldingsEntry)>> = HashMap::new();
+    for inv in &investment_entries {
+        if result.contains_key(&inv.name) {
+            continue; // Already matched via saved preferences
+        }
+        if let Some(cid) = inv.connection_id {
+            inv_by_conn.entry(cid).or_default().push(inv);
+        }
+    }
+    for (idx, ce) in cash_entries.iter().enumerate() {
+        if matched_cash_indices.contains(&idx) {
+            continue; // Already matched via saved preferences
+        }
+        if let Some(cid) = ce.connection_id {
+            cash_by_conn.entry(cid).or_default().push((idx, ce));
+        }
+    }
+
+    for (cid, invs) in &inv_by_conn {
+        if let Some(cashes) = cash_by_conn.get(cid) {
+            if invs.len() == 1 && cashes.len() == 1 {
+                // Exactly 1 investment + 1 cash in this connection → direct match
+                let cash_amount = cashes[0].1.fiats_sum;
+                result.insert(invs[0].name.clone(), cash_amount);
+                matched_cash_indices.insert(cashes[0].0);
+                crate::debug_log(&format!(
+                    "finary_cash_mapping: matched '{}' → cash {:.2} (connection_id={}, 1:1)",
+                    invs[0].name, cash_amount, cid
+                ));
+            } else {
+                // N investments + M cash accounts — ambiguous case
+                // Use correlation_id heuristic as temporary fallback
+                let mut sorted_invs: Vec<&&HoldingsEntry> = invs.iter().collect();
+                let mut sorted_cashes: Vec<&(usize, &HoldingsEntry)> = cashes.iter().collect();
+                sorted_invs.sort_by_key(|e| e.correlation_id.unwrap_or(i64::MAX));
+                sorted_cashes.sort_by_key(|e| e.1.correlation_id.unwrap_or(i64::MAX));
+                for (i, inv) in sorted_invs.iter().enumerate() {
+                    if let Some(cash_pair) = sorted_cashes.get(i) {
+                        result.insert(inv.name.clone(), cash_pair.1.fiats_sum);
+                        matched_cash_indices.insert(cash_pair.0);
+                        crate::debug_log(&format!(
+                            "finary_cash_mapping: matched '{}' → cash {:.2} (connection_id={}, correlation pair, needs_confirmation)",
+                            inv.name, cash_pair.1.fiats_sum, cid
+                        ));
+                    }
+                }
+                // Record this as an ambiguous group for the frontend
+                let inv_json: Vec<Value> = invs.iter().map(|e| json!({
+                    "name": e.name,
+                    "connection_id": e.connection_id,
+                    "correlation_id": e.correlation_id,
+                    "securities_count": e.securities_count,
+                })).collect();
+                let cash_json: Vec<Value> = cashes.iter().map(|(_, e)| json!({
+                    "name": e.name,
+                    "connection_id": e.connection_id,
+                    "correlation_id": e.correlation_id,
+                    "fiats_sum": e.fiats_sum,
+                })).collect();
+                ambiguous_groups.push(json!({
+                    "connection_id": cid,
+                    "investment_accounts": inv_json,
+                    "cash_accounts": cash_json,
+                    "needs_confirmation": true,
+                }));
+            }
+        }
+    }
+
+    // Strategy 2: For investment accounts without connection_id, try institution name prefix
+    for inv in &investment_entries {
+        if result.contains_key(&inv.name) {
+            continue; // Already matched
+        }
+        if inv.connection_id.is_some() {
+            continue; // Had a connection_id but no cash match — skip prefix fallback
+        }
+        if inv.institution_name.is_empty() {
+            continue;
+        }
+        // Find unmatched cash accounts whose institution name starts with same prefix
+        let inv_prefix = inv.institution_name.split_whitespace().next().unwrap_or_default().to_lowercase();
+        let mut prefix_cash_sum = 0.0;
+        for (idx, ce) in cash_entries.iter().enumerate() {
+            if matched_cash_indices.contains(&idx) {
+                continue;
+            }
+            let ce_prefix = ce.institution_name.split_whitespace().next().unwrap_or_default().to_lowercase();
+            if !inv_prefix.is_empty() && inv_prefix == ce_prefix {
+                prefix_cash_sum += ce.fiats_sum;
+                matched_cash_indices.insert(idx);
+            }
+        }
+        if prefix_cash_sum > 0.0 {
+            result.insert(inv.name.clone(), prefix_cash_sum);
+            crate::debug_log(&format!(
+                "finary_cash_mapping: matched '{}' → cash {:.2} (institution prefix '{}')",
+                inv.name, prefix_cash_sum, inv_prefix
+            ));
+        }
+    }
+
+    // Log unmatched cash accounts
+    for (idx, ce) in cash_entries.iter().enumerate() {
+        if !matched_cash_indices.contains(&idx) {
+            crate::debug_log(&format!(
+                "finary_cash_mapping: unmatched cash account '{}' ({:.2}€, connection_id={:?})",
+                ce.name, ce.fiats_sum, ce.connection_id
+            ));
+        }
+    }
+
+    // Also add any accounts that are BOTH investment + cash (fiats on the investment account itself)
+    for inv in &investment_entries {
+        if inv.fiats_sum > 0.0 {
+            *result.entry(inv.name.clone()).or_insert(0.0) += inv.fiats_sum;
+            crate::debug_log(&format!(
+                "finary_cash_mapping: '{}' has direct fiats {:.2} (investment account with cash)",
+                inv.name, inv.fiats_sum
+            ));
+        }
+    }
+
+    CashMappingResult { mapping: result, ambiguous_groups }
 }
 
 /// Derive a short, human-readable ticker from the security name when Finary

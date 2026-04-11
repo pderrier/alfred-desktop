@@ -422,6 +422,21 @@
           <ul id="line-memory-history" class="lm-tag-list"></ul>
         </article>
 
+        <!-- ⑤½ Notes & Discussions (collapsed, user-saved insights) -->
+        <details id="line-memory-notes-section" class="lm-news-details hidden">
+          <summary class="lm-heading-sm">Notes &amp; Discussions</summary>
+          <div style="padding:0.4rem 0;display:flex;flex-direction:column;gap:0.6rem">
+            <div id="line-memory-key-reasoning-block">
+              <label style="font-size:0.7rem;color:var(--sea-muted,#8a9bb0)">Key Reasoning</label>
+              <p id="line-memory-key-reasoning" class="lm-memory-text" style="white-space:pre-wrap;margin:0.2rem 0 0"></p>
+            </div>
+            <div id="line-memory-user-note-block">
+              <label style="font-size:0.7rem;color:var(--sea-muted,#8a9bb0)">Personal Note</label>
+              <p id="line-memory-user-note" class="lm-memory-text" style="white-space:pre-wrap;margin:0.2rem 0 0"></p>
+            </div>
+          </div>
+        </details>
+
         <!-- ⑥ News sources (collapsed) -->
         <details class="lm-news-details">
           <summary class="lm-heading-sm">News Sources <button id="line-memory-news-detail-btn" class="inline-detail-btn" type="button" title="Expand">&#9432;</button></summary>
@@ -439,7 +454,7 @@
         </article>
 
         <div class="shell-actions">
-          <button id="line-memory-ask-btn" class="cmd-btn" type="button">Ask about this</button>
+          <button id="line-memory-ask-btn" class="cmd-btn" type="button">&#x1F4AC; Ask about this</button>
           <button id="line-memory-close-btn" class="ghost-btn" type="button">Close</button>
         </div>
       </div>

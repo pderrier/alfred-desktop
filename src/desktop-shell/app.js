@@ -387,7 +387,7 @@ function renderActionsNow(items = [], recommendations = []) {
     const shortRationale = rationale.length > 200 ? rationale.slice(0, 200) + "\u2026" : rationale;
     const hasMore = rationale.length > 200;
     card.innerHTML = `
-      <p class="action-header">${action.priority}. ${nameHtml}<button class="ghost-btn action-ask-btn" style="margin-left:0.5rem;padding:0.15rem 0.5rem;font-size:0.7rem;vertical-align:middle" title="Ask about this action">Ask</button></p>
+      <p class="action-header">${action.priority}. ${nameHtml}<button class="ghost-btn action-ask-btn" style="margin-left:0.5rem;padding:0.2rem 0.6rem;font-size:0.75rem;vertical-align:middle;border-radius:6px" title="Ask about this action">\uD83D\uDCAC Ask</button></p>
       <p class="action-detail"><span class="action-signal-badge">${escapeHtml(action.action)}</span> <span class="action-order-type">${orderLabel}</span>${metrics.length > 0 ? ` · ${metrics.join(" · ")}` : ""}</p>
       <p class="action-rationale">${escapeHtml(shortRationale)}${hasMore ? ` <a href="#" class="action-expand">voir plus</a>` : ""}</p>
     `;
@@ -451,8 +451,8 @@ function injectSynthesisAskButton(synthCard, model) {
 
   const btn = document.createElement("button");
   btn.className = "ghost-btn synthesis-ask-btn";
-  btn.style.cssText = "margin-top:0.5rem;padding:0.2rem 0.6rem;font-size:0.75rem";
-  btn.textContent = "Ask about this synthesis";
+  btn.style.cssText = "margin-top:0.5rem;padding:0.3rem 0.8rem;font-size:0.8rem;border-radius:6px";
+  btn.textContent = "\uD83D\uDCAC Ask about this synthesis";
   btn.addEventListener("click", async () => {
     const m = latestReportModel;
     if (!m) return;

@@ -586,6 +586,22 @@ export function initLineModal() {
     renderNewsDetail(details.news || []);
     renderAnalysisList(lineMemoryAnalysisNode, toMetricRows(details.analysis, { analyse_technique: "Technical", analyse_fondamentale: "Fundamental", analyse_sentiment: "Sentiment" }), "No analysis.");
     if (lineMemoryMemorySummaryNode) lineMemoryMemorySummaryNode.textContent = String(memory.llm_memory_summary || "No memory.");
+    // Notes & Discussions — user-saved insights from chat drill-downs
+    const notesSection = document.getElementById("line-memory-notes-section");
+    const keyReasoningNode = document.getElementById("line-memory-key-reasoning");
+    const userNoteNode = document.getElementById("line-memory-user-note");
+    const keyReasoning = memory.key_reasoning || "";
+    const userNote = memory.user_note || "";
+    const hasNotes = keyReasoning || userNote;
+    if (notesSection) notesSection.classList.toggle("hidden", !hasNotes);
+    if (keyReasoningNode) {
+      keyReasoningNode.textContent = keyReasoning || "No reasoning saved.";
+      document.getElementById("line-memory-key-reasoning-block")?.classList.toggle("hidden", !keyReasoning);
+    }
+    if (userNoteNode) {
+      userNoteNode.textContent = userNote || "No personal note.";
+      document.getElementById("line-memory-user-note-block")?.classList.toggle("hidden", !userNote);
+    }
     const signals = memory.llm_strong_signals || [];
     renderSimpleList(lineMemorySignalsNode, signals, "No signals.");
     lineMemorySignalsNode?.closest("article")?.classList?.toggle("hidden", signals.length === 0);

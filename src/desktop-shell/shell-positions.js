@@ -93,10 +93,17 @@ export function renderPositionsTable(viewModel, dashboardPayload) {
     const valueBadge = value > 0
       ? ` <span class="pos-value-badge">${formatCurrency(value)} <span class="pos-weight">(${weight.toFixed(1)}%)</span></span>`
       : "";
-    // Next analysis date
+    // Next analysis date — overdue check
     const reanalyseAfter = rec?.reanalyseAfter || "";
+    const isOverdue = reanalyseAfter && reanalyseAfter.length >= 10
+      && reanalyseAfter.slice(0, 10) <= new Date().toISOString().slice(0, 10);
+    const reanalyseIcon = isOverdue ? "\u23F0" : "\u{1F4C5}";
+    const reanalyseCls = isOverdue ? "pos-reanalyse pos-reanalyse-overdue" : "pos-reanalyse";
+    const reanalyseTitle = isOverdue && rec?.reanalyseReason
+      ? ` title="${escapeHtml(rec.reanalyseReason)}"`
+      : "";
     const reanalyseCell = reanalyseAfter
-      ? `<span class="pos-reanalyse">\u{1F4C5} ${escapeHtml(reanalyseAfter)}</span>`
+      ? `<span class="${reanalyseCls}"${reanalyseTitle}>${reanalyseIcon} ${escapeHtml(reanalyseAfter)}</span>`
       : "";
 
     // Main row

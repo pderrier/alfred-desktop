@@ -319,6 +319,33 @@ function renderActiveRunIndicator() {
   }
 }
 
+// ── Stale Reanalysis Badge (Phase 1b) ─────────────────────────
+
+export async function refreshStaleBadge() {
+  try {
+    const { invoke } = window.__TAURI__.core;
+    const result = await invoke("get_stale_positions_local");
+    const count = result?.stale_count || 0;
+    let badge = document.getElementById("sidebar-stale-badge");
+    if (count > 0) {
+      if (!badge && sidebarAccountsNode) {
+        badge = document.createElement("div");
+        badge.id = "sidebar-stale-badge";
+        badge.className = "stale-badge";
+        sidebarAccountsNode.parentNode.insertBefore(badge, sidebarAccountsNode.nextSibling);
+      }
+      if (badge) {
+        badge.textContent = `\u23F0 ${count} position${count > 1 ? "s" : ""} need${count === 1 ? "s" : ""} reanalysis`;
+        badge.classList.remove("hidden");
+      }
+    } else if (badge) {
+      badge.classList.add("hidden");
+    }
+  } catch (e) {
+    // Silently ignore — non-critical UI feature
+  }
+}
+
 let lastStackHealth = null;
 
 function renderStatusPillFromState() {
@@ -401,6 +428,9 @@ function clearReportSections() {
   if (nextAnalysis) { nextAnalysis.textContent = ""; nextAnalysis.classList.add("hidden"); }
   const watchlistSummary = document.getElementById("watchlist-summary");
   if (watchlistSummary) { watchlistSummary.textContent = ""; watchlistSummary.classList.add("hidden"); }
+  // Phase 2b: remove theme concentration card
+  const themeCard = document.getElementById("theme-concentration-card");
+  if (themeCard) themeCard.remove();
   if (positionsTbodyNode) positionsTbodyNode.innerHTML = "";
   if (positionsEmptyNode) positionsEmptyNode.classList.add("hidden");
   if (overviewPanelNode) overviewPanelNode.classList.add("hidden");

@@ -221,6 +221,9 @@
           <!-- Global pipeline progress (visible during run) -->
           <div id="run-pipeline-bar" class="run-pipeline-bar hidden"></div>
 
+          <!-- Run Diff (Phase 4a) -->
+          <div id="run-diff-container" class="hidden"></div>
+
           <!-- Synthesis card -->
           <section id="report-synthesis-card" class="card report-synthesis-card">
             <h2>Market Synthesis</h2>
@@ -437,6 +440,9 @@
           </div>
         </details>
 
+        <!-- ⑤¾ Signal Accuracy Scorecard (Phase 3b) -->
+        <div id="line-memory-scorecard" class="scorecard-section hidden"></div>
+
         <!-- ⑥ News sources (collapsed) -->
         <details class="lm-news-details">
           <summary class="lm-heading-sm">News Sources <button id="line-memory-news-detail-btn" class="inline-detail-btn" type="button" title="Expand">&#9432;</button></summary>
@@ -604,6 +610,9 @@
         on('splash-close',  function () { win.close(); });
       });
     </script>
+    <script type="module" src="/desktop-shell/app-alfred-overlay.js"></script>
+    <script type="module" src="/desktop-shell/app-alfred-triggers.js"></script>
+    <script type="module" src="/desktop-shell/app-alfred-idle.js"></script>
     <script type="module" src="/desktop-shell/app.js"></script>
   </body>
 </html>

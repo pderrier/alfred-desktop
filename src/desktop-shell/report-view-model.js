@@ -309,6 +309,24 @@ function hasSubstantiveRunPayload(run) {
   );
 }
 
+// ── Unified data source resolution (replaces multi-path fallback cascade) ──
+function hasRecos(source) {
+  return source && typeof source === "object"
+    && Array.isArray(source.recommandations) && source.recommandations.length > 0;
+}
+function sameRunId(report, run) {
+  if (!report || !run) return false;
+  const a = String(report.run_id || "").trim();
+  const b = String(run.run_id || "").trim();
+  return a !== "" && a === b;
+}
+function resolveDataSource(latestRun, latestReport) {
+  if (hasRecos(latestRun?.composed_payload)) return "composed";
+  if (Array.isArray(latestRun?.pending_recommandations) && latestRun.pending_recommandations.length > 0) return "pending";
+  if (sameRunId(latestReport, latestRun) && hasRecos(latestReport?.payload)) return "artifact";
+  return "empty";
+}
+
 function parseTimestamp(value) {
   const parsed = Date.parse(String(value || ""));
   return Number.isFinite(parsed) ? parsed : null;
@@ -334,23 +352,22 @@ export function buildReportViewModel(dashboardPayload) {
       ? latestRun.composed_payload
       : {};
   const runStatus = asText(latestRunSummary?.status || latestRun?.status).toLowerCase();
-  const latestRunIsAuthoritative = hasSubstantiveRunPayload(latestRun);
-  const effectiveArtifactReport = latestRunIsAuthoritative
-    ? null
-    : hasSubstantiveReportPayload(latestReportPayload)
-      ? latestReport
-      : latestHistoricalReport || latestReport;
+
+  // Unified data source resolution — single cascade, no multi-path fallbacks
+  const dataSource = resolveDataSource(latestRun, latestReport);
+  const primaryPayload =
+    dataSource === "composed" ? currentRunPayload
+    : dataSource === "artifact" ? (latestReport?.payload || {})
+    : {};
+  const effectiveRecommendationsSource =
+    dataSource === "composed" ? currentRunPayload.recommandations
+    : dataSource === "pending" ? latestRun.pending_recommandations
+    : dataSource === "artifact" ? (latestReport?.payload?.recommandations || [])
+    : [];
+  // Backward compat aliases used downstream
+  const latestRunIsAuthoritative = dataSource === "composed" || dataSource === "pending";
+  const effectiveArtifactReport = dataSource === "artifact" ? latestReport : null;
   const effectiveArtifactPayload = effectiveArtifactReport?.payload || {};
-  const fallbackRecommendations = Array.isArray(currentRunPayload.recommandations)
-    ? currentRunPayload.recommandations
-    : Array.isArray(latestRun?.pending_recommandations)
-      ? latestRun.pending_recommandations
-      : [];
-  const effectiveRecommendationsSource = latestRunIsAuthoritative
-    ? fallbackRecommendations
-    : Array.isArray(effectiveArtifactPayload.recommandations)
-      ? effectiveArtifactPayload.recommandations
-      : fallbackRecommendations;
   const effectiveRunId = latestRun?.run_id || effectiveArtifactReport?.run_id || null;
 
   const recommendations = Array.isArray(effectiveRecommendationsSource)
@@ -367,15 +384,11 @@ export function buildReportViewModel(dashboardPayload) {
     : [];
   const collectedOnlyRecommendations = buildCollectedOnlyRecommendations(latestRun, recommendations);
   const effectiveRecommendations = recommendations.concat(collectedOnlyRecommendations);
-  const effectiveActions = latestRunIsAuthoritative
-    ? Array.isArray(currentRunPayload.actions_immediates)
+  const effectiveActions = Array.isArray(primaryPayload.actions_immediates) && primaryPayload.actions_immediates.length > 0
+    ? primaryPayload.actions_immediates
+    : Array.isArray(currentRunPayload.actions_immediates)
       ? currentRunPayload.actions_immediates
-      : []
-    : Array.isArray(effectiveArtifactPayload.actions_immediates)
-      ? effectiveArtifactPayload.actions_immediates
-      : Array.isArray(currentRunPayload.actions_immediates)
-        ? currentRunPayload.actions_immediates
-        : [];
+      : [];
   const NON_ACTIONABLE = new Set(["CONSERVER", "SURVEILLANCE", "HOLD", "WATCH", "MONITOR"]);
   const actionsNow = Array.isArray(effectiveActions)
     ? effectiveActions.map(normalizeActionItem).filter((a) => !NON_ACTIONABLE.has((a.action || "").toUpperCase()))
@@ -434,17 +447,15 @@ export function buildReportViewModel(dashboardPayload) {
 
   return {
     value: asNumber(
-      latestRunIsAuthoritative ? currentRunPayload.valeur_portefeuille : effectiveArtifactPayload.valeur_portefeuille,
+      primaryPayload.valeur_portefeuille,
       asNumber(currentRunPayload.valeur_portefeuille, asNumber(latestSummary.valeur_portefeuille, null))
     ),
     gain: asNumber(
-      latestRunIsAuthoritative
-        ? currentRunPayload.plus_value_totale
-        : effectiveArtifactPayload.plus_value_totale,
+      primaryPayload.plus_value_totale,
       asNumber(currentRunPayload.plus_value_totale, asNumber(latestSummary.plus_value_totale, null))
     ),
     cash: asNumber(
-      latestRunIsAuthoritative ? currentRunPayload.liquidites : effectiveArtifactPayload.liquidites,
+      primaryPayload.liquidites,
       asNumber(currentRunPayload.liquidites, asNumber(latestSummary.liquidites, null))
     ),
     recommendationCount:
@@ -452,24 +463,20 @@ export function buildReportViewModel(dashboardPayload) {
         ? effectiveRecommendations.length
         : asNumber(latestSummary.recommandations_count, 0),
     synthesis: asText(
-      (latestRunIsAuthoritative ? currentRunPayload.synthese_marche : effectiveArtifactPayload.synthese_marche) ||
-        fallbackSynthesis,
+      primaryPayload.synthese_marche || currentRunPayload.synthese_marche || fallbackSynthesis,
       "No synthesis yet."
     ),
     watchlistSummary: asText(
-      (latestRunIsAuthoritative ? currentRunPayload.opportunites_watchlist : effectiveArtifactPayload.opportunites_watchlist) ||
-        currentRunPayload.opportunites_watchlist,
+      primaryPayload.opportunites_watchlist || currentRunPayload.opportunites_watchlist,
       ""
     ),
     nextAnalysis: asText(
-      (latestRunIsAuthoritative ? currentRunPayload.prochaine_analyse : effectiveArtifactPayload.prochaine_analyse) ||
-        currentRunPayload.prochaine_analyse,
+      primaryPayload.prochaine_analyse || currentRunPayload.prochaine_analyse,
       ""
     ),
     lastUpdate: asText(
-      (latestRunIsAuthoritative
-        ? currentRunPayload.date
-        : effectiveArtifactReport?.saved_at || effectiveArtifactPayload.date) ||
+      primaryPayload.date ||
+        effectiveArtifactReport?.saved_at ||
         currentRunPayload.date ||
         latestRun?.updated_at ||
         latestRunSummary?.updated_at,
@@ -504,7 +511,11 @@ export function buildReportViewModel(dashboardPayload) {
       ),
       recoCount: effectiveRecommendations.length
     }),
-    actionsNow
+    actionsNow,
+    // Phase 2b: theme concentration from composed_payload
+    themeConcentration: (latestRunIsAuthoritative
+      ? currentRunPayload.theme_concentration
+      : effectiveArtifactPayload.theme_concentration) || null
   };
 }
 

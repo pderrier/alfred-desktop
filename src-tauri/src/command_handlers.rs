@@ -274,6 +274,225 @@ pub fn run_save_user_preferences(prefs: serde_json::Value) -> Result<serde_json:
     Ok(json!({ "ok": true }))
 }
 
+// ── Stale Reanalysis Alerts (Phase 1b) ──
+
+pub fn run_get_stale_positions() -> Result<serde_json::Value> {
+    let path = crate::resolve_runtime_state_dir().join("line-memory.json");
+    if !path.exists() {
+        return Ok(json!({ "stale_count": 0, "stale_tickers": [] }));
+    }
+    let store = crate::storage::read_json_file(&path)?;
+    let by_ticker = match store.get("by_ticker").and_then(|v| v.as_object()) {
+        Some(bt) => bt,
+        None => return Ok(json!({ "stale_count": 0, "stale_tickers": [] })),
+    };
+
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let mut stale: Vec<serde_json::Value> = Vec::new();
+
+    for (ticker, entry) in by_ticker {
+        let reanalyse_after = entry
+            .get("reanalyse_after")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if reanalyse_after.is_empty() || reanalyse_after.len() < 10 {
+            continue;
+        }
+        // Compare date strings lexicographically (ISO format — this works correctly)
+        let date_part = &reanalyse_after[..10];
+        if date_part <= today.as_str() {
+            let reason = entry
+                .get("reanalyse_reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            stale.push(json!({
+                "ticker": ticker,
+                "reanalyse_after": date_part,
+                "reanalyse_reason": reason,
+            }));
+        }
+    }
+
+    let count = stale.len();
+    Ok(json!({ "stale_count": count, "stale_tickers": stale }))
+}
+
+// ── Signal Scorecard (Phase 3b) ──
+
+pub fn run_get_signal_scorecard(ticker: String) -> Result<serde_json::Value> {
+    let ticker = ticker.trim().to_uppercase();
+    if ticker.is_empty() {
+        return Ok(json!({ "ticker": "", "signals": [], "overall_accuracy_pct": 0, "scored_count": 0, "correct_count": 0, "trend": "stable" }));
+    }
+    let path = crate::resolve_runtime_state_dir().join("line-memory.json");
+    if !path.exists() {
+        return Ok(json!({ "ticker": ticker, "signals": [], "overall_accuracy_pct": 0, "scored_count": 0, "correct_count": 0, "trend": "stable" }));
+    }
+    let store = crate::storage::read_json_file(&path)?;
+    let entry = store.get("by_ticker")
+        .and_then(|bt| bt.get(&ticker));
+    let entry = match entry {
+        Some(e) => e,
+        None => return Ok(json!({ "ticker": ticker, "signals": [], "overall_accuracy_pct": 0, "scored_count": 0, "correct_count": 0, "trend": "stable" })),
+    };
+
+    let history = entry.get("signal_history").and_then(|v| v.as_array());
+    let history = match history {
+        Some(h) if !h.is_empty() => h,
+        _ => return Ok(json!({ "ticker": ticker, "signals": [], "overall_accuracy_pct": 0, "scored_count": 0, "correct_count": 0, "trend": "stable" })),
+    };
+
+    // Current price from most recent signal or price_tracking
+    let current_price = entry.get("price_tracking")
+        .and_then(|pt| pt.get("current_price").or_else(|| pt.get("price_at_signal")))
+        .and_then(|v| v.as_f64())
+        .or_else(|| history.first()
+            .and_then(|h| h.get("price_at_signal"))
+            .and_then(|v| v.as_f64()))
+        .unwrap_or(0.0);
+
+    let buy_signals = ["ACHAT", "ACHAT_FORT", "RENFORCEMENT"];
+    let sell_signals = ["VENTE", "ALLEGEMENT"];
+
+    let mut signals = Vec::new();
+    let mut correct = 0usize;
+    let mut incorrect = 0usize;
+
+    for sig in history.iter() {
+        let signal = sig.get("signal").and_then(|v| v.as_str()).unwrap_or("");
+        let conviction = sig.get("conviction").and_then(|v| v.as_str()).unwrap_or("");
+        let date = sig.get("date").and_then(|v| v.as_str()).unwrap_or("");
+        let price_at = sig.get("price_at_signal").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let return_pct = if price_at > 0.0 { (current_price - price_at) / price_at * 100.0 } else { 0.0 };
+        let upper = signal.to_uppercase();
+        let accuracy = if buy_signals.contains(&upper.as_str()) {
+            if return_pct > 0.0 { correct += 1; "correct" } else { incorrect += 1; "incorrect" }
+        } else if sell_signals.contains(&upper.as_str()) {
+            if return_pct < 0.0 { correct += 1; "correct" } else { incorrect += 1; "incorrect" }
+        } else {
+            "neutral"
+        };
+        signals.push(json!({
+            "date": date,
+            "signal": signal,
+            "conviction": conviction,
+            "price_at_signal": price_at,
+            "current_price": current_price,
+            "return_pct": (return_pct * 10.0).round() / 10.0,
+            "accuracy": accuracy,
+        }));
+    }
+
+    let scored = correct + incorrect;
+    let accuracy_pct = if scored > 0 { (correct as f64 / scored as f64 * 100.0).round() } else { 0.0 };
+
+    // Trend: compare recent 3 vs older
+    let recent_correct = signals.iter().take(3).filter(|s| s.get("accuracy").and_then(|v| v.as_str()) == Some("correct")).count();
+    let recent_scored = signals.iter().take(3).filter(|s| s.get("accuracy").and_then(|v| v.as_str()) != Some("neutral")).count();
+    let older_correct = signals.iter().skip(3).filter(|s| s.get("accuracy").and_then(|v| v.as_str()) == Some("correct")).count();
+    let older_scored = signals.iter().skip(3).filter(|s| s.get("accuracy").and_then(|v| v.as_str()) != Some("neutral")).count();
+    let trend = if recent_scored < 2 || older_scored < 2 { "stable" }
+    else {
+        let recent_rate = recent_correct as f64 / recent_scored as f64;
+        let older_rate = older_correct as f64 / older_scored as f64;
+        if recent_rate > older_rate + 0.15 { "improving" }
+        else if recent_rate < older_rate - 0.15 { "declining" }
+        else { "stable" }
+    };
+
+    Ok(json!({
+        "ticker": ticker,
+        "signals": signals,
+        "overall_accuracy_pct": accuracy_pct,
+        "scored_count": scored,
+        "correct_count": correct,
+        "trend": trend,
+    }))
+}
+
+// ── Run Diff (Phase 4a) ──
+
+pub fn run_get_run_diff() -> Result<serde_json::Value> {
+    let path = crate::resolve_runtime_state_dir().join("line-memory.json");
+    if !path.exists() {
+        return Ok(json!({ "has_previous": false, "changes": [], "summary": { "signal_changes": 0, "upgrades": 0, "downgrades": 0, "significant_moves": 0, "total_positions": 0 } }));
+    }
+    let store = crate::storage::read_json_file(&path)?;
+    let by_ticker = match store.get("by_ticker").and_then(|v| v.as_object()) {
+        Some(bt) => bt,
+        None => return Ok(json!({ "has_previous": false, "changes": [], "summary": {} })),
+    };
+
+    let buy_strength = |s: &str| -> i32 {
+        match s.to_uppercase().as_str() {
+            "VENTE" => 1, "ALLEGEMENT" => 2, "SURVEILLANCE" => 3,
+            "CONSERVER" => 4, "RENFORCEMENT" => 5, "ACHAT" => 6, "ACHAT_FORT" => 7,
+            _ => 3,
+        }
+    };
+
+    let mut changes = Vec::new();
+    let mut signal_changes = 0usize;
+    let mut upgrades = 0usize;
+    let mut downgrades = 0usize;
+    let mut significant_moves = 0usize;
+    let mut total = 0usize;
+
+    for (ticker, entry) in by_ticker {
+        let history = entry.get("signal_history").and_then(|v| v.as_array());
+        let history = match history {
+            Some(h) if h.len() >= 2 => h,
+            _ => continue,
+        };
+        total += 1;
+        let curr = &history[0];
+        let prev = &history[1];
+        let curr_signal = curr.get("signal").and_then(|v| v.as_str()).unwrap_or("");
+        let prev_signal = prev.get("signal").and_then(|v| v.as_str()).unwrap_or("");
+        let curr_conv = curr.get("conviction").and_then(|v| v.as_str()).unwrap_or("");
+        let prev_conv = prev.get("conviction").and_then(|v| v.as_str()).unwrap_or("");
+        let curr_price = curr.get("price_at_signal").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let prev_price = prev.get("price_at_signal").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let price_change = if prev_price > 0.0 { (curr_price - prev_price) / prev_price * 100.0 } else { 0.0 };
+        let sig_changed = curr_signal != prev_signal;
+        let conv_changed = curr_conv != prev_conv;
+        let big_move = price_change.abs() > 5.0;
+
+        if sig_changed || conv_changed || big_move {
+            if sig_changed {
+                signal_changes += 1;
+                if buy_strength(curr_signal) > buy_strength(prev_signal) { upgrades += 1; }
+                else { downgrades += 1; }
+            }
+            if big_move { significant_moves += 1; }
+            changes.push(json!({
+                "ticker": ticker,
+                "signal_changed": sig_changed,
+                "prev_signal": prev_signal,
+                "curr_signal": curr_signal,
+                "conviction_changed": conv_changed,
+                "prev_conviction": prev_conv,
+                "curr_conviction": curr_conv,
+                "price_change_pct": (price_change * 10.0).round() / 10.0,
+                "significant_price_move": big_move,
+            }));
+        }
+    }
+
+    Ok(json!({
+        "has_previous": total > 0,
+        "changes": changes,
+        "summary": {
+            "signal_changes": signal_changes,
+            "upgrades": upgrades,
+            "downgrades": downgrades,
+            "significant_moves": significant_moves,
+            "total_positions": total,
+        }
+    }))
+}
+
 pub fn run_account_positions(account: String) -> Result<serde_json::Value> {
     // 1. Try Finary snapshot store
     let snapshot_path = crate::paths::resolve_source_snapshot_store_path();

@@ -124,6 +124,11 @@ pub(crate) fn build_report_prompt(run_state: &Value) -> String {
     let account = run_state.get("account").and_then(|v| v.as_str()).unwrap_or("");
     let previous_syntheses = build_previous_syntheses_section(account);
 
+    // Phase 2b: theme concentration section
+    let run_id = run_state.get("run_id").and_then(|v| v.as_str()).unwrap_or("");
+    let concentration = crate::native_mcp_analysis::compute_theme_concentration(run_id);
+    let concentration_section = crate::native_mcp_analysis::build_theme_concentration_text(&concentration);
+
     format!(
         r#"Tu es un conseiller financier bienveillant qui parle a un investisseur particulier.
 Pas de jargon technique — explique simplement, comme a un ami.
@@ -140,7 +145,7 @@ RESUME DU PORTEFEUILLE:
 
 RECOMMANDATIONS PAR LIGNE (signaux definitifs — ne pas contredire):
 {rec_lines}
-{guidelines_section}{previous_syntheses}
+{guidelines_section}{concentration_section}{previous_syntheses}
 ---
 
 Produis un JSON avec exactement ces champs:
@@ -189,6 +194,7 @@ Reponds uniquement en JSON valide."#,
         nb_vente = nb_vente,
         rec_lines = rec_lines.join("\n"),
         guidelines_section = guidelines_section,
+        concentration_section = concentration_section,
     )
 }
 

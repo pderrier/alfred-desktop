@@ -470,6 +470,30 @@ async fn update_line_memory_local(
     .map_err(|e: anyhow::Error| e.to_string())
 }
 
+#[tauri::command]
+async fn get_stale_positions_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_get_stale_positions)
+        .await
+        .map_err(|e| format!("get_stale_positions_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_signal_scorecard_local(ticker: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || command_handlers::run_get_signal_scorecard(ticker))
+        .await
+        .map_err(|e| format!("get_signal_scorecard_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_run_diff_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_get_run_diff)
+        .await
+        .map_err(|e| format!("get_run_diff_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
 fn run_tauri_app() -> anyhow::Result<()> {
     load_local_env();
 
@@ -532,7 +556,10 @@ fn run_tauri_app() -> anyhow::Result<()> {
             install_update_local,
             js_log_local,
             chat_wizard_send_local,
-            update_line_memory_local
+            update_line_memory_local,
+            get_stale_positions_local,
+            get_signal_scorecard_local,
+            get_run_diff_local
         ])
         .run(tauri::generate_context!())
         .map_err(|e| anyhow!("tauri_app_launch_failed:{e}"))?;

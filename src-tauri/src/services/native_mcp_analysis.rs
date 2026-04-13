@@ -521,6 +521,108 @@ fn sync_line_memory(run_id: &str, ticker: &str, rec: &Value, current_price: f64)
     }
 }
 
+// ── Theme concentration aggregation (Phase 2b) ─────────────────
+
+/// Compute theme concentration from line memory V2 data.
+/// Returns a JSON object with concentrated themes (3+ tickers sharing a theme).
+pub(crate) fn compute_theme_concentration(_run_id: &str) -> serde_json::Value {
+    let path = crate::resolve_runtime_state_dir().join("line-memory.json");
+    let store = if path.exists() {
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .unwrap_or_else(|| json!({}))
+    } else {
+        return json!({ "themes": [], "total_concentrated": 0 });
+    };
+
+    let by_ticker = match store.get("by_ticker").and_then(|v| v.as_object()) {
+        Some(bt) => bt,
+        None => return json!({ "themes": [], "total_concentrated": 0 }),
+    };
+
+    // Build map: theme_slug -> Vec<ticker>
+    let mut theme_map: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+
+    for (ticker, entry) in by_ticker {
+        if let Some(themes_arr) = entry.get("news_themes").and_then(|v| v.as_array()) {
+            for theme_val in themes_arr {
+                if let Some(slug) = theme_val.as_str() {
+                    let slug = slug.trim().to_lowercase();
+                    if slug.is_empty() { continue; }
+                    let tickers = theme_map.entry(slug).or_default();
+                    let upper = ticker.trim().to_uppercase();
+                    if !tickers.contains(&upper) {
+                        tickers.push(upper);
+                    }
+                }
+            }
+        }
+    }
+
+    // Filter to themes with 3+ tickers
+    let mut concentrated: Vec<Value> = theme_map
+        .into_iter()
+        .filter(|(_, tickers)| tickers.len() >= 3)
+        .map(|(theme, mut tickers)| {
+            tickers.sort();
+            let count = tickers.len();
+            json!({
+                "theme": theme,
+                "tickers": tickers,
+                "count": count,
+            })
+        })
+        .collect();
+
+    // Sort by count descending, then by theme name
+    concentrated.sort_by(|a, b| {
+        let ca = a.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+        let cb = b.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+        cb.cmp(&ca).then_with(|| {
+            let ta = a.get("theme").and_then(|v| v.as_str()).unwrap_or("");
+            let tb = b.get("theme").and_then(|v| v.as_str()).unwrap_or("");
+            ta.cmp(tb)
+        })
+    });
+
+    let total = concentrated.len();
+    if total > 0 {
+        crate::debug_log(&format!(
+            "[theme-concentration] found {total} concentrated themes across portfolio"
+        ));
+    }
+
+    json!({
+        "themes": concentrated,
+        "total_concentrated": total,
+    })
+}
+
+/// Build a human-readable French text block for theme concentration.
+/// Returns empty string when no concentrated themes exist.
+pub(crate) fn build_theme_concentration_text(concentration: &Value) -> String {
+    let themes = match concentration.get("themes").and_then(|v| v.as_array()) {
+        Some(arr) if !arr.is_empty() => arr,
+        _ => return String::new(),
+    };
+
+    let mut lines = vec![
+        "\nCONCENTRATION THEMATIQUE:".to_string(),
+    ];
+    for entry in themes {
+        let theme = entry.get("theme").and_then(|v| v.as_str()).unwrap_or("?");
+        let count = entry.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+        let tickers = entry.get("tickers").and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
+            .unwrap_or_default();
+        lines.push(format!("- \"{theme}\" ({count} positions): {tickers}"));
+    }
+    lines.push("Attention: risque de concentration thematique.".to_string());
+    lines.join("\n")
+}
+
 // ── Chat-to-Memory: partial update of line memory fields ──────
 
 /// Update specific fields in the line-memory.json store for a given ticker.
@@ -913,6 +1015,10 @@ fn build_synthesis_prompt(run_id: &str) -> String {
         .unwrap_or_default();
     let previous_syntheses = crate::llm_prompts::build_previous_syntheses_section_public(&account);
 
+    // Phase 2b: theme concentration
+    let concentration = compute_theme_concentration(run_id);
+    let concentration_section = build_theme_concentration_text(&concentration);
+
     format!(
         r#"Tu es Alfred, un gestionnaire de portefeuille qui conseille un investisseur particulier.
 Tu dois produire la synthese globale du portefeuille pour le run "{run_id}".
@@ -986,7 +1092,7 @@ WORKFLOW STRICT — suis ces etapes dans l'ordre :
 5. Appelle `finalize_report(run_id="{run_id}")` pour composer et persister le rapport.
 
 {previous_syntheses}
-
+{concentration_section}
 REGLES:
 - Ne saute AUCUNE etape (get_run_context, check_coverage, validate_synthesis, finalize_report).
 - N'appelle PAS get_line_data ni validate_recommendation — les analyses par ligne
@@ -998,6 +1104,7 @@ CRITIQUE — si tu ne fais pas les etapes 4 ET 5, le rapport est PERDU.
 Le travail d'analyse de toutes les lignes sera gache. Tu DOIS appeler
 validate_synthesis puis finalize_report. Pas d'exception."#,
         run_id = run_id,
+        concentration_section = concentration_section,
     )
 }
 
@@ -1380,7 +1487,12 @@ pub fn run_synthesis_turn(run_id: &str, data_dir: &str) -> Result<Value> {
 
     match last_result.unwrap_or_else(|| Err(anyhow::anyhow!("synthesis_no_result"))) {
         Ok(turn_result) => {
-            crate::run_state_cache::flush_now(run_id);
+            // Evict (not just flush) — the MCP server process may have written
+            // a completed state directly to disk via finalize_report. If we only
+            // flush, the cache overwrites that completed state with the stale
+            // "running" version. Evict discards the cache so load_run_by_id_direct
+            // reads the authoritative on-disk state.
+            crate::run_state_cache::evict(run_id);
             let run_state = crate::load_run_by_id_direct(run_id)?;
             let status = run_state
                 .get("orchestration")

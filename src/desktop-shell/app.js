@@ -39,6 +39,9 @@ import { resolveShellRefreshPlan } from "/desktop-shell/refresh-policy.js";
 import {
   reduceRunActivityState
 } from "/desktop-shell/run-activity-model.js";
+import { initAlfredOverlay } from "/desktop-shell/app-alfred-overlay.js";
+import { registerDefaultTriggers } from "/desktop-shell/app-alfred-triggers.js";
+import { startIdleTimer } from "/desktop-shell/app-alfred-idle.js";
 import {
   initShellLayout,
   renderSidebar,
@@ -187,12 +190,16 @@ const runOperations = createRunOperationsController({
       if (mainRunView) mainRunView.classList.remove("live-run");
       if (event?.type === "run.completed") {
         showToast("Analysis complete");
+        // Notify Alfred overlay (triggers don't fire in Phase A — wiring only)
+        alfredOverlay.notify("run-completed", event);
         // Refresh to show new results
         refreshDashboard().catch(() => {});
       } else {
         // Show clear failure state — don't silently fall back to old report
         const errorMsg = event?.message || "Analysis failed";
         showErrorModal("Analysis Failed", errorMsg, "You can retry the analysis from the sidebar.");
+        // Notify Alfred overlay (triggers don't fire in Phase A — wiring only)
+        alfredOverlay.notify("run-failed", event);
         // Show failure in synthesis card
         const synthNode = document.getElementById("report-synthesis");
         if (synthNode) {
@@ -213,6 +220,12 @@ const runOperations = createRunOperationsController({
   },
   onError: () => {}
 });
+
+// ── Alfred Overlay (proactive assistant panel) ──────────────────
+
+const alfredOverlay = initAlfredOverlay();
+registerDefaultTriggers(alfredOverlay);
+startIdleTimer(() => alfredOverlay.notify("idle", {}), 300000);
 
 // ── Wizard (delegated to app-wizard.js) ──────────────────────────
 
@@ -480,6 +493,82 @@ function injectSynthesisAskButton(synthCard, model) {
   synthCard.appendChild(btn);
 }
 
+// ── Run Diff (Phase 4a) ─────────────────────────────────────────
+
+async function renderRunDiff() {
+  const container = document.getElementById("run-diff-container");
+  if (!container) return;
+  try {
+    const invoke = window.__TAURI__?.core?.invoke;
+    if (!invoke) { container.classList.add("hidden"); return; }
+    const diff = await invoke("get_run_diff_local");
+    if (!diff?.has_previous || !diff.changes?.length) { container.classList.add("hidden"); return; }
+    const s = diff.summary;
+    let html = `<section class="card run-diff-section">`;
+    html += `<h2>What Changed</h2>`;
+    html += `<p class="run-diff-summary">${s.signal_changes} signal change${s.signal_changes !== 1 ? "s" : ""} (${s.upgrades} upgrade${s.upgrades !== 1 ? "s" : ""}, ${s.downgrades} downgrade${s.downgrades !== 1 ? "s" : ""}), ${s.significant_moves} significant price move${s.significant_moves !== 1 ? "s" : ""}</p>`;
+    html += `<ul class="run-diff-list">`;
+    for (const c of diff.changes) {
+      const parts = [];
+      if (c.signal_changed) {
+        const cls = c.curr_signal > c.prev_signal ? "diff-upgrade" : "diff-downgrade";
+        parts.push(`<span class="${cls}">${c.prev_signal} \u2192 ${c.curr_signal}</span>`);
+      }
+      if (c.conviction_changed) parts.push(`conviction: ${c.prev_conviction} \u2192 ${c.curr_conviction}`);
+      if (c.significant_price_move) parts.push(`<span class="diff-price-move">${c.price_change_pct >= 0 ? "+" : ""}${c.price_change_pct}%</span>`);
+      html += `<li><strong>${c.ticker}</strong> — ${parts.join(" · ")}</li>`;
+    }
+    html += `</ul></section>`;
+    container.innerHTML = html;
+    container.classList.remove("hidden");
+  } catch {
+    container.classList.add("hidden");
+  }
+}
+
+// ── Theme Concentration (Phase 2b) ──────────────────────────────
+
+function renderThemeConcentration(themeConcentration) {
+  // Remove any existing concentration card
+  const existing = document.getElementById("theme-concentration-card");
+  if (existing) existing.remove();
+
+  if (!themeConcentration) return;
+  const themes = themeConcentration.themes;
+  if (!Array.isArray(themes) || themes.length === 0) return;
+
+  const card = document.createElement("section");
+  card.id = "theme-concentration-card";
+  card.className = "card theme-concentration-card";
+
+  const title = document.createElement("h2");
+  title.textContent = "Theme Concentration Risk";
+  card.appendChild(title);
+
+  const intro = document.createElement("p");
+  intro.className = "theme-concentration-intro";
+  intro.textContent = `${themes.length} theme${themes.length > 1 ? "s" : ""} shared by 3+ positions — potential concentration risk.`;
+  card.appendChild(intro);
+
+  const list = document.createElement("ul");
+  list.className = "theme-concentration-list";
+  for (const entry of themes) {
+    const li = document.createElement("li");
+    const themeLabel = escapeHtml(entry.theme || "?");
+    const count = entry.count || 0;
+    const tickers = (entry.tickers || []).map((t) => escapeHtml(t)).join(", ");
+    li.innerHTML = `<span class="theme-slug">${themeLabel}</span> <span class="theme-count">(${count} positions)</span>: <span class="theme-tickers">${tickers}</span>`;
+    list.appendChild(li);
+  }
+  card.appendChild(list);
+
+  // Insert between synthesis card and actions-now card
+  const actionsCard = actionsNowNode?.closest(".actions-now-card");
+  if (actionsCard && actionsCard.parentNode) {
+    actionsCard.parentNode.insertBefore(card, actionsCard);
+  }
+}
+
 // ── Report rendering ─────────────────────────────────────────────
 
 function renderReport(payload) {
@@ -507,6 +596,10 @@ function renderReport(payload) {
       : "";
   }
   renderActionsNow(model.actionsNow, model.recommendations);
+  // Phase 4a: run diff view
+  renderRunDiff();
+  // Phase 2b: theme concentration risk card
+  renderThemeConcentration(model.themeConcentration);
   // Watchlist opportunities summary
   const watchlistSummaryNode = document.getElementById("watchlist-summary");
   if (watchlistSummaryNode) {
@@ -903,24 +996,11 @@ initShellLayout({
     try {
       const runData = await bridge.getRunById(runId);
       if (runData) {
-        // Build a synthetic report from run data so the view model finds it
-        const composedPayload = runData.composed_payload || {};
-        const syntheticReport = {
-          run_id: runData.run_id,
-          saved_at: runData.updated_at || runData.composed_payload_updated_at,
-          payload: {
-            valeur_portefeuille: composedPayload.valeur_portefeuille ?? runData.portfolio?.valeur_totale ?? 0,
-            plus_value_totale: composedPayload.plus_value_totale ?? runData.portfolio?.plus_value_totale ?? 0,
-            liquidites: composedPayload.liquidites ?? runData.portfolio?.liquidites ?? 0,
-            synthese_marche: composedPayload.synthese_marche || "",
-            actions_immediates: composedPayload.actions_immediates || [],
-            recommandations: composedPayload.recommandations || runData.pending_recommandations || [],
-            llm_utilise: composedPayload.llm_utilise || "unknown"
-          }
-        };
-        // Replace (not merge) the run-specific fields — prevents data bleed between runs.
-        // Clear report_history so the view model doesn't fall back to reports from other runs.
+        // Unified view: run state is authoritative. Keep existing report artifact
+        // only if it belongs to the same run (for artifact fallback in the view model).
         const snapshot = latestDashboardPayload?.snapshot || {};
+        const existingReport = snapshot.latest_report;
+        const keepReport = existingReport?.run_id === runData.run_id ? existingReport : null;
         latestDashboardPayload = {
           ...latestDashboardPayload,
           snapshot: {
@@ -932,8 +1012,8 @@ initShellLayout({
               collected_positions_count: runData.portfolio?.positions?.length || 0,
               pending_recommendations_count: runData.pending_recommandations?.length || 0
             },
-            latest_report: syntheticReport,
-            latest_report_summary: syntheticReport,
+            latest_report: keepReport,
+            latest_report_summary: keepReport,
             report_history: []
           }
         };

@@ -635,7 +635,36 @@ export function initLineModal() {
     const bannedUrls = memory.deep_news_banned_urls || [];
     renderSimpleList(lineMemoryBanlistNode, bannedUrls, "No excluded sources.");
     lineMemoryBanlistNode?.closest("article")?.classList?.toggle("hidden", bannedUrls.length === 0);
+    // Phase 3b: signal accuracy scorecard
+    renderSignalScorecard(ticker);
     setVisible(true);
+  }
+
+  async function renderSignalScorecard(ticker) {
+    const container = document.getElementById("line-memory-scorecard");
+    if (!container) return;
+    try {
+      const invoke = window.__TAURI__?.core?.invoke;
+      if (!invoke) { container.classList.add("hidden"); return; }
+      const data = await invoke("get_signal_scorecard_local", { ticker });
+      if (!data?.signals?.length) { container.classList.add("hidden"); return; }
+      const trendIcon = data.trend === "improving" ? "\u2197\uFE0F" : data.trend === "declining" ? "\u2198\uFE0F" : "\u27A1\uFE0F";
+      const barColor = data.overall_accuracy_pct >= 70 ? "#2a9d8f" : data.overall_accuracy_pct >= 40 ? "#e9c46a" : "#e76f51";
+      let html = `<h3 class="scorecard-title">Signal Accuracy</h3>`;
+      html += `<div class="scorecard-accuracy-bar"><div style="width:${data.overall_accuracy_pct}%;background:${barColor}"></div></div>`;
+      html += `<div class="scorecard-summary">${data.overall_accuracy_pct}% accurate (${data.correct_count}/${data.scored_count} scored) ${trendIcon} ${data.trend}</div>`;
+      html += `<table class="scorecard-table"><thead><tr><th>Date</th><th>Signal</th><th>Price</th><th>Return</th><th></th></tr></thead><tbody>`;
+      for (const s of data.signals.slice(0, 8)) {
+        const icon = s.accuracy === "correct" ? "\u2705" : s.accuracy === "incorrect" ? "\u274C" : "\u2796";
+        const cls = `scorecard-${s.accuracy}`;
+        html += `<tr class="${cls}"><td>${s.date}</td><td>${s.signal}</td><td>${s.price_at_signal?.toFixed(1) || "?"}</td><td>${s.return_pct >= 0 ? "+" : ""}${s.return_pct?.toFixed(1) || 0}%</td><td>${icon}</td></tr>`;
+      }
+      html += `</tbody></table>`;
+      container.innerHTML = html;
+      container.classList.remove("hidden");
+    } catch {
+      container.classList.add("hidden");
+    }
   }
 
   function close() {

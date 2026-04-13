@@ -435,6 +435,9 @@ pub fn persist_retry_global_synthesis(run_id: &str, generated_draft: &serde_json
             .unwrap_or_default();
         crate::debug_log(&format!("report: synthesis validation warnings (kept): {issue_summary}"));
     }
+    // Phase 2b: theme concentration data
+    let theme_concentration = crate::native_mcp_analysis::compute_theme_concentration(run_id);
+
     let payload = json!({
         "date": now_iso_string(),
         "valeur_portefeuille": run_state.get("portfolio").and_then(|v| v.get("valeur_totale")).and_then(|v| v.as_f64()).unwrap_or(0.0),
@@ -443,7 +446,8 @@ pub fn persist_retry_global_synthesis(run_id: &str, generated_draft: &serde_json
         "synthese_marche": synthese,
         "actions_immediates": actions,
         "llm_utilise": generated_draft.get("llm_utilise").cloned().unwrap_or_else(|| json!("litellm")),
-        "recommandations": pending_recommendations
+        "recommandations": pending_recommendations,
+        "theme_concentration": theme_concentration
     });
     let account = run_state.get("account").and_then(|v| v.as_str()).unwrap_or("");
     let (saved_at, history_filename, latest_path_str, history_path_str) =

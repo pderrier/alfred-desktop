@@ -511,16 +511,31 @@ export function registerDefaultTriggers(overlay) {
         const prefs = await invoke("get_user_preferences_local") || {};
         const account = extra?.account || window.__selectedAccount || "";
         const guidelines = (prefs?.guidelines_by_account?.[account] || "").trim();
-        // Don't fire if guidelines are already substantial (> 80 chars)
-        if (guidelines.length > 80) return null;
-        const hasRun = extra?.hasRun !== false;
+        const gl = guidelines.toLowerCase();
+        // Check which strategy aspects are covered (not just length)
+        const aspects = [
+          { key: "horizon", patterns: /horizon|terme|court.terme|long.terme|moyen.terme|short.term|long.term|ans?[\s,]|year/ },
+          { key: "risk", patterns: /risque|risk|conservat|agressif|aggressive|balanced|equilibr|prudent|dynamique/ },
+          { key: "style", patterns: /value|croissance|growth|dividende|dividend|income|passif|passive|index/ },
+          { key: "sectors", patterns: /secteur|sector|tech|sante|health|energie|energy|financ|industriel/ },
+          { key: "geography", patterns: /geograph|europe|france|us|usa|mondial|global|emergent|emerging/ },
+          { key: "constraints", patterns: /pea|cto|compte.titre|enveloppe|fiscal|tax/ },
+          { key: "goals", patterns: /objectif|goal|retraite|retirement|immobilier|epargne|patrimoine|wealth/ },
+        ];
+        const covered = aspects.filter(a => a.patterns.test(gl));
+        const missing = aspects.filter(a => !a.patterns.test(gl));
+        // Don't fire if 5+ aspects are covered
+        if (covered.length >= 5) return null;
         const isEmpty = guidelines.length === 0;
+        const missingLabels = { horizon: "time horizon", risk: "risk tolerance", style: "investment style", sectors: "sector preferences", geography: "geographic focus", constraints: "account type (PEA/CTO)", goals: "investment goals" };
+        const missingList = missing.slice(0, 3).map(a => missingLabels[a.key]).join(", ");
         const msg = isEmpty
           ? "Your portfolio analysis runs without an investment strategy defined. " +
             "I can help you build one through a quick conversation — covering risk tolerance, " +
             "time horizon, sector preferences, and goals."
-          : "Your investment strategy is quite brief. A more detailed strategy helps me give " +
-            "better-targeted recommendations. Want to refine it together?";
+          : `Your strategy covers ${covered.length}/7 aspects. ` +
+            `Missing: ${missingList}${missing.length > 3 ? "..." : ""}. ` +
+            "A complete strategy helps me give better-targeted recommendations.";
         return {
           initialMessage: msg,
           actions: [
@@ -549,12 +564,13 @@ export function registerDefaultTriggers(overlay) {
                 "Constraints: ...\n" +
                 "Goals: ...\n" +
                 "Notes: ...\n\n" +
-                (guidelines ? `Current guidelines (user wrote): "${guidelines}"\nBuild on these.\n` : "") +
+                (guidelines ? `Current guidelines (user wrote): "${guidelines}"\nBuild on these — skip aspects already covered.\n` : "") +
+                (missing.length < 7 ? `Already covered: ${covered.map(a => a.key).join(", ")}. Focus on what's missing: ${missing.map(a => a.key).join(", ")}.\n` : "") +
                 "Be concise, friendly, use French if the user responds in French. " +
                 "One question at a time. Summarize at the end.",
               chatMessage: isEmpty
                 ? "Let's define your investment strategy! First — what's your investment horizon? Are you investing for the short term (less than a year), medium term (1-5 years), or long term (5+ years)?"
-                : `I see you've written: "${guidelines}". Let's flesh this out. What's your risk tolerance — conservative, balanced, or aggressive?`
+                : `Your strategy covers ${covered.map(a => a.key).join(", ")} — nice! Let me help fill in the gaps. ${missing.length > 0 ? `First: ${missingLabels[missing[0].key]}?` : "Anything you'd like to refine?"}`
             },
             { label: "Not now", dismiss: true }
           ],

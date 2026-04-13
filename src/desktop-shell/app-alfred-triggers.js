@@ -6,7 +6,10 @@
  *          and post-analysis summary (alfred-run-completed). These declare
  *          `autoFireOn` so the overlay bus fires them automatically when
  *          matching events arrive via notify().
- * Phase C+: Stale positions, idle, onboarding triggers (registered but disabled).
+ * Phase C: Proactive triggers — idle suggestions, stale positions, onboarding
+ *          incomplete, and unlinked cash accounts. These use async contextBuilders
+ *          that query backend state and return null when nothing to show.
+ * Phase D: Additional triggers (registered but disabled, ready for future enabling).
  *
  * Usage:
  *   import { registerDefaultTriggers } from "/desktop-shell/app-alfred-triggers.js";

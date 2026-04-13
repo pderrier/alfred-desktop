@@ -45,6 +45,10 @@ let chatSendBtn = null;
 let chatExpandLink = null;
 let chatSending = false;
 
+// ── Alfred suggestions preference ─────────────────────────────
+/** When true, all triggers with priority < 8 are suppressed. */
+let alfredSuggestionsDisabled = false;
+
 // ── Session memory ─────────────────────────────────────────────
 /** @type {Array<{triggerId: string, timestamp: number, action: string}>} */
 const sessionEvents = [];
@@ -219,7 +223,11 @@ function showPanel(triggerId, context, triggerDef) {
           btn.className = "alfred-btn alfred-btn-dismiss";
           btn.addEventListener("click", () => {
             recordSessionEvent(triggerId, "dismissed");
-            snooze(triggerId, triggerDef.snoozeDuration || 3600000);
+            snooze(triggerId, action.snoozeDuration || triggerDef.snoozeDuration || 3600000);
+            // Phase C: dismiss actions may also carry a callback (e.g. "Skip" marks onboarding done)
+            if (typeof action.callback === "function") {
+              try { action.callback(); } catch { /* non-critical */ }
+            }
             dismissPanel();
           });
         } else if (action.chat) {
@@ -588,7 +596,8 @@ export function initAlfredOverlay() {
     isOpen,
     notify,
     enterChatMode,
-    getSessionContext
+    getSessionContext,
+    setAlfredSuggestionsEnabled
   };
 }
 
@@ -618,6 +627,8 @@ export function registerTrigger(def) {
  * Attempt to fire a trigger. Checks suppression rules before showing.
  * If a higher-priority trigger is already showing, the new one preempts only if higher priority.
  * contextBuilder may be async (e.g. for Tauri command calls) — handled transparently.
+ * When the user has disabled "Alfred suggestions" in settings, triggers with priority < 8
+ * are silently suppressed.
  * @param {string} triggerId
  * @param {Object} [extraContext] — merged into contextBuilder output
  */
@@ -625,6 +636,10 @@ export function fireTrigger(triggerId, extraContext) {
   const def = triggers.get(triggerId);
   if (!def) return;
   if (!def.enabled) return;
+
+  // Phase C: respect the "Alfred suggestions" user preference
+  // Priority >= 8 triggers (errors, critical) bypass the toggle
+  if (def.priority < 8 && alfredSuggestionsDisabled) return;
 
   // Suppression check
   if (isSuppressed(triggerId, def.cooldown)) return;
@@ -643,6 +658,8 @@ export function fireTrigger(triggerId, extraContext) {
     // Mark as fired early to prevent duplicate fires while awaiting
     markFired(triggerId, def.cooldown);
     contextResult.then((resolved) => {
+      // Phase C: contextBuilder may return null to signal "nothing to show"
+      if (resolved === null) return;
       let context = resolved || {};
       if (extraContext) {
         context = { ...context, ...extraContext };
@@ -661,6 +678,7 @@ export function fireTrigger(triggerId, extraContext) {
   }
 
   // Synchronous path
+  if (contextResult === null) return; // contextBuilder signals "nothing to show"
   let context = contextResult || {};
   if (extraContext) {
     context = { ...context, ...extraContext };
@@ -719,6 +737,15 @@ export function snooze(triggerId, durationMs) {
  */
 export function isOpen() {
   return panelVisible;
+}
+
+/**
+ * Enable or disable Alfred proactive suggestions.
+ * When disabled, triggers with priority < 8 are suppressed.
+ * @param {boolean} enabled
+ */
+export function setAlfredSuggestionsEnabled(enabled) {
+  alfredSuggestionsDisabled = !enabled;
 }
 
 /**

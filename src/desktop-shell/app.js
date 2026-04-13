@@ -98,6 +98,7 @@ const settingsOpenaiModelNode = document.getElementById("settings-openai-model")
 const settingsOpenaiApiBaseNode = document.getElementById("settings-openai-api-base");
 const settingsApikeyToggleNode = document.getElementById("settings-apikey-toggle");
 const settingsApikeyStatusNode = document.getElementById("settings-apikey-status");
+const settingsAlfredSuggestionsNode = document.getElementById("settings-alfred-suggestions");
 
 // ── State ────────────────────────────────────────────────────────
 
@@ -688,6 +689,9 @@ async function refreshDashboardInner() {
 
   // Check for ambiguous cash account groups that need user confirmation
   checkAmbiguousCashGroups(finaryMeta).catch(() => {});
+
+  // Phase C: notify Alfred overlay that dashboard data is loaded
+  alfredOverlay.notify("dashboard-loaded", { finaryMeta });
 }
 
 /**
@@ -865,6 +869,18 @@ function renderRuntimeSettings(settings) {
       const li = document.createElement("li");
       li.textContent = `${cred.label}: ${cred.status}`;
       settingsCredentialsNode.appendChild(li);
+    }
+  }
+  // Phase C: load Alfred suggestions preference into checkbox
+  if (settingsAlfredSuggestionsNode) {
+    const tauriInv = window?.__TAURI__?.core?.invoke;
+    if (tauriInv) {
+      tauriInv("get_user_preferences_local").then((prefs) => {
+        const enabled = prefs?.alfred_suggestions_enabled !== false; // default: on
+        settingsAlfredSuggestionsNode.checked = enabled;
+      }).catch(() => {
+        settingsAlfredSuggestionsNode.checked = true; // default on
+      });
     }
   }
 }
@@ -1105,6 +1121,15 @@ settingsSaveBtn?.addEventListener("click", async () => {
   try {
     const updated = await bridge.updateRuntimeSettings(collectRuntimeSettingsFormValues());
     renderRuntimeSettings(updated);
+    // Phase C: save Alfred suggestions preference
+    const tauriInv = window?.__TAURI__?.core?.invoke;
+    if (tauriInv && settingsAlfredSuggestionsNode) {
+      const enabled = settingsAlfredSuggestionsNode.checked;
+      await tauriInv("save_user_preferences_local", {
+        prefs: { alfred_suggestions_enabled: enabled }
+      });
+      alfredOverlay.setAlfredSuggestionsEnabled(enabled);
+    }
     showToast("Settings saved", "success");
     refreshWizardSourcePolicy(latestFinarySessionPayload);
   } catch (error) {
@@ -1735,6 +1760,23 @@ window.__openWizardForAccount = (accountName) => {
   wizard.open({ account: accountName });
 };
 
+// Phase C: bridge functions for proactive triggers
+window.__triggerOnboarding = () => { checkOnboarding(); };
+window.__openCashWizard = (groups) => {
+  if (groups && groups.length > 0) {
+    const group = groups[0];
+    const investmentAccounts = group.investment_accounts || [];
+    const cashAccounts = group.cash_accounts || [];
+    if (investmentAccounts.length > 0 && cashAccounts.length > 0) {
+      openCashMatchingWizard({
+        investmentAccounts,
+        cashAccounts,
+        title: "Link Cash Accounts"
+      });
+    }
+  }
+};
+
 // View a specific run from the welcome page
 window.__viewRun = (runId) => {
   // Programmatically click the run entry in the sidebar if it exists
@@ -1829,6 +1871,16 @@ bootstrap.runStartupSessionCheck().then(async () => {
     }
     renderWelcome();
   }
+
+  // Phase C: load Alfred suggestions preference and notify app-ready
+  if (tauriInvokePost) {
+    try {
+      const prefsForAlfred = await tauriInvokePost("get_user_preferences_local") || {};
+      const suggestionsEnabled = prefsForAlfred?.alfred_suggestions_enabled !== false; // default: on
+      alfredOverlay.setAlfredSuggestionsEnabled(suggestionsEnabled);
+    } catch { /* not critical — default is enabled */ }
+  }
+  alfredOverlay.notify("app-ready", {});
 }).catch((err) => {
   bootstrap.showStartupError("Startup failed", String(err?.message || err));
 });

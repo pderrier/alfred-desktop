@@ -12,6 +12,125 @@ use std::thread;
 use anyhow::Result;
 use serde_json::{json, Value};
 
+// ── Line Memory Cache (C-1 fix) ────────────────────────────────
+// Same pattern as run_state_cache.rs: in-memory state, all writes go through
+// cache, flushed to disk on demand. Eliminates concurrent file I/O entirely.
+
+struct LineMemoryCache {
+    store: Value,
+    dirty: bool,
+    loaded: bool,
+}
+
+static LINE_MEMORY_CACHE: std::sync::OnceLock<std::sync::Mutex<LineMemoryCache>> =
+    std::sync::OnceLock::new();
+
+fn lm_cache() -> &'static std::sync::Mutex<LineMemoryCache> {
+    LINE_MEMORY_CACHE.get_or_init(|| {
+        std::sync::Mutex::new(LineMemoryCache {
+            store: json!({
+                "by_ticker": {},
+                "global_deep_news_banned_urls": [],
+                "deep_news_rotation_cache": { "by_ticker": {} }
+            }),
+            dirty: false,
+            loaded: false,
+        })
+    })
+}
+
+fn lm_default_store() -> Value {
+    json!({
+        "by_ticker": {},
+        "global_deep_news_banned_urls": [],
+        "deep_news_rotation_cache": { "by_ticker": {} }
+    })
+}
+
+fn lm_path() -> std::path::PathBuf {
+    crate::resolve_runtime_state_dir().join("line-memory.json")
+}
+
+/// Load line-memory.json from disk into cache (first access or reload).
+fn line_memory_load() -> Value {
+    let mut guard = lm_cache().lock().unwrap_or_else(|p| p.into_inner());
+    if guard.loaded {
+        return guard.store.clone();
+    }
+    let path = lm_path();
+    guard.store = if path.exists() {
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .unwrap_or_else(lm_default_store)
+    } else {
+        lm_default_store()
+    };
+    guard.loaded = true;
+    guard.dirty = false;
+    guard.store.clone()
+}
+
+/// Read cached line-memory store. Falls back to disk if not yet loaded.
+pub fn line_memory_read() -> Value {
+    let guard = lm_cache().lock().unwrap_or_else(|p| p.into_inner());
+    if guard.loaded {
+        return guard.store.clone();
+    }
+    drop(guard); // release lock before disk I/O
+    line_memory_load()
+}
+
+/// Mutate the cached line-memory store in memory. No disk I/O.
+fn line_memory_patch<F>(mutator: F)
+where
+    F: FnOnce(&mut Value),
+{
+    let mut guard = lm_cache().lock().unwrap_or_else(|p| p.into_inner());
+    if !guard.loaded {
+        let path = lm_path();
+        guard.store = if path.exists() {
+            std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                .unwrap_or_else(lm_default_store)
+        } else {
+            lm_default_store()
+        };
+        guard.loaded = true;
+    }
+    mutator(&mut guard.store);
+    guard.dirty = true;
+}
+
+/// Flush cached line-memory to disk if dirty. Called at end of analysis run.
+pub fn line_memory_flush_now() {
+    let to_write = {
+        let mut guard = lm_cache().lock().unwrap_or_else(|p| p.into_inner());
+        if !guard.dirty || !guard.loaded {
+            return;
+        }
+        guard.dirty = false;
+        Some(guard.store.clone())
+    };
+    if let Some(store) = to_write {
+        let pb = lm_path();
+        if let Err(e) = crate::storage::write_json_file(&pb, &store) {
+            crate::debug_log(&format!("line_memory_flush_now: write failed: {e}"));
+        } else {
+            crate::debug_log("line_memory_flush_now: flushed to disk");
+        }
+    }
+}
+
+/// Invalidate the line-memory cache (force reload from disk on next access).
+/// Called when external code may have written to line-memory.json directly.
+pub fn line_memory_invalidate() {
+    let mut guard = lm_cache().lock().unwrap_or_else(|p| p.into_inner());
+    guard.loaded = false;
+    guard.dirty = false;
+}
+
 // ── MCP results sidecar merge ───────────────────────────────────
 
 /// Merge MCP results from the sidecar JSONL file into the run state.
@@ -50,7 +169,12 @@ fn merge_mcp_results(run_id: &str, data_dir: &str) {
                     let lid = line_id.to_string();
                     let rec_clone = rec.clone();
                     let _ = crate::run_state_cache::patch(data_path, run_id, |state| {
-                        let pending = state.as_object_mut().unwrap()
+                        // C-2: safe access — avoid unwrap() panic on non-object state
+                        let obj = match state.as_object_mut() {
+                            Some(o) => o,
+                            None => { crate::debug_log("merge_mcp_results: state is not an object"); return; }
+                        };
+                        let pending = obj
                             .entry("pending_recommandations")
                             .or_insert_with(|| json!([]));
                         if let Some(arr) = pending.as_array_mut() {
@@ -353,39 +477,17 @@ fn sync_line_memory(run_id: &str, ticker: &str, rec: &Value, current_price: f64)
     let ticker = ticker.trim().to_uppercase();
     if ticker.is_empty() { return; }
 
-    let path = crate::resolve_runtime_state_dir().join("line-memory.json");
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let today = &now[..10]; // "YYYY-MM-DD"
+    let today = now[..10].to_string(); // "YYYY-MM-DD" — safe, ASCII only
 
-    // Read existing store (or create empty)
-    let mut store = if path.exists() {
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-            .unwrap_or_else(|| json!({
-                "by_ticker": {},
-                "global_deep_news_banned_urls": [],
-                "deep_news_rotation_cache": { "by_ticker": {} }
-            }))
-    } else {
-        json!({
-            "by_ticker": {},
-            "global_deep_news_banned_urls": [],
-            "deep_news_rotation_cache": { "by_ticker": {} }
-        })
+    // Read current ticker entry from cache (for merge)
+    let current = {
+        let store = line_memory_read();
+        store.get("by_ticker")
+            .and_then(|bt| bt.get(&ticker))
+            .cloned()
+            .unwrap_or(json!({}))
     };
-
-    let by_ticker = store.get_mut("by_ticker")
-        .and_then(|v| v.as_object_mut());
-    let by_ticker = match by_ticker {
-        Some(bt) => bt,
-        None => {
-            store["by_ticker"] = json!({});
-            store["by_ticker"].as_object_mut().unwrap()
-        }
-    };
-
-    let current = by_ticker.get(&ticker).cloned().unwrap_or(json!({}));
 
     // Extract fields from recommendation
     let signal = as_str(rec.get("signal"));
@@ -444,21 +546,10 @@ fn sync_line_memory(run_id: &str, ticker: &str, rec: &Value, current_price: f64)
         }
     }
 
-    // Merge deep news banned URLs into global list
-    let rec_banned = json_str_array(rec.get("deep_news_banned_urls")).collect::<Vec<_>>();
-    if !rec_banned.is_empty() {
-        let global = store.get_mut("global_deep_news_banned_urls")
-            .and_then(|v| v.as_array_mut());
-        if let Some(arr) = global {
-            for url in &rec_banned {
-                let url_val = Value::String(url.to_string());
-                if !arr.contains(&url_val) {
-                    arr.push(url_val);
-                }
-            }
-            while arr.len() > 2000 { arr.remove(0); }
-        }
-    }
+    // Collect deep news banned URLs for merge
+    let rec_banned: Vec<String> = json_str_array(rec.get("deep_news_banned_urls"))
+        .map(|s| s.to_string())
+        .collect();
 
     // Build the V2 ticker entry — NO V1 fields
     let entry = json!({
@@ -507,18 +598,34 @@ fn sync_line_memory(run_id: &str, ticker: &str, rec: &Value, current_price: f64)
         "user_action": current.get("user_action").cloned().unwrap_or(Value::Null),
     });
 
-    // Re-acquire by_ticker after store borrows
-    if let Some(bt) = store.get_mut("by_ticker").and_then(|v| v.as_object_mut()) {
-        bt.insert(ticker.clone(), entry);
-    }
+    // C-1: Write to in-memory cache (no direct file I/O, flushed at end of run)
+    let ticker_key = ticker.clone();
+    let run_id_log = run_id.to_string();
+    line_memory_patch(move |store| {
+        // Ensure by_ticker exists
+        if !store.get("by_ticker").and_then(|v| v.as_object()).is_some() {
+            store["by_ticker"] = json!({});
+        }
+        if let Some(bt) = store.get_mut("by_ticker").and_then(|v| v.as_object_mut()) {
+            bt.insert(ticker_key.clone(), entry);
+        }
 
-    // Atomic write
-    let pb = std::path::PathBuf::from(&path);
-    if let Err(e) = crate::storage::write_json_file(&pb, &store) {
-        crate::debug_log(&format!("sync_line_memory: write failed for {ticker}: {e}"));
-    } else {
-        crate::debug_log(&format!("sync_line_memory: updated V2 for {ticker} run {run_id}"));
-    }
+        // Merge deep news banned URLs into global list
+        if !rec_banned.is_empty() {
+            if let Some(arr) = store.get_mut("global_deep_news_banned_urls")
+                .and_then(|v| v.as_array_mut())
+            {
+                for url in &rec_banned {
+                    let url_val = Value::String(url.to_string());
+                    if !arr.contains(&url_val) {
+                        arr.push(url_val);
+                    }
+                }
+                while arr.len() > 2000 { arr.remove(0); }
+            }
+        }
+    });
+    crate::debug_log(&format!("sync_line_memory: updated V2 for {ticker} run {run_id_log} (cached)"));
 }
 
 // ── Theme concentration aggregation (Phase 2b) ─────────────────
@@ -526,15 +633,8 @@ fn sync_line_memory(run_id: &str, ticker: &str, rec: &Value, current_price: f64)
 /// Compute theme concentration from line memory V2 data.
 /// Returns a JSON object with concentrated themes (3+ tickers sharing a theme).
 pub(crate) fn compute_theme_concentration(_run_id: &str) -> serde_json::Value {
-    let path = crate::resolve_runtime_state_dir().join("line-memory.json");
-    let store = if path.exists() {
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-            .unwrap_or_else(|| json!({}))
-    } else {
-        return json!({ "themes": [], "total_concentrated": 0 });
-    };
+    // C-1: Read from in-memory cache (falls back to disk if cache not loaded)
+    let store = line_memory_read();
 
     let by_ticker = match store.get("by_ticker").and_then(|v| v.as_object()) {
         Some(bt) => bt,
@@ -639,73 +739,65 @@ pub fn update_line_memory_fields(
         return Err(anyhow::anyhow!("update_line_memory_fields: empty ticker"));
     }
 
-    let path = crate::resolve_runtime_state_dir().join("line-memory.json");
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let today = now[..10].to_string(); // safe — ASCII only
 
-    let mut store = if path.exists() {
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-            .unwrap_or_else(|| json!({
-                "by_ticker": {},
-                "global_deep_news_banned_urls": [],
-                "deep_news_rotation_cache": { "by_ticker": {} }
-            }))
-    } else {
-        json!({
-            "by_ticker": {},
-            "global_deep_news_banned_urls": [],
-            "deep_news_rotation_cache": { "by_ticker": {} }
-        })
-    };
+    // Prepare owned values for the closure (captures must be 'static-compatible)
+    let key_reasoning_owned = key_reasoning.map(|s| s.to_string());
+    let user_note_owned = user_note.map(|s| s.to_string());
+    let ticker_key = ticker.clone();
 
-    // Ensure by_ticker exists
-    if !store.get("by_ticker").and_then(|v| v.as_object()).is_some() {
-        store["by_ticker"] = json!({});
-    }
-
-    let entry = store
-        .get_mut("by_ticker")
-        .and_then(|v| v.as_object_mut())
-        .and_then(|bt| bt.entry(&ticker).or_insert_with(|| json!({"schema_version": 2, "ticker": &ticker})).as_object_mut());
-
-    let entry = match entry {
-        Some(e) => e,
-        None => return Err(anyhow::anyhow!("update_line_memory_fields: failed to access ticker entry")),
-    };
-
-    if let Some(reasoning) = key_reasoning {
-        entry.insert("key_reasoning".to_string(), Value::String(reasoning.to_string()));
-    }
-
-    if let Some(note) = user_note {
-        // Merge into user_action — preserve `followed` and `date` if they exist
-        let mut action = entry.get("user_action")
-            .and_then(|v| v.as_object())
-            .cloned()
-            .unwrap_or_default();
-        action.insert("note".to_string(), Value::String(note.to_string()));
-        if !action.contains_key("date") {
-            action.insert("date".to_string(), Value::String(now[..10].to_string()));
+    // C-1: Mutate via in-memory cache — flush is deferred or explicit
+    line_memory_patch(move |store| {
+        // Ensure by_ticker exists
+        if !store.get("by_ticker").and_then(|v| v.as_object()).is_some() {
+            store["by_ticker"] = json!({});
         }
-        entry.insert("user_action".to_string(), Value::Object(action));
-    }
 
-    if let Some(themes) = news_themes {
-        let merged = merge_string_list(
-            themes.iter().map(|s| s.as_str()),
-            15,
-        );
-        entry.insert(
-            "news_themes".to_string(),
-            Value::Array(merged.into_iter().map(Value::String).collect()),
-        );
-    }
+        let entry = store
+            .get_mut("by_ticker")
+            .and_then(|v| v.as_object_mut())
+            .and_then(|bt| bt.entry(&ticker_key).or_insert_with(|| json!({"schema_version": 2, "ticker": &ticker_key})).as_object_mut());
 
-    entry.insert("updated_at".to_string(), Value::String(now));
+        let entry = match entry {
+            Some(e) => e,
+            None => { crate::debug_log("update_line_memory_fields: failed to access ticker entry"); return; }
+        };
 
-    let pb = std::path::PathBuf::from(&path);
-    crate::storage::write_json_file(&pb, &store)?;
+        if let Some(reasoning) = key_reasoning_owned {
+            entry.insert("key_reasoning".to_string(), Value::String(reasoning));
+        }
+
+        if let Some(note) = user_note_owned {
+            // Merge into user_action — preserve `followed` and `date` if they exist
+            let mut action = entry.get("user_action")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+            action.insert("note".to_string(), Value::String(note));
+            if !action.contains_key("date") {
+                action.insert("date".to_string(), Value::String(today));
+            }
+            entry.insert("user_action".to_string(), Value::Object(action));
+        }
+
+        if let Some(themes) = news_themes {
+            let merged = merge_string_list(
+                themes.iter().map(|s| s.as_str()),
+                15,
+            );
+            entry.insert(
+                "news_themes".to_string(),
+                Value::Array(merged.into_iter().map(Value::String).collect()),
+            );
+        }
+
+        entry.insert("updated_at".to_string(), Value::String(now));
+    });
+
+    // For UI-triggered writes (Save to Memory panel), flush immediately
+    // so the user sees updated data on next read without waiting for run completion.
+    line_memory_flush_now();
     crate::debug_log(&format!("update_line_memory_fields: updated {ticker}"));
     Ok(())
 }
@@ -862,7 +954,16 @@ fn non_empty_str(v: Option<&Value>) -> Option<String> {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max { s.to_string() } else { s[..max].to_string() }
+    if s.len() <= max {
+        s.to_string()
+    } else if s.is_char_boundary(max) {
+        s[..max].to_string()
+    } else {
+        // Find the largest valid char boundary at or before max
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) { end -= 1; }
+        s[..end].to_string()
+    }
 }
 
 /// Collect string items from a JSON array, deduplicating and capping at max_items.
@@ -1493,6 +1594,7 @@ pub fn run_synthesis_turn(run_id: &str, data_dir: &str) -> Result<Value> {
             // "running" version. Evict discards the cache so load_run_by_id_direct
             // reads the authoritative on-disk state.
             crate::run_state_cache::evict(run_id);
+            line_memory_flush_now();
             let run_state = crate::load_run_by_id_direct(run_id)?;
             let status = run_state
                 .get("orchestration")
@@ -1596,6 +1698,7 @@ fn run_native_synthesis(run_id: &str, data_dir: &str) -> Result<Value> {
             }
             crate::debug_log(&format!("[native-synthesis] synthesis ({} chars), finalizing", synthese.len()));
             crate::mcp_server::dispatch_tool_direct(dd, "finalize_report", &json!({"run_id": run_id}));
+            line_memory_flush_now();
             return Ok(json!({
                 "ok": true,
                 "orchestration_status": "completed",
@@ -1623,6 +1726,7 @@ fn run_native_synthesis(run_id: &str, data_dir: &str) -> Result<Value> {
 /// the turn output (agent text or composed_payload) and persist directly.
 fn codex_synthesis_fallback(run_id: &str, turn_result: &Value) -> Result<Value> {
     crate::run_state_cache::flush_now(run_id);
+    line_memory_flush_now();
     let run_state = crate::load_run_by_id_direct(run_id)?;
     let reco_count = run_state
         .get("pending_recommandations")

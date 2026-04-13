@@ -496,4 +496,87 @@ export function registerDefaultTriggers(overlay) {
     autoFireOn: "scorecard-review-due",
     enabled: false // Phase D — ready for Phase C to enable
   });
+
+  // ── Strategy Refinement — proactive help building investment guidelines ──
+  overlay.registerTrigger({
+    id: "alfred-strategy-refine",
+    priority: 4,
+    cooldown: 86400000 * 7, // 7 days
+    label: "Investment Strategy",
+    enabled: true,
+    contextBuilder: async (extra) => {
+      try {
+        const invoke = window.__TAURI__?.core?.invoke;
+        if (!invoke) return null;
+        const prefs = await invoke("get_user_preferences_local") || {};
+        const account = extra?.account || window.__selectedAccount || "";
+        const guidelines = (prefs?.guidelines_by_account?.[account] || "").trim();
+        // Don't fire if guidelines are already substantial (> 80 chars)
+        if (guidelines.length > 80) return null;
+        const hasRun = extra?.hasRun !== false;
+        const isEmpty = guidelines.length === 0;
+        const msg = isEmpty
+          ? "Your portfolio analysis runs without an investment strategy defined. " +
+            "I can help you build one through a quick conversation — covering risk tolerance, " +
+            "time horizon, sector preferences, and goals."
+          : "Your investment strategy is quite brief. A more detailed strategy helps me give " +
+            "better-targeted recommendations. Want to refine it together?";
+        return {
+          initialMessage: msg,
+          actions: [
+            {
+              label: "Refine my strategy",
+              primary: true,
+              chat: true,
+              systemContext:
+                "You are Alfred, a portfolio analysis assistant helping the user define their investment strategy. " +
+                "Guide them through these aspects one at a time, in a conversational way:\n" +
+                "1. **Investment horizon**: short-term (< 1 year), medium (1-5 years), long-term (5+ years)\n" +
+                "2. **Risk tolerance**: conservative, balanced, or aggressive\n" +
+                "3. **Investment style**: value, growth, income/dividends, index/passive, or mixed\n" +
+                "4. **Sector preferences**: any sectors to favor or avoid? (tech, energy, healthcare, etc.)\n" +
+                "5. **Geographic focus**: France/Europe only, global, emerging markets?\n" +
+                "6. **Account constraints**: PEA (French tax wrapper — EU stocks only), CTO (no restrictions), both?\n" +
+                "7. **Specific goals**: retirement, house purchase, education fund, wealth building?\n" +
+                "8. **Current concerns**: anything worrying them about the market or their portfolio?\n\n" +
+                "After gathering answers, produce a structured strategy summary in this format:\n" +
+                "STRATEGY:\n" +
+                "Horizon: ...\n" +
+                "Risk: ...\n" +
+                "Style: ...\n" +
+                "Sectors: ...\n" +
+                "Geography: ...\n" +
+                "Constraints: ...\n" +
+                "Goals: ...\n" +
+                "Notes: ...\n\n" +
+                (guidelines ? `Current guidelines (user wrote): "${guidelines}"\nBuild on these.\n` : "") +
+                "Be concise, friendly, use French if the user responds in French. " +
+                "One question at a time. Summarize at the end.",
+              chatMessage: isEmpty
+                ? "Let's define your investment strategy! First — what's your investment horizon? Are you investing for the short term (less than a year), medium term (1-5 years), or long term (5+ years)?"
+                : `I see you've written: "${guidelines}". Let's flesh this out. What's your risk tolerance — conservative, balanced, or aggressive?`
+            },
+            { label: "Not now", dismiss: true }
+          ],
+          // After chat, extract the STRATEGY block and save to guidelines
+          onChatComplete: async (history) => {
+            try {
+              const lastAssistant = [...history].reverse().find(m => m.role === "assistant");
+              if (!lastAssistant) return;
+              const strategyMatch = lastAssistant.content.match(/STRATEGY:\s*\n([\s\S]*?)(?:\n\n|$)/i);
+              if (strategyMatch) {
+                const strategy = strategyMatch[1].trim();
+                const prefs2 = await invoke("get_user_preferences_local") || {};
+                if (!prefs2.guidelines_by_account) prefs2.guidelines_by_account = {};
+                prefs2.guidelines_by_account[account] = strategy;
+                await invoke("save_user_preferences_local", { prefs: prefs2 });
+                window.__SHELL_LAYOUT?.showToast?.("Investment strategy saved — next analysis will use it.", "success");
+              }
+            } catch { /* best effort */ }
+          }
+        };
+      } catch { return null; }
+    },
+    autoFireOn: "run-completed"
+  });
 }

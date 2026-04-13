@@ -93,6 +93,7 @@ pub fn request_cancellation(operation_id: &str) -> Result<serde_json::Value> {
                     }
                 });
                 crate::run_state_cache::evict(run_id);
+                crate::native_mcp_analysis::line_memory_flush_now();
             }
         }
     }

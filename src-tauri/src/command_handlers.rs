@@ -277,11 +277,19 @@ pub fn run_save_user_preferences(prefs: serde_json::Value) -> Result<serde_json:
 // ── Stale Reanalysis Alerts (Phase 1b) ──
 
 pub fn run_get_stale_positions() -> Result<serde_json::Value> {
-    let path = crate::resolve_runtime_state_dir().join("line-memory.json");
-    if !path.exists() {
-        return Ok(json!({ "stale_count": 0, "stale_tickers": [] }));
-    }
-    let store = crate::storage::read_json_file(&path)?;
+    // C-1: Read from in-memory cache if loaded, else fall back to disk
+    let store = {
+        let cached = crate::native_mcp_analysis::line_memory_read();
+        if cached.get("by_ticker").is_some() {
+            cached
+        } else {
+            let path = crate::resolve_runtime_state_dir().join("line-memory.json");
+            if !path.exists() {
+                return Ok(json!({ "stale_count": 0, "stale_tickers": [] }));
+            }
+            crate::storage::read_json_file(&path)?
+        }
+    };
     let by_ticker = match store.get("by_ticker").and_then(|v| v.as_object()) {
         Some(bt) => bt,
         None => return Ok(json!({ "stale_count": 0, "stale_tickers": [] })),
@@ -299,8 +307,13 @@ pub fn run_get_stale_positions() -> Result<serde_json::Value> {
             continue;
         }
         // Compare date strings lexicographically (ISO format — this works correctly)
-        let date_part = &reanalyse_after[..10];
-        if date_part <= today.as_str() {
+        // Safety: validate ASCII before byte-slicing to avoid UTF-8 boundary panic (W-1)
+        let date_part: String = if reanalyse_after.is_ascii() {
+            reanalyse_after[..10].to_string()
+        } else {
+            reanalyse_after.chars().take(10).collect()
+        };
+        if date_part.as_str() <= today.as_str() {
             let reason = entry
                 .get("reanalyse_reason")
                 .and_then(|v| v.as_str())
@@ -308,7 +321,7 @@ pub fn run_get_stale_positions() -> Result<serde_json::Value> {
                 .to_string();
             stale.push(json!({
                 "ticker": ticker,
-                "reanalyse_after": date_part,
+                "reanalyse_after": &date_part,
                 "reanalyse_reason": reason,
             }));
         }
@@ -325,11 +338,19 @@ pub fn run_get_signal_scorecard(ticker: String) -> Result<serde_json::Value> {
     if ticker.is_empty() {
         return Ok(json!({ "ticker": "", "signals": [], "overall_accuracy_pct": 0, "scored_count": 0, "correct_count": 0, "trend": "stable" }));
     }
-    let path = crate::resolve_runtime_state_dir().join("line-memory.json");
-    if !path.exists() {
-        return Ok(json!({ "ticker": ticker, "signals": [], "overall_accuracy_pct": 0, "scored_count": 0, "correct_count": 0, "trend": "stable" }));
-    }
-    let store = crate::storage::read_json_file(&path)?;
+    // C-1: Read from in-memory cache if loaded, else fall back to disk
+    let store = {
+        let cached = crate::native_mcp_analysis::line_memory_read();
+        if cached.get("by_ticker").is_some() {
+            cached
+        } else {
+            let path = crate::resolve_runtime_state_dir().join("line-memory.json");
+            if !path.exists() {
+                return Ok(json!({ "ticker": ticker, "signals": [], "overall_accuracy_pct": 0, "scored_count": 0, "correct_count": 0, "trend": "stable" }));
+            }
+            crate::storage::read_json_file(&path)?
+        }
+    };
     let entry = store.get("by_ticker")
         .and_then(|bt| bt.get(&ticker));
     let entry = match entry {
@@ -342,6 +363,15 @@ pub fn run_get_signal_scorecard(ticker: String) -> Result<serde_json::Value> {
         Some(h) if !h.is_empty() => h,
         _ => return Ok(json!({ "ticker": ticker, "signals": [], "overall_accuracy_pct": 0, "scored_count": 0, "correct_count": 0, "trend": "stable" })),
     };
+
+    // W-2: Sort history by date descending to ensure newest-first ordering
+    let mut sorted_history = history.clone();
+    sorted_history.sort_by(|a, b| {
+        let da = a.get("date").and_then(|v| v.as_str()).unwrap_or("");
+        let db = b.get("date").and_then(|v| v.as_str()).unwrap_or("");
+        db.cmp(da)
+    });
+    let history = &sorted_history;
 
     // Current price from most recent signal or price_tracking
     let current_price = entry.get("price_tracking")
@@ -414,11 +444,19 @@ pub fn run_get_signal_scorecard(ticker: String) -> Result<serde_json::Value> {
 // ── Run Diff (Phase 4a) ──
 
 pub fn run_get_run_diff() -> Result<serde_json::Value> {
-    let path = crate::resolve_runtime_state_dir().join("line-memory.json");
-    if !path.exists() {
-        return Ok(json!({ "has_previous": false, "changes": [], "summary": { "signal_changes": 0, "upgrades": 0, "downgrades": 0, "significant_moves": 0, "total_positions": 0 } }));
-    }
-    let store = crate::storage::read_json_file(&path)?;
+    // C-1: Read from in-memory cache if loaded, else fall back to disk
+    let store = {
+        let cached = crate::native_mcp_analysis::line_memory_read();
+        if cached.get("by_ticker").is_some() {
+            cached
+        } else {
+            let path = crate::resolve_runtime_state_dir().join("line-memory.json");
+            if !path.exists() {
+                return Ok(json!({ "has_previous": false, "changes": [], "summary": { "signal_changes": 0, "upgrades": 0, "downgrades": 0, "significant_moves": 0, "total_positions": 0 } }));
+            }
+            crate::storage::read_json_file(&path)?
+        }
+    };
     let by_ticker = match store.get("by_ticker").and_then(|v| v.as_object()) {
         Some(bt) => bt,
         None => return Ok(json!({ "has_previous": false, "changes": [], "summary": {} })),
@@ -440,11 +478,18 @@ pub fn run_get_run_diff() -> Result<serde_json::Value> {
     let mut total = 0usize;
 
     for (ticker, entry) in by_ticker {
-        let history = entry.get("signal_history").and_then(|v| v.as_array());
-        let history = match history {
+        let raw_history = entry.get("signal_history").and_then(|v| v.as_array());
+        let raw_history = match raw_history {
             Some(h) if h.len() >= 2 => h,
             _ => continue,
         };
+        // W-2: Sort by date descending to ensure newest-first ordering
+        let mut history = raw_history.clone();
+        history.sort_by(|a, b| {
+            let da = a.get("date").and_then(|v| v.as_str()).unwrap_or("");
+            let db = b.get("date").and_then(|v| v.as_str()).unwrap_or("");
+            db.cmp(da)
+        });
         total += 1;
         let curr = &history[0];
         let prev = &history[1];
@@ -462,8 +507,9 @@ pub fn run_get_run_diff() -> Result<serde_json::Value> {
         if sig_changed || conv_changed || big_move {
             if sig_changed {
                 signal_changes += 1;
+                // W-3: explicit equality check — equal-strength signals are not upgrades or downgrades
                 if buy_strength(curr_signal) > buy_strength(prev_signal) { upgrades += 1; }
-                else { downgrades += 1; }
+                else if buy_strength(curr_signal) < buy_strength(prev_signal) { downgrades += 1; }
             }
             if big_move { significant_moves += 1; }
             changes.push(json!({

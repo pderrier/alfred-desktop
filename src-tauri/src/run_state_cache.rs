@@ -109,7 +109,10 @@ where
             },
         );
     }
-    let entry = guard.entries.get_mut(run_id).unwrap();
+    let entry = match guard.entries.get_mut(run_id) {
+        Some(e) => e,
+        None => return Err(anyhow!("cache_entry_missing_after_load:{}", run_id)),
+    };
     mutator(&mut entry.state);
     entry.dirty = true;
     Ok(entry.state.clone())

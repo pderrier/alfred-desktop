@@ -955,8 +955,50 @@ fn build_cash_mapping(holdings_accounts: &[Value]) -> CashMappingResult {
         }
     }
 
-    // Strategy 2: For unmatched accounts without connection_id, flag as ambiguous for wizard.
-    // Do NOT attempt heuristic matching — wrong matches are worse than no match.
+    // Strategy 1.5: Semantic name matching for unmatched accounts.
+    // Match cash accounts whose names suggest a link to an investment account
+    // (e.g., "Compte especes PEA" ↔ "PEA" or "Compte especes PEA-PME" ↔ "PEA-PME").
+    // Skip generic names like "Compte cheque", "Livret A" — only match "espece"/"especes" names.
+    {
+        let unmatched_invs: Vec<&HoldingsEntry> = investment_entries.iter()
+            .filter(|inv| !result.contains_key(&inv.name))
+            .copied()
+            .collect();
+        let unmatched_cash: Vec<(usize, &HoldingsEntry)> = cash_entries.iter().enumerate()
+            .filter(|(idx, _)| !matched_cash_indices.contains(idx))
+            .map(|(idx, e)| (idx, *e))
+            .collect();
+
+        for inv in &unmatched_invs {
+            let inv_lower = inv.name.to_lowercase();
+            // Find a cash account whose name contains "espece" AND contains the investment account name (or vice versa)
+            let candidate = unmatched_cash.iter().find(|(idx, ce)| {
+                if matched_cash_indices.contains(idx) { return false; }
+                let cash_lower = ce.name.to_lowercase();
+                let is_cash_like = cash_lower.contains("esp\u{00E8}ce") || cash_lower.contains("espece");
+                if !is_cash_like { return false; }
+                // Check if the cash name contains the investment name or shares a key suffix
+                // e.g., "Compte espèces PEA" contains "PEA", and inv.name is "PEA" or "Plan Epargne en Action"
+                let inv_words: Vec<&str> = inv_lower.split_whitespace().collect();
+                let cash_words: Vec<&str> = cash_lower.split_whitespace().collect();
+                // Match if any significant word (>2 chars) from inv appears in cash name
+                inv_words.iter().any(|w| w.len() > 2 && cash_lower.contains(w))
+                || cash_words.iter().any(|w| w.len() > 2 && w != &"compte" && w != &"especes" && w != &"esp\u{00E8}ces" && inv_lower.contains(w))
+                // Same institution check
+                || (!inv.institution_name.is_empty() && inv.institution_name == ce.institution_name)
+            });
+            if let Some((idx, ce)) = candidate {
+                result.insert(inv.name.clone(), ce.fiats_sum);
+                matched_cash_indices.insert(*idx);
+                crate::debug_log(&format!(
+                    "finary_cash_mapping: matched '{}' → cash {:.2} (semantic name match → '{}')",
+                    inv.name, ce.fiats_sum, ce.name
+                ));
+            }
+        }
+    }
+
+    // Strategy 2: For still-unmatched accounts, flag as ambiguous for wizard.
     {
         let unmatched_invs: Vec<&HoldingsEntry> = investment_entries.iter()
             .filter(|inv| !result.contains_key(&inv.name))

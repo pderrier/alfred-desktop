@@ -780,9 +780,10 @@ async function checkAmbiguousCashGroups(finaryMeta) {
         }
 
         await tauriInvoke("save_user_preferences_local", { prefs });
-        showToast("Cash account mapping saved", "success");
+        const savedCount = Object.keys(prefs.cash_account_links || {}).length;
+        showToast(`Cash mapping saved (${savedCount} link${savedCount !== 1 ? "s" : ""}) — persisted for future runs.`, "success");
       } catch (err) {
-        showToast(`Failed to save mapping: ${err?.message || err}`, "error");
+        showToast(`Failed to save cash mapping: ${err?.message || err}`, "error");
       }
     }
   }

@@ -2255,22 +2255,28 @@ main {
   }
 }
 
-/* ── Update banner (optional update notification) ──────────────── */
-.update-banner {
-  display: flex;
-  align-items: center;
-  gap: 0.6rem;
-  padding: 0.5rem 1rem;
-  background: rgba(18, 29, 40, 0.95);
-  border-bottom: 1px solid rgba(47, 143, 93, 0.5);
-  font-size: 0.8rem;
-  color: rgba(255, 255, 255, 0.85);
-  z-index: 50;
-  flex-wrap: wrap;
+/* ── Update modal (optional update notification) ──────────────── */
+.update-modal-overlay {
+  position: fixed; inset: 0; z-index: 10000;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0, 0, 0, 0.55); backdrop-filter: blur(4px);
 }
-.update-banner .update-progress {
-  width: 100%;
+.update-modal {
+  background: var(--sea-card, #1a2332); border: 1px solid rgba(47, 143, 93, 0.5);
+  border-radius: 12px; padding: 1.5rem 2rem; max-width: 400px; width: 90%;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.4);
 }
+.update-modal-title { margin: 0 0 0.6rem; font-size: 1.1rem; font-weight: 700; }
+.update-modal-version { margin: 0 0 0.4rem; font-size: 0.9rem; color: var(--sea-ink, #d0d8e4); }
+.update-modal-notes { margin: 0 0 0.8rem; font-size: 0.82rem; color: var(--sea-muted, #8a9bb0); line-height: 1.4; }
+.update-modal .update-progress { margin: 0.5rem 0; }
+.update-modal .update-progress-text { font-size: 0.75rem; color: var(--sea-muted); }
+.update-modal .update-error { margin: 0.3rem 0 0; color: #f08a77; font-size: 0.75rem; }
+.update-modal-actions { display: flex; gap: 0.6rem; margin-top: 1rem; }
+.update-modal-actions .cmd-btn { flex: 1; }
+.update-modal-actions .ghost-btn { flex: 0 0 auto; }
+/* Legacy banner — kept for backward compat but no longer generated */
+.update-banner { display: none; }
 
 /* ── Mandatory update overlay (inside splash) ──────────────────── */
 .update-mandatory {

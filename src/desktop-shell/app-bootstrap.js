@@ -110,32 +110,34 @@ export function initBootstrap(deps) {
   }
 
   function showOptionalUpdateBanner(update) {
-    const layout = document.querySelector(".app-layout") || document.body;
-    const existing = document.getElementById("update-banner");
+    const existing = document.getElementById("update-modal-overlay");
     if (existing) existing.remove();
 
-    const banner = document.createElement("div");
-    banner.id = "update-banner";
-    banner.className = "update-banner";
-    banner.innerHTML = `
-      <span>Update available: <strong>v${update.latest_version}</strong>${update.release_notes ? " — " + update.release_notes : ""}</span>
-      <button class="cmd-btn-sm update-banner-install">Update</button>
-      <button class="cmd-btn-sm update-banner-dismiss" style="background:transparent;border:1px solid rgba(255,255,255,0.2)">Dismiss</button>
+    const overlay = document.createElement("div");
+    overlay.id = "update-modal-overlay";
+    overlay.className = "update-modal-overlay";
+    overlay.innerHTML = `
+      <div class="update-modal">
+        <h2 class="update-modal-title">Update Available</h2>
+        <p class="update-modal-version">Version <strong>v${update.latest_version}</strong> is ready to install.</p>
+        ${update.release_notes ? `<p class="update-modal-notes">${update.release_notes}</p>` : ""}
+        <div class="update-progress hidden">
+          <div class="splash-loader" style="display:block;margin:0.5rem 0"><div class="splash-loader-bar" style="width:0%;animation:none"></div></div>
+          <span class="update-progress-text"></span>
+          <p class="update-error hidden"></p>
+        </div>
+        <div class="update-modal-actions">
+          <button class="cmd-btn update-modal-install" type="button">Install Update</button>
+          <button class="ghost-btn update-modal-dismiss" type="button">Not Now</button>
+        </div>
+      </div>
     `;
-    layout.prepend(banner);
+    document.body.appendChild(overlay);
 
-    const progressWrap = document.createElement("div");
-    progressWrap.className = "update-progress hidden";
-    progressWrap.innerHTML = `
-      <div class="splash-loader" style="display:block;margin:0.3rem 0"><div class="splash-loader-bar" style="width:0%;animation:none"></div></div>
-      <span class="update-progress-text" style="font-size:0.7rem;color:rgba(255,255,255,0.5)"></span>
-      <p class="update-error hidden" style="margin:0.3rem 0 0;color:#f08a77;font-size:0.72rem"></p>
-    `;
-    banner.appendChild(progressWrap);
+    const progressWrap = overlay.querySelector(".update-progress");
 
-    banner.querySelector(".update-banner-dismiss").addEventListener("click", async () => {
-      banner.remove();
-      // Remember dismissed version
+    overlay.querySelector(".update-modal-dismiss").addEventListener("click", async () => {
+      overlay.remove();
       try {
         const tauriInvoke = window?.__TAURI__?.core?.invoke;
         if (tauriInvoke) await tauriInvoke("save_user_preferences_local", {
@@ -144,9 +146,9 @@ export function initBootstrap(deps) {
       } catch { /* not critical */ }
     });
 
-    banner.querySelector(".update-banner-install").addEventListener("click", () => {
-      const installBtn = banner.querySelector(".update-banner-install");
-      const dismissBtn = banner.querySelector(".update-banner-dismiss");
+    overlay.querySelector(".update-modal-install").addEventListener("click", () => {
+      const installBtn = overlay.querySelector(".update-modal-install");
+      const dismissBtn = overlay.querySelector(".update-modal-dismiss");
       const errorText = progressWrap.querySelector(".update-error");
       dismissBtn.classList.add("hidden");
       runDownloadAndInstall(update, installBtn, progressWrap,

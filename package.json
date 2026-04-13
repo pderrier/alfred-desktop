@@ -1,6 +1,6 @@
 {
   "name": "alfred-desktop",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "description": "Alfred Desktop — AI-powered portfolio analysis for retail investors",

@@ -392,6 +392,18 @@ async fn finary_sync_snapshot_local() -> Result<serde_json::Value, String> {
         .map_err(|e| e.to_string())
 }
 
+// ── CSV import preview ──────────────────────────────────────────────────
+
+#[tauri::command]
+async fn preview_csv_import_local(csv_text: String, account: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        native_collection::preview_csv_import(&csv_text, &account)
+    })
+    .await
+    .map_err(|e| format!("preview_csv_import_local_failed:join:{e}"))?
+    .map_err(|e| e.to_string())
+}
+
 // ── LLM backend commands ─────────────────────────────────────────────────
 
 #[tauri::command]
@@ -566,6 +578,7 @@ fn run_tauri_app() -> anyhow::Result<()> {
             storage_clear_log_local,
             check_api_auth_local,
             finary_sync_snapshot_local,
+            preview_csv_import_local,
             check_openai_api_key_local,
             check_for_update_local,
             download_update_local,

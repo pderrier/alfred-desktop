@@ -243,7 +243,7 @@ fn parse_csv_upload_text(raw: &str, account: &str) -> Result<Value> {
         }
     }
 
-    // ── Tier 2 & 3: heuristic + LLM fallback ───────────────────────
+    // ── Parse headers & detect CSV type ──────────────────────────────
     let delimiter = detect_csv_delimiter(&text);
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     if lines.len() < 2 {
@@ -255,7 +255,39 @@ fn parse_csv_upload_text(raw: &str, account: &str) -> Result<Value> {
         .map(|line| split_csv_line(line, delimiter))
         .collect();
 
-    // Tier 2: heuristic column mapping
+    // ── Tier 1.5: Transaction history detection ────────────────────
+    let csv_type = detect_csv_type(&headers);
+    if csv_type == CsvType::TransactionHistory {
+        crate::debug_log("[csv-parse] tier 1.5: transaction history format detected");
+        let (broker_name, txn_mapping) = detect_broker_transaction_mapping(&headers)
+            .unwrap_or_else(|| {
+                crate::debug_log("[csv-parse] no known broker detected, using heuristic transaction mapping");
+                ("Unknown", heuristic_transaction_column_map(&headers))
+            });
+        crate::debug_log(&format!("[csv-parse] broker: {}, date={} ticker={} action={} qty={} price={} amount={} fees={} fx={}",
+            broker_name, txn_mapping.date, txn_mapping.ticker, txn_mapping.action,
+            txn_mapping.quantity, txn_mapping.price, txn_mapping.amount,
+            txn_mapping.fees, txn_mapping.fx_rate
+        ));
+        let transactions = parse_transactions(&data_rows, &txn_mapping, broker_name);
+        if !transactions.is_empty() {
+            let snapshot = reconcile_transactions(&transactions, acct);
+            // Check if reconciliation produced any positions
+            let pos_count = snapshot
+                .get("positions")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            if pos_count > 0 {
+                return wrap_snapshot(snapshot);
+            }
+            crate::debug_log("[csv-parse] transaction reconciliation produced 0 open positions, falling through to snapshot parsing");
+        } else {
+            crate::debug_log("[csv-parse] transaction parsing produced 0 trades, falling through to snapshot parsing");
+        }
+    }
+
+    // ── Tier 2: heuristic snapshot column mapping ──────────────────
     let mapping = heuristic_column_map(&headers);
     if mapping.ticker >= 0 && mapping.quantite >= 0 {
         crate::debug_log(&format!("[csv-parse] tier 2: heuristic mapping — ticker={} quantite={}", mapping.ticker, mapping.quantite));
@@ -298,7 +330,7 @@ fn wrap_snapshot(portfolio: Value) -> Result<Value> {
     if portfolio.get("positions").and_then(|v| v.as_array()).map(|a| a.is_empty()).unwrap_or(true) {
         return Err(anyhow!("csv_upload_no_positions_found"));
     }
-    Ok(json!({
+    let mut result = json!({
         "portfolio_source": "csv",
         "positions": portfolio.get("positions").cloned().unwrap_or_else(|| json!([])),
         "transactions": [],
@@ -306,7 +338,15 @@ fn wrap_snapshot(portfolio: Value) -> Result<Value> {
         "valeur_totale": portfolio.get("valeur_totale").cloned().unwrap_or_else(|| json!(0.0)),
         "plus_value_totale": portfolio.get("plus_value_totale").cloned().unwrap_or_else(|| json!(0.0)),
         "liquidites": portfolio.get("liquidites").cloned().unwrap_or_else(|| json!(0.0))
-    }))
+    });
+    // Preserve transaction history metadata (source, reconciliation) through normalization
+    if let Some(source) = portfolio.get("source") {
+        result.as_object_mut().unwrap().insert("csv_source".to_string(), source.clone());
+    }
+    if let Some(reconciliation) = portfolio.get("reconciliation") {
+        result.as_object_mut().unwrap().insert("reconciliation".to_string(), reconciliation.clone());
+    }
+    Ok(result)
 }
 
 // ── CSV parsing utilities ───────────────────────────────────────
@@ -442,6 +482,719 @@ fn apply_column_mapping(mapping: &ColumnMapping, rows: &[Vec<String>], account_n
         );
     }
     positions
+}
+
+// ── Transaction history parsing (Revolut, DEGIRO, Trading 212, IBKR, etc.) ──
+
+#[derive(Debug, Clone, PartialEq)]
+enum CsvType {
+    PositionSnapshot,
+    TransactionHistory,
+}
+
+/// Score headers to decide whether this CSV is a position snapshot or transaction history.
+fn detect_csv_type(headers: &[String]) -> CsvType {
+    let history_keywords = [
+        "date", "type", "action", "buy", "sell", "order", "trade",
+        "transaction", "side", "buy/sell", "direction", "execution",
+    ];
+    let snapshot_keywords = [
+        "quantite", "valorisation", "cours", "quantity", "value",
+        "current", "market_value", "valo", "pru", "avg_cost",
+        "prix_revient", "gain", "pnl",
+    ];
+    // Extra history-only keywords that never appear in snapshots
+    let history_strong = [
+        "fee", "commission", "comm/fee", "transaction costs",
+        "exchange rate", "fx rate", "fx_rate", "t. price", "proceeds",
+        "price / share", "price per share", "total amount",
+    ];
+
+    let h_lower: Vec<String> = headers.iter().map(|h| h.to_lowercase()).collect();
+
+    let history_score: usize = h_lower
+        .iter()
+        .filter(|h| history_keywords.iter().any(|k| h.contains(k)))
+        .count()
+        + h_lower
+            .iter()
+            .filter(|h| history_strong.iter().any(|k| h.contains(k)))
+            .count()
+            * 2; // Strong indicators count double
+
+    let snapshot_score: usize = h_lower
+        .iter()
+        .filter(|h| snapshot_keywords.iter().any(|k| h.contains(k)))
+        .count();
+
+    if history_score > snapshot_score {
+        CsvType::TransactionHistory
+    } else {
+        CsvType::PositionSnapshot
+    }
+}
+
+/// A single parsed trade from a transaction history CSV.
+#[derive(Debug, Clone)]
+struct CsvTransaction {
+    date: String,        // ISO date (YYYY-MM-DD) or original date string
+    ticker: String,
+    isin: String,
+    name: String,
+    action: String,      // "BUY" or "SELL"
+    quantity: f64,
+    price: f64,          // per share
+    amount: f64,         // total (positive = outflow for BUY, inflow for SELL)
+    currency: String,
+    fees: f64,
+    fx_rate: f64,        // 1.0 if same currency or unavailable
+}
+
+/// Column mapping for transaction history CSVs.
+struct TransactionColumnMapping {
+    date: i32,
+    ticker: i32,
+    isin: i32,
+    name: i32,
+    action: i32,
+    quantity: i32,
+    price: i32,
+    amount: i32,
+    currency: i32,
+    fees: i32,
+    fx_rate: i32,
+}
+
+/// Detect known broker format from headers and return a column mapping.
+fn detect_broker_transaction_mapping(headers: &[String]) -> Option<(&'static str, TransactionColumnMapping)> {
+    let h_lower: Vec<String> = headers.iter().map(|h| h.to_lowercase().trim().to_string()).collect();
+    let find = |patterns: &[&str]| -> i32 {
+        h_lower
+            .iter()
+            .position(|h| patterns.iter().any(|p| *h == *p || h.contains(p)))
+            .map(|i| i as i32)
+            .unwrap_or(-1)
+    };
+    let exact = |patterns: &[&str]| -> i32 {
+        h_lower
+            .iter()
+            .position(|h| patterns.contains(&h.as_str()))
+            .map(|i| i as i32)
+            .unwrap_or(-1)
+    };
+
+    // ── Revolut ────────────────────────────────────────────────────
+    // Headers: Date, Ticker, Type, Quantity, Price per share, Total Amount, Currency, FX Rate
+    if exact(&["ticker"]) >= 0 && exact(&["type"]) >= 0 && find(&["price per share"]) >= 0 {
+        return Some(("Revolut", TransactionColumnMapping {
+            date: exact(&["date"]),
+            ticker: exact(&["ticker"]),
+            isin: -1, // Revolut doesn't export ISIN
+            name: -1,
+            action: exact(&["type"]),
+            quantity: exact(&["quantity"]),
+            price: find(&["price per share"]),
+            amount: find(&["total amount"]),
+            currency: exact(&["currency"]),
+            fees: -1, // Revolut doesn't have a fees column
+            fx_rate: find(&["fx rate"]),
+        }));
+    }
+
+    // ── Trading 212 ────────────────────────────────────────────────
+    // Headers: Action, Time, ISIN, Ticker, Name, No. of shares, Price / share,
+    //          Currency (Price / share), Exchange rate, Total, Currency (Total)
+    if exact(&["action"]) >= 0 && find(&["no. of shares"]) >= 0 && find(&["price / share"]) >= 0 {
+        return Some(("Trading212", TransactionColumnMapping {
+            date: find(&["time"]),
+            ticker: exact(&["ticker"]),
+            isin: exact(&["isin"]),
+            name: exact(&["name"]),
+            action: exact(&["action"]),
+            quantity: find(&["no. of shares"]),
+            price: find(&["price / share"]),
+            amount: find(&["total", "result"]),
+            currency: find(&["currency (total)", "currency (price / share)"]),
+            fees: -1,
+            fx_rate: find(&["exchange rate"]),
+        }));
+    }
+
+    // ── DEGIRO ─────────────────────────────────────────────────────
+    // Headers: Date, Time, Product, ISIN, Reference Exchange, Quantity, Price,
+    //          Local value, Value, Exchange rate, Transaction costs, Total
+    if find(&["product"]) >= 0 && find(&["transaction costs"]) >= 0 && find(&["reference exchange"]) >= 0 {
+        return Some(("DEGIRO", TransactionColumnMapping {
+            date: exact(&["date"]),
+            ticker: -1, // DEGIRO uses Product name, no ticker column
+            isin: exact(&["isin"]),
+            name: find(&["product"]),
+            action: -1, // DEGIRO encodes direction via sign of quantity
+            quantity: exact(&["quantity"]),
+            price: exact(&["price"]),
+            amount: find(&["total", "value"]),
+            currency: -1, // Inferred from column headers or separate currency column
+            fees: find(&["transaction costs"]),
+            fx_rate: find(&["exchange rate"]),
+        }));
+    }
+
+    // ── Interactive Brokers ────────────────────────────────────────
+    // Headers: TradeDate, Symbol, Description, Buy/Sell, Quantity, T. Price, Proceeds, Comm/Fee, Currency
+    if find(&["tradedate"]) >= 0 && find(&["buy/sell"]) >= 0 {
+        return Some(("IBKR", TransactionColumnMapping {
+            date: find(&["tradedate"]),
+            ticker: find(&["symbol"]),
+            isin: -1,
+            name: find(&["description"]),
+            action: find(&["buy/sell"]),
+            quantity: exact(&["quantity"]),
+            price: find(&["t. price", "tradeprice"]),
+            amount: find(&["proceeds"]),
+            currency: exact(&["currency"]),
+            fees: find(&["comm/fee", "commission"]),
+            fx_rate: -1,
+        }));
+    }
+
+    None
+}
+
+/// Heuristic column mapping for unknown transaction history formats.
+fn heuristic_transaction_column_map(headers: &[String]) -> TransactionColumnMapping {
+    let normalized: Vec<String> = headers.iter().map(|h| normalize_header(h)).collect();
+    let find = |patterns: &[&str]| -> i32 {
+        normalized
+            .iter()
+            .position(|h| patterns.iter().any(|p| h.contains(p)))
+            .map(|i| i as i32)
+            .unwrap_or(-1)
+    };
+
+    TransactionColumnMapping {
+        date: find(&["date", "time", "execution", "trade_date", "settlement"]),
+        ticker: find(&["ticker", "symbol", "code", "mnemo"]),
+        isin: find(&["isin"]),
+        name: find(&["name", "product", "instrument", "description", "security", "asset"]),
+        action: find(&["action", "type", "side", "buy/sell", "direction", "operation"]),
+        quantity: find(&["quantity", "qty", "shares", "units", "no. of shares", "amount"]),
+        price: find(&["price", "price per share", "price / share", "t. price", "execution price"]),
+        amount: find(&["total", "amount", "proceeds", "value", "net"]),
+        currency: find(&["currency", "ccy"]),
+        fees: find(&["fee", "commission", "comm/fee", "transaction cost", "costs"]),
+        fx_rate: find(&["fx rate", "exchange rate", "fx_rate", "rate"]),
+    }
+}
+
+/// Normalize an action string to "BUY" or "SELL".
+fn normalize_action(raw: &str) -> String {
+    let lower = raw.trim().to_lowercase();
+    if lower.contains("buy") || lower.contains("market buy") || lower.contains("limit buy") || lower == "achat" {
+        "BUY".to_string()
+    } else if lower.contains("sell") || lower.contains("market sell") || lower.contains("limit sell") || lower == "vente" {
+        "SELL".to_string()
+    } else {
+        // Return original uppercase — caller will filter unknowns
+        raw.trim().to_uppercase()
+    }
+}
+
+/// Attempt to normalize a date string to ISO YYYY-MM-DD.
+/// Handles common formats: DD/MM/YYYY, MM/DD/YYYY (heuristic), YYYY-MM-DD, DD-MM-YYYY,
+/// and ISO datetime with 'T'.
+fn normalize_date(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    // Already ISO format (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)
+    if trimmed.len() >= 10 && trimmed.as_bytes()[4] == b'-' && trimmed.as_bytes()[7] == b'-' {
+        return trimmed[..10].to_string();
+    }
+    // DD/MM/YYYY or DD-MM-YYYY (European — day first)
+    let parts: Vec<&str> = trimmed.split(|c: char| c == '/' || c == '-' || c == '.').collect();
+    if parts.len() >= 3 {
+        let (a, b, c) = (parts[0].trim(), parts[1].trim(), parts[2].trim());
+        // If first part is 4 digits → YYYY/MM/DD
+        if a.len() == 4 {
+            return format!("{}-{:0>2}-{:0>2}", a, b, c.get(..2).unwrap_or(c));
+        }
+        // If third part is 4 digits → DD/MM/YYYY (European) or MM/DD/YYYY (US)
+        if c.len() == 4 || c.len() > 4 {
+            let year = c.get(..4).unwrap_or(c);
+            let day_num: u32 = a.parse().unwrap_or(0);
+            // Heuristic: if first part > 12, it must be a day (European)
+            if day_num > 12 {
+                return format!("{}-{:0>2}-{:0>2}", year, b, a);
+            }
+            // Otherwise assume European (DD/MM/YYYY) which is standard in EU broker exports
+            return format!("{}-{:0>2}-{:0>2}", year, b, a);
+        }
+        // Two-digit year: assume 20xx
+        if c.len() == 2 {
+            let day_num: u32 = a.parse().unwrap_or(0);
+            if day_num > 12 {
+                return format!("20{}-{:0>2}-{:0>2}", c, b, a);
+            }
+            return format!("20{}-{:0>2}-{:0>2}", c, b, a);
+        }
+    }
+    // If datetime string, try to extract date portion before space or 'T'
+    if let Some(date_part) = trimmed.split_whitespace().next() {
+        if date_part != trimmed {
+            return normalize_date(date_part);
+        }
+    }
+    // Fallback: return as-is
+    trimmed.to_string()
+}
+
+/// Parse transaction rows using the given column mapping.
+/// Skips rows that don't have a recognizable BUY/SELL action, or where quantity is zero.
+fn parse_transactions(
+    rows: &[Vec<String>],
+    mapping: &TransactionColumnMapping,
+    broker_name: &str,
+) -> Vec<CsvTransaction> {
+    let col = |row: &Vec<String>, idx: i32| -> String {
+        if idx < 0 {
+            return String::new();
+        }
+        row.get(idx as usize).cloned().unwrap_or_default().trim().to_string()
+    };
+    let num = |row: &Vec<String>, idx: i32| -> f64 {
+        if idx < 0 {
+            return 0.0;
+        }
+        parse_fr_number(row.get(idx as usize).map(String::as_str).unwrap_or_default())
+    };
+
+    let mut transactions = Vec::new();
+    for row in rows {
+        let raw_action = col(row, mapping.action);
+        let action = if mapping.action >= 0 && !raw_action.is_empty() {
+            let normalized = normalize_action(&raw_action);
+            if normalized != "BUY" && normalized != "SELL" {
+                continue; // Skip dividends, splits, corporate actions, etc.
+            }
+            normalized
+        } else {
+            // DEGIRO-style: infer from sign of quantity
+            let qty = num(row, mapping.quantity);
+            if qty > 0.0 {
+                "BUY".to_string()
+            } else if qty < 0.0 {
+                "SELL".to_string()
+            } else {
+                continue;
+            }
+        };
+
+        let quantity = num(row, mapping.quantity).abs();
+        if quantity == 0.0 || !quantity.is_finite() {
+            continue;
+        }
+
+        let price = num(row, mapping.price).abs();
+        let amount_raw = num(row, mapping.amount);
+        let amount = if amount_raw != 0.0 {
+            amount_raw.abs()
+        } else {
+            quantity * price
+        };
+
+        let ticker_raw = col(row, mapping.ticker).to_uppercase();
+        let isin_raw = col(row, mapping.isin).to_uppercase();
+        let name_raw = col(row, mapping.name);
+
+        // Must have at least a ticker, ISIN, or name to identify the security
+        if ticker_raw.is_empty() && isin_raw.is_empty() && name_raw.is_empty() {
+            continue;
+        }
+
+        let ticker = if !ticker_raw.is_empty() {
+            ticker_raw.clone()
+        } else if !isin_raw.is_empty() {
+            isin_raw.clone()
+        } else {
+            derive_ticker_from_name(&name_raw, "")
+        };
+
+        let currency = col(row, mapping.currency).to_uppercase();
+        let fx_rate_raw = num(row, mapping.fx_rate);
+        let fx_rate = if fx_rate_raw > 0.0 && fx_rate_raw.is_finite() {
+            fx_rate_raw
+        } else {
+            1.0
+        };
+        let fees = num(row, mapping.fees).abs();
+        let date = normalize_date(&col(row, mapping.date));
+
+        transactions.push(CsvTransaction {
+            date,
+            ticker,
+            isin: isin_raw,
+            name: if name_raw.is_empty() { ticker_raw.clone() } else { name_raw },
+            action,
+            quantity,
+            price,
+            amount,
+            currency: if currency.is_empty() { "EUR".to_string() } else { currency },
+            fees,
+            fx_rate,
+        });
+    }
+
+    crate::debug_log(&format!(
+        "[csv-parse] parsed {} transactions from {} rows (broker: {})",
+        transactions.len(),
+        rows.len(),
+        broker_name
+    ));
+    transactions
+}
+
+/// Reconcile a list of chronological transactions into current portfolio positions.
+///
+/// Uses weighted-average cost method:
+/// - BUY: adds to position, updates weighted average cost
+/// - SELL: reduces position at current average cost (FIFO not needed for average cost)
+///
+/// Non-EUR amounts are converted using the FX rate if available in the CSV row.
+/// If no FX rate is available and currency != EUR, the position is flagged.
+fn reconcile_transactions(transactions: &[CsvTransaction], account: &str) -> Value {
+    use std::collections::BTreeMap;
+
+    struct PositionAccumulator {
+        ticker: String,
+        isin: String,
+        name: String,
+        quantity: f64,
+        total_cost_eur: f64, // total cost basis in EUR
+        currency: String,
+        has_unconverted: bool, // flagged if FX rate was missing for non-EUR
+    }
+
+    let mut accumulators: BTreeMap<String, PositionAccumulator> = BTreeMap::new();
+    let mut total_trades = 0usize;
+    let mut min_date = String::new();
+    let mut max_date = String::new();
+
+    // Sort transactions by date for chronological processing
+    let mut sorted = transactions.to_vec();
+    sorted.sort_by(|a, b| a.date.cmp(&b.date));
+
+    for txn in &sorted {
+        total_trades += 1;
+
+        // Track date range
+        if !txn.date.is_empty() {
+            if min_date.is_empty() || txn.date < min_date {
+                min_date = txn.date.clone();
+            }
+            if max_date.is_empty() || txn.date > max_date {
+                max_date = txn.date.clone();
+            }
+        }
+
+        // Use ticker as the grouping key; fall back to ISIN
+        let key = if !txn.ticker.is_empty() {
+            txn.ticker.clone()
+        } else {
+            txn.isin.clone()
+        };
+        if key.is_empty() {
+            continue;
+        }
+
+        // Convert to EUR using FX rate
+        let is_eur = txn.currency == "EUR" || txn.currency.is_empty();
+        let fx = if is_eur { 1.0 } else { txn.fx_rate };
+        let has_unconverted = !is_eur && (fx - 1.0).abs() < f64::EPSILON && txn.fx_rate == 1.0;
+        let price_eur = txn.price / fx;
+        let amount_eur = txn.amount / fx;
+        let _fees_eur = txn.fees / fx;
+
+        let acc = accumulators.entry(key.clone()).or_insert_with(|| PositionAccumulator {
+            ticker: txn.ticker.clone(),
+            isin: txn.isin.clone(),
+            name: txn.name.clone(),
+            quantity: 0.0,
+            total_cost_eur: 0.0,
+            currency: txn.currency.clone(),
+            has_unconverted: false,
+        });
+
+        // Update name/isin if we get better data
+        if acc.isin.is_empty() && !txn.isin.is_empty() {
+            acc.isin = txn.isin.clone();
+        }
+        if (acc.name.is_empty() || acc.name == acc.ticker) && !txn.name.is_empty() {
+            acc.name = txn.name.clone();
+        }
+        if has_unconverted {
+            acc.has_unconverted = true;
+        }
+
+        match txn.action.as_str() {
+            "BUY" => {
+                let cost = if amount_eur > 0.0 {
+                    amount_eur
+                } else {
+                    txn.quantity * price_eur
+                };
+                acc.total_cost_eur += cost;
+                acc.quantity += txn.quantity;
+            }
+            "SELL" => {
+                if acc.quantity > 0.0 {
+                    // Reduce cost basis proportionally (weighted average method)
+                    let avg_cost = acc.total_cost_eur / acc.quantity;
+                    let sold_qty = txn.quantity.min(acc.quantity);
+                    acc.total_cost_eur -= avg_cost * sold_qty;
+                    acc.quantity -= sold_qty;
+                    // Clamp near-zero to zero (floating point)
+                    if acc.quantity.abs() < 1e-9 {
+                        acc.quantity = 0.0;
+                        acc.total_cost_eur = 0.0;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Build positions from accumulators — only include positions with quantity > 0
+    let acct_name = if account.is_empty() { "CSV_import" } else { account };
+    let positions: Vec<Value> = accumulators
+        .values()
+        .filter(|acc| acc.quantity > 1e-9) // Filter out fully sold positions
+        .map(|acc| {
+            let prix_revient = if acc.quantity > 0.0 {
+                acc.total_cost_eur / acc.quantity
+            } else {
+                0.0
+            };
+            let mut pos = serde_json::to_value(crate::models::Position {
+                ticker: acc.ticker.clone(),
+                nom: if acc.name.is_empty() { acc.ticker.clone() } else { acc.name.clone() },
+                isin: if acc.isin.is_empty() { None } else { Some(acc.isin.clone()) },
+                quantite: acc.quantity,
+                prix_actuel: 0.0,      // Filled by enrichment pipeline
+                prix_revient,
+                valeur_actuelle: 0.0,   // Filled by enrichment pipeline
+                plus_moins_value: 0.0,  // Filled by enrichment pipeline
+                plus_moins_value_pct: 0.0,
+                compte: acct_name.to_string(),
+                position_type: None,
+            })
+            .unwrap_or_default();
+
+            // Flag unconverted currency positions
+            if acc.has_unconverted {
+                if let Some(obj) = pos.as_object_mut() {
+                    obj.insert("_currency_warning".to_string(), json!(format!(
+                        "Non-EUR amounts for {} were not converted (FX rate unavailable in CSV)",
+                        acc.currency
+                    )));
+                }
+            }
+            pos
+        })
+        .collect();
+
+    let unique_tickers: std::collections::HashSet<&str> = accumulators
+        .values()
+        .filter(|acc| acc.quantity > 1e-9)
+        .map(|acc| acc.ticker.as_str())
+        .collect();
+
+    let date_range = if !min_date.is_empty() && !max_date.is_empty() {
+        format!("{} to {}", min_date, max_date)
+    } else {
+        String::new()
+    };
+
+    crate::debug_log(&format!(
+        "[csv-parse] reconciled {} trades → {} open positions ({} tickers), date range: {}",
+        total_trades,
+        positions.len(),
+        unique_tickers.len(),
+        if date_range.is_empty() { "unknown" } else { &date_range }
+    ));
+
+    json!({
+        "positions": positions,
+        "source": "csv_transaction_history",
+        "reconciliation": {
+            "total_trades": total_trades,
+            "tickers": unique_tickers.len(),
+            "date_range": date_range
+        },
+        "valeur_totale": 0.0,
+        "plus_value_totale": 0.0,
+        "liquidites": 0.0
+    })
+}
+
+/// Preview a CSV import without committing it. Returns format detection,
+/// broker identification, reconciled positions (for transaction history),
+/// warnings, and statistics. The frontend shows this preview and may open
+/// the chat wizard for user confirmation before proceeding.
+pub fn preview_csv_import(raw: &str, account: &str) -> Result<Value> {
+    let text: String = raw
+        .lines()
+        .filter(|line| !line.starts_with("--- FILE: "))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let acct = if account.is_empty() { "CSV_import" } else { account };
+
+    // ── Tier 1: Boursorama format ──────────────────────────────────
+    if let Ok(snap) = parse_positions_text(&text, acct) {
+        let pos = snap.get("positions").and_then(|v| v.as_array());
+        if pos.map(|a| !a.is_empty()).unwrap_or(false) {
+            let count = pos.map(|a| a.len()).unwrap_or(0);
+            return Ok(json!({
+                "preview": true,
+                "detected_format": "position_snapshot",
+                "detected_broker": "Boursorama",
+                "positions": snap.get("positions").cloned().unwrap_or_else(|| json!([])),
+                "warnings": [],
+                "stats": {
+                    "position_count": count,
+                    "valeur_totale": snap.get("valeur_totale").cloned().unwrap_or_else(|| json!(0.0)),
+                },
+                "ready": true
+            }));
+        }
+    }
+
+    // ── Parse headers ──────────────────────────────────────────────
+    let delimiter = detect_csv_delimiter(&text);
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.len() < 2 {
+        return Err(anyhow!("csv_upload_empty:CSV has fewer than 2 non-empty lines"));
+    }
+    let headers: Vec<String> = split_csv_line(lines[0], delimiter);
+    let data_rows: Vec<Vec<String>> = lines[1..]
+        .iter()
+        .map(|line| split_csv_line(line, delimiter))
+        .collect();
+
+    let csv_type = detect_csv_type(&headers);
+
+    // ── Transaction history preview ────────────────────────────────
+    if csv_type == CsvType::TransactionHistory {
+        let (broker_name, txn_mapping) = detect_broker_transaction_mapping(&headers)
+            .unwrap_or_else(|| ("Unknown", heuristic_transaction_column_map(&headers)));
+
+        let transactions = parse_transactions(&data_rows, &txn_mapping, broker_name);
+
+        let mut warnings: Vec<Value> = Vec::new();
+        let buy_count = transactions.iter().filter(|t| t.action == "BUY").count();
+        let sell_count = transactions.iter().filter(|t| t.action == "SELL").count();
+
+        // Check for unconverted currencies
+        let unconverted: Vec<&CsvTransaction> = transactions
+            .iter()
+            .filter(|t| {
+                let is_eur = t.currency == "EUR" || t.currency.is_empty();
+                !is_eur && (t.fx_rate - 1.0).abs() < f64::EPSILON
+            })
+            .collect();
+        if !unconverted.is_empty() {
+            let currencies: std::collections::HashSet<&str> =
+                unconverted.iter().map(|t| t.currency.as_str()).collect();
+            warnings.push(json!(format!(
+                "{} trades in {} without FX rate — amounts not converted to EUR",
+                unconverted.len(),
+                currencies.into_iter().collect::<Vec<_>>().join(", ")
+            )));
+        }
+
+        // Reconcile to get positions
+        let snapshot = reconcile_transactions(&transactions, acct);
+        let positions = snapshot.get("positions").cloned().unwrap_or_else(|| json!([]));
+        let pos_count = positions.as_array().map(|a| a.len()).unwrap_or(0);
+
+        if pos_count == 0 && !transactions.is_empty() {
+            warnings.push(json!("All positions appear to have been fully sold — no open positions remain"));
+        }
+
+        // Check for missing column mappings
+        if txn_mapping.ticker < 0 && txn_mapping.isin < 0 && txn_mapping.name < 0 {
+            warnings.push(json!("Could not identify ticker/ISIN/name columns — positions may be misidentified"));
+        }
+        if txn_mapping.date < 0 {
+            warnings.push(json!("No date column detected — reconciliation order may be incorrect"));
+        }
+
+        let needs_confirmation = broker_name == "Unknown" || !warnings.is_empty();
+
+        return Ok(json!({
+            "preview": true,
+            "detected_format": "transaction_history",
+            "detected_broker": broker_name,
+            "positions": positions,
+            "warnings": warnings,
+            "stats": {
+                "total_trades": transactions.len(),
+                "buy_count": buy_count,
+                "sell_count": sell_count,
+                "tickers": pos_count,
+                "date_range": snapshot.get("reconciliation").and_then(|r| r.get("date_range")).cloned().unwrap_or_else(|| json!(""))
+            },
+            "ready": !needs_confirmation,
+            "needs_chat_confirmation": needs_confirmation,
+            "headers": headers,
+            "sample_rows": data_rows.iter().take(5).cloned().collect::<Vec<_>>(),
+            "column_mapping": {
+                "date": txn_mapping.date,
+                "ticker": txn_mapping.ticker,
+                "isin": txn_mapping.isin,
+                "name": txn_mapping.name,
+                "action": txn_mapping.action,
+                "quantity": txn_mapping.quantity,
+                "price": txn_mapping.price,
+                "amount": txn_mapping.amount,
+                "currency": txn_mapping.currency,
+                "fees": txn_mapping.fees,
+                "fx_rate": txn_mapping.fx_rate
+            }
+        }));
+    }
+
+    // ── Position snapshot preview ──────────────────────────────────
+    let mapping = heuristic_column_map(&headers);
+    if mapping.ticker >= 0 && mapping.quantite >= 0 {
+        let positions = apply_column_mapping(&mapping, &data_rows, acct);
+        if !positions.is_empty() {
+            return Ok(json!({
+                "preview": true,
+                "detected_format": "position_snapshot",
+                "detected_broker": "Unknown",
+                "positions": positions,
+                "warnings": [],
+                "stats": { "position_count": positions.len() },
+                "ready": true
+            }));
+        }
+    }
+
+    // ── Unknown format — needs LLM assistance ──────────────────────
+    Ok(json!({
+        "preview": true,
+        "detected_format": "unknown",
+        "detected_broker": null,
+        "positions": [],
+        "warnings": ["Could not automatically detect column mappings — please confirm in chat"],
+        "stats": { "row_count": data_rows.len(), "column_count": headers.len() },
+        "ready": false,
+        "needs_chat_confirmation": true,
+        "headers": headers,
+        "sample_rows": data_rows.iter().take(5).cloned().collect::<Vec<_>>()
+    }))
 }
 
 fn load_csv_export_snapshot(export_path: &str, account_name: &str) -> Result<Value> {

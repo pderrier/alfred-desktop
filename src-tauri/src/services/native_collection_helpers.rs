@@ -193,7 +193,7 @@ pub(crate) fn normalize_finary_snapshot(snapshot: &Value) -> Value {
 }
 
 pub(crate) fn normalize_csv_snapshot(snapshot: &Value) -> Value {
-    json!({
+    let mut result = json!({
         "portfolio_source": "csv",
         "positions": snapshot.get("positions").cloned().unwrap_or_else(|| json!([])),
         "transactions": snapshot.get("transactions").cloned().unwrap_or_else(|| json!([])),
@@ -201,7 +201,15 @@ pub(crate) fn normalize_csv_snapshot(snapshot: &Value) -> Value {
         "valeur_totale": to_number(snapshot.get("valeur_totale")),
         "plus_value_totale": to_number(snapshot.get("plus_value_totale")),
         "liquidites": to_number(snapshot.get("liquidites"))
-    })
+    });
+    // Preserve transaction history reconciliation metadata through normalization
+    if let Some(csv_source) = snapshot.get("csv_source") {
+        result.as_object_mut().unwrap().insert("csv_source".to_string(), csv_source.clone());
+    }
+    if let Some(reconciliation) = snapshot.get("reconciliation") {
+        result.as_object_mut().unwrap().insert("reconciliation".to_string(), reconciliation.clone());
+    }
+    result
 }
 
 pub(crate) fn parse_fr_number(raw: &str) -> f64 {

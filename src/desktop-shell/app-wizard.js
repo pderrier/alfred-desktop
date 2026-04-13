@@ -9,7 +9,7 @@ import {
 } from "/desktop-shell/run-wizard-policy.js";
 import { buildRunAnalysisOptions } from "/desktop-shell/report-view-model.js";
 import { formatBridgeError, isErrorCritical, extractErrorCode } from "/shared/run-operations-controller.js";
-import { openCashMatchingWizard } from "/desktop-shell/app-chat-wizard.js";
+import { openCashMatchingWizard, openChatWizard } from "/desktop-shell/app-chat-wizard.js";
 
 // ── DOM nodes ────────────────────────────────────────────────────
 
@@ -409,6 +409,119 @@ export function initWizard(deps) {
       }
       const guidelines = agentGuidelinesInputNode?.value || "";
       const analysisMode = wizardAnalysisModeNode?.value || "full_run";
+
+      // ── CSV preview + chat confirmation flow ─────────────────────
+      // For CSV text imports, preview the parsing before committing.
+      // If transaction history is detected with warnings or unknown format,
+      // open the chat wizard for user confirmation.
+      if (source === "csv" && (wizardCsvTextNode?.value || "").trim()) {
+        try {
+          const tauriInvoke = window?.__TAURI__?.core?.invoke;
+          if (tauriInvoke) {
+            setWizardStatus("Analyzing CSV format...", "status-loading");
+            const preview = await tauriInvoke("preview_csv_import_local", {
+              csvText: wizardCsvTextNode.value,
+              account: account || ""
+            });
+            if (preview && preview.preview) {
+              const format = preview.detected_format || "unknown";
+              const broker = preview.detected_broker || "Unknown";
+              const warnings = Array.isArray(preview.warnings) ? preview.warnings : [];
+              const positions = Array.isArray(preview.positions) ? preview.positions : [];
+              const stats = preview.stats || {};
+              const needsChat = preview.needs_chat_confirmation || false;
+
+              if (format === "transaction_history") {
+                // Show a summary toast regardless
+                const posCount = positions.length;
+                const tradeCount = stats.total_trades || 0;
+                showToast(
+                  `Detected ${broker} transaction history: ${tradeCount} trades -> ${posCount} position(s)`,
+                  warnings.length > 0 ? "warning" : "success"
+                );
+
+                // If there are warnings or unknown broker, open chat wizard for confirmation
+                if (needsChat) {
+                  setWizardStatus("Waiting for CSV confirmation...", "status-loading");
+                  const posTable = positions.map(p => {
+                    const t = p.ticker || "?";
+                    const q = (p.quantite || 0).toFixed(2);
+                    const c = (p.prix_revient || 0).toFixed(2);
+                    return `  ${t}: ${q} shares @ ${c} EUR avg cost`;
+                  }).join("\n");
+                  const warnText = warnings.length > 0
+                    ? "\n\nWarnings:\n" + warnings.map(w => `  - ${w}`).join("\n")
+                    : "";
+                  const systemContext = `You are helping the user validate a CSV import for their portfolio tracker. The CSV was detected as a ${format} from broker "${broker}". Here is the parsed preview:\n\nPositions (${positions.length}):\n${posTable}${warnText}\n\nStats: ${JSON.stringify(stats)}\n\nHeaders: ${JSON.stringify(preview.headers || [])}\nSample rows (first 5): ${JSON.stringify((preview.sample_rows || []).slice(0, 3))}\n\nIf the user says "yes" or confirms, the import will proceed. If they point out issues, acknowledge them and suggest they re-export or correct the CSV. You cannot change the parsing — only help them understand and confirm.`;
+                  const initialMessage = `I parsed your CSV as a **${format}** from **${broker}**.\n\n**${positions.length} open position(s)** from **${stats.total_trades || 0} trades** (${stats.buy_count || 0} buys, ${stats.sell_count || 0} sells).${stats.date_range ? `\nDate range: ${stats.date_range}` : ""}${warnText ? `\n\n${warnText}` : ""}\n\nDoes this look correct? Say **yes** to proceed with the analysis, or tell me what looks wrong.`;
+
+                  const chatResult = await openChatWizard({
+                    title: "Confirm CSV Import",
+                    systemContext,
+                    initialMessage,
+                    extractResult: (history) => {
+                      // Check if the last user message is a confirmation
+                      const lastUserMsg = [...history].reverse().find(m => m.role === "user");
+                      const text = (lastUserMsg?.content || "").toLowerCase().trim();
+                      const confirmed = /^(yes|ok|confirm|correct|proceed|looks?\s*good|go\s*ahead|lgtm)/i.test(text);
+                      return confirmed ? { confirmed: true } : null;
+                    }
+                  });
+
+                  if (!chatResult || !chatResult.confirmed) {
+                    setWizardStatus("CSV import cancelled by user.", "status-idle");
+                    return;
+                  }
+                  setWizardStatus("CSV confirmed. Starting analysis...", "status-success");
+                }
+              } else if (format === "unknown" && needsChat) {
+                // Unknown format — let user discuss with LLM before proceeding
+                setWizardStatus("Unknown CSV format — opening assistant...", "status-loading");
+                const headerList = (preview.headers || []).map((h, i) => `  [${i}] ${h}`).join("\n");
+                const sampleText = (preview.sample_rows || []).slice(0, 3).map(
+                  (row, i) => `  Row ${i + 1}: ${row.join(" | ")}`
+                ).join("\n");
+                const systemContext = `You are helping the user import a CSV file into their portfolio tracker. The format is unknown — it could be a position snapshot or transaction history. Here are the headers and first rows:\n\nHeaders:\n${headerList}\n\nSample data:\n${sampleText}\n\nHelp the user understand what format this is. If it looks like a position snapshot (current holdings), or a transaction history (buy/sell orders), tell them. If the columns are unclear, ask the user to identify key columns (ticker, quantity, price, date, action). If they confirm it looks correct, we will proceed with the best-guess parsing.`;
+                const initialMessage = `I could not automatically detect the format of your CSV. Here are the columns I found:\n\n${headerList}\n\nDoes this look like a **position snapshot** (current holdings) or a **transaction history** (buy/sell orders)? If you can tell me which columns are the ticker, quantity, and price, I can help parse it correctly.`;
+
+                const chatResult = await openChatWizard({
+                  title: "Identify CSV Format",
+                  systemContext,
+                  initialMessage,
+                  extractResult: (history) => {
+                    const lastUserMsg = [...history].reverse().find(m => m.role === "user");
+                    const text = (lastUserMsg?.content || "").toLowerCase().trim();
+                    const confirmed = /^(yes|ok|confirm|correct|proceed|looks?\s*good|go\s*ahead|lgtm)/i.test(text);
+                    return confirmed ? { confirmed: true } : null;
+                  }
+                });
+
+                if (!chatResult || !chatResult.confirmed) {
+                  setWizardStatus("CSV import cancelled.", "status-idle");
+                  return;
+                }
+                setWizardStatus("Proceeding with best-guess parsing...", "status-success");
+              } else if (format === "position_snapshot") {
+                // Known snapshot — show quick confirmation
+                showToast(
+                  `Detected ${broker} snapshot: ${positions.length} position(s)`,
+                  "success"
+                );
+              }
+            }
+          }
+        } catch (previewErr) {
+          // Preview failed — proceed with normal parsing (the backend will handle it)
+          const msg = String(previewErr?.message || previewErr || "");
+          if (msg.includes("csv_upload_empty") || msg.includes("csv_upload_no_positions")) {
+            setWizardStatus("CSV appears empty or unreadable. Check the file.", "status-error");
+            return;
+          }
+          // For other errors, log and continue — the analysis pipeline will re-parse
+          console.warn("[csv-preview] preview failed, proceeding:", msg);
+        }
+      }
+
       const options = buildRunAnalysisOptions({
         source, account,
         csvText: wizardCsvTextNode?.value || "",

@@ -190,7 +190,7 @@ const runOperations = createRunOperationsController({
       if (mainRunView) mainRunView.classList.remove("live-run");
       if (event?.type === "run.completed") {
         showToast("Analysis complete");
-        // Notify Alfred overlay (triggers don't fire in Phase A — wiring only)
+        // Notify Alfred overlay — Phase B: reactive triggers auto-fire
         alfredOverlay.notify("run-completed", event);
         // Refresh to show new results
         refreshDashboard().catch(() => {});
@@ -198,7 +198,7 @@ const runOperations = createRunOperationsController({
         // Show clear failure state — don't silently fall back to old report
         const errorMsg = event?.message || "Analysis failed";
         showErrorModal("Analysis Failed", errorMsg, "You can retry the analysis from the sidebar.");
-        // Notify Alfred overlay (triggers don't fire in Phase A — wiring only)
+        // Notify Alfred overlay — Phase B: reactive triggers auto-fire
         alfredOverlay.notify("run-failed", event);
         // Show failure in synthesis card
         const synthNode = document.getElementById("report-synthesis");
@@ -1571,6 +1571,150 @@ function renderWelcome() {
   contentNode.innerHTML = html;
 }
 
+// ── Onboarding chat wizard (Phase 4b) ───────────────────────────
+
+const ONBOARDING_SYSTEM_CONTEXT = `You are Alfred, a portfolio analysis assistant. Guide the user through first-time setup.
+
+Step 1: Ask if they have a Finary account. If yes, guide them to connect (explain the browser login flow — a browser window will open automatically). If no, explain CSV import option.
+Step 2: Help them choose an LLM backend — Codex (free, OAuth login) or Native API (API key, pay-per-use). Explain the trade-offs briefly: Codex is free and easy, Native API gives more control and model choice but requires an OpenAI API key.
+Step 3: If they chose Native API, ask them to paste their OpenAI API key. Validate it. If they chose Codex, explain the sign-in flow.
+Step 4: Suggest running their first analysis. Offer to start it now.
+
+Be conversational, friendly, concise. Use French if the user responds in French.
+When presenting choices, number them clearly (1, 2) so the user can respond with a number.
+Do not use markdown headers. Keep responses short (3-5 lines max).`;
+
+const ONBOARDING_INITIAL_MESSAGE = "Bienvenue dans Alfred ! Je suis votre assistant d'analyse de portefeuille. Configurons votre espace ensemble \u2014 \u00e7a prend 2 minutes.\n\nAvez-vous un compte Finary pour synchroniser vos investissements automatiquement ? Si non, pas de souci \u2014 vous pourrez importer un fichier CSV.";
+
+/**
+ * Check if onboarding is needed and launch the chat wizard if so.
+ * Returns true if onboarding was triggered, false otherwise.
+ */
+async function checkOnboarding() {
+  const tauriInvoke = window?.__TAURI__?.core?.invoke;
+  if (!tauriInvoke) return false;
+
+  // Check if onboarding was already completed
+  try {
+    const prefs = await tauriInvoke("get_user_preferences_local");
+    if (prefs?.onboarding_complete === true) return false;
+  } catch { /* no prefs yet — continue */ }
+
+  // Only trigger if BOTH Finary and OpenAI are not configured
+  // If user already connected one during splash, skip onboarding
+  if (lastFinaryOk || lastOpenaiOk) {
+    // At least one service connected — mark onboarding done, skip wizard
+    try {
+      await tauriInvoke("save_user_preferences_local", {
+        prefs: { onboarding_complete: true }
+      });
+    } catch { /* not critical */ }
+    return false;
+  }
+
+  // Launch the onboarding chat wizard
+  const history = await openChatWizard({
+    title: "Alfred Setup",
+    systemContext: ONBOARDING_SYSTEM_CONTEXT,
+    initialMessage: ONBOARDING_INITIAL_MESSAGE,
+    returnHistoryOnClose: true,
+  });
+
+  // Process the conversation to extract user intent
+  await processOnboardingResult(history || []);
+  return true;
+}
+
+/**
+ * Parse onboarding conversation history and trigger appropriate actions.
+ */
+async function processOnboardingResult(history) {
+  const tauriInvoke = window?.__TAURI__?.core?.invoke;
+
+  // Scan conversation for user intent signals
+  const allText = history.map((m) => m.content).join("\n").toLowerCase();
+  const userMessages = history.filter((m) => m.role === "user").map((m) => m.content.toLowerCase());
+  const lastUserMsg = userMessages[userMessages.length - 1] || "";
+
+  let wantsFinary = false;
+  let wantsNativeApi = false;
+  let apiKeyProvided = null;
+  let wantsRunAnalysis = false;
+
+  // Detect Finary intent
+  const finaryYesPatterns = /\b(finary|oui.*finary|yes.*finary|j'ai.*finary|i have.*finary|connect.*finary)\b/;
+  if (finaryYesPatterns.test(allText)) {
+    wantsFinary = true;
+  }
+
+  // Detect LLM backend choice
+  const nativePatterns = /\b(native|api key|api.key|cl[e\u00e9].*api|openai.*key|pay.per.use)\b/;
+  if (nativePatterns.test(allText)) {
+    wantsNativeApi = true;
+  }
+
+  // Detect API key in user messages (OpenAI keys start with sk-)
+  for (const msg of history) {
+    if (msg.role !== "user") continue;
+    const keyMatch = msg.content.match(/\b(sk-[a-zA-Z0-9_-]{20,})\b/);
+    if (keyMatch) {
+      apiKeyProvided = keyMatch[1];
+      wantsNativeApi = true;
+    }
+  }
+
+  // Detect "run analysis" intent
+  const runPatterns = /\b(oui|yes|ok|go|lance|start|run|d[e\u00e9]marr|analys)\b/;
+  if (runPatterns.test(lastUserMsg)) {
+    wantsRunAnalysis = true;
+  }
+
+  // Execute actions based on detected intent
+  // 1. Save API key if provided
+  if (apiKeyProvided && tauriInvoke) {
+    try {
+      await tauriInvoke("runtime_settings_update_local", {
+        settings: {
+          llm_backend: "native",
+          openai_api_key: apiKeyProvided,
+        }
+      });
+      showToast("API key saved", "success");
+      await refreshRuntimeSettings();
+      await refreshAccountStatus();
+      updateAuthPills();
+    } catch (err) {
+      showToast(`Failed to save API key: ${formatBridgeError(err)}`, "error");
+    }
+  }
+
+  // 2. Trigger Finary connection if requested
+  if (wantsFinary) {
+    // Use the same flow as the Connect Finary button
+    window.__connectFinary?.();
+  }
+
+  // 3. Mark onboarding complete
+  if (tauriInvoke) {
+    try {
+      await tauriInvoke("save_user_preferences_local", {
+        prefs: { onboarding_complete: true }
+      });
+    } catch { /* not critical */ }
+  }
+
+  // 4. Refresh state after onboarding
+  await refreshAccountStatus();
+  updateAuthPills();
+  renderWelcome();
+
+  // 5. Trigger run wizard if user wants to run analysis
+  if (wantsRunAnalysis) {
+    // Small delay so the welcome screen renders first
+    setTimeout(() => openRunWizard({}), 400);
+  }
+}
+
 // Open wizard with pre-selected account (used by welcome cards + sidebar)
 window.__openWizardForAccount = (accountName) => {
   wizard.open({ account: accountName });
@@ -1650,7 +1794,10 @@ void refreshRuntimeSettings().catch(() => {});
 bootstrap.runStartupSessionCheck().then(async () => {
   await refreshAccountStatus();
   updateAuthPills();
-  renderWelcome();
+  // Phase 4b: check if onboarding wizard should be shown (first launch, nothing configured)
+  const didOnboard = await checkOnboarding();
+  // If onboarding ran, it already called renderWelcome + refreshAccountStatus
+  if (!didOnboard) renderWelcome();
   // If Finary is connected but we have no accounts, sync from Finary API
   const snapshot = latestDashboardPayload?.snapshot || {};
   const finaryMeta = snapshot.latest_finary_snapshot || {};

@@ -35,6 +35,20 @@ let currentTriggerId = null;
 let currentPriority = 0;
 let panelVisible = false;
 
+// ── Chat mode state ────────────────────────────────────────────
+let chatMode = false;
+let chatHistory = [];
+let chatSystemContext = "";
+let chatMessagesEl = null;
+let chatInputEl = null;
+let chatSendBtn = null;
+let chatExpandLink = null;
+let chatSending = false;
+
+// ── Session memory ─────────────────────────────────────────────
+/** @type {Array<{triggerId: string, timestamp: number, action: string}>} */
+const sessionEvents = [];
+
 // ── DOM construction ────────────────────────────────────────────
 
 function buildPanel() {
@@ -53,6 +67,12 @@ function buildPanel() {
     </div>
     <div class="alfred-body"></div>
     <div class="alfred-actions"></div>
+    <div class="alfred-messages"></div>
+    <div class="alfred-input-row">
+      <input type="text" class="alfred-chat-input" placeholder="Ask Alfred..." />
+      <button class="alfred-send-btn" type="button">Send</button>
+    </div>
+    <a class="alfred-expand-link">Open full chat</a>
     <div class="alfred-countdown-bar"></div>
   `;
 
@@ -64,13 +84,47 @@ function buildPanel() {
   actionsEl = panel.querySelector(".alfred-actions");
   closeBtn = panel.querySelector(".alfred-close");
   countdownBarEl = panel.querySelector(".alfred-countdown-bar");
+  chatMessagesEl = panel.querySelector(".alfred-messages");
+  chatInputEl = panel.querySelector(".alfred-chat-input");
+  chatSendBtn = panel.querySelector(".alfred-send-btn");
+  chatExpandLink = panel.querySelector(".alfred-expand-link");
 
   closeBtn.addEventListener("click", () => {
+    if (chatMode) {
+      recordSessionEvent(currentTriggerId, "chatted");
+    }
     // Dismiss via X => suppress trigger for session
     if (currentTriggerId) {
       suppressForSession(currentTriggerId);
     }
+    exitChatMode();
     dismissPanel();
+  });
+
+  // Chat input: send on Enter
+  chatInputEl.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      sendChatMessage();
+    }
+  });
+
+  // Send button
+  chatSendBtn.addEventListener("click", () => {
+    sendChatMessage();
+  });
+
+  // Expand link: open full chat wizard
+  chatExpandLink.addEventListener("click", (e) => {
+    e.preventDefault();
+    const triggerDef = currentTriggerId ? triggers.get(currentTriggerId) : null;
+    const title = triggerDef?.label || "Alfred";
+    const context = chatSystemContext;
+    const history = [...chatHistory];
+    markHandled(currentTriggerId);
+    exitChatMode();
+    dismissPanel();
+    openChatWizard({ title, systemContext: context, initialMessage: history.length > 0 ? history[0].content : "" });
   });
 
   return panel;
@@ -132,9 +186,15 @@ function markHandled(triggerId) {
 function showPanel(triggerId, context, triggerDef) {
   if (!panelEl) return;
 
+  // Exit any prior chat mode
+  exitChatMode();
+
   currentTriggerId = triggerId;
   currentPriority = triggerDef.priority || 0;
   const { initialMessage, actions } = context;
+
+  // Record session event: shown
+  recordSessionEvent(triggerId, "shown");
 
   // Header label
   if (headerLabelEl) {
@@ -158,19 +218,17 @@ function showPanel(triggerId, context, triggerDef) {
         if (action.dismiss) {
           btn.className = "alfred-btn alfred-btn-dismiss";
           btn.addEventListener("click", () => {
+            recordSessionEvent(triggerId, "dismissed");
             snooze(triggerId, triggerDef.snoozeDuration || 3600000);
             dismissPanel();
           });
         } else if (action.chat) {
           btn.className = "alfred-btn alfred-btn-primary";
           btn.addEventListener("click", () => {
-            markHandled(triggerId);
-            dismissPanel();
-            openChatWizard({
-              title: triggerDef.label || "Alfred",
-              systemContext: context.systemContext || "",
-              initialMessage: context.chatMessage || initialMessage || ""
-            });
+            // Enter inline chat mode instead of opening full modal
+            const sysCtx = buildFullSystemContext(context.systemContext || "", triggerId);
+            const firstMsg = context.chatMessage || initialMessage || "";
+            enterChatMode(sysCtx, firstMsg, triggerId);
           });
         } else if (action.callback && typeof action.callback === "function") {
           btn.className = "alfred-btn alfred-btn-secondary";
@@ -265,10 +323,12 @@ export function initAlfredOverlay() {
  * @param {string} def.id
  * @param {number} def.priority — 1-10
  * @param {number} def.cooldown — ms
- * @param {Function} def.contextBuilder — () => { initialMessage, actions[], systemContext?, chatMessage? }
+ * @param {Function} def.contextBuilder — (extra) => { initialMessage, actions[], systemContext?, chatMessage? }
+ *                                         May be async (return a Promise).
  * @param {string} def.label — human-readable label for the panel header
  * @param {number} [def.snoozeDuration] — ms to snooze on "Not now" (default 1h)
  * @param {boolean} [def.enabled] — if false, trigger cannot fire (default true)
+ * @param {string} [def.autoFireOn] — event name that triggers automatic firing via notify()
  */
 export function registerTrigger(def) {
   if (!def || !def.id) return;
@@ -282,6 +342,7 @@ export function registerTrigger(def) {
 /**
  * Attempt to fire a trigger. Checks suppression rules before showing.
  * If a higher-priority trigger is already showing, the new one preempts only if higher priority.
+ * contextBuilder may be async (e.g. for Tauri command calls) — handled transparently.
  * @param {string} triggerId
  * @param {Object} [extraContext] — merged into contextBuilder output
  */
@@ -296,11 +357,36 @@ export function fireTrigger(triggerId, extraContext) {
   // If panel is already open with a higher-priority trigger, don't preempt
   if (panelVisible && currentPriority >= def.priority && currentTriggerId !== triggerId) return;
 
-  // Build context
-  let context = {};
+  // Build context — contextBuilder may return a Promise (async)
+  let contextResult = {};
   if (typeof def.contextBuilder === "function") {
-    context = def.contextBuilder(extraContext) || {};
+    contextResult = def.contextBuilder(extraContext);
   }
+
+  // Handle async contextBuilder transparently
+  if (contextResult && typeof contextResult.then === "function") {
+    // Mark as fired early to prevent duplicate fires while awaiting
+    markFired(triggerId, def.cooldown);
+    contextResult.then((resolved) => {
+      let context = resolved || {};
+      if (extraContext) {
+        context = { ...context, ...extraContext };
+      }
+      // Re-check suppression — state may have changed while awaiting
+      if (panelVisible && currentPriority >= def.priority && currentTriggerId !== triggerId) return;
+      if (panelVisible) {
+        clearAutoDismiss();
+        panelEl.classList.remove("visible");
+      }
+      showPanel(triggerId, context, def);
+    }).catch((err) => {
+      console.warn(`[Alfred] contextBuilder for "${triggerId}" failed:`, err);
+    });
+    return;
+  }
+
+  // Synchronous path
+  let context = contextResult || {};
   if (extraContext) {
     context = { ...context, ...extraContext };
   }
@@ -355,11 +441,22 @@ export function isOpen() {
 }
 
 /**
- * Store an event for triggers to inspect later.
- * Triggers can call eventStore.get(eventName) to check data.
+ * Store an event and auto-fire any triggers registered with a matching autoFireOn.
+ *
+ * Phase A stored events passively. Phase B adds reactive dispatch: when a trigger
+ * declares `autoFireOn: "run-failed"`, calling `notify("run-failed", data)` will
+ * automatically attempt to fire that trigger with the event data as extra context.
+ *
  * @param {string} eventName
  * @param {*} data
  */
 export function notify(eventName, data) {
   eventStore.set(eventName, { data, timestamp: Date.now() });
+
+  // Phase B: reactive dispatch — fire triggers whose autoFireOn matches this event
+  for (const [, def] of triggers) {
+    if (def.autoFireOn === eventName && def.enabled) {
+      fireTrigger(def.id, data);
+    }
+  }
 }

@@ -577,6 +577,6 @@ export function registerDefaultTriggers(overlay) {
         };
       } catch { return null; }
     },
-    autoFireOn: "run-completed"
+    autoFireOn: "app-ready"
   });
 }

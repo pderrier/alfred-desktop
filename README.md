@@ -8,17 +8,30 @@
 
 ## Download
 
-**[Windows installer (MSI)](https://vps-c5793aab.vps.ovh.net/alfred/release/windows/latest)** — Alfred Desktop v0.1.0 for Windows 10/11 (x64)
+**[Windows installer (MSI)](https://vps-c5793aab.vps.ovh.net/alfred/release/windows/latest)** — Alfred Desktop v0.2.1 for Windows 10/11 (x64)
 
 > Note: The installer is not code-signed yet. Windows SmartScreen may show a warning — click "More info" → "Run anyway" to proceed.
 
-**[macOS installer (DMG)](https://vps-c5793aab.vps.ovh.net/alfred/release/macos/latest)** — Alfred Desktop v0.1.0 for macOS 10.15+ (Apple Silicon)
+**[macOS installer (DMG)](https://vps-c5793aab.vps.ovh.net/alfred/release/macos/latest)** — Alfred Desktop v0.2.1 for macOS 10.15+ (Apple Silicon)
 
 > **Note: The DMG is not notarized yet.** macOS Gatekeeper will block the app on first launch. Three ways to bypass it:
 >
 > 1. **Right-click → Open** on the app in Finder, then click "Open" in the dialog. Simplest — works on most setups.
 > 2. **System Settings → Privacy & Security → Open Anyway** — after a blocked launch attempt, a button appears at the bottom of the Privacy & Security pane.
 > 3. **Terminal (power users):** `xattr -cr "/Applications/Alfred Desktop.app"` — strips the quarantine attribute entirely; no dialog needed after that.
+
+## What's new in v0.2.1
+
+- **Stale position alerts** — sidebar badge + overdue markers when positions need reanalysis
+- **Theme concentration risk** — detects when 3+ positions share a news theme, warns in synthesis and UI
+- **Signal scorecard** — "Was I Right?" accuracy tracker per position in the detail modal
+- **Run diff view** — "What Changed" summary at top of report (signal upgrades/downgrades, price moves)
+- **Alfred overlay** — proactive assistant infrastructure (trigger system, idle detection, panel renderer)
+- **Chat drill-down** — "Discuss about it" button now at top of position modal (always visible)
+- **Unified view architecture** — single data source for all rendering paths, no more display glitches when browsing
+- **Cash mapping fixes** — 5 bugs fixed: semantic name matching, pre-run wizard timing, save persistence feedback
+- **Update modal** — proper centered dialog replaces the old inline banner
+- **Cache race fix** — synthesis results no longer lost when MCP server and main process write concurrently
 
 ## Features
 

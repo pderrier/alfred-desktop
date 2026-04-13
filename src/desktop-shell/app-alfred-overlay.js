@@ -286,6 +286,255 @@ function clearAutoDismiss() {
   }
 }
 
+// ── Session memory ─────────────────────────────────────────────
+
+function recordSessionEvent(triggerId, action) {
+  if (!triggerId) return;
+  sessionEvents.push({ triggerId, timestamp: Date.now(), action });
+}
+
+/**
+ * Build a human-readable summary of what Alfred showed this session.
+ * Used as additional context when entering chat mode.
+ * @returns {string}
+ */
+export function getSessionContext() {
+  if (sessionEvents.length === 0) return "";
+  const lines = [];
+  const triggerLabels = new Map();
+  for (const [id, def] of triggers) {
+    triggerLabels.set(id, def.label || id);
+  }
+  // Deduplicate — summarize by trigger
+  const byTrigger = new Map();
+  for (const evt of sessionEvents) {
+    if (!byTrigger.has(evt.triggerId)) {
+      byTrigger.set(evt.triggerId, []);
+    }
+    byTrigger.get(evt.triggerId).push(evt);
+  }
+  for (const [tid, events] of byTrigger) {
+    const label = triggerLabels.get(tid) || tid;
+    const actions = events.map((e) => e.action);
+    const chatted = actions.includes("chatted");
+    const dismissed = actions.includes("dismissed");
+    if (chatted) {
+      lines.push(`Earlier this session, I showed "${label}" and you chatted with me about it.`);
+    } else if (dismissed) {
+      lines.push(`Earlier this session, I showed "${label}" but you dismissed it.`);
+    } else {
+      lines.push(`Earlier this session, I showed "${label}".`);
+    }
+  }
+  return lines.join(" ");
+}
+
+/**
+ * Combine the trigger-specific system context with session memory.
+ * @param {string} triggerContext — the trigger's systemContext
+ * @param {string} triggerId
+ * @returns {string}
+ */
+function buildFullSystemContext(triggerContext, triggerId) {
+  const session = getSessionContext();
+  let ctx = triggerContext || "";
+  if (session) {
+    ctx += "\n\n[Session context] " + session;
+  }
+  return ctx;
+}
+
+// ── Chat mode engine ───────────────────────────────────────────
+
+/**
+ * Enter inline chat mode in the Alfred panel.
+ * Hides the static body/actions and shows the message area + input.
+ * @param {string} systemContext — system prompt for LLM
+ * @param {string} firstMessage — initial assistant message
+ * @param {string} [triggerId] — the trigger that opened chat mode
+ */
+export function enterChatMode(systemContext, firstMessage, triggerId) {
+  if (!panelEl) return;
+
+  chatMode = true;
+  chatHistory = [];
+  chatSystemContext = systemContext || "";
+  chatSending = false;
+
+  // Stop auto-dismiss — chat mode stays open
+  clearAutoDismiss();
+
+  // Switch panel to chat mode
+  panelEl.classList.add("alfred-chat-mode");
+
+  // Hide static content
+  if (bodyEl) bodyEl.style.display = "none";
+  if (actionsEl) actionsEl.style.display = "none";
+  if (countdownBarEl) countdownBarEl.style.display = "none";
+
+  // Show chat elements
+  if (chatMessagesEl) {
+    chatMessagesEl.style.display = "flex";
+    chatMessagesEl.innerHTML = "";
+  }
+  if (chatInputEl) {
+    chatInputEl.parentElement.style.display = "flex";
+    chatInputEl.value = "";
+    chatInputEl.disabled = false;
+  }
+  if (chatSendBtn) chatSendBtn.disabled = false;
+  if (chatExpandLink) chatExpandLink.style.display = "";
+
+  // Add initial assistant message
+  if (firstMessage) {
+    addChatBubble("assistant", firstMessage);
+    chatHistory.push({ role: "assistant", content: firstMessage });
+  }
+
+  // Record session event
+  recordSessionEvent(triggerId || currentTriggerId, "chatted");
+
+  // Focus the input
+  if (chatInputEl) chatInputEl.focus();
+}
+
+/**
+ * Exit chat mode, restoring the panel to its static notification layout.
+ */
+function exitChatMode() {
+  if (!chatMode) return;
+  chatMode = false;
+  chatHistory = [];
+  chatSystemContext = "";
+  chatSending = false;
+
+  if (!panelEl) return;
+  panelEl.classList.remove("alfred-chat-mode");
+
+  // Restore static content visibility
+  if (bodyEl) bodyEl.style.display = "";
+  if (actionsEl) actionsEl.style.display = "";
+  if (countdownBarEl) countdownBarEl.style.display = "";
+
+  // Hide chat elements
+  if (chatMessagesEl) {
+    chatMessagesEl.style.display = "none";
+    chatMessagesEl.innerHTML = "";
+  }
+  if (chatInputEl) chatInputEl.parentElement.style.display = "none";
+  if (chatExpandLink) chatExpandLink.style.display = "none";
+}
+
+/**
+ * Add a message bubble to the chat area.
+ * @param {"user"|"assistant"} role
+ * @param {string} text
+ * @returns {HTMLElement}
+ */
+function addChatBubble(role, text) {
+  if (!chatMessagesEl) return null;
+  const bubble = document.createElement("div");
+  bubble.className = role === "user" ? "alfred-msg-user" : "alfred-msg-assistant";
+  bubble.textContent = text;
+  chatMessagesEl.appendChild(bubble);
+  chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
+  return bubble;
+}
+
+/**
+ * Show a typing indicator in the chat area.
+ * @returns {HTMLElement}
+ */
+function showTypingIndicator() {
+  if (!chatMessagesEl) return null;
+  const indicator = document.createElement("div");
+  indicator.className = "alfred-msg-assistant alfred-typing";
+  indicator.innerHTML = '<span class="dot"></span><span class="dot"></span><span class="dot"></span>';
+  chatMessagesEl.appendChild(indicator);
+  chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
+  return indicator;
+}
+
+/**
+ * Send a message in the mini-chat. Calls chat_wizard_send_local Tauri command.
+ */
+async function sendChatMessage() {
+  if (!chatMode || chatSending) return;
+  const text = (chatInputEl?.value || "").trim();
+  if (!text) return;
+
+  chatSending = true;
+  chatInputEl.value = "";
+  if (chatInputEl) chatInputEl.disabled = true;
+  if (chatSendBtn) chatSendBtn.disabled = true;
+
+  // User bubble
+  addChatBubble("user", text);
+  chatHistory.push({ role: "user", content: text });
+
+  // Typing indicator
+  const typing = showTypingIndicator();
+
+  try {
+    const tauriInvoke = window?.__TAURI__?.core?.invoke;
+    if (!tauriInvoke) throw new Error("Tauri not available");
+
+    const result = await tauriInvoke("chat_wizard_send_local", {
+      context: chatSystemContext,
+      history: chatHistory.slice(0, -1), // prior messages (user msg sent separately)
+      userMessage: text,
+    });
+
+    // Remove typing indicator
+    if (typing && typing.parentElement) typing.remove();
+
+    const response = result?.response || "(no response)";
+    addChatBubble("assistant", response);
+    chatHistory.push({ role: "assistant", content: response });
+  } catch (err) {
+    // Remove typing indicator
+    if (typing && typing.parentElement) typing.remove();
+    addChatBubble("assistant", `Error: ${err?.message || err}`);
+  }
+
+  chatSending = false;
+  if (chatInputEl) chatInputEl.disabled = false;
+  if (chatSendBtn) chatSendBtn.disabled = false;
+  if (chatInputEl) chatInputEl.focus();
+}
+
+// ── Persistent session state (Tauri) ───────────────────────────
+
+/**
+ * Save Alfred session state to disk via Tauri command.
+ * @param {Object} state
+ */
+async function saveSessionState(state) {
+  try {
+    const tauriInvoke = window?.__TAURI__?.core?.invoke;
+    if (!tauriInvoke) return;
+    await tauriInvoke("save_alfred_state_local", { state });
+  } catch (err) {
+    console.warn("[Alfred] Failed to save session state:", err);
+  }
+}
+
+/**
+ * Load Alfred session state from disk via Tauri command.
+ * @returns {Promise<Object>}
+ */
+async function loadSessionState() {
+  try {
+    const tauriInvoke = window?.__TAURI__?.core?.invoke;
+    if (!tauriInvoke) return {};
+    const result = await tauriInvoke("load_alfred_state_local");
+    return result || {};
+  } catch (err) {
+    console.warn("[Alfred] Failed to load session state:", err);
+    return {};
+  }
+}
+
 // ── Public API ──────────────────────────────────────────────────
 
 /**
@@ -294,6 +543,21 @@ function clearAutoDismiss() {
  */
 export function initAlfredOverlay() {
   buildPanel();
+
+  // Initialize chat elements as hidden (non-chat mode default)
+  if (chatMessagesEl) chatMessagesEl.style.display = "none";
+  if (chatInputEl) chatInputEl.parentElement.style.display = "none";
+  if (chatExpandLink) chatExpandLink.style.display = "none";
+
+  // Load persisted session state (async, non-blocking)
+  loadSessionState().then((state) => {
+    if (state && Array.isArray(state.sessionEvents)) {
+      // Restore prior session events for context continuity
+      for (const evt of state.sessionEvents) {
+        sessionEvents.push(evt);
+      }
+    }
+  });
 
   // Expose a debug hook for console testing (Phase A acceptance criterion)
   window.__alfred = {
@@ -304,7 +568,16 @@ export function initAlfredOverlay() {
     },
     hide: () => dismissPanel(),
     triggers: () => [...triggers.keys()],
-    fire: (id, extra) => fireTrigger(id, extra)
+    fire: (id, extra) => fireTrigger(id, extra),
+    chat: (ctx) => {
+      if (panelEl) {
+        const sysCtx = ctx?.systemContext || "You are Alfred, a helpful portfolio assistant.";
+        const msg = ctx?.initialMessage || "How can I help?";
+        showPanel("__debug_chat__", { initialMessage: msg, actions: [{ label: "Talk to Alfred", chat: true }], systemContext: sysCtx, chatMessage: msg }, { priority: 1, label: "Debug Chat" });
+      }
+    },
+    sessionContext: () => getSessionContext(),
+    sessionEvents: () => [...sessionEvents]
   };
 
   return {
@@ -313,7 +586,9 @@ export function initAlfredOverlay() {
     dismissPanel,
     snooze,
     isOpen,
-    notify
+    notify,
+    enterChatMode,
+    getSessionContext
   };
 }
 
@@ -409,10 +684,16 @@ export function fireTrigger(triggerId, extraContext) {
 export function dismissPanel() {
   if (!panelEl) return;
   clearAutoDismiss();
+  exitChatMode();
   panelEl.classList.remove("visible");
   panelVisible = false;
   currentTriggerId = null;
   currentPriority = 0;
+
+  // Persist session state (non-blocking)
+  if (sessionEvents.length > 0) {
+    saveSessionState({ sessionEvents, savedAt: new Date().toISOString() });
+  }
 
   // After transition ends, add hidden class
   setTimeout(() => {

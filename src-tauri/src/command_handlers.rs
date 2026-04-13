@@ -543,6 +543,23 @@ pub fn run_account_positions(account: String) -> Result<serde_json::Value> {
     Ok(json!({ "positions": [], "source": "none" }))
 }
 
+// ── Alfred Session State (Phase D) ──
+
+pub fn run_save_alfred_state(state: serde_json::Value) -> Result<serde_json::Value> {
+    let path = crate::resolve_runtime_state_dir().join("alfred-session.json");
+    crate::storage::write_json_file(&path, &state)?;
+    Ok(json!({"ok": true}))
+}
+
+pub fn run_load_alfred_state() -> Result<serde_json::Value> {
+    let path = crate::resolve_runtime_state_dir().join("alfred-session.json");
+    if path.exists() {
+        crate::storage::read_json_file(&path)
+    } else {
+        Ok(json!({}))
+    }
+}
+
 pub fn run_ensure_codex() -> Result<serde_json::Value> {
     crate::codex::ensure_codex_available()
 }

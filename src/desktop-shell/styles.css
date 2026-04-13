@@ -2437,3 +2437,141 @@ main {
   opacity: 0.4;
   width: 0%;
 }
+
+/* ── Alfred Chat Mode (Phase D) ──────────────────────────────── */
+
+.alfred-panel.alfred-chat-mode {
+  height: 420px;
+  max-height: calc(100vh - 3rem);
+}
+
+.alfred-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0.6rem 0.8rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  min-height: 0;
+  max-height: 300px;
+  scroll-behavior: smooth;
+}
+
+.alfred-msg-user,
+.alfred-msg-assistant {
+  max-width: 85%;
+  padding: 0.5rem 0.75rem;
+  border-radius: 10px;
+  font-size: 0.8rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.alfred-msg-user {
+  align-self: flex-end;
+  background: rgba(56, 132, 244, 0.18);
+  color: var(--text-primary, #e0e8f0);
+  border-bottom-right-radius: 3px;
+}
+
+.alfred-msg-assistant {
+  align-self: flex-start;
+  background: rgba(73, 100, 126, 0.22);
+  color: var(--text-primary, #e0e8f0);
+  border-bottom-left-radius: 3px;
+}
+
+.alfred-input-row {
+  display: flex;
+  gap: 0.4rem;
+  padding: 0.5rem 0.8rem;
+  border-top: 1px solid var(--border-soft);
+  align-items: center;
+}
+
+.alfred-chat-input {
+  flex: 1;
+  background: rgba(10, 17, 24, 0.5);
+  border: 1px solid rgba(73, 100, 126, 0.4);
+  border-radius: 8px;
+  color: var(--text-primary, #e0e8f0);
+  padding: 0.4rem 0.6rem;
+  font-size: 0.8rem;
+  font-family: inherit;
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.alfred-chat-input:focus {
+  border-color: rgba(142, 202, 230, 0.6);
+}
+
+.alfred-chat-input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.alfred-send-btn {
+  padding: 0.4rem 0.7rem;
+  font-size: 0.76rem;
+  font-weight: 600;
+  border-radius: 8px;
+  border: 1px solid rgba(142, 202, 230, 0.5);
+  background: linear-gradient(180deg, rgba(142, 202, 230, 0.22) 0%, rgba(142, 202, 230, 0.10) 100%);
+  color: var(--accent);
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+  white-space: nowrap;
+}
+
+.alfred-send-btn:hover:not(:disabled) {
+  background: linear-gradient(180deg, rgba(142, 202, 230, 0.32) 0%, rgba(142, 202, 230, 0.18) 100%);
+  border-color: rgba(142, 202, 230, 0.7);
+}
+
+.alfred-send-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.alfred-expand-link {
+  display: block;
+  text-align: center;
+  padding: 0.3rem 0.8rem 0.5rem;
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  text-decoration: none;
+  cursor: pointer;
+  transition: color 0.15s;
+}
+
+.alfred-expand-link:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+/* Typing indicator dots */
+.alfred-typing {
+  display: flex;
+  gap: 0.25rem;
+  align-items: center;
+  padding: 0.6rem 0.75rem;
+}
+
+.alfred-typing .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-secondary);
+  animation: alfred-dot-pulse 1.4s infinite ease-in-out both;
+}
+
+.alfred-typing .dot:nth-child(1) { animation-delay: -0.32s; }
+.alfred-typing .dot:nth-child(2) { animation-delay: -0.16s; }
+.alfred-typing .dot:nth-child(3) { animation-delay: 0s; }
+
+@keyframes alfred-dot-pulse {
+  0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
+  40% { transform: scale(1); opacity: 1; }
+}

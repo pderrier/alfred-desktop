@@ -577,6 +577,6 @@ export function registerDefaultTriggers(overlay) {
         };
       } catch { return null; }
     },
-    autoFireOn: "app-ready"
+    autoFireOn: "run-wizard-opened"
   });
 }

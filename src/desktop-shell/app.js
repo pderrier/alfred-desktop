@@ -225,6 +225,7 @@ const runOperations = createRunOperationsController({
 // ── Alfred Overlay (proactive assistant panel) ──────────────────
 
 const alfredOverlay = initAlfredOverlay();
+window.__alfredOverlay = alfredOverlay; // exposed for cross-module notify (run wizard, etc.)
 registerDefaultTriggers(alfredOverlay);
 startIdleTimer(() => alfredOverlay.notify("idle", {}), 300000);
 

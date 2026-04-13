@@ -339,6 +339,8 @@ export function initWizard(deps) {
     loadGuidelinesForAccount(targetAccount || getSelectedWizardAccount());
     refreshWizardAnalysisModes();
     setWizardVisible(true);
+    // Notify Alfred — strategy refinement trigger checks if guidelines are empty
+    window.__alfredOverlay?.notify?.("run-wizard-opened", { account: targetAccount || getSelectedWizardAccount() });
     if (statusText) setWizardStatus(statusText, statusClass || "status-idle");
   }
 

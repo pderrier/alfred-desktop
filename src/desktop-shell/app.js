@@ -1648,9 +1648,13 @@ async function processOnboardingResult(history) {
   }
 
   // Detect LLM backend choice
+  let wantsCodex = false;
   const nativePatterns = /\b(native|api key|api.key|cl[e\u00e9].*api|openai.*key|pay.per.use)\b/;
+  const codexPatterns = /\b(codex|free|gratuit|oauth|option 1|choix 1)\b/;
   if (nativePatterns.test(allText)) {
     wantsNativeApi = true;
+  } else if (codexPatterns.test(allText)) {
+    wantsCodex = true;
   }
 
   // Detect API key in user messages (OpenAI keys start with sk-)
@@ -1688,10 +1692,21 @@ async function processOnboardingResult(history) {
     }
   }
 
-  // 2. Trigger Finary connection if requested
+  // 2. Trigger Finary connection if requested (non-blocking — runs in background)
   if (wantsFinary) {
-    // Use the same flow as the Connect Finary button
     window.__connectFinary?.();
+  }
+
+  // 2b. Trigger Codex OAuth login if user chose Codex (and no API key was provided)
+  if (wantsCodex && !apiKeyProvided) {
+    try {
+      await bridge.codexSessionLogin();
+      showToast("OpenAI connected via Codex", "success");
+      await refreshAccountStatus();
+      updateAuthPills();
+    } catch (err) {
+      showToast(`Codex sign-in: ${formatBridgeError(err)}`, "error");
+    }
   }
 
   // 3. Mark onboarding complete

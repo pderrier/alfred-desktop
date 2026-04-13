@@ -514,13 +514,13 @@ export function registerDefaultTriggers(overlay) {
         const gl = guidelines.toLowerCase();
         // Check which strategy aspects are covered (not just length)
         const aspects = [
-          { key: "horizon", patterns: /horizon|terme|court.terme|long.terme|moyen.terme|short.term|long.term|ans?[\s,]|year/ },
-          { key: "risk", patterns: /risque|risk|conservat|agressif|aggressive|balanced|equilibr|prudent|dynamique/ },
-          { key: "style", patterns: /value|croissance|growth|dividende|dividend|income|passif|passive|index/ },
-          { key: "sectors", patterns: /secteur|sector|tech|sante|health|energie|energy|financ|industriel/ },
-          { key: "geography", patterns: /geograph|europe|france|us|usa|mondial|global|emergent|emerging/ },
-          { key: "constraints", patterns: /pea|cto|compte.titre|enveloppe|fiscal|tax/ },
-          { key: "goals", patterns: /objectif|goal|retraite|retirement|immobilier|epargne|patrimoine|wealth/ },
+          { key: "horizon", patterns: /horizon|terme|court[\s-]?terme|long[\s-]?terme|moyen[\s-]?terme|short[\s-]?term|long[\s-]?term|medium[\s-]?term|\d+\s*ans?|\d+\s*years?|dur[eé]e|temporalit|placement.*dur|p[eé]riode|holding period/ },
+          { key: "risk", patterns: /risque|risk|conservat|agress|defensive|d[eé]fensif|balanced|[eé]quilibr|prudent|dynamique|mod[eé]r[eé]|tol[eé]rance|volatilit|s[eé]curit|protection|drawdown|perte max/ },
+          { key: "style", patterns: /value|croissance|growth|dividende|dividend|income|rendement|passif|passive|index|etf|stock.pick|fond|opcvm|buy.and.hold|momentum|quality|contrarian|small.cap|large.cap|mid.cap|blend/ },
+          { key: "sectors", patterns: /secteur|sector|tech|sant[eé]|health|[eé]nergie|energy|financ|industriel|pharma|luxe|d[eé]fense|immobilier|reit|consumer|consomm|telecom|mat[eé]riaux|materials|automobile|a[eé]ro|spatial|ia\b|intelligence artificielle|biotech|crypto|minier|utilities|infra/ },
+          { key: "geography", patterns: /g[eé]ograph|europe|france|fran[cç]ais|us\b|usa|am[eé]ric|mondial|global|[eé]mergent|emerging|asie|asia|japon|japan|chine|china|international|domestique|zone euro|eurozone|uk|royaume.uni|nordic|scandina|afrique|latam|br[eé]sil/ },
+          { key: "constraints", patterns: /pea|cto|compte[\s-]?titre|enveloppe|fiscal|tax|assurance[\s-]?vie|av\b|per\b|[eé]ligib|wrapper|d[eé]duction|imp[oô]t|niche|plafond|versement|retrait/ },
+          { key: "goals", patterns: /objectif|goal|retraite|retirement|immobilier|[eé]pargne|patrimoine|wealth|compl[eé]ment.*revenu|rente|capital|ind[eé]pendance|libert[eé]|[eé]tudes|education|enfant|child|succession|h[eé]ritage|achat|maison|house|voyage|projet|s[eé]curit[eé].*financi/ },
         ];
         const covered = aspects.filter(a => a.patterns.test(gl));
         const missing = aspects.filter(a => !a.patterns.test(gl));

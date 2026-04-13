@@ -690,6 +690,24 @@ async function refreshDashboardInner() {
   checkAmbiguousCashGroups(finaryMeta).catch(() => {});
 }
 
+/**
+ * Given a raw name (possibly decorated with parenthesized amounts), find the
+ * closest canonical name from a list. Strips trailing `(...)`, tries exact,
+ * case-insensitive, and substring containment matches.
+ */
+function findClosestName(rawName, canonicalNames) {
+  const cleaned = (rawName || "").replace(/\s*\([^)]*\)\s*$/, "").trim();
+  if (canonicalNames.includes(cleaned)) return cleaned;
+  const lower = cleaned.toLowerCase();
+  const ci = canonicalNames.find((n) => n.toLowerCase() === lower);
+  if (ci) return ci;
+  const sub = canonicalNames.find(
+    (n) => lower.includes(n.toLowerCase()) || n.toLowerCase().includes(lower)
+  );
+  if (sub) return sub;
+  return cleaned; // best effort
+}
+
 /** Track whether we've already prompted for ambiguous cash groups this session */
 let cashWizardShownThisSession = false;
 
@@ -749,7 +767,16 @@ async function checkAmbiguousCashGroups(finaryMeta) {
           }
         } else {
           // User provided explicit mapping: { inv_name: cash_name }
-          Object.assign(prefs.cash_account_links, result);
+          // Keys are already normalized by extractCashMapping(), but do a final
+          // safety pass: resolve each key against known investmentAccount names
+          // so decorated text (e.g. "Compte espèce PEA (228.45€)") never leaks.
+          const knownInvNames = investmentAccounts.map((a) => a.name);
+          const knownCashNames = cashAccounts.map((a) => a.name);
+          for (const [rawKey, rawVal] of Object.entries(result)) {
+            const cleanKey = findClosestName(rawKey, knownInvNames);
+            const cleanVal = findClosestName(rawVal, knownCashNames);
+            prefs.cash_account_links[cleanKey] = cleanVal;
+          }
         }
 
         await tauriInvoke("save_user_preferences_local", { prefs });

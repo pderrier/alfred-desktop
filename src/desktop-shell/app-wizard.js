@@ -9,6 +9,7 @@ import {
 } from "/desktop-shell/run-wizard-policy.js";
 import { buildRunAnalysisOptions } from "/desktop-shell/report-view-model.js";
 import { formatBridgeError, isErrorCritical, extractErrorCode } from "/shared/run-operations-controller.js";
+import { openCashMatchingWizard } from "/desktop-shell/app-chat-wizard.js";
 
 // ── DOM nodes ────────────────────────────────────────────────────
 
@@ -414,6 +415,64 @@ export function initWizard(deps) {
         runMode: analysisMode
       });
       if (account && guidelines) saveGuidelinesForAccount(account, guidelines);
+
+      // Bug 3 fix: Check for unresolved ambiguous cash groups BEFORE starting the run.
+      // If the source is Finary-based and there are uncovered cash mappings, show the
+      // cash wizard first so the mapping is saved before the pipeline reads it.
+      if (source === "finary" || source === "finary_cached") {
+        try {
+          const tauriInvoke = window?.__TAURI__?.core?.invoke;
+          if (tauriInvoke) {
+            const preRunPrefs = await tauriInvoke("get_user_preferences_local") || {};
+            const finaryMeta = getLatestDashboardPayload()?.snapshot?.latest_finary_snapshot || {};
+            const groups = Array.isArray(finaryMeta.ambiguous_cash_groups)
+              ? finaryMeta.ambiguous_cash_groups
+              : [];
+            const savedLinks = preRunPrefs.cash_account_links || {};
+            const uncoveredGroups = groups.filter((g) =>
+              (g.investment_accounts || []).some((a) => !savedLinks[a.name])
+            );
+            if (uncoveredGroups.length > 0) {
+              // Show cash wizard for each uncovered group before proceeding
+              for (const group of uncoveredGroups) {
+                const investmentAccounts = group.investment_accounts || [];
+                const cashAccounts = group.cash_accounts || [];
+                if (investmentAccounts.length === 0 || cashAccounts.length === 0) continue;
+                const currentMapping = {};
+                for (let i = 0; i < investmentAccounts.length; i++) {
+                  if (cashAccounts[i]) {
+                    currentMapping[investmentAccounts[i].name] = cashAccounts[i].fiats_sum;
+                  }
+                }
+                const wizResult = await openCashMatchingWizard({
+                  investmentAccounts,
+                  cashAccounts,
+                  currentMapping,
+                });
+                if (wizResult) {
+                  const prefs = await tauriInvoke("get_user_preferences_local") || {};
+                  if (!prefs.cash_account_links) prefs.cash_account_links = {};
+                  if (wizResult.confirmed) {
+                    for (let i = 0; i < investmentAccounts.length; i++) {
+                      if (cashAccounts[i]) {
+                        prefs.cash_account_links[investmentAccounts[i].name] = cashAccounts[i].name;
+                      }
+                    }
+                  } else {
+                    Object.assign(prefs.cash_account_links, wizResult);
+                  }
+                  await tauriInvoke("save_user_preferences_local", { prefs });
+                  showToast("Cash account mapping saved", "success");
+                } else {
+                  // User cancelled — warn but allow the run to proceed with incomplete mapping
+                  showToast("Cash mapping skipped — cash values may be zero", "warning");
+                }
+              }
+            }
+          }
+        } catch { /* cash pre-check failed — proceed anyway */ }
+      }
+
       setWizardVisible(false);
       try {
         await runOperations.runAnalysis(options);

@@ -295,30 +295,100 @@ Does this mapping look correct? You can say "yes" to confirm, or tell me which a
 }
 
 /**
+ * Strip trailing parenthesized content and trim whitespace from an account name.
+ * E.g. `"Compte espèce PEA (228.45€)"` → `"Compte espèce PEA"`
+ */
+function normalizeAccountName(name) {
+  return (name || "").replace(/\s*\([^)]*\)\s*$/, "").trim();
+}
+
+/**
+ * Given a raw key extracted from the LLM, find the best matching canonical account name.
+ * Checks exact match first, then normalized match, then substring containment.
+ */
+function resolveToCanonicalName(rawName, canonicalNames) {
+  const normalized = normalizeAccountName(rawName);
+  // Exact match
+  if (canonicalNames.includes(normalized)) return normalized;
+  // Case-insensitive match
+  const lower = normalized.toLowerCase();
+  const ci = canonicalNames.find((n) => n.toLowerCase() === lower);
+  if (ci) return ci;
+  // Substring containment — the canonical name is contained in the raw name or vice versa
+  const sub = canonicalNames.find(
+    (n) => lower.includes(n.toLowerCase()) || n.toLowerCase().includes(lower)
+  );
+  if (sub) return sub;
+  // Fallback: return normalized form (best effort)
+  return normalized;
+}
+
+/**
+ * Parse arrow-separated mapping lines from text.
+ * Handles: `->`, `→`, `←`, `<->`, with or without quotes, bullet points, numbered lists.
+ * Returns array of [left, right] pairs.
+ */
+function parseArrowLines(text) {
+  const pairs = [];
+  const lines = text.split("\n");
+  // Match lines with -> or → (with optional leading bullets, numbers, dashes)
+  const arrowRe = /^[\s\-*\d.)]*["']?(.+?)["']?\s*(?:->|→|<->|<→)\s*["']?(.+?)["']?\s*$/;
+  for (const line of lines) {
+    const m = line.match(arrowRe);
+    if (m && m[1] && m[2]) {
+      pairs.push([m[1].trim(), m[2].trim()]);
+    }
+  }
+  return pairs;
+}
+
+/**
  * Parse the conversation to extract the confirmed cash account mapping.
  * Looks for the last assistant message with a MAPPING: block, or falls back
- * to user confirmation of the initial mapping.
+ * to arrow-line scanning, then to user confirmation of the initial mapping.
  */
 function extractCashMapping(history, investmentAccounts, cashAccounts) {
-  // Look backwards through assistant messages for MAPPING: blocks
+  const invNames = (investmentAccounts || []).map((a) => a.name);
+  const cashNames = (cashAccounts || []).map((a) => a.name);
+
+  /**
+   * Build a normalized mapping from raw pairs, resolving keys/values against
+   * canonical investment/cash account names and stripping decorated text.
+   */
+  function buildNormalizedMapping(pairs) {
+    const mapping = {};
+    for (const [rawKey, rawVal] of pairs) {
+      const key = resolveToCanonicalName(rawKey, invNames);
+      const val = resolveToCanonicalName(rawVal, cashNames);
+      if (key && val) mapping[key] = val;
+    }
+    return Object.keys(mapping).length > 0 ? mapping : null;
+  }
+
+  // Strategy 1: Look backwards through assistant messages for MAPPING: blocks
   for (let i = history.length - 1; i >= 0; i--) {
     const msg = history[i];
     if (msg.role !== "assistant") continue;
     const mappingMatch = msg.content.match(/MAPPING:\s*\n([\s\S]*?)(?:\n\n|$)/i);
     if (mappingMatch) {
-      const lines = mappingMatch[1].split("\n").filter((l) => l.includes("->"));
-      const mapping = {};
-      for (const line of lines) {
-        const parts = line.split("->").map((s) => s.replace(/"/g, "").trim());
-        if (parts.length === 2 && parts[0] && parts[1]) {
-          mapping[parts[0]] = parts[1];
-        }
-      }
-      if (Object.keys(mapping).length > 0) return mapping;
+      const pairs = parseArrowLines(mappingMatch[1]);
+      const mapping = buildNormalizedMapping(pairs);
+      if (mapping) return mapping;
     }
   }
 
-  // If the user confirmed the initial mapping, look for confirmation words
+  // Strategy 2: Fallback — scan all assistant messages for any arrow lines
+  for (let i = history.length - 1; i >= 0; i--) {
+    const msg = history[i];
+    if (msg.role !== "assistant") continue;
+    const pairs = parseArrowLines(msg.content);
+    if (pairs.length > 0) {
+      const mapping = buildNormalizedMapping(pairs);
+      if (mapping) return mapping;
+    }
+  }
+
+  // Strategy 3: If the user confirmed the initial mapping, look for confirmation words
   const lastUserMsg = [...history].reverse().find((m) => m.role === "user");
   if (lastUserMsg) {
     const text = lastUserMsg.content.toLowerCase();

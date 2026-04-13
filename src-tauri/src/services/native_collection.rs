@@ -785,7 +785,10 @@ fn build_cash_mapping(holdings_accounts: &[Value]) -> CashMappingResult {
     let mut entries: Vec<HoldingsEntry> = Vec::new();
     for acct in holdings_accounts {
         let name = acct.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-        let connection_id = acct.get("connection_id").and_then(|v| v.as_i64());
+        let connection_id = acct.get("connection_id").and_then(|v| v.as_i64())
+            .or_else(|| acct.get("institution_connection")
+                .and_then(|ic| ic.get("id"))
+                .and_then(|v| v.as_i64()));
         let correlation_id = acct.get("correlation_id").and_then(|v| v.as_i64());
         let institution_name = acct.get("institution")
             .and_then(|v| v.get("name"))
@@ -821,10 +824,26 @@ fn build_cash_mapping(holdings_accounts: &[Value]) -> CashMappingResult {
     let investment_entries: Vec<&HoldingsEntry> = entries.iter().filter(|e| e.securities_count > 0).collect();
     let cash_entries: Vec<&HoldingsEntry> = entries.iter().filter(|e| e.fiats_sum > 0.0 && e.securities_count == 0).collect();
 
-    // Build name → entry lookup for saved links resolution
-    let cash_by_name: HashMap<&str, &HoldingsEntry> = cash_entries.iter()
-        .map(|e| (e.name.as_str(), *e))
-        .collect();
+    // Build name → entry lookup for saved links resolution.
+    // Use compound key `institution::name` for disambiguation when duplicate names exist.
+    let mut cash_by_name: HashMap<String, &HoldingsEntry> = HashMap::new();
+    let mut cash_name_counts: HashMap<&str, usize> = HashMap::new();
+    for e in &cash_entries {
+        *cash_name_counts.entry(e.name.as_str()).or_insert(0) += 1;
+    }
+    for e in &cash_entries {
+        // Always insert by plain name (last one wins for unambiguous lookups)
+        cash_by_name.insert(e.name.clone(), *e);
+        // If duplicate names exist, also insert with compound key for disambiguation
+        if cash_name_counts.get(e.name.as_str()).copied().unwrap_or(0) > 1 {
+            let compound = format!("{}::{}", e.institution_name, e.name);
+            crate::debug_log(&format!(
+                "finary_cash_mapping: duplicate cash name '{}' — adding compound key '{}'",
+                e.name, compound
+            ));
+            cash_by_name.insert(compound, *e);
+        }
+    }
 
     crate::debug_log(&format!(
         "finary_cash_mapping: {} investment accounts, {} cash accounts out of {} total",
@@ -835,13 +854,26 @@ fn build_cash_mapping(holdings_accounts: &[Value]) -> CashMappingResult {
     let mut matched_cash_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut ambiguous_groups: Vec<Value> = Vec::new();
 
-    // Strategy 0: Apply persisted cash_account_links from user preferences
+    // Strategy 0: Apply persisted cash_account_links from user preferences.
+    // Check both plain name and compound key (`institution::name`) formats.
     for inv in &investment_entries {
         if let Some(cash_name) = saved_links.get(&inv.name) {
-            if let Some(cash_entry) = cash_by_name.get(cash_name.as_str()) {
+            // Try exact match first, then compound key with institution prefix
+            let cash_entry = cash_by_name.get(cash_name.as_str())
+                .or_else(|| {
+                    // If the saved link uses a compound key like "Bourso::Compte espèce PEA"
+                    if cash_name.contains("::") {
+                        cash_by_name.get(cash_name.as_str())
+                    } else {
+                        // Try building a compound key from the investment's institution
+                        let compound = format!("{}::{}", inv.institution_name, cash_name);
+                        cash_by_name.get(compound.as_str())
+                    }
+                });
+            if let Some(cash_entry) = cash_entry {
                 result.insert(inv.name.clone(), cash_entry.fiats_sum);
                 // Mark the cash entry as matched
-                if let Some(idx) = cash_entries.iter().position(|e| e.name == cash_entry.name) {
+                if let Some(idx) = cash_entries.iter().position(|e| e.name == cash_entry.name && e.institution_name == cash_entry.institution_name) {
                     matched_cash_indices.insert(idx);
                 }
                 crate::debug_log(&format!(

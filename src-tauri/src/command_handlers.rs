@@ -606,6 +606,118 @@ pub fn run_load_alfred_state() -> Result<serde_json::Value> {
     }
 }
 
+// ── Export Report as Markdown (Item 12) ──
+
+pub fn run_export_report_markdown(payload: serde_json::Value) -> Result<serde_json::Value> {
+    // Build a default export path in the data dir
+    let data_dir = crate::paths::default_data_dir();
+    let exports_dir = data_dir.join("exports");
+    std::fs::create_dir_all(&exports_dir)
+        .map_err(|e| anyhow!("export_mkdir_failed:{e}"))?;
+
+    let account = payload.get("account")
+        .and_then(|v| v.as_str())
+        .unwrap_or("portfolio");
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let safe_account = account.replace(|c: char| !c.is_alphanumeric() && c != '-' && c != '_', "_");
+    let filename = format!("alfred-report-{}-{}.md", safe_account, date);
+    let path = exports_dir.join(&filename);
+
+    let md = format_report_markdown(&payload);
+    std::fs::write(&path, md.as_bytes())
+        .map_err(|e| anyhow!("export_write_failed:{e}"))?;
+
+    Ok(json!({
+        "ok": true,
+        "path": path.to_string_lossy().to_string(),
+        "filename": filename,
+    }))
+}
+
+fn format_report_markdown(payload: &serde_json::Value) -> String {
+    let mut md = String::new();
+
+    // Frontmatter
+    let account = payload.get("account").and_then(|v| v.as_str()).unwrap_or("N/A");
+    let date = payload.get("lastUpdate").and_then(|v| v.as_str()).unwrap_or("N/A");
+    let value = payload.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let gain = payload.get("gain").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let cash = payload.get("cash").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+    md.push_str("---\n");
+    md.push_str(&format!("account: {}\n", account));
+    md.push_str(&format!("date: {}\n", date));
+    md.push_str(&format!("portfolio_value: {:.0}\n", value));
+    md.push_str(&format!("gain: {:.0}\n", gain));
+    md.push_str(&format!("cash: {:.0}\n", cash));
+    md.push_str("---\n\n");
+
+    md.push_str(&format!("# Alfred Report — {}\n\n", account));
+    md.push_str(&format!("**Date**: {} | **Value**: {:.0}\u{00a0}\u{20ac} | **Gain**: {:.0}\u{00a0}\u{20ac} | **Cash**: {:.0}\u{00a0}\u{20ac}\n\n", date, value, gain, cash));
+
+    // Synthesis
+    let synthesis = payload.get("synthesis").and_then(|v| v.as_str()).unwrap_or("");
+    if !synthesis.is_empty() {
+        md.push_str("## Synthesis\n\n");
+        md.push_str(synthesis);
+        md.push_str("\n\n");
+    }
+
+    // Action table
+    let actions = payload.get("actionsNow").and_then(|v| v.as_array());
+    if let Some(actions) = actions {
+        if !actions.is_empty() {
+            md.push_str("## Immediate Actions\n\n");
+            md.push_str("| # | Ticker | Action | Type | Rationale |\n");
+            md.push_str("|---|--------|--------|------|----------|\n");
+            for action in actions {
+                let priority = action.get("priority").and_then(|v| v.as_u64()).unwrap_or(0);
+                let ticker = action.get("ticker").and_then(|v| v.as_str()).unwrap_or("?");
+                let signal = action.get("action").and_then(|v| v.as_str()).unwrap_or("?");
+                let order = action.get("orderType").and_then(|v| v.as_str()).unwrap_or("MARKET");
+                let rationale = action.get("rationale").and_then(|v| v.as_str()).unwrap_or("");
+                // Truncate rationale for table readability
+                let short_rationale = if rationale.len() > 120 {
+                    format!("{}...", &rationale[..rationale.char_indices().nth(120).map(|(i,_)| i).unwrap_or(rationale.len())])
+                } else {
+                    rationale.to_string()
+                };
+                md.push_str(&format!("| {} | {} | {} | {} | {} |\n",
+                    priority, ticker, signal, order, short_rationale.replace('|', "\\|")));
+            }
+            md.push_str("\n");
+        }
+    }
+
+    // Positions summary
+    let recommendations = payload.get("recommendations").and_then(|v| v.as_array());
+    if let Some(recs) = recommendations {
+        if !recs.is_empty() {
+            md.push_str("## Positions\n\n");
+            md.push_str("| Ticker | Name | Signal | Conviction | Summary |\n");
+            md.push_str("|--------|------|--------|------------|--------|\n");
+            for rec in recs {
+                let ticker = rec.get("ticker").and_then(|v| v.as_str()).unwrap_or("?");
+                let name = rec.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let signal = rec.get("signal").and_then(|v| v.as_str()).unwrap_or("");
+                let conviction = rec.get("conviction").and_then(|v| v.as_str()).unwrap_or("");
+                let summary = rec.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+                let short_summary = if summary.len() > 100 {
+                    format!("{}...", &summary[..summary.char_indices().nth(100).map(|(i,_)| i).unwrap_or(summary.len())])
+                } else {
+                    summary.to_string()
+                };
+                md.push_str(&format!("| {} | {} | {} | {} | {} |\n",
+                    ticker, name, signal, conviction, short_summary.replace('|', "\\|")));
+            }
+            md.push_str("\n");
+        }
+    }
+
+    md.push_str("---\n*Generated by Alfred Desktop*\n");
+    md
+}
+
 pub fn run_ensure_codex() -> Result<serde_json::Value> {
     crate::codex::ensure_codex_available()
 }

@@ -522,6 +522,14 @@ async fn load_alfred_state_local() -> Result<serde_json::Value, String> {
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn export_report_markdown_local(payload: serde_json::Value) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || command_handlers::run_export_report_markdown(payload))
+        .await
+        .map_err(|e| format!("export_report_markdown_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
 fn run_tauri_app() -> anyhow::Result<()> {
     load_local_env();
 
@@ -590,7 +598,8 @@ fn run_tauri_app() -> anyhow::Result<()> {
             get_signal_scorecard_local,
             get_run_diff_local,
             save_alfred_state_local,
-            load_alfred_state_local
+            load_alfred_state_local,
+            export_report_markdown_local
         ])
         .run(tauri::generate_context!())
         .map_err(|e| anyhow!("tauri_app_launch_failed:{e}"))?;

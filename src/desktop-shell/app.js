@@ -69,7 +69,9 @@ import {
   getSelectedAccount,
   getStashedLineStatus,
   updateSingleLineProgress,
-  accountAccentColor
+  accountAccentColor,
+  preRenderQueuedPositions,
+  showConnectingPlaceholder
 } from "/desktop-shell/shell-layout.js";
 
 // ── Live DOM nodes ───────────────────────────────────────────────
@@ -137,6 +139,8 @@ const runOperations = createRunOperationsController({
     if (event?.type === "run.started" || event?.type === "run.accepted") {
       activeRunRefresh = true;
       lastDoneCount = 0;
+      // Capture positions BEFORE clearing — needed for pre-rendering "Queued" rows
+      const previousPositions = latestDashboardPayload?.snapshot?.latest_run?.portfolio?.positions || [];
       // Clear ALL stale run data — prevents showing previous account's positions/actions/synthesis
       if (latestDashboardPayload?.snapshot) {
         latestDashboardPayload.snapshot.latest_run = null;
@@ -148,6 +152,12 @@ const runOperations = createRunOperationsController({
       setStopAnalysisVisible(true);
       setActiveRunState(true);
       showRunView({ starting: true, live: true });
+      // Pre-render portfolio positions as "Queued" rows before first line-status-update
+      if (previousPositions.length > 0) {
+        preRenderQueuedPositions(previousPositions);
+      }
+      // Show "Connecting..." placeholder in synthesis card
+      showConnectingPlaceholder();
       if (event?.run_id) {
         activeRunId = event.run_id;
         setLiveRunActiveId(event.run_id);
@@ -193,8 +203,15 @@ const runOperations = createRunOperationsController({
         showToast("Analysis complete");
         // Notify Alfred overlay — Phase B: reactive triggers auto-fire
         alfredOverlay.notify("run-completed", event);
-        // Refresh to show new results
-        refreshDashboard().catch(() => {});
+        // Refresh to show new results, then fire data-dependent triggers
+        refreshDashboard().then(() => {
+          // Post-refresh: fire accuracy nudge with recommendation data
+          if (latestReportModel?.recommendations) {
+            alfredOverlay.notify("run-completed-with-data", {
+              recommendations: latestReportModel.recommendations,
+            });
+          }
+        }).catch(() => {});
       } else {
         // Show clear failure state — don't silently fall back to old report
         const errorMsg = event?.message || "Analysis failed";
@@ -437,6 +454,7 @@ function renderActionsNow(items = [], recommendations = []) {
       if (expandLink && rationaleNode) {
         expandLink.addEventListener("click", (e) => {
           e.preventDefault();
+          e.stopPropagation();
           rationaleNode.textContent = rationale;
         });
       }
@@ -473,6 +491,20 @@ function renderActionsNow(items = [], recommendations = []) {
         }
       });
     }
+    // Click on card body opens line detail modal (Ask button calls stopPropagation)
+    card.style.cursor = "pointer";
+    card.addEventListener("click", () => {
+      const ticker = action.ticker || "";
+      const name = action.nom || "";
+      const rec = ticker
+        ? recommendations.find((r) => r.ticker === ticker)
+        : name
+          ? recommendations.find((r) => (r.name || r.nom) === name)
+          : null;
+      if (rec) {
+        openLineMemoryModal(rec);
+      }
+    });
     actionsNowNode.appendChild(card);
   }
 }
@@ -564,6 +596,12 @@ function renderThemeConcentration(themeConcentration) {
   const themes = themeConcentration.themes;
   if (!Array.isArray(themes) || themes.length === 0) return;
 
+  // Sort by count descending for relevance
+  const sorted = [...themes].sort((a, b) => (b.count || 0) - (a.count || 0));
+  const TOP_N = 5;
+  const topThemes = sorted.slice(0, TOP_N);
+  const overflowThemes = sorted.slice(TOP_N);
+
   const card = document.createElement("section");
   card.id = "theme-concentration-card";
   card.className = "card theme-concentration-card";
@@ -574,26 +612,64 @@ function renderThemeConcentration(themeConcentration) {
 
   const intro = document.createElement("p");
   intro.className = "theme-concentration-intro";
-  intro.textContent = `${themes.length} theme${themes.length > 1 ? "s" : ""} shared by 3+ positions — potential concentration risk.`;
+  intro.textContent = `${sorted.length} theme${sorted.length > 1 ? "s" : ""} shared by 3+ positions — potential concentration risk.`;
   card.appendChild(intro);
 
   const list = document.createElement("ul");
   list.className = "theme-concentration-list";
-  for (const entry of themes) {
-    const li = document.createElement("li");
-    const themeLabel = escapeHtml(entry.theme || "?");
-    const count = entry.count || 0;
-    const tickers = (entry.tickers || []).map((t) => escapeHtml(t)).join(", ");
-    li.innerHTML = `<span class="theme-slug">${themeLabel}</span> <span class="theme-count">(${count} positions)</span>: <span class="theme-tickers">${tickers}</span>`;
-    list.appendChild(li);
+  for (const entry of topThemes) {
+    list.appendChild(buildThemeLi(entry));
   }
   card.appendChild(list);
+
+  // "Show N more" toggle for overflow themes
+  if (overflowThemes.length > 0) {
+    const overflowList = document.createElement("ul");
+    overflowList.className = "theme-concentration-list theme-overflow hidden";
+    for (const entry of overflowThemes) {
+      overflowList.appendChild(buildThemeLi(entry));
+    }
+    card.appendChild(overflowList);
+
+    const toggle = document.createElement("button");
+    toggle.className = "ghost-btn theme-toggle-btn";
+    toggle.textContent = `Show ${overflowThemes.length} more`;
+    toggle.addEventListener("click", () => {
+      const isHidden = overflowList.classList.toggle("hidden");
+      toggle.textContent = isHidden
+        ? `Show ${overflowThemes.length} more`
+        : "Show less";
+    });
+    card.appendChild(toggle);
+  }
+
+  // "Ask Alfred" button
+  const askBtn = document.createElement("button");
+  askBtn.className = "ghost-btn theme-ask-alfred-btn";
+  askBtn.innerHTML = `\uD83D\uDCAC Ask Alfred`;
+  askBtn.addEventListener("click", () => {
+    const themeNames = sorted.map((t) => t.theme || "?");
+    window.__alfredOverlay?.fireTrigger("alfred-theme-concentration", {
+      themes: themeNames,
+      themeCount: sorted.length,
+    });
+  });
+  card.appendChild(askBtn);
 
   // Insert between synthesis card and actions-now card
   const actionsCard = actionsNowNode?.closest(".actions-now-card");
   if (actionsCard && actionsCard.parentNode) {
     actionsCard.parentNode.insertBefore(card, actionsCard);
   }
+}
+
+function buildThemeLi(entry) {
+  const li = document.createElement("li");
+  const themeLabel = escapeHtml(entry.theme || "?");
+  const count = entry.count || 0;
+  const tickers = (entry.tickers || []).map((t) => escapeHtml(t)).join(", ");
+  li.innerHTML = `<span class="theme-slug">${themeLabel}</span> <span class="theme-count">(${count} positions)</span>: <span class="theme-tickers">${tickers}</span>`;
+  return li;
 }
 
 // ── Report rendering ─────────────────────────────────────────────

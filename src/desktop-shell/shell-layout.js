@@ -19,12 +19,10 @@ import {
   setLiveRunActiveId,
   getLiveRunActiveId,
   setLiveRunViewingId,
-  preRenderQueuedPositions,
-  showConnectingPlaceholder,
 } from "/desktop-shell/shell-live-run.js";
 
 // Re-export for backward compat with app.js imports
-export { renderLivePositions, updateSingleLineProgress, renderTopBarProgress, renderPipelineBar, clearRunPipelineBar, setLiveRunContext, setLiveRunActiveId, setLiveRunViewingId, preRenderQueuedPositions, showConnectingPlaceholder };
+export { renderLivePositions, updateSingleLineProgress, renderTopBarProgress, renderPipelineBar, clearRunPipelineBar, setLiveRunContext, setLiveRunActiveId, setLiveRunViewingId };
 
 // ── DOM refs ──────────────────────────────────────────────────────
 
@@ -496,8 +494,22 @@ export function showToast(message, tone = "") {
   const item = document.createElement("div");
   item.className = `toast-item ${tone ? `tone-${tone}` : ""}`.trim();
   item.textContent = message;
+  // Item 14: Error toasts persist — add close button, no auto-dismiss
+  if (tone === "error") {
+    const closeBtn = document.createElement("button");
+    closeBtn.className = "toast-close-btn";
+    closeBtn.innerHTML = "&times;";
+    closeBtn.title = "Dismiss";
+    closeBtn.style.cssText = "background:none;border:none;color:inherit;font-size:1.1rem;cursor:pointer;margin-left:0.6rem;padding:0 0.2rem;opacity:0.7;line-height:1";
+    closeBtn.addEventListener("click", () => item.remove());
+    item.style.display = "flex";
+    item.style.alignItems = "center";
+    item.style.justifyContent = "space-between";
+    item.appendChild(closeBtn);
+  } else {
+    setTimeout(() => item.remove(), 5000);
+  }
   toastContainer.appendChild(item);
-  setTimeout(() => item.remove(), 5000);
 }
 
 export function showErrorModal(title, message, hint) {

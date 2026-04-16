@@ -1500,6 +1500,34 @@ struct CashMappingResult {
 fn build_cash_mapping(holdings_accounts: &[Value]) -> CashMappingResult {
     use std::collections::HashMap;
 
+    // Load persisted cash account links from user preferences
+    let prefs = crate::runtime_settings::get_user_preferences();
+    let saved_links: HashMap<String, String> = prefs
+        .get("cash_account_links")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if !saved_links.is_empty() {
+        crate::debug_log(&format!(
+            "finary_cash_mapping: loaded {} persisted cash_account_links from preferences",
+            saved_links.len()
+        ));
+    }
+
+    build_cash_mapping_with_links(holdings_accounts, &saved_links)
+}
+
+fn build_cash_mapping_with_links(
+    holdings_accounts: &[Value],
+    saved_links: &std::collections::HashMap<String, String>,
+) -> CashMappingResult {
+    use std::collections::HashMap;
+
     crate::debug_log(&format!(
         "finary_cash_mapping: build_cash_mapping called with {} holdings_accounts",
         holdings_accounts.len()
@@ -1519,25 +1547,6 @@ fn build_cash_mapping(holdings_accounts: &[Value]) -> CashMappingResult {
         institution_name: String,
         securities_count: usize,
         fiats_sum: f64,
-    }
-
-    // Load persisted cash account links from user preferences
-    let prefs = crate::runtime_settings::get_user_preferences();
-    let saved_links: HashMap<String, String> = prefs
-        .get("cash_account_links")
-        .and_then(|v| v.as_object())
-        .map(|obj| {
-            obj.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    if !saved_links.is_empty() {
-        crate::debug_log(&format!(
-            "finary_cash_mapping: loaded {} persisted cash_account_links from preferences",
-            saved_links.len()
-        ));
     }
 
     // Parse all holdings accounts
@@ -2790,5 +2799,43 @@ mod tests {
         // The investment account has direct fiats so it should appear in mapping
         assert_eq!(result.mapping.get("PEA avec espèces").copied(), Some(200.0),
             "investment with direct fiats should contribute cash from fiats field");
+    }
+
+    #[test]
+    fn build_cash_mapping_none_sentinel_inserts_zero_and_skips_heuristics() {
+        use std::collections::HashMap;
+        let accounts = vec![
+            make_account("PEA", Some(101), 3, 0.0, "Bourso"),
+            make_account("Compte espèce PEA", Some(101), 0, 500.0, "Bourso"),
+        ];
+        let mut saved_links = HashMap::new();
+        saved_links.insert("PEA".to_string(), "__none__".to_string());
+
+        let result = build_cash_mapping_with_links(&accounts, &saved_links);
+        assert_eq!(
+            result.mapping.get("PEA").copied(),
+            Some(0.0),
+            "__none__ sentinel should insert 0.0 for the investment account"
+        );
+        assert!(
+            result.ambiguous_groups.is_empty(),
+            "__none__ sentinel should prevent heuristic fallthrough"
+        );
+    }
+
+    #[test]
+    fn build_cash_mapping_with_links_empty_links_same_as_no_links() {
+        use std::collections::HashMap;
+        let accounts = vec![
+            make_account("PEA", Some(101), 3, 0.0, "Bourso"),
+            make_account("Compte espèce PEA", Some(101), 0, 500.0, "Bourso"),
+        ];
+        let empty_links = HashMap::new();
+        let result = build_cash_mapping_with_links(&accounts, &empty_links);
+        assert_eq!(
+            result.mapping.get("PEA").copied(),
+            Some(500.0),
+            "empty saved_links should behave same as build_cash_mapping (1:1 auto-match)"
+        );
     }
 }

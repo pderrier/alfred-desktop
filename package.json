@@ -10,7 +10,9 @@
     "build:windows": "node src-tauri/scripts/tauri-cli-runner.mjs build src-tauri/tauri.windows.conf.json",
     "build:macos": "node src-tauri/scripts/tauri-cli-runner.mjs build src-tauri/tauri.macos.conf.json",
     "check": "cd src-tauri && cargo check",
-    "test": "cd src-tauri && cargo test"
+    "test": "cd src-tauri && cargo test",
+    "test:js": "node --test test/*.test.js",
+    "test:all": "npm run test:js && npm run test"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"

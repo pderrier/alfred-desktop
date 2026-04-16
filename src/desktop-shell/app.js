@@ -434,8 +434,8 @@ function renderActionsNow(items = [], recommendations = []) {
           initialMessage: `This is the ${action.action} recommendation for ${label} (priority ${action.priority || "N/A"}). What would you like to know?`,
           returnHistoryOnClose: true,
           onDone: async (history) => {
+            doneHandled = true; // set synchronously BEFORE any await — prevents double save panel
             if (!rec) return;
-            doneHandled = true;
             const hadConversation = history.some((m) => m.role === "user");
             const prefill = hadConversation
               ? await synthesizeChatForMemoryWithUI(ticker, name, history)
@@ -480,7 +480,7 @@ function injectSynthesisAskButton(synthCard, model) {
       initialMessage: `This is the global synthesis for your ${account} portfolio. What would you like to explore?`,
       returnHistoryOnClose: true,
       onDone: async (history) => {
-        doneHandled = true;
+        doneHandled = true; // set synchronously BEFORE any await — prevents double save panel
         const hadConversation = history.some((m) => m.role === "user");
         const prefill = hadConversation
           ? await synthesizeChatForMemoryWithUI("_PORTFOLIO", account, history)

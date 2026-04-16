@@ -428,6 +428,12 @@ function clearReportSections() {
   if (nextAnalysis) { nextAnalysis.textContent = ""; nextAnalysis.classList.add("hidden"); }
   const watchlistSummary = document.getElementById("watchlist-summary");
   if (watchlistSummary) { watchlistSummary.textContent = ""; watchlistSummary.classList.add("hidden"); }
+  // Clear run diff to prevent stale data from previous account
+  const runDiffContainer = document.getElementById("run-diff-container");
+  if (runDiffContainer) {
+    runDiffContainer.innerHTML = "";
+    runDiffContainer.classList.add("hidden");
+  }
   // Phase 2b: remove theme concentration card
   const themeCard = document.getElementById("theme-concentration-card");
   if (themeCard) themeCard.remove();

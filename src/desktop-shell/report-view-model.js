@@ -66,7 +66,25 @@ function normalizeLineMemory(raw = {}, fallback = {}) {
       ? nested.deep_news_banned_urls
       : Array.isArray(base?.deep_news_banned_urls)
         ? base.deep_news_banned_urls
-        : []
+        : [],
+    // V2 fields — pass through from raw line memory
+    signal_history: Array.isArray(nested?.signal_history)
+      ? nested.signal_history
+      : Array.isArray(base?.signal_history)
+        ? base.signal_history
+        : [],
+    key_reasoning: asText(nested?.key_reasoning || base?.key_reasoning),
+    price_tracking: (nested?.price_tracking && typeof nested.price_tracking === "object")
+      ? nested.price_tracking
+      : (base?.price_tracking && typeof base.price_tracking === "object")
+        ? base.price_tracking
+        : null,
+    news_themes: Array.isArray(nested?.news_themes)
+      ? nested.news_themes
+      : Array.isArray(base?.news_themes)
+        ? base.news_themes
+        : [],
+    trend: asText(nested?.trend || base?.trend)
   };
 }
 

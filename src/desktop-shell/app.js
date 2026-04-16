@@ -349,6 +349,25 @@ function buildSynthesisContext(model) {
       .join(", ");
     sections.push(`Actions (${model.actionsNow.length}): ${actionList}`);
   }
+  // Per-position signal summary for position-specific questions
+  const recs = model.recommendations || [];
+  if (recs.length > 0) {
+    const signalLines = recs.slice(0, 15).map((r) => {
+      const t = r.ticker || r.nom || "?";
+      const sig = r.signal || "?";
+      const conv = r.conviction || "";
+      const synth = r.synthese || r.summary || "";
+      const oneLiner = synth.length > 80 ? synth.slice(0, 77) + "..." : synth;
+      return `${t}: ${sig}${conv ? ` (${conv})` : ""}${oneLiner ? ` — ${oneLiner}` : ""}`;
+    });
+    sections.push(`Position signals:\n${signalLines.join("\n")}`);
+  }
+  // Theme concentration
+  const themes = model.themeConcentration?.themes;
+  if (Array.isArray(themes) && themes.length > 0) {
+    const themeNames = themes.map((t) => t.theme || t.name || "?").slice(0, 10);
+    sections.push(`Theme concentration: ${themes.length} themes shared by 3+ positions: ${themeNames.join(", ")}`);
+  }
   return `You are a senior portfolio analyst. The user wants to discuss the portfolio-level synthesis. Answer questions about strategy, macro context, or reasoning. Be concise. Only answer questions related to the portfolio and financial analysis. Politely decline any off-topic requests.\n\n${sections.join("\n")}`;
 }
 
@@ -365,11 +384,17 @@ function buildActionContext(action, recommendations) {
   if (typeof action.priceLimit === "number" && action.priceLimit > 0) sections.push(`Price limit: ${formatCurrency(action.priceLimit)}`);
 
   // If there's a matching recommendation, include full position context
-  if (ticker && Array.isArray(recommendations)) {
-    const rec = recommendations.find((r) => r.ticker === ticker);
-    if (rec) {
+  if (Array.isArray(recommendations)) {
+    const rec = ticker
+      ? recommendations.find((r) => r.ticker === ticker)
+      : null;
+    // Fallback: try matching by name if ticker lookup failed
+    const effectiveRec = rec || (name
+      ? recommendations.find((r) => (r.name || r.nom) === name)
+      : null);
+    if (effectiveRec) {
       sections.push("\n--- Full position analysis ---");
-      sections.push(buildPositionContext(rec));
+      sections.push(buildPositionContext(effectiveRec));
     }
   }
 
@@ -790,6 +815,18 @@ async function checkAmbiguousCashGroups(finaryMeta) {
       } catch (err) {
         showToast(`Failed to save cash mapping: ${err?.message || err}`, "error");
       }
+    } else {
+      // User cancelled/skipped — save "__none__" sentinel so we don't re-prompt next session
+      try {
+        const prefs = await tauriInvoke("get_user_preferences_local") || {};
+        if (!prefs.cash_account_links) prefs.cash_account_links = {};
+        for (const inv of investmentAccounts) {
+          if (!prefs.cash_account_links[inv.name]) {
+            prefs.cash_account_links[inv.name] = "__none__";
+          }
+        }
+        await tauriInvoke("save_user_preferences_local", { prefs });
+      } catch { /* best effort */ }
     }
   }
 }

@@ -294,12 +294,33 @@ export function buildPositionContext(rec) {
     sections.push(`Recent news: ${headlines}`);
   }
 
-  // Line memory
+  // Line memory — V1 fields
   if (memory.llm_memory_summary) sections.push(`Memory: ${memory.llm_memory_summary}`);
   const signals = memory.llm_strong_signals || [];
   if (signals.length > 0) sections.push(`Signals: ${signals.join(", ")}`);
   const keyHistory = memory.llm_key_history || [];
   if (keyHistory.length > 0) sections.push(`History: ${keyHistory.slice(0, 5).join("; ")}`);
+
+  // Line memory — V2 fields
+  if (memory.key_reasoning) sections.push(`Key reasoning: ${memory.key_reasoning}`);
+  const sigHistory = memory.signal_history || [];
+  if (sigHistory.length > 0) {
+    const recent = sigHistory.slice(-3).map((entry) => {
+      const date = entry.date || "?";
+      const sig = entry.signal || entry.recommendation || "?";
+      const conv = entry.conviction || "?";
+      const price = entry.price_at_signal != null ? ` @ ${entry.price_at_signal}` : "";
+      return `[${date}] ${sig} (${conv})${price}`;
+    });
+    sections.push(`Signal history: ${recent.join(", ")}`);
+  }
+  const priceTracking = memory.price_tracking;
+  if (priceTracking?.return_since_signal_pct != null) {
+    sections.push(`Return since signal: ${priceTracking.return_since_signal_pct}%`);
+  }
+  const newsThemes = memory.news_themes || [];
+  if (newsThemes.length > 0) sections.push(`Active themes: ${newsThemes.slice(0, 5).join(", ")}`);
+  if (memory.trend) sections.push(`Trend: ${memory.trend}`);
 
   return `The user is inspecting their ${ticker}${name ? ` (${name})` : ""} position. Here is the full analysis context:\n\n${sections.join("\n")}\n\nYou are a portfolio analysis assistant. Answer questions about this position based on the context above. This is a read-only discussion — you cannot change recommendations or portfolio state. Be concise and specific. Only answer questions related to the portfolio, positions, and financial analysis. Politely decline any off-topic requests.`;
 }

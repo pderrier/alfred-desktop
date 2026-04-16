@@ -123,14 +123,6 @@ pub fn line_memory_flush_now() {
     }
 }
 
-/// Invalidate the line-memory cache (force reload from disk on next access).
-/// Called when external code may have written to line-memory.json directly.
-pub fn line_memory_invalidate() {
-    let mut guard = lm_cache().lock().unwrap_or_else(|p| p.into_inner());
-    guard.loaded = false;
-    guard.dirty = false;
-}
-
 // ── MCP results sidecar merge ───────────────────────────────────
 
 /// Merge MCP results from the sidecar JSONL file into the run state.

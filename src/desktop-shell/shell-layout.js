@@ -19,10 +19,12 @@ import {
   setLiveRunActiveId,
   getLiveRunActiveId,
   setLiveRunViewingId,
+  preRenderQueuedPositions,
+  showConnectingPlaceholder,
 } from "/desktop-shell/shell-live-run.js";
 
 // Re-export for backward compat with app.js imports
-export { renderLivePositions, updateSingleLineProgress, renderTopBarProgress, renderPipelineBar, clearRunPipelineBar, setLiveRunContext, setLiveRunActiveId, setLiveRunViewingId };
+export { renderLivePositions, updateSingleLineProgress, renderTopBarProgress, renderPipelineBar, clearRunPipelineBar, setLiveRunContext, setLiveRunActiveId, setLiveRunViewingId, preRenderQueuedPositions, showConnectingPlaceholder };
 
 // ── DOM refs ──────────────────────────────────────────────────────
 

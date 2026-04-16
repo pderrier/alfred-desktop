@@ -82,6 +82,42 @@ function buildLiveRow(ticker, lineStatus) {
   return tr;
 }
 
+/**
+ * Pre-render portfolio positions as "Queued" rows before the first line-status-update arrives.
+ * Called from app.js on run.started to eliminate the blank-screen window.
+ * @param {Array} positions — portfolio positions from latestDashboardPayload
+ */
+export function preRenderQueuedPositions(positions) {
+  if (!positionsTbodyNode || !Array.isArray(positions) || positions.length === 0) return;
+  // Only pre-render if the table is currently empty (fresh run start)
+  if (positionsTbodyNode.querySelectorAll("tr.pos-main-row[data-ticker]").length > 0) return;
+  if (positionsEmptyNode) positionsEmptyNode.classList.add("hidden");
+  for (const pos of positions) {
+    const ticker = pos.ticker || "";
+    if (!ticker) continue;
+    positionsTbodyNode.appendChild(buildLiveRow(ticker, "waiting"));
+  }
+  // Update progress counter
+  if (positionsProgressNode) {
+    positionsProgressNode.textContent = `0/${positions.length} done · ${positions.length} queued`;
+    positionsProgressNode.classList.remove("hidden");
+  }
+}
+
+/**
+ * Show "Connecting to analysis server..." in the synthesis card area.
+ * Cleared automatically when the first line-status-update arrives via updateSynthesisCardDuringRun.
+ */
+export function showConnectingPlaceholder() {
+  const synthesis = document.getElementById("report-synthesis");
+  if (synthesis) {
+    synthesis.innerHTML = `<span class="synthesis-pending-label synthesis-connecting"><span class="pipeline-spinner"></span>Connecting to analysis server\u2026</span>`;
+  }
+  if (reportSynthesisCardNode) {
+    reportSynthesisCardNode.classList.add("synthesis-pending");
+  }
+}
+
 function ensureWatchlistSeparator() {
   if (!positionsTbodyNode) return;
   if (positionsTbodyNode.querySelector(".watchlist-separator-row")) return;
@@ -461,7 +497,7 @@ function renderLiveStatusChip(raw) {
     status === "repairing" ? "s-repairing" :
     status === "collecting" ? "s-collecting" :
     (status === "failed" || status === "aborted") ? "s-failed" :
-    "s-waiting";
+    "s-queued";
   const label =
     status === "done" ? "\u2713 Done" :
     status === "collecting" ? "Collecting\u2026" :
@@ -469,7 +505,7 @@ function renderLiveStatusChip(raw) {
     status === "repairing" ? "Repairing\u2026" :
     status === "failed" ? "\u2717 Failed" :
     status === "aborted" ? "Aborted" :
-    status === "waiting" ? "\u00b7\u00b7\u00b7" :
+    status === "waiting" ? "Queued" :
     status || "\u2014";
   const chip = `<span class="pipeline-chip ${chipClass}">${spinner}${escapeHtml(label)}</span>`;
   if (errorMsg) {

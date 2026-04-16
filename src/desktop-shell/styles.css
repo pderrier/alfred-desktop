@@ -933,6 +933,7 @@ main {
 .pipeline-chip.s-analyzing { color: #dff2ff; background: rgba(20, 53, 86, 0.85); }
 .pipeline-chip.s-collecting { color: #fff0c9; background: rgba(87, 61, 15, 0.7); }
 .pipeline-chip.s-waiting { color: var(--sea-muted); background: rgba(28, 42, 55, 0.5); opacity: 0.6; }
+.pipeline-chip.s-queued { color: #b0c4d6; background: rgba(35, 55, 72, 0.6); opacity: 0.7; font-weight: 600; }
 .pipeline-chip.s-repairing { color: #ffe0b2; background: rgba(120, 60, 10, 0.75); }
 .pipeline-chip.s-failed { color: #ffd7d0; background: rgba(74, 24, 20, 0.7); }
 .pipeline-chip.s-completed { color: #c8f0d8; background: rgba(18, 60, 38, 0.7); }
@@ -1085,6 +1086,10 @@ main {
   font-style: italic;
 }
 
+.synthesis-connecting {
+  opacity: 0.7;
+}
+
 /* ── Toast ─────────────────────────────────────────────────────── */
 
 .toast-container {
@@ -1215,6 +1220,11 @@ main {
   border: 1px solid rgba(73, 100, 126, 0.34);
   background: linear-gradient(180deg, rgba(14, 24, 34, 0.96) 0%, rgba(10, 17, 24, 0.96) 100%);
   padding: 0.85rem 0.9rem;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+.action-card:hover {
+  border-color: rgba(142, 202, 230, 0.5);
+  box-shadow: 0 0 8px rgba(142, 202, 230, 0.15);
 }
 
 .action-card.tone-buy {
@@ -1400,6 +1410,21 @@ main {
 }
 .theme-tickers {
   color: var(--sea-ink);
+}
+.theme-overflow.hidden {
+  display: none;
+}
+.theme-toggle-btn {
+  margin-top: 0.4rem;
+  font-size: 0.78rem;
+  color: #f4c46a;
+  cursor: pointer;
+}
+.theme-ask-alfred-btn {
+  margin-top: 0.5rem;
+  font-size: 0.78rem;
+  color: var(--sea-accent);
+  cursor: pointer;
 }
 
 /* ── Signal Accuracy Scorecard (Phase 3b) ── */

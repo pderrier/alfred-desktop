@@ -69,9 +69,7 @@ import {
   getSelectedAccount,
   getStashedLineStatus,
   updateSingleLineProgress,
-  accountAccentColor,
-  preRenderQueuedPositions,
-  showConnectingPlaceholder
+  accountAccentColor
 } from "/desktop-shell/shell-layout.js";
 
 // ── Live DOM nodes ───────────────────────────────────────────────
@@ -113,6 +111,9 @@ let latestRunActivity = null;
 let activeRunRefresh = false;
 let activeRunId = null;
 let lastDoneCount = 0;
+let linesDoneCounter = 0; // Item 11: count done lines for overlay commentary
+let lineTimingStart = new Map(); // Item 15: track per-line analysis start time
+let lineTimingHistory = []; // Item 15: recent completion durations (ms)
 let uiEvents = [];
 let autoRefreshTimer = null;
 let refreshInFlight = false;
@@ -139,8 +140,9 @@ const runOperations = createRunOperationsController({
     if (event?.type === "run.started" || event?.type === "run.accepted") {
       activeRunRefresh = true;
       lastDoneCount = 0;
-      // Capture positions BEFORE clearing — needed for pre-rendering "Queued" rows
-      const previousPositions = latestDashboardPayload?.snapshot?.latest_run?.portfolio?.positions || [];
+      linesDoneCounter = 0;
+      lineTimingStart = new Map();
+      lineTimingHistory = [];
       // Clear ALL stale run data — prevents showing previous account's positions/actions/synthesis
       if (latestDashboardPayload?.snapshot) {
         latestDashboardPayload.snapshot.latest_run = null;
@@ -152,12 +154,6 @@ const runOperations = createRunOperationsController({
       setStopAnalysisVisible(true);
       setActiveRunState(true);
       showRunView({ starting: true, live: true });
-      // Pre-render portfolio positions as "Queued" rows before first line-status-update
-      if (previousPositions.length > 0) {
-        preRenderQueuedPositions(previousPositions);
-      }
-      // Show "Connecting..." placeholder in synthesis card
-      showConnectingPlaceholder();
       if (event?.run_id) {
         activeRunId = event.run_id;
         setLiveRunActiveId(event.run_id);
@@ -172,6 +168,43 @@ const runOperations = createRunOperationsController({
         stashLiveRunState(event.line_status, latestDashboardPayload, event.stage);
         // During active run, push events own position rendering — no dashboard refresh needed
         renderLivePositions(event.line_status, latestDashboardPayload);
+
+        // Item 11 + 15: Track per-line timing and done count for overlay + ETA
+        const tickers = Object.keys(event.line_status).filter((t) => t !== "__synthesis__");
+        let completedCount = 0;
+        let latestDoneTicker = "";
+        for (const ticker of tickers) {
+          const raw = event.line_status[ticker];
+          const s = typeof raw === "object" ? (raw?.status || "") : String(raw || "");
+          // Track when lines start analyzing (for ETA calculation)
+          if ((s === "analyzing" || s === "collecting") && !lineTimingStart.has(ticker)) {
+            lineTimingStart.set(ticker, Date.now());
+          }
+          if (s === "done" || s === "failed" || s === "aborted") {
+            completedCount++;
+            // Record completion time for ETA + track newly completed ticker
+            if (s === "done" && lineTimingStart.has(ticker)) {
+              const elapsed = Date.now() - lineTimingStart.get(ticker);
+              lineTimingHistory.push(elapsed);
+              lineTimingStart.delete(ticker);
+              latestDoneTicker = ticker; // capture the ticker that just finished
+            }
+          }
+        }
+        const totalCount = tickers.length;
+
+        // Item 11: Notify overlay every 3 newly completed lines
+        if (completedCount > linesDoneCounter) {
+          const prevDone = linesDoneCounter;
+          linesDoneCounter = completedCount;
+          // Fire every 3 lines that reach done
+          if (Math.floor(completedCount / 3) > Math.floor(prevDone / 3)) {
+            alfredOverlay.notify("line-analyzed", { completedCount, totalCount, latestTicker: latestDoneTicker });
+          }
+        }
+
+        // Item 15: Update ETA display
+        updateAnalysisEta(completedCount, totalCount);
       }
       renderTopBarProgress({ status: event.status || "running", line_progress: event.line_progress });
       renderPipelineBar(event.stage || "collecting_data");
@@ -203,15 +236,8 @@ const runOperations = createRunOperationsController({
         showToast("Analysis complete");
         // Notify Alfred overlay — Phase B: reactive triggers auto-fire
         alfredOverlay.notify("run-completed", event);
-        // Refresh to show new results, then fire data-dependent triggers
-        refreshDashboard().then(() => {
-          // Post-refresh: fire accuracy nudge with recommendation data
-          if (latestReportModel?.recommendations) {
-            alfredOverlay.notify("run-completed-with-data", {
-              recommendations: latestReportModel.recommendations,
-            });
-          }
-        }).catch(() => {});
+        // Refresh to show new results
+        refreshDashboard().catch(() => {});
       } else {
         // Show clear failure state — don't silently fall back to old report
         const errorMsg = event?.message || "Analysis failed";
@@ -366,25 +392,6 @@ function buildSynthesisContext(model) {
       .join(", ");
     sections.push(`Actions (${model.actionsNow.length}): ${actionList}`);
   }
-  // Per-position signal summary for position-specific questions
-  const recs = model.recommendations || [];
-  if (recs.length > 0) {
-    const signalLines = recs.slice(0, 15).map((r) => {
-      const t = r.ticker || r.nom || "?";
-      const sig = r.signal || "?";
-      const conv = r.conviction || "";
-      const synth = r.synthese || r.summary || "";
-      const oneLiner = synth.length > 80 ? synth.slice(0, 77) + "..." : synth;
-      return `${t}: ${sig}${conv ? ` (${conv})` : ""}${oneLiner ? ` — ${oneLiner}` : ""}`;
-    });
-    sections.push(`Position signals:\n${signalLines.join("\n")}`);
-  }
-  // Theme concentration
-  const themes = model.themeConcentration?.themes;
-  if (Array.isArray(themes) && themes.length > 0) {
-    const themeNames = themes.map((t) => t.theme || t.name || "?").slice(0, 10);
-    sections.push(`Theme concentration: ${themes.length} themes shared by 3+ positions: ${themeNames.join(", ")}`);
-  }
   return `You are a senior portfolio analyst. The user wants to discuss the portfolio-level synthesis. Answer questions about strategy, macro context, or reasoning. Be concise. Only answer questions related to the portfolio and financial analysis. Politely decline any off-topic requests.\n\n${sections.join("\n")}`;
 }
 
@@ -401,17 +408,11 @@ function buildActionContext(action, recommendations) {
   if (typeof action.priceLimit === "number" && action.priceLimit > 0) sections.push(`Price limit: ${formatCurrency(action.priceLimit)}`);
 
   // If there's a matching recommendation, include full position context
-  if (Array.isArray(recommendations)) {
-    const rec = ticker
-      ? recommendations.find((r) => r.ticker === ticker)
-      : null;
-    // Fallback: try matching by name if ticker lookup failed
-    const effectiveRec = rec || (name
-      ? recommendations.find((r) => (r.name || r.nom) === name)
-      : null);
-    if (effectiveRec) {
+  if (ticker && Array.isArray(recommendations)) {
+    const rec = recommendations.find((r) => r.ticker === ticker);
+    if (rec) {
       sections.push("\n--- Full position analysis ---");
-      sections.push(buildPositionContext(effectiveRec));
+      sections.push(buildPositionContext(rec));
     }
   }
 
@@ -454,7 +455,6 @@ function renderActionsNow(items = [], recommendations = []) {
       if (expandLink && rationaleNode) {
         expandLink.addEventListener("click", (e) => {
           e.preventDefault();
-          e.stopPropagation();
           rationaleNode.textContent = rationale;
         });
       }
@@ -477,8 +477,8 @@ function renderActionsNow(items = [], recommendations = []) {
           initialMessage: `This is the ${action.action} recommendation for ${label} (priority ${action.priority || "N/A"}). What would you like to know?`,
           returnHistoryOnClose: true,
           onDone: async (history) => {
-            doneHandled = true; // set synchronously BEFORE any await — prevents double save panel
             if (!rec) return;
+            doneHandled = true;
             const hadConversation = history.some((m) => m.role === "user");
             const prefill = hadConversation
               ? await synthesizeChatForMemoryWithUI(ticker, name, history)
@@ -491,20 +491,6 @@ function renderActionsNow(items = [], recommendations = []) {
         }
       });
     }
-    // Click on card body opens line detail modal (Ask button calls stopPropagation)
-    card.style.cursor = "pointer";
-    card.addEventListener("click", () => {
-      const ticker = action.ticker || "";
-      const name = action.nom || "";
-      const rec = ticker
-        ? recommendations.find((r) => r.ticker === ticker)
-        : name
-          ? recommendations.find((r) => (r.name || r.nom) === name)
-          : null;
-      if (rec) {
-        openLineMemoryModal(rec);
-      }
-    });
     actionsNowNode.appendChild(card);
   }
 }
@@ -537,7 +523,7 @@ function injectSynthesisAskButton(synthCard, model) {
       initialMessage: `This is the global synthesis for your ${account} portfolio. What would you like to explore?`,
       returnHistoryOnClose: true,
       onDone: async (history) => {
-        doneHandled = true; // set synchronously BEFORE any await — prevents double save panel
+        doneHandled = true;
         const hadConversation = history.some((m) => m.role === "user");
         const prefill = hadConversation
           ? await synthesizeChatForMemoryWithUI("_PORTFOLIO", account, history)
@@ -596,12 +582,6 @@ function renderThemeConcentration(themeConcentration) {
   const themes = themeConcentration.themes;
   if (!Array.isArray(themes) || themes.length === 0) return;
 
-  // Sort by count descending for relevance
-  const sorted = [...themes].sort((a, b) => (b.count || 0) - (a.count || 0));
-  const TOP_N = 5;
-  const topThemes = sorted.slice(0, TOP_N);
-  const overflowThemes = sorted.slice(TOP_N);
-
   const card = document.createElement("section");
   card.id = "theme-concentration-card";
   card.className = "card theme-concentration-card";
@@ -612,49 +592,20 @@ function renderThemeConcentration(themeConcentration) {
 
   const intro = document.createElement("p");
   intro.className = "theme-concentration-intro";
-  intro.textContent = `${sorted.length} theme${sorted.length > 1 ? "s" : ""} shared by 3+ positions — potential concentration risk.`;
+  intro.textContent = `${themes.length} theme${themes.length > 1 ? "s" : ""} shared by 3+ positions — potential concentration risk.`;
   card.appendChild(intro);
 
   const list = document.createElement("ul");
   list.className = "theme-concentration-list";
-  for (const entry of topThemes) {
-    list.appendChild(buildThemeLi(entry));
+  for (const entry of themes) {
+    const li = document.createElement("li");
+    const themeLabel = escapeHtml(entry.theme || "?");
+    const count = entry.count || 0;
+    const tickers = (entry.tickers || []).map((t) => escapeHtml(t)).join(", ");
+    li.innerHTML = `<span class="theme-slug">${themeLabel}</span> <span class="theme-count">(${count} positions)</span>: <span class="theme-tickers">${tickers}</span>`;
+    list.appendChild(li);
   }
   card.appendChild(list);
-
-  // "Show N more" toggle for overflow themes
-  if (overflowThemes.length > 0) {
-    const overflowList = document.createElement("ul");
-    overflowList.className = "theme-concentration-list theme-overflow hidden";
-    for (const entry of overflowThemes) {
-      overflowList.appendChild(buildThemeLi(entry));
-    }
-    card.appendChild(overflowList);
-
-    const toggle = document.createElement("button");
-    toggle.className = "ghost-btn theme-toggle-btn";
-    toggle.textContent = `Show ${overflowThemes.length} more`;
-    toggle.addEventListener("click", () => {
-      const isHidden = overflowList.classList.toggle("hidden");
-      toggle.textContent = isHidden
-        ? `Show ${overflowThemes.length} more`
-        : "Show less";
-    });
-    card.appendChild(toggle);
-  }
-
-  // "Ask Alfred" button
-  const askBtn = document.createElement("button");
-  askBtn.className = "ghost-btn theme-ask-alfred-btn";
-  askBtn.innerHTML = `\uD83D\uDCAC Ask Alfred`;
-  askBtn.addEventListener("click", () => {
-    const themeNames = sorted.map((t) => t.theme || "?");
-    window.__alfredOverlay?.fireTrigger("alfred-theme-concentration", {
-      themes: themeNames,
-      themeCount: sorted.length,
-    });
-  });
-  card.appendChild(askBtn);
 
   // Insert between synthesis card and actions-now card
   const actionsCard = actionsNowNode?.closest(".actions-now-card");
@@ -663,13 +614,30 @@ function renderThemeConcentration(themeConcentration) {
   }
 }
 
-function buildThemeLi(entry) {
-  const li = document.createElement("li");
-  const themeLabel = escapeHtml(entry.theme || "?");
-  const count = entry.count || 0;
-  const tickers = (entry.tickers || []).map((t) => escapeHtml(t)).join(", ");
-  li.innerHTML = `<span class="theme-slug">${themeLabel}</span> <span class="theme-count">(${count} positions)</span>: <span class="theme-tickers">${tickers}</span>`;
-  return li;
+// ── ETA display (Item 15) ────────────────────────────────────────
+
+function updateAnalysisEta(completedCount, totalCount) {
+  const progressNode = document.getElementById("positions-progress");
+  if (!progressNode || totalCount === 0) return;
+  const remaining = totalCount - completedCount;
+  if (remaining <= 0) {
+    progressNode.textContent = "";
+    progressNode.classList.add("hidden");
+    return;
+  }
+  if (lineTimingHistory.length === 0) {
+    // No timing data yet — show count only
+    progressNode.textContent = `Analyzing ${completedCount} of ${totalCount} positions\u2026`;
+    return;
+  }
+  // Average of recent completions (last 10 for smoothing)
+  const recent = lineTimingHistory.slice(-10);
+  const avgMs = recent.reduce((sum, d) => sum + d, 0) / recent.length;
+  const etaMs = remaining * avgMs;
+  const etaMin = Math.ceil(etaMs / 60000);
+  const etaLabel = etaMin <= 1 ? "< 1 min" : `~${etaMin} min`;
+  progressNode.textContent = `Analyzing ${completedCount} of ${totalCount} positions (${etaLabel} remaining)`;
+  progressNode.classList.remove("hidden");
 }
 
 // ── Report rendering ─────────────────────────────────────────────
@@ -699,6 +667,8 @@ function renderReport(payload) {
       : "";
   }
   renderActionsNow(model.actionsNow, model.recommendations);
+  // Item 12: Export button
+  injectExportButton(model);
   // Phase 4a: run diff view
   renderRunDiff();
   // Phase 2b: theme concentration risk card
@@ -723,6 +693,44 @@ function renderReport(payload) {
       nextAnalysisNode.classList.add("hidden");
     }
   }
+}
+
+// ── Export button (Item 12) ──────────────────────────────────────
+
+function injectExportButton(model) {
+  // Insert into the KPI strip section (tab-overview-panel)
+  const kpiStrip = document.getElementById("tab-overview-panel");
+  if (!kpiStrip) return;
+  // Remove existing export button if present
+  kpiStrip.querySelector(".report-export-btn")?.remove();
+  if (!model.synthesis || model.synthesis === "No synthesis yet.") return;
+
+  const btn = document.createElement("button");
+  btn.className = "ghost-btn report-export-btn";
+  btn.style.cssText = "margin-left:auto;padding:0.3rem 0.8rem;font-size:0.78rem;border-radius:6px;white-space:nowrap";
+  btn.textContent = "\uD83D\uDCE4 Export";
+  btn.title = "Export report as Markdown";
+  btn.addEventListener("click", async () => {
+    const tauriInvoke = window?.__TAURI__?.core?.invoke;
+    if (!tauriInvoke) {
+      showToast("Export not available outside desktop app", "error");
+      return;
+    }
+    btn.disabled = true;
+    btn.textContent = "Exporting\u2026";
+    try {
+      const result = await tauriInvoke("export_report_markdown_local", {
+        payload: JSON.parse(JSON.stringify(latestReportModel)),
+      });
+      const path = result?.path || result;
+      showToast(`Report exported to ${path}`, "success");
+    } catch (err) {
+      showToast(`Export failed: ${err?.message || err}`, "error");
+    }
+    btn.disabled = false;
+    btn.textContent = "\uD83D\uDCE4 Export";
+  });
+  kpiStrip.appendChild(btn);
 }
 
 // ── Dashboard refresh ────────────────────────────────────────────
@@ -872,16 +880,18 @@ async function checkAmbiguousCashGroups(finaryMeta) {
             }
           }
         } else {
-          // User provided explicit mapping: { inv_name: cash_name }
-          // Keys are already normalized by extractCashMapping(), but do a final
-          // safety pass: resolve each key against known investmentAccount names
-          // so decorated text (e.g. "Compte espèce PEA (228.45€)") never leaks.
+          // User provided explicit mapping: { inv_name: cash_name | "__none__" }
           const knownInvNames = investmentAccounts.map((a) => a.name);
           const knownCashNames = cashAccounts.map((a) => a.name);
           for (const [rawKey, rawVal] of Object.entries(result)) {
             const cleanKey = findClosestName(rawKey, knownInvNames);
-            const cleanVal = findClosestName(rawVal, knownCashNames);
-            prefs.cash_account_links[cleanKey] = cleanVal;
+            // Item 16: Handle __none__ sentinel — "no cash account" is a valid choice
+            if (rawVal === "__none__") {
+              prefs.cash_account_links[cleanKey] = "__none__";
+            } else {
+              const cleanVal = findClosestName(rawVal, knownCashNames);
+              prefs.cash_account_links[cleanKey] = cleanVal;
+            }
           }
         }
 
@@ -891,18 +901,6 @@ async function checkAmbiguousCashGroups(finaryMeta) {
       } catch (err) {
         showToast(`Failed to save cash mapping: ${err?.message || err}`, "error");
       }
-    } else {
-      // User cancelled/skipped — save "__none__" sentinel so we don't re-prompt next session
-      try {
-        const prefs = await tauriInvoke("get_user_preferences_local") || {};
-        if (!prefs.cash_account_links) prefs.cash_account_links = {};
-        for (const inv of investmentAccounts) {
-          if (!prefs.cash_account_links[inv.name]) {
-            prefs.cash_account_links[inv.name] = "__none__";
-          }
-        }
-        await tauriInvoke("save_user_preferences_local", { prefs });
-      } catch { /* best effort */ }
     }
   }
 }

@@ -402,6 +402,27 @@ export function registerDefaultTriggers(overlay) {
     enabled: true
   });
 
+  // ── Item 11: Mid-run overlay commentary ──────────────────────────
+
+  overlay.registerTrigger({
+    id: "alfred-analysis-progress",
+    priority: 2,
+    cooldown: 30000, // 30s between messages to avoid spam
+    autoFireOn: "line-analyzed",
+    label: "Analysis Progress",
+    contextBuilder: (extra) => {
+      const { completedCount, totalCount, latestTicker } = extra || {};
+      if (!completedCount || !totalCount) return null;
+      const msg = `Analyzed ${completedCount}/${totalCount} positions\u2026 just finished ${latestTicker || "a position"}.`;
+      return {
+        initialMessage: msg,
+        autoDismissMs: 8000,
+        actions: [] // No actions — informational only
+      };
+    },
+    enabled: true
+  });
+
   // ── Phase D triggers (registered but disabled, ready for Phase C to enable) ──
 
   overlay.registerTrigger({
@@ -431,7 +452,7 @@ export function registerDefaultTriggers(overlay) {
       };
     },
     autoFireOn: "theme-concentration-detected",
-    enabled: true
+    enabled: false // Phase D — ready for Phase C to enable
   });
 
   overlay.registerTrigger({
@@ -495,93 +516,6 @@ export function registerDefaultTriggers(overlay) {
     },
     autoFireOn: "scorecard-review-due",
     enabled: false // Phase D — ready for Phase C to enable
-  });
-
-  // ── Accuracy Nudge — post-run check for signals that aged badly ──
-  overlay.registerTrigger({
-    id: "alfred-accuracy-nudge",
-    priority: 4,
-    cooldown: 0, // per-run (fires once per run completion)
-    autoFireOn: "run-completed-with-data",
-    label: "Accuracy Check",
-    contextBuilder: (extra) => {
-      const recommendations = extra?.recommendations;
-      if (!Array.isArray(recommendations) || recommendations.length === 0) return null;
-
-      // Per-ticker 24h cooldown via localStorage
-      const COOLDOWN_KEY = "alfred-accuracy-nudge-cooldowns";
-      const COOLDOWN_MS = 86400000; // 24 hours
-      const now = Date.now();
-      let tickerCooldowns = {};
-      try { tickerCooldowns = JSON.parse(localStorage.getItem(COOLDOWN_KEY) || "{}"); } catch { /* ignore */ }
-
-      // Signals where positive return = correct direction
-      const BULLISH_SIGNALS = new Set(["RENFORCER", "CONSERVER", "ACHETER", "BUY", "HOLD", "REINFORCE"]);
-      // Signals where negative return = correct direction
-      const BEARISH_SIGNALS = new Set(["ALLEGER", "VENDRE", "SELL", "REDUCE"]);
-      const THRESHOLD_PCT = 10;
-
-      const misaligned = [];
-      for (const rec of recommendations) {
-        const lm = rec.lineMemory || rec.memoire_ligne || {};
-        const pt = lm.price_tracking;
-        if (!pt || pt.return_since_signal_pct == null) continue;
-        const returnPct = Number(pt.return_since_signal_pct);
-        if (!Number.isFinite(returnPct)) continue;
-        const signal = String(rec.signal || "").toUpperCase();
-        const isBullish = BULLISH_SIGNALS.has(signal);
-        const isBearish = BEARISH_SIGNALS.has(signal);
-        // Check for misalignment: bullish signal but price dropped, or bearish signal but price rose
-        const misalignedAmt = isBullish ? -returnPct : isBearish ? returnPct : 0;
-        const ticker = rec.ticker || rec.nom || "?";
-        if (misalignedAmt >= THRESHOLD_PCT) {
-          // Per-ticker 24h cooldown
-          const lastNudged = tickerCooldowns[ticker] || 0;
-          if (now - lastNudged < COOLDOWN_MS) continue;
-          misaligned.push({ ticker, signal, returnPct, misalignedAmt });
-        }
-      }
-      if (misaligned.length === 0) return null;
-
-      // Cap at top 2 worst-performing
-      misaligned.sort((a, b) => b.misalignedAmt - a.misalignedAmt);
-      const top = misaligned.slice(0, 2);
-
-      // Record per-ticker cooldown
-      for (const m of top) { tickerCooldowns[m.ticker] = now; }
-      try { localStorage.setItem(COOLDOWN_KEY, JSON.stringify(tickerCooldowns)); } catch { /* ignore */ }
-
-      const lines = top.map((m) => {
-        const dir = m.returnPct >= 0 ? "+" : "";
-        return `**${m.ticker}**: price moved ${dir}${m.returnPct.toFixed(1)}% against ${m.signal} signal`;
-      });
-
-      const firstTicker = top[0].ticker;
-      return {
-        initialMessage:
-          `My call on ${top.length === 1 ? firstTicker : `${top.length} positions`} hasn't aged well.\n\n` +
-          lines.join("\n") +
-          "\n\nWant to revisit?",
-        actions: top.map((m) => ({
-          label: `Revisit ${m.ticker}`,
-          callback: () => {
-            if (window.__openLineMemoryModal) {
-              const rec = recommendations.find((r) => (r.ticker || r.nom) === m.ticker);
-              if (rec) window.__openLineMemoryModal(rec);
-            }
-          },
-        })).concat([
-          { label: "Dismiss", dismiss: true },
-        ]),
-        systemContext:
-          `The user's portfolio has ${top.length} position(s) where the recommendation signal is not aligned with price movement:\n` +
-          top.map((m) => `- ${m.ticker}: signal ${m.signal}, return ${m.returnPct.toFixed(1)}%`).join("\n") +
-          "\nHelp them evaluate whether to adjust their position or maintain conviction. Be concise and practical.",
-        chatMessage:
-          `I've noticed ${top.length} position${top.length > 1 ? "s" : ""} where the price has moved against the recommendation signal. Let me help you evaluate whether to adjust.`,
-      };
-    },
-    enabled: true,
   });
 
   // ── Strategy Refinement — proactive help building investment guidelines ──

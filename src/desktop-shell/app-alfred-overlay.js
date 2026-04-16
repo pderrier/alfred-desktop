@@ -44,8 +44,6 @@ let chatInputEl = null;
 let chatSendBtn = null;
 let chatExpandLink = null;
 let chatSending = false;
-/** @type {Function|null} onChatComplete callback from current trigger context */
-let currentOnChatComplete = null;
 
 // ── Alfred suggestions preference ─────────────────────────────
 /** When true, all triggers with priority < 8 are suppressed. */
@@ -197,7 +195,6 @@ function showPanel(triggerId, context, triggerDef) {
 
   currentTriggerId = triggerId;
   currentPriority = triggerDef.priority || 0;
-  currentOnChatComplete = typeof context.onChatComplete === "function" ? context.onChatComplete : null;
   const { initialMessage, actions } = context;
 
   // Record session event: shown
@@ -265,9 +262,11 @@ function showPanel(triggerId, context, triggerDef) {
   panelEl.classList.add("visible");
   panelVisible = true;
 
-  // Auto-dismiss for non-error triggers (priority < 8) after 90 seconds
+  // Auto-dismiss: use context-specific duration if provided, else 90s for non-error triggers
   clearAutoDismiss();
-  if (currentPriority < 8) {
+  if (context.autoDismissMs > 0) {
+    startAutoDismiss(context.autoDismissMs);
+  } else if (currentPriority < 8) {
     startAutoDismiss(90000);
   }
 }
@@ -414,21 +413,6 @@ export function enterChatMode(systemContext, firstMessage, triggerId) {
  */
 function exitChatMode() {
   if (!chatMode) return;
-
-  // Fire onChatComplete callback if there was meaningful chat (at least one user message)
-  if (currentOnChatComplete && chatHistory.some((m) => m.role === "user")) {
-    try {
-      const result = currentOnChatComplete([...chatHistory]);
-      // Handle async callbacks (best-effort, non-blocking)
-      if (result && typeof result.then === "function") {
-        result.catch((err) => console.warn("[Alfred] onChatComplete failed:", err));
-      }
-    } catch (err) {
-      console.warn("[Alfred] onChatComplete failed:", err);
-    }
-  }
-  currentOnChatComplete = null;
-
   chatMode = false;
   chatHistory = [];
   chatSystemContext = "";
@@ -725,7 +709,6 @@ export function dismissPanel() {
   panelVisible = false;
   currentTriggerId = null;
   currentPriority = 0;
-  currentOnChatComplete = null;
 
   // Persist session state (non-blocking)
   if (sessionEvents.length > 0) {

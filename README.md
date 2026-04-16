@@ -8,11 +8,11 @@
 
 ## Download
 
-**[Windows installer (MSI)](https://vps-c5793aab.vps.ovh.net/alfred/release/windows/latest)** — Alfred Desktop v0.2.1 for Windows 10/11 (x64)
+**[Windows installer (MSI)](https://vps-c5793aab.vps.ovh.net/alfred/release/windows/latest)** — Alfred Desktop v0.2.2 for Windows 10/11 (x64)
 
 > Note: The installer is not code-signed yet. Windows SmartScreen may show a warning — click "More info" → "Run anyway" to proceed.
 
-**[macOS installer (DMG)](https://vps-c5793aab.vps.ovh.net/alfred/release/macos/latest)** — Alfred Desktop v0.2.1 for macOS 10.15+ (Apple Silicon)
+**[macOS installer (DMG)](https://vps-c5793aab.vps.ovh.net/alfred/release/macos/latest)** — Alfred Desktop v0.2.2 for macOS 10.15+ (Apple Silicon)
 
 > **Note: The DMG is not notarized yet.** macOS Gatekeeper will block the app on first launch. Three ways to bypass it:
 >
@@ -20,7 +20,25 @@
 > 2. **System Settings → Privacy & Security → Open Anyway** — after a blocked launch attempt, a button appears at the bottom of the Privacy & Security pane.
 > 3. **Terminal (power users):** `xattr -cr "/Applications/Alfred Desktop.app"` — strips the quarantine attribute entirely; no dialog needed after that.
 
-## What's new in v0.2.1
+## What's new in v0.2.2
+
+- **Chat quality overhaul** — V2 line memory fields (signal history, key reasoning, price tracking, trends, themes) now injected into all chat context builders. Position, action, and synthesis chats all have richer, more accurate context
+- **Accuracy nudge** — Alfred proactively alerts when a recommendation signal has aged badly (price moved 10%+ against the signal direction). Top 2 worst per run, 24h per-ticker cooldown
+- **Mid-run overlay commentary** — Alfred comments on analysis progress every few positions ("Analyzed 8/15... just finished AAPL")
+- **ETA during analysis** — "Analyzing 8 of 15 positions (~3 min remaining)" based on rolling per-position timing
+- **Cash matching dropdown** — replaced verbose LLM text wizard with a clean dropdown UI. Pre-selects heuristic match, "No cash account" option, optional "Ask Alfred" fallback for edge cases
+- **Persistent cash dismiss** — accounts with no cash mapping are remembered across sessions (no more re-prompting)
+- **Export to Obsidian/Drive** — export analysis results as markdown with YAML frontmatter, action table, and positions table. Saves to `data/exports/`
+- **Queued status chips** — positions show "Queued" immediately on run start instead of blank screen
+- **Action cards → line modal** — click any recommended action badge to open the full position detail modal
+- **Theme concentration top-5** — themes sorted by relevance, capped at top 5 with "Show more" toggle + "Ask Alfred" button
+- **Persist error toasts** — error notifications stay visible until manually dismissed (no more 5-second auto-dismiss)
+- **onChatComplete wiring** — overlay chat sessions now properly fire completion callbacks (strategy refinement results saved)
+- **Stale run diff fix** — "What Changed" panel now clears correctly on account switch
+- **QA critical fixes** — 10 `unwrap()` calls replaced with safe alternatives, `doneHandled` race fixed, dead code removed
+- **148 JS + 4 Rust unit tests** — full test coverage for context builders, accuracy nudge logic, live run, theme concentration, cash sentinel
+
+## What was new in v0.2.1
 
 - **Stale position alerts** — sidebar badge + overdue markers when positions need reanalysis
 - **Theme concentration risk** — detects when 3+ positions share a news theme, warns in synthesis and UI

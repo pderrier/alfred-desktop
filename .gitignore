@@ -31,3 +31,4 @@ src-tauri/codex-runtime/
 .alfred.local.env
 .env
 .env.local
+.claude/

@@ -1617,6 +1617,15 @@ fn build_cash_mapping(holdings_accounts: &[Value]) -> CashMappingResult {
     // Check both plain name and compound key (`institution::name`) formats.
     for inv in &investment_entries {
         if let Some(cash_name) = saved_links.get(&inv.name) {
+            // User explicitly dismissed cash mapping for this account — assign zero cash
+            if cash_name == "__none__" {
+                result.insert(inv.name.clone(), 0.0);
+                crate::debug_log(&format!(
+                    "finary_cash_mapping: '{}' → 0.00 (user dismissed — no cash account)",
+                    inv.name
+                ));
+                continue;
+            }
             // Try exact match first, then compound key with institution prefix
             let cash_entry = cash_by_name.get(cash_name.as_str())
                 .or_else(|| {

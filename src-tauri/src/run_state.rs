@@ -433,10 +433,12 @@ fn load_latest_finary_snapshot_meta() -> serde_json::Value {
     });
     if let Some(arr) = ambiguous_cash_groups.as_array() {
         if !arr.is_empty() {
-            meta.as_object_mut().unwrap().insert(
-                "ambiguous_cash_groups".to_string(),
-                ambiguous_cash_groups,
-            );
+            if let Some(obj) = meta.as_object_mut() {
+                obj.insert(
+                    "ambiguous_cash_groups".to_string(),
+                    ambiguous_cash_groups,
+                );
+            }
         }
     }
     meta

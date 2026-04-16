@@ -184,10 +184,9 @@ pub(crate) fn normalize_finary_snapshot(snapshot: &Value) -> Value {
     });
     // Preserve ambiguous cash groups through normalization so the wizard can trigger
     if let Some(groups) = snapshot.get("ambiguous_cash_groups") {
-        result.as_object_mut().unwrap().insert(
-            "ambiguous_cash_groups".to_string(),
-            groups.clone(),
-        );
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert("ambiguous_cash_groups".to_string(), groups.clone());
+        }
     }
     result
 }
@@ -204,10 +203,14 @@ pub(crate) fn normalize_csv_snapshot(snapshot: &Value) -> Value {
     });
     // Preserve transaction history reconciliation metadata through normalization
     if let Some(csv_source) = snapshot.get("csv_source") {
-        result.as_object_mut().unwrap().insert("csv_source".to_string(), csv_source.clone());
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert("csv_source".to_string(), csv_source.clone());
+        }
     }
     if let Some(reconciliation) = snapshot.get("reconciliation") {
-        result.as_object_mut().unwrap().insert("reconciliation".to_string(), reconciliation.clone());
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert("reconciliation".to_string(), reconciliation.clone());
+        }
     }
     result
 }

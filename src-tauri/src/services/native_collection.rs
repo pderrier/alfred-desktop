@@ -341,10 +341,14 @@ fn wrap_snapshot(portfolio: Value) -> Result<Value> {
     });
     // Preserve transaction history metadata (source, reconciliation) through normalization
     if let Some(source) = portfolio.get("source") {
-        result.as_object_mut().unwrap().insert("csv_source".to_string(), source.clone());
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert("csv_source".to_string(), source.clone());
+        }
     }
     if let Some(reconciliation) = portfolio.get("reconciliation") {
-        result.as_object_mut().unwrap().insert("reconciliation".to_string(), reconciliation.clone());
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert("reconciliation".to_string(), reconciliation.clone());
+        }
     }
     Ok(result)
 }
@@ -1443,10 +1447,12 @@ fn fetch_finary_snapshot(run_id: &str, _request_fn: HttpRequestFn) -> Result<Val
     });
     // Include ambiguous cash groups that need user confirmation
     if !cash_result.ambiguous_groups.is_empty() {
-        snapshot.as_object_mut().unwrap().insert(
-            "ambiguous_cash_groups".to_string(),
-            json!(cash_result.ambiguous_groups),
-        );
+        if let Some(obj) = snapshot.as_object_mut() {
+            obj.insert(
+                "ambiguous_cash_groups".to_string(),
+                json!(cash_result.ambiguous_groups),
+            );
+        }
     }
     Ok(snapshot)
 }

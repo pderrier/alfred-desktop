@@ -82,11 +82,11 @@ pub fn merge_recommendation(existing: &Value, new: &Value) -> Value {
         for (key, new_val) in update {
             let is_empty = new_val.is_null()
                 || (new_val.is_string() && new_val.as_str().unwrap_or_default().trim().is_empty())
-                || (new_val.is_array() && new_val.as_array().unwrap().is_empty());
+                || (new_val.as_array().is_some_and(|a| a.is_empty()));
             let existing_has_value = base.get(key).is_some_and(|v| {
                 !v.is_null()
                     && !(v.is_string() && v.as_str().unwrap_or_default().trim().is_empty())
-                    && !(v.is_array() && v.as_array().unwrap().is_empty())
+                    && !(v.as_array().is_some_and(|a| a.is_empty()))
             });
             if is_empty && existing_has_value {
                 continue;
@@ -116,7 +116,11 @@ fn load_run_state(data_dir: &Path, run_id: &str) -> Result<Value> {
                     let line_id = entry.get("line_id").and_then(|v| v.as_str()).unwrap_or("");
                     let rec = entry.get("recommendation").cloned().unwrap_or(json!({}));
                     if !line_id.is_empty() {
-                        let pending = state.as_object_mut().unwrap()
+                        let obj = match state.as_object_mut() {
+                            Some(o) => o,
+                            None => continue,
+                        };
+                        let pending = obj
                             .entry("pending_recommandations")
                             .or_insert_with(|| json!([]));
                         if let Some(arr) = pending.as_array_mut() {
@@ -912,10 +916,9 @@ fn tool_validate_recommendation(data_dir: &Path, params: &Value) -> Result<Value
         "issues": [],
     });
     if !warnings.is_empty() {
-        result
-            .as_object_mut()
-            .unwrap()
-            .insert("warnings".to_string(), json!(warnings));
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert("warnings".to_string(), json!(warnings));
+        }
     }
     Ok(result)
 }

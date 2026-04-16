@@ -227,18 +227,132 @@ export function openChatWizard(config) {
   });
 }
 
-// ── Cash account matching helper ──────────────────────────────────
+// ── Cash account matching — structured dropdown UI (Item 16) ─────
 
 /**
- * Open a chat wizard pre-configured for ambiguous cash account matching.
+ * Open a dropdown-based modal for cash account matching.
+ * Replaces the verbose LLM text-based chat with a structured UI.
  *
  * @param {Object} opts
  * @param {Array} opts.investmentAccounts — [{ name, connection_id, securities_count, ... }]
  * @param {Array} opts.cashAccounts — [{ name, connection_id, fiats_sum, ... }]
- * @param {Object} opts.currentMapping — { investmentName: cashAmount } — heuristic mapping to confirm
- * @returns {Promise<Object|null>} — confirmed mapping { investmentAccountName: cashAccountName } or null
+ * @param {Object} [opts.currentMapping] — { investmentName: cashAmount } — heuristic mapping
+ * @returns {Promise<Object|null>} — mapping { investmentAccountName: cashAccountName } or null
  */
 export function openCashMatchingWizard(opts) {
+  const { investmentAccounts, cashAccounts, currentMapping } = opts;
+
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    overlay.style.zIndex = "10000";
+
+    // Build best-guess pre-selections from heuristic mapping
+    const heuristicMap = buildHeuristicPreselection(investmentAccounts, cashAccounts, currentMapping);
+
+    let html = `
+      <div class="modal-card" style="width:min(36rem,calc(100vw - 2rem));max-height:min(70vh,40rem);display:flex;flex-direction:column;padding:0">
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:1rem 1.2rem 0.6rem;border-bottom:1px solid rgba(73,100,126,0.3)">
+          <h3 style="margin:0;font-size:1rem;color:var(--sea-text,#e0e8f0)">Link Cash Accounts</h3>
+          <button class="cm-close-btn" style="background:none;border:none;color:var(--sea-muted,#8a9bb0);font-size:1.2rem;cursor:pointer;padding:0.2rem 0.4rem" title="Close">&times;</button>
+        </div>
+        <div style="flex:1;overflow-y:auto;padding:1rem 1.2rem;display:flex;flex-direction:column;gap:1rem">
+    `;
+
+    for (const inv of investmentAccounts) {
+      const invName = escapeHtml(inv.name || "");
+      const selectId = `cm-select-${invName.replace(/[^a-zA-Z0-9]/g, "_")}`;
+      html += `
+        <div class="cm-row" style="display:flex;flex-direction:column;gap:0.3rem">
+          <label style="font-size:0.85rem;font-weight:600;color:var(--sea-text,#e0e8f0)">For ${invName}, select cash account:</label>
+          <select class="cm-select" data-inv-name="${invName}" id="${selectId}" style="padding:0.5rem 0.7rem;background:rgba(10,17,24,0.6);border:1px solid rgba(73,100,126,0.4);border-radius:8px;color:var(--sea-text,#e0e8f0);font-size:0.85rem;font-family:inherit">
+            ${cashAccounts.map((c) => {
+              const cashLabel = `${escapeHtml(c.name)} (${formatEuro(c.fiats_sum || 0)})`;
+              const selected = heuristicMap[inv.name] === c.name ? "selected" : "";
+              return `<option value="${escapeHtml(c.name)}" ${selected}>${cashLabel}</option>`;
+            }).join("")}
+            <option value="__none__"${!heuristicMap[inv.name] ? " selected" : ""}>No cash account</option>
+          </select>
+        </div>
+      `;
+    }
+
+    html += `
+        </div>
+        <div style="display:flex;gap:0.5rem;padding:0.8rem 1.2rem;border-top:1px solid rgba(73,100,126,0.3);align-items:center;justify-content:space-between">
+          <a href="#" class="cm-help-link" style="font-size:0.78rem;color:var(--sea-muted,#8a9bb0)">Need help? Ask Alfred</a>
+          <div style="display:flex;gap:0.5rem">
+            <button class="cm-cancel-btn cmd-btn ghost-btn">Cancel</button>
+            <button class="cm-confirm-btn cmd-btn">Confirm</button>
+          </div>
+        </div>
+      </div>
+    `;
+
+    overlay.innerHTML = html;
+    document.body.appendChild(overlay);
+
+    let resolved = false;
+    function finish(value) {
+      if (resolved) return;
+      resolved = true;
+      overlay.remove();
+      resolve(value);
+    }
+
+    // Confirm — build mapping from selects
+    overlay.querySelector(".cm-confirm-btn")?.addEventListener("click", () => {
+      const mapping = {};
+      const selects = overlay.querySelectorAll(".cm-select");
+      for (const sel of selects) {
+        const invName = sel.dataset.invName;
+        const cashName = sel.value;
+        if (invName && cashName) {
+          mapping[invName] = cashName;
+        }
+      }
+      finish(mapping);
+    });
+
+    // Cancel
+    overlay.querySelector(".cm-cancel-btn")?.addEventListener("click", () => finish(null));
+    overlay.querySelector(".cm-close-btn")?.addEventListener("click", () => finish(null));
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) finish(null);
+    });
+
+    // Help link — fall back to LLM chat wizard
+    overlay.querySelector(".cm-help-link")?.addEventListener("click", (e) => {
+      e.preventDefault();
+      finish(null);
+      openCashMatchingWizardLlm(opts).then(resolve);
+    });
+  });
+}
+
+/**
+ * Build a heuristic pre-selection map: { investmentName: cashName }.
+ * Uses index-based mapping from currentMapping amounts to find best match.
+ */
+function buildHeuristicPreselection(investmentAccounts, cashAccounts, currentMapping) {
+  const preselection = {};
+  if (!currentMapping) return preselection;
+  // currentMapping is { investmentName: cashAmount }
+  // Match by amount to find which cash account the heuristic chose
+  for (const [invName, cashAmount] of Object.entries(currentMapping)) {
+    const bestCash = cashAccounts.find((c) => Math.abs((c.fiats_sum || 0) - cashAmount) < 0.01);
+    if (bestCash) {
+      preselection[invName] = bestCash.name;
+    }
+  }
+  return preselection;
+}
+
+/**
+ * LLM-based cash matching wizard — fallback for "Need help? Ask Alfred".
+ * Preserves the original chat-based approach as optional.
+ */
+function openCashMatchingWizardLlm(opts) {
   const { investmentAccounts, cashAccounts, currentMapping } = opts;
 
   const investmentList = investmentAccounts

@@ -579,7 +579,17 @@ export function initWizard(deps) {
                   await tauriInvoke("save_user_preferences_local", { prefs });
                   showToast("Cash account mapping saved", "success");
                 } else {
-                  // User cancelled — warn but allow the run to proceed with incomplete mapping
+                  // User cancelled — save "__none__" sentinel so we don't re-prompt next session
+                  try {
+                    const prefs = await tauriInvoke("get_user_preferences_local") || {};
+                    if (!prefs.cash_account_links) prefs.cash_account_links = {};
+                    for (const inv of investmentAccounts) {
+                      if (!prefs.cash_account_links[inv.name]) {
+                        prefs.cash_account_links[inv.name] = "__none__";
+                      }
+                    }
+                    await tauriInvoke("save_user_preferences_local", { prefs });
+                  } catch { /* best effort */ }
                   showToast("Cash mapping skipped — cash values may be zero", "warning");
                 }
               }

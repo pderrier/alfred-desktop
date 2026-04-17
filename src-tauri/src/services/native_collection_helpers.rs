@@ -1,6 +1,7 @@
 use std::{collections::HashSet, env};
 
 use anyhow::Result;
+use regex::Regex;
 use serde_json::{json, Map, Value};
 
 pub(crate) type HttpRequestFn =
@@ -234,6 +235,40 @@ pub(crate) fn parse_fr_number(raw: &str) -> f64 {
         &sanitized
     };
     stripped.parse::<f64>().unwrap_or(0.0)
+}
+
+/// Extract a value using a regex capture group 1. If no regex or no match, returns raw as-is.
+pub(crate) fn extract_with_pattern(raw: &str, regex: Option<&Regex>) -> String {
+    let Some(re) = regex else { return raw.to_string() };
+    re.captures(raw)
+        .and_then(|caps| caps.get(1))
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| raw.to_string())
+}
+
+/// Parse a numeric string according to the specified number format.
+/// - "french": comma is decimal separator, space/dot are thousands separators
+/// - "english": dot is decimal separator, comma is thousands separator
+pub(crate) fn parse_number_with_format(raw: &str, number_format: &str) -> f64 {
+    let trimmed = raw
+        .replace('\u{202f}', "")
+        .replace('\u{00a0}', "")
+        .trim()
+        .to_string();
+    if trimmed.is_empty() {
+        return 0.0;
+    }
+    match number_format {
+        "english" => {
+            // Strip thousands commas, parse with dot as decimal
+            let cleaned = trimmed.replace(',', "").replace(' ', "");
+            cleaned.parse::<f64>().unwrap_or(0.0)
+        }
+        _ => {
+            // French: space/dot are thousands, comma is decimal
+            parse_fr_number(&trimmed)
+        }
+    }
 }
 
 pub(crate) fn normalize_url(raw: &str) -> String {

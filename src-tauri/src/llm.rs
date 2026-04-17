@@ -567,20 +567,23 @@ pub fn generate_watchlist_suggestions(
     Ok(watchlist)
 }
 
-// ── CSV column adaptation ─────────────────────────────────────────
+// ── Universal CSV format analysis ─────────────────────────────────
 
-/// Ask the LLM to map unknown CSV columns to our expected fields.
-/// Returns a JSON object with `column_mapping`, `number_format`, etc.
-pub fn adapt_csv_columns(
+/// Ask the LLM to analyze a CSV format and return a CsvParsingSpec.
+/// The spec describes how to deterministically parse the CSV.
+pub fn analyze_csv_format(
     headers: &[String],
     sample_rows: &[Vec<String>],
     delimiter: char,
-) -> Result<Value> {
-    let prompt = crate::llm_prompts::build_csv_adaptation_prompt(headers, sample_rows, delimiter);
+    row_count: usize,
+) -> Result<crate::native_collection::CsvParsingSpec> {
+    let prompt = crate::llm_prompts::build_universal_csv_parsing_prompt(
+        headers, sample_rows, delimiter, row_count,
+    );
     let mode = resolve_generation_mode();
 
     crate::debug_log(&format!(
-        "[csv-adapt] requesting LLM column mapping for {} headers, mode={mode}",
+        "[csv-analyze] requesting LLM CSV analysis for {} headers, mode={mode}",
         headers.len()
     ));
 
@@ -599,11 +602,33 @@ pub fn adapt_csv_columns(
     };
 
     let draft = crate::llm_parsing::extract_draft_from_response(&response)?;
-    let mapping = draft
-        .get("column_mapping")
-        .cloned()
-        .unwrap_or_else(|| draft.clone());
+    crate::debug_log(&format!("[csv-analyze] LLM response: {draft}"));
 
-    crate::debug_log(&format!("[csv-adapt] LLM mapping: {mapping}"));
-    Ok(draft)
+    // Validate required fields
+    let format_type = draft.get("format_type").and_then(|v| v.as_str()).unwrap_or_default();
+    if format_type != "transaction_history" && format_type != "position_snapshot" {
+        return Err(anyhow!("csv_analyze_invalid_format_type:{format_type}"));
+    }
+    if draft.get("columns").is_none() {
+        return Err(anyhow!("csv_analyze_missing_columns"));
+    }
+
+    // Validate column indices are within range
+    let max_col = headers.len() as i64;
+    if let Some(columns) = draft.get("columns").and_then(|v| v.as_object()) {
+        for (field, col_val) in columns {
+            if let Some(idx) = col_val.get("index").and_then(|v| v.as_i64()) {
+                if idx < 0 || idx >= max_col {
+                    crate::debug_log(&format!(
+                        "[csv-analyze] warning: column '{field}' index {idx} out of range (0..{max_col})"
+                    ));
+                }
+            }
+        }
+    }
+
+    let spec: crate::native_collection::CsvParsingSpec = serde_json::from_value(draft.clone())
+        .map_err(|e| anyhow!("csv_analyze_deserialize_failed:{e}"))?;
+
+    Ok(spec)
 }

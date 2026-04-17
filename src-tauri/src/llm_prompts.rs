@@ -930,63 +930,108 @@ fn truncate_str(s: &str, max: usize) -> String {
     if s.len() <= max { s.to_string() } else { format!("{}...", &s[..s.char_indices().nth(max).map(|(i,_)|i).unwrap_or(s.len())]) }
 }
 
-// ── CSV column adaptation prompt ────────────────────────────────
+// ── Universal CSV parsing prompt ────────────────────────────────
 
-pub(crate) fn build_csv_adaptation_prompt(
+pub(crate) fn build_universal_csv_parsing_prompt(
     headers: &[String],
     sample_rows: &[Vec<String>],
     delimiter: char,
+    row_count: usize,
 ) -> String {
-    let header_line = headers.join(" | ");
+    let header_line = headers
+        .iter()
+        .enumerate()
+        .map(|(i, h)| format!("[{i}] {h}"))
+        .collect::<Vec<_>>()
+        .join("  ");
     let sample_lines: Vec<String> = sample_rows
         .iter()
         .take(5)
         .map(|row| row.join(" | "))
         .collect();
+    let delim_display = match delimiter {
+        '\t' => "TAB".to_string(),
+        c => format!("'{c}'"),
+    };
+    let delim_json = match delimiter {
+        '\t' => "\\t".to_string(),
+        c => c.to_string(),
+    };
 
     format!(
-        r#"Tu reçois un fichier CSV de portefeuille boursier avec un format inconnu.
-Le délimiteur est '{delimiter}'.
+        r#"You are analyzing a CSV file from a stock brokerage or portfolio tracker.
+Delimiter: {delim_display}. Total data rows: {row_count}.
 
-HEADERS (colonnes):
+HEADERS (with column index):
 {header_line}
 
-EXEMPLE DE LIGNES (max 5):
+SAMPLE DATA (first {sample_count} rows):
 {samples}
 
-Ta tâche: identifier quelles colonnes correspondent à ces champs obligatoires et optionnels.
+YOUR TASK: Produce a JSON spec describing how to parse this CSV. Determine whether it is:
+1. A TRANSACTION HISTORY (buy/sell trades over time) — look for date, action/type, price per share
+2. A POSITION SNAPSHOT (current holdings) — look for quantity, current price, market value
 
-Champs OBLIGATOIRES (le CSV est invalide sans eux):
-- ticker: le code ticker ou symbole de l'action (ex: MC, AAPL, NL0000235190)
-- quantite: le nombre de parts/actions détenues
+COLUMN FIELDS (set to null if absent in this CSV):
+For TRANSACTION HISTORY: ticker, isin, name, date, action, quantity, price, amount, currency, fees, fx_rate
+For POSITION SNAPSHOT: ticker, isin, name, quantity, current_price, market_value, cost_basis, pnl, account
 
-Champs OPTIONNELS:
-- nom: le nom complet de l'entreprise
-- isin: le code ISIN (ex: FR0000121014)
-- prix_actuel: le cours/prix actuel
-- valeur_actuelle: la valorisation totale de la ligne
-- prix_revient: le prix de revient unitaire (PRU)
-- plus_moins_value: la plus ou moins-value latente
-- compte: le nom du compte (PEA, CTO, etc.)
+Each column entry is either null (absent) or {{"index": <col_number>}} with an optional "parse_pattern" regex.
 
-Réponds UNIQUEMENT avec un JSON valide:
+PARSE_PATTERN: If a cell value contains non-numeric characters (currency codes, symbols, spaces in numbers), provide a regex with capture group 1 that extracts the numeric part. Examples:
+- "USD 235.56" → parse_pattern: "^[A-Z]{{3}}\\s*([\\d.,]+)$"
+- "1 234,56 €" → parse_pattern: "([\\d\\s.,]+)"
+- "$1,234.56" → parse_pattern: "[\\$€£]?\\s*([\\d.,]+)"
+- "2021-01-29T14:10:34.893Z" → parse_pattern: "^(\\d{{4}}-\\d{{2}}-\\d{{2}})"
+If cells are already clean numbers, omit parse_pattern.
+
+NUMBER_FORMAT: Examine the decimal separators in sample data:
+- "english": dot is decimal (1,234.56)
+- "french": comma is decimal (1 234,56)
+
+ACTION_MAP: For transaction history, map the raw action values you see in sample data to BUY/SELL.
+Example: {{"BUY": ["BUY", "Market buy", "Limit buy"], "SELL": ["SELL", "Market sell"]}}
+
+INFER_ACTION_FROM_QUANTITY_SIGN: Set true if there is NO action column and quantity sign indicates direction (positive=BUY, negative=SELL). This is common for DEGIRO.
+
+KNOWN BROKER PATTERNS (for reference only — analyze the actual data):
+- Revolut: Date,Ticker,Type,Quantity,Price per share,Total Amount,Currency,FX Rate (english numbers, "USD 235.56" amounts)
+- Trading 212: Action,Time,ISIN,Ticker,Name,No. of shares,Price / share,Currency,Exchange rate,Total (english)
+- DEGIRO: Date,Time,Product,ISIN,Reference Exchange,Quantity,Price,Local value,Value,Exchange rate,Transaction costs,Total (no action column, infer from qty sign)
+- IBKR: TradeDate,Symbol,Description,Buy/Sell,Quantity,T. Price,Proceeds,Comm/Fee,Currency (english)
+- Boursorama: Nom,Code ISIN,Quantite,Cours,Valorisation,+/- Value,PRU (french numbers, semicolons)
+
+Return ONLY valid JSON — no explanation, no markdown fences:
 {{
-  "column_mapping": {{
-    "ticker": <index_colonne>,
-    "quantite": <index_colonne>,
-    "nom": <index_colonne_ou_null>,
-    "isin": <index_colonne_ou_null>,
-    "prix_actuel": <index_colonne_ou_null>,
-    "valeur_actuelle": <index_colonne_ou_null>,
-    "prix_revient": <index_colonne_ou_null>,
-    "plus_moins_value": <index_colonne_ou_null>,
-    "compte": <index_colonne_ou_null>
+  "format_type": "transaction_history" or "position_snapshot",
+  "delimiter": "{delim_json}",
+  "header_row_index": 0,
+  "skip_rows_before_header": 0,
+  "number_format": "english" or "french",
+  "columns": {{
+    "ticker": {{"index": N}} or null,
+    "isin": {{"index": N}} or null,
+    "name": {{"index": N}} or null,
+    "quantity": {{"index": N, "parse_pattern": "..."}} or null,
+    "price": {{"index": N, "parse_pattern": "..."}} or null,
+    "amount": {{"index": N, "parse_pattern": "..."}} or null,
+    "date": {{"index": N, "parse_pattern": "..."}} or null,
+    "action": {{"index": N}} or null,
+    "currency": {{"index": N}} or null,
+    "fees": {{"index": N, "parse_pattern": "..."}} or null,
+    "fx_rate": {{"index": N, "parse_pattern": "..."}} or null,
+    "current_price": {{"index": N, "parse_pattern": "..."}} or null,
+    "market_value": {{"index": N, "parse_pattern": "..."}} or null,
+    "cost_basis": {{"index": N, "parse_pattern": "..."}} or null,
+    "pnl": {{"index": N, "parse_pattern": "..."}} or null,
+    "account": {{"index": N}} or null
   }},
-  "header_row_index": <0_si_la_premiere_ligne_est_le_header>,
-  "number_format": "french" | "english",
-  "confidence": "high" | "medium" | "low"
+  "action_map": {{"BUY": [...], "SELL": [...]}} or null,
+  "infer_action_from_quantity_sign": false,
+  "confidence": "high" or "medium" or "low"
 }}"#,
-        samples = sample_lines.join("\n")
+        sample_count = sample_lines.len(),
+        samples = sample_lines.join("\n"),
     )
 }
 

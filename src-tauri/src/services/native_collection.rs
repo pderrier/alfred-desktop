@@ -2699,6 +2699,18 @@ pub fn execute_native_local_analysis_workflow(
     execute_native_local_analysis_workflow_with(options, llm_token, native_request_fn)
 }
 
+// ── Test-only public wrappers ──────────────────────────────────────
+
+#[cfg(test)]
+pub fn compute_header_fingerprint_for_test(headers: &[String]) -> String {
+    compute_header_fingerprint(headers)
+}
+
+#[cfg(test)]
+pub fn execute_spec_for_test(spec: &CsvParsingSpec, rows: &[Vec<String>], headers: &[String], account: &str) -> Result<Value> {
+    execute_spec(spec, rows, headers, account)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

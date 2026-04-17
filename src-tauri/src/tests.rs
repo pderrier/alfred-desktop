@@ -2033,13 +2033,52 @@ use crate::storage::read_json_file;
     }
 
     #[test]
-    fn csv_upload_heuristic_parses_english_headers() {
-        // English CSV with comma delimiter — not Boursorama format
+    fn csv_upload_with_cached_spec_parses_english_headers() {
+        // English CSV with comma delimiter — pre-cache a spec so the LLM is not needed
         let csv_text = "Symbol,Company,Qty,Last Price,Market Value,PnL\nAAPL,Apple Inc,50,185.50,9275.00,1250.00\nMSFT,Microsoft,30,380.20,11406.00,2100.00";
 
         let _guard = env_lock();
         let base_dir = std::env::temp_dir().join(format!("alfred-csv-heuristic-{}", now_epoch_ms()));
         let run_id = init_csv_run_with_account(&base_dir, "CSV_heuristic");
+
+        // Pre-cache a CsvParsingSpec for these headers so the 2-tier flow hits cache
+        let headers = vec!["Symbol", "Company", "Qty", "Last Price", "Market Value", "PnL"]
+            .into_iter().map(String::from).collect::<Vec<_>>();
+        let fingerprint = crate::native_collection::compute_header_fingerprint_for_test(&headers);
+        let spec = CsvParsingSpec {
+            format_type: "position_snapshot".to_string(),
+            delimiter: ",".to_string(),
+            header_row_index: 0,
+            skip_rows_before_header: 0,
+            number_format: "english".to_string(),
+            columns: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("ticker".to_string(), col(0));
+                m.insert("name".to_string(), col(1));
+                m.insert("quantity".to_string(), col(2));
+                m.insert("current_price".to_string(), col(3));
+                m.insert("market_value".to_string(), col(4));
+                m.insert("pnl".to_string(), col(5));
+                m
+            },
+            action_map: None,
+            infer_action_from_quantity_sign: false,
+            confidence: "high".to_string(),
+        };
+        // Write the spec to user-preferences via the same path used by cache_spec
+        let mut prefs = crate::runtime_settings::get_user_preferences();
+        if let Some(obj) = prefs.as_object_mut() {
+            let specs = obj.entry("csv_parsing_specs").or_insert_with(|| json!({}));
+            if let Some(specs_obj) = specs.as_object_mut() {
+                specs_obj.insert(fingerprint.clone(), json!({
+                    "spec": serde_json::to_value(&spec).unwrap(),
+                    "cached_at": "2026-04-17",
+                    "hit_count": 0,
+                    "original_headers": headers,
+                }));
+            }
+        }
+        let _ = crate::runtime_settings::save_user_preferences(&prefs);
 
         let result = crate::native_collection::execute_native_local_analysis_workflow_with(
             Some(json!({
@@ -2052,7 +2091,7 @@ use crate::storage::read_json_file;
             |_url, _method, _timeout, _body, _auth, _retries| Ok(json!({"error": "mock"})),
         );
 
-        assert!(result.is_ok(), "heuristic csv should succeed, got: {:?}", result.err());
+        assert!(result.is_ok(), "cached spec csv should succeed, got: {:?}", result.err());
         let payload = result.unwrap();
         assert_eq!(payload["result"]["collection"]["positions_count"], 2,
             "should have 2 positions (AAPL + MSFT)");
@@ -2082,4 +2121,241 @@ use crate::storage::read_json_file;
         assert!(err.contains("csv_input_missing"), "error should be csv_input_missing, got: {err}");
 
         cleanup_csv_run(&base_dir);
+    }
+
+    // ── Universal CSV parser tests ─────────────────────────────────
+
+    use crate::native_collection::{CsvParsingSpec, ColumnSpec};
+
+    fn make_spec(format_type: &str, number_format: &str, columns: Vec<(&str, Option<ColumnSpec>)>) -> CsvParsingSpec {
+        let mut col_map = std::collections::HashMap::new();
+        for (k, v) in columns {
+            col_map.insert(k.to_string(), v);
+        }
+        CsvParsingSpec {
+            format_type: format_type.to_string(),
+            delimiter: ",".to_string(),
+            header_row_index: 0,
+            skip_rows_before_header: 0,
+            number_format: number_format.to_string(),
+            columns: col_map,
+            action_map: None,
+            infer_action_from_quantity_sign: false,
+            confidence: "high".to_string(),
+        }
+    }
+
+    fn col(index: i32) -> Option<ColumnSpec> {
+        Some(ColumnSpec { index, parse_pattern: None })
+    }
+
+    fn col_with_pattern(index: i32, pattern: &str) -> Option<ColumnSpec> {
+        Some(ColumnSpec { index, parse_pattern: Some(pattern.to_string()) })
+    }
+
+    #[test]
+    fn test_header_fingerprint_stability() {
+        let _guard = env_lock();
+        let h1 = vec!["Date".to_string(), "Ticker".to_string(), "Type".to_string()];
+        let h2 = vec!["Type".to_string(), "Date".to_string(), "Ticker".to_string()];
+        let fp1 = crate::native_collection::compute_header_fingerprint_for_test(&h1);
+        let fp2 = crate::native_collection::compute_header_fingerprint_for_test(&h2);
+        assert_eq!(fp1, fp2, "same headers in different order should produce same fingerprint");
+        assert_eq!(fp1.len(), 16, "fingerprint should be 16 hex chars");
+
+        let h3 = vec!["Date".to_string(), "Symbol".to_string(), "Type".to_string()];
+        let fp3 = crate::native_collection::compute_header_fingerprint_for_test(&h3);
+        assert_ne!(fp1, fp3, "different headers should produce different fingerprint");
+    }
+
+    #[test]
+    fn test_number_format_english_vs_french() {
+        let _guard = env_lock();
+        use crate::native_collection_helpers::parse_number_with_format;
+
+        assert!((parse_number_with_format("1,234.56", "english") - 1234.56).abs() < 0.01);
+        assert!((parse_number_with_format("1 234,56", "french") - 1234.56).abs() < 0.01);
+        assert!((parse_number_with_format("235.56", "english") - 235.56).abs() < 0.01);
+        assert!((parse_number_with_format("235,56", "french") - 235.56).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_parse_pattern_currency_prefix() {
+        let _guard = env_lock();
+        use crate::native_collection_helpers::{extract_with_pattern, parse_number_with_format};
+        use regex::Regex;
+
+        let re = Regex::new(r"^[A-Z]{3}\s*([\d.,]+)$").unwrap();
+        let extracted = extract_with_pattern("USD 235.56", Some(&re));
+        assert_eq!(extracted, "235.56");
+        assert!((parse_number_with_format(&extracted, "english") - 235.56).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_parse_pattern_euro_suffix() {
+        let _guard = env_lock();
+        use crate::native_collection_helpers::{extract_with_pattern, parse_number_with_format};
+        use regex::Regex;
+
+        let re = Regex::new(r"([\d\s.,]+)").unwrap();
+        let extracted = extract_with_pattern("1 234,56 €", Some(&re));
+        assert!((parse_number_with_format(&extracted, "french") - 1234.56).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_parse_pattern_dollar_prefix() {
+        let _guard = env_lock();
+        use crate::native_collection_helpers::{extract_with_pattern, parse_number_with_format};
+        use regex::Regex;
+
+        let re = Regex::new(r"[\$€£]?\s*([\d.,]+)").unwrap();
+        let extracted = extract_with_pattern("$1,234.56", Some(&re));
+        assert!((parse_number_with_format(&extracted, "english") - 1234.56).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_parse_pattern_fallback_on_invalid_regex() {
+        let _guard = env_lock();
+        use crate::native_collection_helpers::extract_with_pattern;
+
+        // Invalid regex should not compile — function should gracefully return raw
+        // (The compile happens in compile_spec_patterns, which skips invalid regexes,
+        //  so extract_with_pattern gets None for those fields)
+        let result = extract_with_pattern("235.56", None);
+        assert_eq!(result, "235.56");
+    }
+
+    #[test]
+    fn test_execute_spec_revolut_transactions() {
+        let _guard = env_lock();
+        let mut spec = make_spec("transaction_history", "english", vec![
+            ("date", col(0)),
+            ("ticker", col(1)),
+            ("action", col(2)),
+            ("quantity", col(3)),
+            ("price", col_with_pattern(4, r"^[A-Z]{3}\s*([\d.,]+)$")),
+            ("amount", col_with_pattern(5, r"^[A-Z]{3}\s*([\d.,]+)$")),
+            ("currency", col(6)),
+            ("fx_rate", col(7)),
+        ]);
+        let mut action_map = std::collections::HashMap::new();
+        action_map.insert("BUY".to_string(), vec!["BUY".to_string(), "Market buy".to_string(), "Limit buy".to_string()]);
+        action_map.insert("SELL".to_string(), vec!["SELL".to_string(), "Market sell".to_string(), "Limit sell".to_string()]);
+        spec.action_map = Some(action_map);
+
+        let headers = vec!["Date", "Ticker", "Type", "Quantity", "Price per share", "Total Amount", "Currency", "FX Rate"]
+            .into_iter().map(String::from).collect::<Vec<_>>();
+        let rows = vec![
+            vec!["2024-01-15", "AAPL", "BUY", "10", "USD 185.50", "USD 1855.00", "USD", "0.92"],
+            vec!["2024-02-20", "AAPL", "BUY", "5", "USD 190.00", "USD 950.00", "USD", "0.93"],
+            vec!["2024-03-10", "MSFT", "Market buy", "3", "USD 415.00", "USD 1245.00", "USD", "0.91"],
+        ].into_iter().map(|r| r.into_iter().map(String::from).collect()).collect::<Vec<Vec<String>>>();
+
+        let result = crate::native_collection::execute_spec_for_test(&spec, &rows, &headers, "Revolut");
+        assert!(result.is_ok(), "execute_spec should succeed: {:?}", result.err());
+        let snapshot = result.unwrap();
+        let positions = snapshot.get("positions").unwrap().as_array().unwrap();
+        assert_eq!(positions.len(), 2, "should have AAPL and MSFT");
+
+        // Find AAPL position
+        let aapl = positions.iter().find(|p| p.get("ticker").unwrap().as_str() == Some("AAPL")).unwrap();
+        assert!((aapl.get("quantite").unwrap().as_f64().unwrap() - 15.0).abs() < 0.01);
+        // prix_revient = weighted avg cost: (1855/0.92 + 950/0.93) / 15
+        let pr = aapl.get("prix_revient").unwrap().as_f64().unwrap();
+        assert!(pr > 195.0 && pr < 210.0, "AAPL prix_revient should be around 202, got {pr}");
+    }
+
+    #[test]
+    fn test_execute_spec_degiro_infer_action_from_sign() {
+        let _guard = env_lock();
+        let spec = CsvParsingSpec {
+            format_type: "transaction_history".to_string(),
+            delimiter: ",".to_string(),
+            header_row_index: 0,
+            skip_rows_before_header: 0,
+            number_format: "english".to_string(),
+            columns: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("date".to_string(), col(0));
+                m.insert("name".to_string(), col(1));
+                m.insert("isin".to_string(), col(2));
+                m.insert("quantity".to_string(), col(3));
+                m.insert("price".to_string(), col(4));
+                m.insert("amount".to_string(), col(5));
+                m.insert("fees".to_string(), col(6));
+                m
+            },
+            action_map: None,
+            infer_action_from_quantity_sign: true,
+            confidence: "high".to_string(),
+        };
+
+        let headers = vec!["Date", "Product", "ISIN", "Quantity", "Price", "Total", "Fees"]
+            .into_iter().map(String::from).collect::<Vec<_>>();
+        let rows = vec![
+            vec!["2024-01-15", "Apple Inc", "US0378331005", "10", "185.50", "1855.00", "2.50"],
+            vec!["2024-02-20", "Apple Inc", "US0378331005", "-3", "190.00", "570.00", "2.50"],
+            vec!["2024-03-10", "Microsoft Corp", "US5949181045", "5", "415.00", "2075.00", "3.00"],
+        ].into_iter().map(|r| r.into_iter().map(String::from).collect()).collect::<Vec<Vec<String>>>();
+
+        let result = crate::native_collection::execute_spec_for_test(&spec, &rows, &headers, "DEGIRO");
+        assert!(result.is_ok(), "execute_spec should succeed: {:?}", result.err());
+        let snapshot = result.unwrap();
+        let positions = snapshot.get("positions").unwrap().as_array().unwrap();
+        assert_eq!(positions.len(), 2, "should have APPLE and MSFT");
+
+        let apple = positions.iter().find(|p| {
+            let t = p.get("ticker").unwrap().as_str().unwrap_or("");
+            t == "US0378331005" || t.contains("APPLE")
+        }).unwrap();
+        assert!((apple.get("quantite").unwrap().as_f64().unwrap() - 7.0).abs() < 0.01,
+            "APPLE should have 10-3=7 shares");
+    }
+
+    #[test]
+    fn test_execute_spec_position_snapshot() {
+        let _guard = env_lock();
+        let spec = make_spec("position_snapshot", "french", vec![
+            ("ticker", col(1)),
+            ("name", col(0)),
+            ("quantity", col(2)),
+            ("current_price", col(3)),
+            ("market_value", col(4)),
+            ("cost_basis", col(5)),
+            ("pnl", col(6)),
+        ]);
+
+        let headers = vec!["Nom", "Ticker", "Quantite", "Cours", "Valo", "PRU", "+/-MV"]
+            .into_iter().map(String::from).collect::<Vec<_>>();
+        let rows = vec![
+            vec!["Total Energies", "TTE", "50", "58,30", "2 915,00", "55,20", "155,00"],
+            vec!["Air Liquide", "AI", "10", "175,40", "1 754,00", "160,00", "154,00"],
+        ].into_iter().map(|r| r.into_iter().map(String::from).collect()).collect::<Vec<Vec<String>>>();
+
+        let result = crate::native_collection::execute_spec_for_test(&spec, &rows, &headers, "Test");
+        assert!(result.is_ok(), "execute_spec should succeed: {:?}", result.err());
+        let snapshot = result.unwrap();
+        let positions = snapshot.get("positions").unwrap().as_array().unwrap();
+        assert_eq!(positions.len(), 2);
+
+        let tte = positions.iter().find(|p| p.get("ticker").unwrap().as_str() == Some("TTE")).unwrap();
+        assert!((tte.get("quantite").unwrap().as_f64().unwrap() - 50.0).abs() < 0.01);
+        assert!((tte.get("prix_actuel").unwrap().as_f64().unwrap() - 58.30).abs() < 0.1);
+        assert!((tte.get("valeur_actuelle").unwrap().as_f64().unwrap() - 2915.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_csv_parsing_spec_serde_roundtrip() {
+        let _guard = env_lock();
+        let spec = make_spec("transaction_history", "english", vec![
+            ("ticker", col(1)),
+            ("quantity", col_with_pattern(3, r"^[\d.,]+$")),
+            ("isin", None),
+        ]);
+        let json_val = serde_json::to_value(&spec).unwrap();
+        let roundtrip: CsvParsingSpec = serde_json::from_value(json_val).unwrap();
+        assert_eq!(roundtrip.format_type, "transaction_history");
+        assert_eq!(roundtrip.number_format, "english");
+        assert!(roundtrip.columns.get("isin").unwrap().is_none());
+        assert!(roundtrip.columns.get("ticker").unwrap().is_some());
     }

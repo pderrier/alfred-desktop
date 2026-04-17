@@ -224,7 +224,16 @@ pub(crate) fn parse_fr_number(raw: &str) -> f64 {
         .trim()
         .replace(' ', "")
         .replace(',', ".");
-    sanitized.parse::<f64>().unwrap_or(0.0)
+    // Strip leading currency codes (e.g. "USD235.56" from Revolut "USD 235.56")
+    let stripped = if sanitized.len() > 3
+        && sanitized.as_bytes()[..3].iter().all(|b| b.is_ascii_uppercase())
+        && sanitized.as_bytes().get(3).map_or(false, |b| *b == b'-' || *b == b'.' || b.is_ascii_digit())
+    {
+        &sanitized[3..]
+    } else {
+        &sanitized
+    };
+    stripped.parse::<f64>().unwrap_or(0.0)
 }
 
 pub(crate) fn normalize_url(raw: &str) -> String {

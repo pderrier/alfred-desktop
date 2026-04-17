@@ -82,27 +82,24 @@ fn lookup_cached_spec(fingerprint: &str) -> Option<CsvParsingSpec> {
 /// Cache a CsvParsingSpec keyed by header fingerprint.
 fn cache_spec(fingerprint: &str, spec: &CsvParsingSpec, headers: &[String]) {
     let mut prefs = crate::runtime_settings::get_user_preferences();
-    let specs = prefs
-        .as_object_mut()
-        .and_then(|obj| {
-            obj.entry("csv_parsing_specs")
-                .or_insert_with(|| json!({}))
-                .as_object_mut()
-                .map(|m| m as *mut Map<String, Value>)
-        });
-    if let Some(specs_ptr) = specs {
-        let specs_obj = unsafe { &mut *specs_ptr };
-        let hit_count = specs_obj
-            .get(fingerprint)
-            .and_then(|e| e.get("hit_count"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        specs_obj.insert(fingerprint.to_string(), json!({
-            "spec": serde_json::to_value(spec).unwrap_or_default(),
-            "cached_at": crate::now_iso_string(),
-            "hit_count": hit_count + 1,
-            "original_headers": headers,
-        }));
+    // Read existing hit_count before mutating
+    let hit_count = prefs
+        .get("csv_parsing_specs")
+        .and_then(|s| s.get(fingerprint))
+        .and_then(|e| e.get("hit_count"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if let Some(obj) = prefs.as_object_mut() {
+        let specs = obj.entry("csv_parsing_specs")
+            .or_insert_with(|| json!({}));
+        if let Some(specs_obj) = specs.as_object_mut() {
+            specs_obj.insert(fingerprint.to_string(), json!({
+                "spec": serde_json::to_value(spec).unwrap_or_default(),
+                "cached_at": crate::now_iso_string(),
+                "hit_count": hit_count + 1,
+                "original_headers": headers,
+            }));
+        }
     }
     if let Err(e) = crate::runtime_settings::save_user_preferences(&prefs) {
         crate::debug_log(&format!("[csv-cache] failed to save spec: {e}"));
@@ -281,10 +278,13 @@ fn execute_spec(spec: &CsvParsingSpec, rows: &[Vec<String>], _headers: &[String]
                     .unwrap_or(0.0);
                 if quantity == 0.0 || !quantity.is_finite() { continue; }
 
-                let prix_actuel = col_for("current_price")
-                    .or(col_for("price"))
-                    .map(|c| read_num(row, c, "current_price", &patterns, nf))
-                    .unwrap_or(0.0);
+                let prix_actuel = if let Some(c) = col_for("current_price") {
+                    read_num(row, c, "current_price", &patterns, nf)
+                } else if let Some(c) = col_for("price") {
+                    read_num(row, c, "price", &patterns, nf)
+                } else {
+                    0.0
+                };
                 let market_value = col_for("market_value")
                     .map(|c| read_num(row, c, "market_value", &patterns, nf))
                     .unwrap_or(0.0);
@@ -299,8 +299,15 @@ fn execute_spec(spec: &CsvParsingSpec, rows: &[Vec<String>], _headers: &[String]
                     .unwrap_or_default();
 
                 let valeur_actuelle = if market_value != 0.0 { market_value } else { quantity * prix_actuel };
+                // cost_basis: if it looks like total (close to valeur_actuelle), divide by quantity
+                // otherwise treat as per-unit PRU
                 let prix_revient = if cost_basis != 0.0 {
-                    cost_basis
+                    // Heuristic: if cost_basis > 2x prix_actuel, it's likely total cost → divide
+                    if prix_actuel > 0.0 && cost_basis > prix_actuel * 2.0 && quantity > 1.0 {
+                        cost_basis / quantity
+                    } else {
+                        cost_basis
+                    }
                 } else if valeur_actuelle != 0.0 && pnl != 0.0 {
                     (valeur_actuelle - pnl) / quantity
                 } else {
@@ -344,13 +351,14 @@ fn parse_transactions_with_spec(
     broker_name: &str,
     spec: &CsvParsingSpec,
 ) -> Vec<CsvTransaction> {
+    let nf = &spec.number_format;
     let col = |row: &Vec<String>, idx: i32| -> String {
         if idx < 0 { return String::new(); }
         row.get(idx as usize).cloned().unwrap_or_default().trim().to_string()
     };
     let num = |row: &Vec<String>, idx: i32| -> f64 {
         if idx < 0 { return 0.0; }
-        parse_fr_number(row.get(idx as usize).map(String::as_str).unwrap_or_default())
+        parse_number_with_format(row.get(idx as usize).map(String::as_str).unwrap_or_default(), nf)
     };
 
     let mut transactions = Vec::new();
@@ -625,26 +633,41 @@ fn prepare_csv_text(raw: &str) -> (String, Option<Value>) {
         .collect::<Vec<_>>()
         .join("\n");
 
-    // Extract Boursorama metadata (Valo total line) before removing it
-    let metadata = text.lines()
+    // Extract Boursorama metadata (Valo total line) and strip it from text
+    let metadata_line = text.lines()
         .find(|line| line.contains("Valo total") && line.contains("Solde espèces"))
-        .map(|totals_line| {
-            let valeur_totale = totals_line.split("Valo total").nth(1)
-                .and_then(|p| p.split('=').nth(1))
-                .and_then(|p| p.split(';').next())
-                .map(parse_fr_number).unwrap_or(0.0);
-            let plus_value_totale = totals_line.split("+/- value latente").nth(1)
-                .and_then(|p| p.split('=').nth(1))
-                .and_then(|p| p.split(';').next())
-                .map(parse_fr_number).unwrap_or(0.0);
-            let liquidites = totals_line.split("Solde espèces").nth(1)
-                .and_then(|p| p.split('=').nth(1))
-                .and_then(|p| p.split(';').next())
-                .map(parse_fr_number).unwrap_or(0.0);
-            json!({ "valeur_totale": valeur_totale, "plus_value_totale": plus_value_totale, "liquidites": liquidites })
-        });
+        .map(|s| s.to_string());
 
-    (text, metadata)
+    let metadata = metadata_line.as_deref().map(|totals_line| {
+        let valeur_totale = totals_line.split("Valo total").nth(1)
+            .and_then(|p| p.split('=').nth(1))
+            .and_then(|p| p.split(';').next())
+            .map(parse_fr_number).unwrap_or(0.0);
+        let plus_value_totale = totals_line.split("+/- value latente").nth(1)
+            .and_then(|p| p.split('=').nth(1))
+            .and_then(|p| p.split(';').next())
+            .map(parse_fr_number).unwrap_or(0.0);
+        let liquidites = totals_line.split("Solde espèces").nth(1)
+            .and_then(|p| p.split('=').nth(1))
+            .and_then(|p| p.split(';').next())
+            .map(parse_fr_number).unwrap_or(0.0);
+        json!({ "valeur_totale": valeur_totale, "plus_value_totale": plus_value_totale, "liquidites": liquidites })
+    });
+
+    // Strip metadata lines (Valo total, Meta;ignored) from the text so they don't become data rows
+    let clean_text = if metadata.is_some() {
+        text.lines()
+            .filter(|line| {
+                !(line.contains("Valo total") && line.contains("Solde espèces"))
+                && !line.starts_with("Meta;")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        text
+    };
+
+    (clean_text, metadata)
 }
 
 /// Parse raw CSV text from the file picker (possibly multiple files concatenated

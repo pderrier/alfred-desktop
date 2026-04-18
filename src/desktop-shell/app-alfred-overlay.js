@@ -33,6 +33,7 @@ let autoDismissTimer = null;
 let countdownBarEl = null;
 let currentTriggerId = null;
 let currentPriority = 0;
+let currentContext = null;
 let panelVisible = false;
 
 // ── Chat mode state ────────────────────────────────────────────
@@ -52,6 +53,21 @@ let alfredSuggestionsDisabled = false;
 // ── Session memory ─────────────────────────────────────────────
 /** @type {Array<{triggerId: string, timestamp: number, action: string}>} */
 const sessionEvents = [];
+
+// ── onChatComplete callback ─────────────────────────────────────
+
+/**
+ * Invoke the onChatComplete callback from the current trigger context, if defined.
+ * This allows triggers (e.g. strategy-refine) to persist results after an
+ * overlay mini-chat session ends.
+ */
+function invokeOnChatComplete() {
+  if (currentContext && typeof currentContext.onChatComplete === "function" && chatHistory.length > 0) {
+    try { currentContext.onChatComplete([...chatHistory]); } catch (err) {
+      console.warn("[Alfred] onChatComplete callback failed:", err);
+    }
+  }
+}
 
 // ── DOM construction ────────────────────────────────────────────
 
@@ -96,6 +112,8 @@ function buildPanel() {
   closeBtn.addEventListener("click", () => {
     if (chatMode) {
       recordSessionEvent(currentTriggerId, "chatted");
+      // Invoke onChatComplete callback if the trigger context defined one
+      invokeOnChatComplete();
     }
     // Dismiss via X => suppress trigger for session
     if (currentTriggerId) {
@@ -195,6 +213,7 @@ function showPanel(triggerId, context, triggerDef) {
 
   currentTriggerId = triggerId;
   currentPriority = triggerDef.priority || 0;
+  currentContext = context;
   const { initialMessage, actions } = context;
 
   // Record session event: shown
@@ -709,6 +728,7 @@ export function dismissPanel() {
   panelVisible = false;
   currentTriggerId = null;
   currentPriority = 0;
+  currentContext = null;
 
   // Persist session state (non-blocking)
   if (sessionEvents.length > 0) {

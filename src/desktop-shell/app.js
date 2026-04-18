@@ -540,7 +540,7 @@ function injectSynthesisAskButton(synthCard, model) {
 
 // ── Run Diff (Phase 4a) ─────────────────────────────────────────
 
-async function renderRunDiff() {
+async function renderRunDiff(recommendations = []) {
   const container = document.getElementById("run-diff-container");
   if (!container) return;
   try {
@@ -548,12 +548,27 @@ async function renderRunDiff() {
     if (!invoke) { container.classList.add("hidden"); return; }
     const diff = await invoke("get_run_diff_local");
     if (!diff?.has_previous || !diff.changes?.length) { container.classList.add("hidden"); return; }
-    const s = diff.summary;
+    // Scope diff to tickers in the current run's portfolio (prevents stale cross-account data)
+    const runTickers = new Set(recommendations.map((r) => (r.ticker || "").toUpperCase()).filter(Boolean));
+    const scopedChanges = runTickers.size > 0
+      ? diff.changes.filter((c) => runTickers.has((c.ticker || "").toUpperCase()))
+      : diff.changes;
+    if (scopedChanges.length === 0) { container.classList.add("hidden"); return; }
+    // Recompute summary from scoped changes
+    const s = { signal_changes: 0, upgrades: 0, downgrades: 0, significant_moves: 0 };
+    for (const c of scopedChanges) {
+      if (c.signal_changed) {
+        s.signal_changes++;
+        if (c.curr_signal > c.prev_signal) s.upgrades++;
+        else if (c.curr_signal < c.prev_signal) s.downgrades++;
+      }
+      if (c.significant_price_move) s.significant_moves++;
+    }
     let html = `<section class="card run-diff-section">`;
     html += `<h2>What Changed</h2>`;
     html += `<p class="run-diff-summary">${s.signal_changes} signal change${s.signal_changes !== 1 ? "s" : ""} (${s.upgrades} upgrade${s.upgrades !== 1 ? "s" : ""}, ${s.downgrades} downgrade${s.downgrades !== 1 ? "s" : ""}), ${s.significant_moves} significant price move${s.significant_moves !== 1 ? "s" : ""}</p>`;
     html += `<ul class="run-diff-list">`;
-    for (const c of diff.changes) {
+    for (const c of scopedChanges) {
       const parts = [];
       if (c.signal_changed) {
         const cls = c.curr_signal > c.prev_signal ? "diff-upgrade" : "diff-downgrade";
@@ -669,8 +684,8 @@ function renderReport(payload) {
   renderActionsNow(model.actionsNow, model.recommendations);
   // Item 12: Export button
   injectExportButton(model);
-  // Phase 4a: run diff view
-  renderRunDiff();
+  // Phase 4a: run diff view — scoped to tickers in this run's portfolio
+  renderRunDiff(model.recommendations);
   // Phase 2b: theme concentration risk card
   renderThemeConcentration(model.themeConcentration);
   // Watchlist opportunities summary

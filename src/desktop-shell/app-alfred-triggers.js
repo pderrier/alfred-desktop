@@ -16,6 +16,80 @@
  *   registerDefaultTriggers(alfredOverlay);
  */
 
+import { openChatWizard } from "/desktop-shell/app-chat-wizard.js";
+
+// ── Onboarding chat wizard ─────────────────────────────────────
+
+const ONBOARDING_SYSTEM_CONTEXT = `Tu es Alfred, l'assistant intelligent de gestion de portefeuille. L'utilisateur vient de lancer l'application pour la première fois et n'a pas encore configuré son compte.
+
+Guide-le à travers les 3 étapes de configuration, une à la fois. Sois accueillant, concis et utile.
+
+**Étape 1 : Source du portefeuille**
+Demande à l'utilisateur comment il souhaite connecter son portefeuille :
+- **Finary** (synchronisation automatique) : il devra fournir son token de session Finary. Explique qu'il peut le trouver dans les cookies de son navigateur sur finary.com (cookie "session"). Une fois fourni, Alfred synchronisera automatiquement ses comptes.
+- **Import CSV** : il peut importer un fichier CSV avec ses positions. Explique le format attendu (colonnes : ISIN ou ticker, quantité, prix d'achat). Après la configuration, il pourra utiliser le bouton "Import CSV" dans l'interface.
+
+**Étape 2 : Backend LLM (moteur d'analyse)**
+Explique les 3 modes disponibles pour l'analyse IA :
+- **Codex (gratuit)** : utilise le serveur Alfred, aucune clé API nécessaire. Bon pour commencer.
+- **Native (clé API personnelle)** : utilise directement l'API Anthropic avec sa propre clé. Plus rapide, plus de contrôle.
+- **Native OAuth** : utilise l'app Codex comme proxy OAuth. Pas de clé API nécessaire, authentification via navigateur.
+Recommande le mode Codex pour commencer si l'utilisateur n'est pas sûr.
+
+**Étape 3 : Première analyse**
+Une fois les choix faits, propose de lancer la première analyse du portefeuille. Explique que l'analyse prend environ 2-3 minutes et couvre : évaluation fondamentale, actualités récentes, diversification, et recommandations.
+
+Règles :
+- Parle en français.
+- Une étape à la fois — ne submerge pas l'utilisateur.
+- Si l'utilisateur dit "skip" ou veut passer une étape, accepte et passe à la suivante.
+- Sois encourageant et montre que la configuration est simple.
+- Ne demande PAS de données sensibles autres que le token Finary (qui est nécessaire pour la synchronisation).`;
+
+const ONBOARDING_INITIAL_MESSAGE = `Bienvenue dans Alfred ! Je suis votre assistant de gestion de portefeuille.
+
+Je vais vous guider à travers la configuration en 3 étapes rapides :
+1. Connecter votre portefeuille (Finary ou CSV)
+2. Choisir votre moteur d'analyse IA
+3. Lancer votre première analyse
+
+Commençons ! Comment souhaitez-vous connecter votre portefeuille ?
+- **Finary** : synchronisation automatique de vos comptes
+- **CSV** : import manuel de vos positions`;
+
+/**
+ * Launch the onboarding chat wizard modal.
+ * On completion (close/done), delegates to the app-level processOnboardingResult
+ * (exposed as window.__processOnboardingResult) which handles intent extraction,
+ * API key saving, Finary connection, and first-run triggering.
+ * Falls back to basic onboarding_complete save if the bridge isn't registered yet.
+ */
+async function launchOnboardingWizard() {
+  const invoke = window.__TAURI__?.core?.invoke;
+
+  const history = await openChatWizard({
+    title: "Configuration d'Alfred",
+    systemContext: ONBOARDING_SYSTEM_CONTEXT,
+    initialMessage: ONBOARDING_INITIAL_MESSAGE,
+    returnHistoryOnClose: true,
+  });
+
+  // Delegate to app.js rich result processor if available
+  if (typeof window.__processOnboardingResult === "function") {
+    await window.__processOnboardingResult(history || []);
+    return;
+  }
+
+  // Fallback: just mark onboarding complete
+  if (invoke) {
+    try {
+      await invoke("save_user_preferences_local", {
+        prefs: { onboarding_complete: true },
+      });
+    } catch { /* non-critical */ }
+  }
+}
+
 /**
  * Register all default triggers with the Alfred overlay bus.
  * @param {Object} overlay — the overlay API returned by initAlfredOverlay()
@@ -298,7 +372,7 @@ export function registerDefaultTriggers(overlay) {
     priority: 7,
     cooldown: 0, // fires once, then marked handled
     autoFireOn: "app-ready",
-    label: "Setup",
+    label: "Configuration",
     contextBuilder: async (_extra) => {
       const invoke = window.__TAURI__?.core?.invoke;
       if (!invoke) return null;
@@ -306,47 +380,15 @@ export function registerDefaultTriggers(overlay) {
         const prefs = await invoke("get_user_preferences_local");
         if (prefs?.onboarding_complete === true) return null; // already done
       } catch { /* no prefs yet — show the prompt */ }
-      return {
-        initialMessage:
-          "It looks like setup isn't finished. Want me to help you connect your portfolio?",
-        actions: [
-          {
-            label: "Start setup",
-            callback: () => {
-              // Trigger the onboarding chat wizard flow
-              // Use the global checkOnboarding bridge or open wizard directly
-              if (typeof window.__triggerOnboarding === "function") {
-                window.__triggerOnboarding();
-              } else {
-                // Fallback: click run-analysis to prompt the wizard
-                document.getElementById("cmd-run-analysis")?.click();
-              }
-            }
-          },
-          {
-            label: "Skip",
-            callback: async () => {
-              // Mark onboarding complete so this never fires again
-              const inv = window.__TAURI__?.core?.invoke;
-              if (inv) {
-                try {
-                  await inv("save_user_preferences_local", {
-                    prefs: { onboarding_complete: true }
-                  });
-                } catch { /* not critical */ }
-              }
-            },
-            dismiss: true
-          }
-        ],
-        systemContext:
-          "The user has not completed initial setup. Help them get started with connecting " +
-          "their portfolio (Finary or CSV) and configuring their LLM backend. Be welcoming and concise.",
-        chatMessage:
-          "Welcome! Let's get you set up. I can help you connect your portfolio and configure Alfred."
-      };
+
+      // Launch the chat wizard directly — no intermediate panel.
+      // Fire-and-forget: the wizard handles its own lifecycle.
+      launchOnboardingWizard();
+
+      // Return null so the overlay bus does not show a panel.
+      return null;
     },
-    enabled: true
+    enabled: true,
   });
 
   overlay.registerTrigger({

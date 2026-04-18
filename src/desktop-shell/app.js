@@ -1708,62 +1708,15 @@ function renderWelcome() {
   contentNode.innerHTML = html;
 }
 
-// ── Onboarding chat wizard (Phase 4b) ───────────────────────────
-
-const ONBOARDING_SYSTEM_CONTEXT = `You are Alfred, a portfolio analysis assistant. Guide the user through first-time setup.
-
-Step 1: Ask if they have a Finary account. If yes, guide them to connect (explain the browser login flow — a browser window will open automatically). If no, explain CSV import option.
-Step 2: Help them choose an LLM backend — Codex (free, OAuth login) or Native API (API key, pay-per-use). Explain the trade-offs briefly: Codex is free and easy, Native API gives more control and model choice but requires an OpenAI API key.
-Step 3: If they chose Native API, ask them to paste their OpenAI API key. Validate it. If they chose Codex, explain the sign-in flow.
-Step 4: Suggest running their first analysis. Offer to start it now.
-
-Be conversational, friendly, concise. Use French if the user responds in French.
-When presenting choices, number them clearly (1, 2) so the user can respond with a number.
-Do not use markdown headers. Keep responses short (3-5 lines max).`;
-
-const ONBOARDING_INITIAL_MESSAGE = "Bienvenue dans Alfred ! Je suis votre assistant d'analyse de portefeuille. Configurons votre espace ensemble \u2014 \u00e7a prend 2 minutes.\n\nAvez-vous un compte Finary pour synchroniser vos investissements automatiquement ? Si non, pas de souci \u2014 vous pourrez importer un fichier CSV.";
-
-/**
- * Check if onboarding is needed and launch the chat wizard if so.
- * Returns true if onboarding was triggered, false otherwise.
- */
-async function checkOnboarding() {
-  const tauriInvoke = window?.__TAURI__?.core?.invoke;
-  if (!tauriInvoke) return false;
-
-  // Check if onboarding was already completed
-  try {
-    const prefs = await tauriInvoke("get_user_preferences_local");
-    if (prefs?.onboarding_complete === true) return false;
-  } catch { /* no prefs yet — continue */ }
-
-  // Only trigger if BOTH Finary and OpenAI are not configured
-  // If user already connected one during splash, skip onboarding
-  if (lastFinaryOk || lastOpenaiOk) {
-    // At least one service connected — mark onboarding done, skip wizard
-    try {
-      await tauriInvoke("save_user_preferences_local", {
-        prefs: { onboarding_complete: true }
-      });
-    } catch { /* not critical */ }
-    return false;
-  }
-
-  // Launch the onboarding chat wizard
-  const history = await openChatWizard({
-    title: "Alfred Setup",
-    systemContext: ONBOARDING_SYSTEM_CONTEXT,
-    initialMessage: ONBOARDING_INITIAL_MESSAGE,
-    returnHistoryOnClose: true,
-  });
-
-  // Process the conversation to extract user intent
-  await processOnboardingResult(history || []);
-  return true;
-}
+// ── Onboarding result processing (Phase 4b) ────────────────────
+// The onboarding chat wizard is launched by the alfred-onboarding-incomplete
+// trigger in app-alfred-triggers.js. This module handles the result processing
+// (intent extraction, API key saving, Finary connection, first-run trigger)
+// because it has access to app-level functions (showToast, refreshAccountStatus, etc).
 
 /**
  * Parse onboarding conversation history and trigger appropriate actions.
+ * Called by launchOnboardingWizard() in app-alfred-triggers.js via window bridge.
  */
 async function processOnboardingResult(history) {
   const tauriInvoke = window?.__TAURI__?.core?.invoke;
@@ -1873,7 +1826,7 @@ window.__openWizardForAccount = (accountName) => {
 };
 
 // Phase C: bridge functions for proactive triggers
-window.__triggerOnboarding = () => { checkOnboarding(); };
+window.__processOnboardingResult = (history) => processOnboardingResult(history);
 window.__openCashWizard = (groups) => {
   if (groups && groups.length > 0) {
     const group = groups[0];
@@ -1963,10 +1916,7 @@ void refreshRuntimeSettings().catch(() => {});
 bootstrap.runStartupSessionCheck().then(async () => {
   await refreshAccountStatus();
   updateAuthPills();
-  // Phase 4b: check if onboarding wizard should be shown (first launch, nothing configured)
-  const didOnboard = await checkOnboarding();
-  // If onboarding ran, it already called renderWelcome + refreshAccountStatus
-  if (!didOnboard) renderWelcome();
+  renderWelcome();
   // If Finary is connected but we have no accounts, sync from Finary API
   const snapshot = latestDashboardPayload?.snapshot || {};
   const finaryMeta = snapshot.latest_finary_snapshot || {};

@@ -601,7 +601,22 @@ pub fn analyze_csv_format(
         }
     };
 
-    let draft = crate::llm_parsing::extract_draft_from_response(&response)?;
+    // The response format differs by backend:
+    // - OpenAI/native: {"choices": [{"message": {"content": "..."}}]}
+    // - Codex proxy: raw JSON object (extracted from agent text) or {"ok": true, "mcp_turn": true}
+    let draft = crate::llm_parsing::extract_draft_from_response(&response)
+        .or_else(|_| {
+            // Codex proxy returns raw JSON — try to use it directly
+            if response.get("format_type").is_some() && response.get("columns").is_some() {
+                Ok(response.clone())
+            } else if let Some(text) = response.get("agent_text").and_then(|v| v.as_str()) {
+                // Codex returned text but extract_draft couldn't parse it — try JSON extraction
+                crate::llm_parsing::extract_json_object(text)
+                    .ok_or_else(|| anyhow!("csv_analyze_no_json_in_agent_text"))
+            } else {
+                Err(anyhow!("csv_analyze_empty_llm_response"))
+            }
+        })?;
     crate::debug_log(&format!("[csv-analyze] LLM response: {draft}"));
 
     // Validate required fields

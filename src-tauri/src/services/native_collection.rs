@@ -2794,14 +2794,17 @@ mod tests {
     }
 
     #[test]
-    fn build_cash_mapping_no_connection_id_falls_through_to_institution_prefix() {
+    fn build_cash_mapping_no_connection_id_falls_through_to_semantic_name() {
+        // Without connection_id, Strategy 1.5 matches cash accounts whose name
+        // contains "espèce"/"espece" and shares a significant word with the
+        // investment account (e.g., "PEA" appears in both names).
         let accounts = vec![
             make_account("PEA Boursorama", None, 3, 0.0, "Boursorama Banque"),
-            make_account("Livret Boursorama", None, 0, 750.0, "Boursorama Banque"),
+            make_account("Compte espèces PEA", None, 0, 750.0, "Boursorama Banque"),
         ];
         let result = build_cash_mapping(&accounts);
         assert_eq!(result.mapping.get("PEA Boursorama").copied(), Some(750.0),
-            "institution prefix match should assign cash to investment");
+            "semantic name match (espèce + shared word) should assign cash to investment");
     }
 
     #[test]

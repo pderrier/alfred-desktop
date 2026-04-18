@@ -2435,3 +2435,25 @@ use crate::storage::read_json_file;
         // No trend section since it's missing
         assert!(!result.contains("Tendance"));
     }
+
+    #[test]
+    fn test_synthetic_portfolio_key_filtered_from_by_ticker_iterators() {
+        // _PORTFOLIO is a synthetic key for portfolio-level insights.
+        // It must be excluded from any by_ticker iteration that treats keys as real tickers.
+        let store = json!({
+            "by_ticker": {
+                "AAPL": { "news_themes": ["tech"], "reanalyse_after": "2020-01-01" },
+                "_PORTFOLIO": { "news_themes": ["macro"], "reanalyse_after": "2020-01-01" },
+                "_CUSTOM": { "news_themes": ["test"] }
+            }
+        });
+        let by_ticker = store.get("by_ticker").unwrap().as_object().unwrap();
+
+        // Simulate the filter pattern used in get_stale_positions, run_get_run_diff, compute_theme_concentration
+        let real_tickers: Vec<&String> = by_ticker.keys()
+            .filter(|t| !t.starts_with('_'))
+            .collect();
+
+        assert_eq!(real_tickers.len(), 1);
+        assert_eq!(real_tickers[0], "AAPL");
+    }

@@ -8,17 +8,26 @@
 
 ## Download
 
-**[Windows installer (MSI)](https://vps-c5793aab.vps.ovh.net/alfred/release/windows/latest)** — Alfred Desktop v0.2.3 for Windows 10/11 (x64)
+**[Windows installer (MSI)](https://vps-c5793aab.vps.ovh.net/alfred/release/windows/latest)** — Alfred Desktop v0.2.4 for Windows 10/11 (x64)
 
 > Note: The installer is not code-signed yet. Windows SmartScreen may show a warning — click "More info" → "Run anyway" to proceed.
 
-**[macOS installer (DMG)](https://vps-c5793aab.vps.ovh.net/alfred/release/macos/latest)** — Alfred Desktop v0.2.3 for macOS 10.15+ (Apple Silicon)
+**[macOS installer (DMG)](https://vps-c5793aab.vps.ovh.net/alfred/release/macos/latest)** — Alfred Desktop v0.2.4 for macOS 10.15+ (Apple Silicon)
 
 > **Note: The DMG is not notarized yet.** macOS Gatekeeper will block the app on first launch. Three ways to bypass it:
 >
 > 1. **Right-click → Open** on the app in Finder, then click "Open" in the dialog. Simplest — works on most setups.
 > 2. **System Settings → Privacy & Security → Open Anyway** — after a blocked launch attempt, a button appears at the bottom of the Privacy & Security pane.
 > 3. **Terminal (power users):** `xattr -cr "/Applications/Alfred Desktop.app"` — strips the quarantine attribute entirely; no dialog needed after that.
+
+## What's new in v0.2.4
+
+- **Q2 roadmap complete** — all phases shipped
+- **Alfred-B fixed** — accuracy-nudge trigger restored, theme-concentration re-enabled, onChatComplete wired
+- **Phase 4b — Onboarding wizard** — chat-based guided setup (portfolio source, LLM backend, first run) in French
+- **LLM parsing facade** — `extract_draft_from_response()` handles all backend formats transparently
+- **Cash mapping** — wizard saves clean account names, not display text
+- **71 tests, 0 failures, 0 warnings**
 
 ## What's new in v0.2.3
 

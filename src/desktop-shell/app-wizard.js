@@ -11,6 +11,25 @@ import { buildRunAnalysisOptions } from "/desktop-shell/report-view-model.js";
 import { formatBridgeError, isErrorCritical, extractErrorCode } from "/shared/run-operations-controller.js";
 import { openCashMatchingWizard, openChatWizard } from "/desktop-shell/app-chat-wizard.js";
 
+// ── Helpers ──────────────────────────────────────────────────────
+
+/**
+ * Strip trailing parenthesized display text and resolve against canonical names.
+ * E.g. "Livret A (24,029.00 €)" → "Livret A" → matched to canonical "Livret A".
+ */
+function resolveWizardName(rawName, canonicalNames) {
+  const stripped = (rawName || "").replace(/\s*\([^)]*\)\s*$/, "").trim();
+  if (canonicalNames.includes(stripped)) return stripped;
+  const lower = stripped.toLowerCase();
+  const ci = canonicalNames.find((n) => n.toLowerCase() === lower);
+  if (ci) return ci;
+  const sub = canonicalNames.find(
+    (n) => lower.includes(n.toLowerCase()) || n.toLowerCase().includes(lower)
+  );
+  if (sub) return sub;
+  return stripped;
+}
+
 // ── DOM nodes ────────────────────────────────────────────────────
 
 const runWizardNode = document.getElementById("run-wizard");
@@ -546,14 +565,18 @@ export function initWizard(deps) {
                 if (wizResult) {
                   const prefs = await tauriInvoke("get_user_preferences_local") || {};
                   if (!prefs.cash_account_links) prefs.cash_account_links = {};
-                  if (wizResult.confirmed) {
-                    for (let i = 0; i < investmentAccounts.length; i++) {
-                      if (cashAccounts[i]) {
-                        prefs.cash_account_links[investmentAccounts[i].name] = cashAccounts[i].name;
-                      }
+                  // Strip trailing parenthesized display text (e.g. "Livret A (24,029.00 €)" → "Livret A")
+                  // and resolve against known canonical names to prevent saving decorated strings.
+                  const knownInvNames = investmentAccounts.map((a) => a.name);
+                  const knownCashNames = cashAccounts.map((a) => a.name);
+                  for (const [rawKey, rawVal] of Object.entries(wizResult)) {
+                    if (rawKey === "confirmed") continue;
+                    const cleanKey = resolveWizardName(rawKey, knownInvNames);
+                    if (rawVal === "__none__") {
+                      prefs.cash_account_links[cleanKey] = "__none__";
+                    } else {
+                      prefs.cash_account_links[cleanKey] = resolveWizardName(rawVal, knownCashNames);
                     }
-                  } else {
-                    Object.assign(prefs.cash_account_links, wizResult);
                   }
                   await tauriInvoke("save_user_preferences_local", { prefs });
                   showToast("Cash account mapping saved", "success");

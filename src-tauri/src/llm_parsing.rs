@@ -7,17 +7,56 @@ use serde_json::Value;
 
 // ── Response extraction ──────────────────────────────────────────
 
+/// Extract a JSON draft object from any LLM backend response format.
+///
+/// Supported formats (tried in order):
+/// 1. **OpenAI Chat Completions**: `{"choices": [{"message": {"content": "..."}}]}`
+///    → extract content string → parse JSON from it
+/// 2. **Codex proxy `agent_text`**: `{"ok": true, "mcp_turn": true, "agent_text": "..."}`
+///    → extract JSON from agent_text string
+/// 3. **Raw domain JSON**: response IS the JSON object directly (has domain-specific
+///    fields like `format_type`, `recommendation`, `synthese_marche`, etc.)
+///    → return as-is (excludes bare `{"ok": true, "mcp_turn": true}` markers)
+/// 4. **Content envelope**: `{"content": "..."}` → extract JSON from content string
 pub(crate) fn extract_draft_from_response(response: &Value) -> Result<Value> {
-    let content = response
+    // Format 1: OpenAI Chat Completions — choices[0].message.content
+    if let Some(content) = response
         .get("choices")
         .and_then(|v| v.as_array())
         .and_then(|arr| arr.first())
         .and_then(|choice| choice.get("message"))
         .and_then(|msg| msg.get("content"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("llm_no_content_in_response"))?;
+    {
+        return extract_json_object(content)
+            .ok_or_else(|| anyhow!("llm_invalid_json_response"));
+    }
 
-    extract_json_object(content).ok_or_else(|| anyhow!("llm_invalid_json_response"))
+    // Format 2: Codex proxy with agent_text wrapper
+    if let Some(text) = response.get("agent_text").and_then(|v| v.as_str()) {
+        return extract_json_object(text)
+            .ok_or_else(|| anyhow!("llm_no_json_in_agent_text"));
+    }
+
+    // Format 3: Raw domain JSON — the response IS the parsed object.
+    // Exclude bare success markers that carry no domain data.
+    if response.is_object() {
+        let is_bare_marker = response.get("ok").is_some()
+            && response.as_object().map_or(true, |m| {
+                m.keys().all(|k| matches!(k.as_str(), "ok" | "mcp_turn" | "agent_text_chars"))
+            });
+        if !is_bare_marker {
+            return Ok(response.clone());
+        }
+    }
+
+    // Format 4: Content envelope — {"content": "..."}
+    if let Some(content) = response.get("content").and_then(|v| v.as_str()) {
+        return extract_json_object(content)
+            .ok_or_else(|| anyhow!("llm_invalid_json_in_content"));
+    }
+
+    Err(anyhow!("llm_no_content_in_response"))
 }
 
 pub(crate) fn extract_recommendation_from_response(response: &Value) -> Result<Value> {

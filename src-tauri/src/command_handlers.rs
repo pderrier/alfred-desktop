@@ -299,6 +299,8 @@ pub fn run_get_stale_positions() -> Result<serde_json::Value> {
     let mut stale: Vec<serde_json::Value> = Vec::new();
 
     for (ticker, entry) in by_ticker {
+        // Skip synthetic keys (e.g. _PORTFOLIO used for portfolio-level insights)
+        if ticker.starts_with('_') { continue; }
         let reanalyse_after = entry
             .get("reanalyse_after")
             .and_then(|v| v.as_str())
@@ -478,6 +480,8 @@ pub fn run_get_run_diff() -> Result<serde_json::Value> {
     let mut total = 0usize;
 
     for (ticker, entry) in by_ticker {
+        // Skip synthetic keys (e.g. _PORTFOLIO used for portfolio-level insights)
+        if ticker.starts_with('_') { continue; }
         let raw_history = entry.get("signal_history").and_then(|v| v.as_array());
         let raw_history = match raw_history {
             Some(h) if h.len() >= 2 => h,

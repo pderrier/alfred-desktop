@@ -638,6 +638,8 @@ pub(crate) fn compute_theme_concentration(_run_id: &str) -> serde_json::Value {
         std::collections::HashMap::new();
 
     for (ticker, entry) in by_ticker {
+        // Skip synthetic keys (e.g. _PORTFOLIO used for portfolio-level insights)
+        if ticker.starts_with('_') { continue; }
         if let Some(themes_arr) = entry.get("news_themes").and_then(|v| v.as_array()) {
             for theme_val in themes_arr {
                 if let Some(slug) = theme_val.as_str() {

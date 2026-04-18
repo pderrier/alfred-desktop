@@ -627,7 +627,7 @@ fn build_sector_cot_section(sector_cot: Option<&Value>) -> String {
     lines.join("\n")
 }
 
-fn build_memory_section(memory: Option<&Value>) -> String {
+pub(crate) fn build_memory_section(memory: Option<&Value>) -> String {
     let m = match memory {
         Some(v) if v.is_object() && !v.as_object().map(|o| o.is_empty()).unwrap_or(true) => v,
         _ => return "MEMOIRE LIGNE: premiere analyse (pas d'historique)".to_string(),

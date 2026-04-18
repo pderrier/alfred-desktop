@@ -2359,3 +2359,79 @@ use crate::storage::read_json_file;
         assert!(roundtrip.columns.get("isin").unwrap().is_none());
         assert!(roundtrip.columns.get("ticker").unwrap().is_some());
     }
+
+    // ── build_memory_section tests ──────────────────────────────────
+
+    #[test]
+    fn test_build_memory_section_v2_full() {
+        let memory = json!({
+            "schema_version": 2,
+            "signal_history": [
+                { "date": "2026-04-01", "signal": "ACHAT", "conviction": "forte", "price_at_signal": 142.5 },
+                { "date": "2026-03-15", "signal": "CONSERVER", "conviction": "moderee", "price_at_signal": 138.0 }
+            ],
+            "key_reasoning": "Strong growth thesis based on margin expansion.",
+            "price_tracking": {
+                "last_signal": "ACHAT",
+                "last_signal_date": "2026-04-01",
+                "price_at_signal": 142.5,
+                "current_price": 151.2,
+                "return_since_signal_pct": 6.1,
+                "signal_accuracy": "correct"
+            },
+            "news_themes": ["tariffs", "margin_expansion"],
+            "trend": "upgrading",
+            "user_action": {
+                "followed": true,
+                "date": "2026-04-02",
+                "note": "Bought 10 shares"
+            }
+        });
+        let result = crate::llm_prompts::build_memory_section(Some(&memory));
+        assert!(result.contains("MEMOIRE LIGNE (historique persistant):"));
+        assert!(result.contains("Signal: ACHAT"));
+        assert!(result.contains("rendement: +6.1%"));
+        assert!(result.contains("correct"));
+        assert!(result.contains("Tendance 3 analyses: upgrading"));
+        assert!(result.contains("Themes: tariffs, margin_expansion"));
+        assert!(result.contains("These: Strong growth thesis"));
+        assert!(result.contains("Action utilisateur: suivi"));
+        assert!(result.contains("Bought 10 shares"));
+    }
+
+    #[test]
+    fn test_build_memory_section_empty_returns_first_analysis() {
+        let result = crate::llm_prompts::build_memory_section(None);
+        assert!(result.contains("premiere analyse"));
+
+        let empty_obj = json!({});
+        let result2 = crate::llm_prompts::build_memory_section(Some(&empty_obj));
+        assert!(result2.contains("premiere analyse"));
+    }
+
+    #[test]
+    fn test_build_memory_section_v1_data_treated_as_first_analysis() {
+        // V1 data (no schema_version, no signal_history) should be treated as first analysis
+        let v1 = json!({
+            "llm_memory_summary": "Old V1 summary",
+            "llm_strong_signals": ["signal1"]
+        });
+        let result = crate::llm_prompts::build_memory_section(Some(&v1));
+        assert!(result.contains("premiere analyse"));
+    }
+
+    #[test]
+    fn test_build_memory_section_partial_v2() {
+        // V2 with only signal_history (no price_tracking, no trend)
+        let partial = json!({
+            "signal_history": [
+                { "date": "2026-04-01", "signal": "ACHAT", "conviction": "forte", "price_at_signal": 100.0 }
+            ],
+            "key_reasoning": "Short thesis."
+        });
+        let result = crate::llm_prompts::build_memory_section(Some(&partial));
+        assert!(result.contains("MEMOIRE LIGNE (historique persistant):"));
+        assert!(result.contains("These: Short thesis."));
+        // No trend section since it's missing
+        assert!(!result.contains("Tendance"));
+    }

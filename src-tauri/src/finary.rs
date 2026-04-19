@@ -700,3 +700,25 @@ pub fn fetch_snapshot() -> Result<Value> {
     fetch_finary_snapshot_with_token(&token)
 }
 
+pub fn list_accounts() -> Result<Value> {
+    let snapshot = fetch_snapshot()?;
+    let accounts = snapshot
+        .get("accountsPayload")
+        .and_then(|v| v.get("result"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let summary: Vec<Value> = accounts
+        .into_iter()
+        .map(|acct| {
+            json!({
+                "id": acct.get("id").cloned().unwrap_or(Value::Null),
+                "name": acct.get("name").cloned().unwrap_or(Value::Null),
+                "slug": acct.get("slug").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect();
+    let count = summary.len();
+    Ok(json!({ "accounts": summary, "count": count }))
+}
+

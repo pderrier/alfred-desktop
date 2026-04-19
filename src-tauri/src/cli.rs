@@ -1,6 +1,6 @@
 //! CLI mode: parse arguments and dispatch to command handlers.
 
-use std::{env, path::PathBuf};
+use std::{env, path::PathBuf, thread, time::Duration};
 
 use anyhow::{anyhow, Result};
 use serde_json::json;
@@ -39,6 +39,38 @@ pub(crate) fn dispatch(args: &[String]) -> Result<serde_json::Value> {
             }))
         }
         "analysis:run-start-local" | "analysis_run_start_local" => command_handlers::invoke_command(command),
+        "analysis:run-start-wait-local" | "analysis_run_start_wait_local" => {
+            let analysis_options = args
+                .get(2)
+                .and_then(|v| {
+                    let trimmed = v.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(json!({"account": trimmed}))
+                    }
+                });
+            let started = command_handlers::run_analysis_start(analysis_options)?;
+            let operation_id = started
+                .get("result")
+                .and_then(|v| v.get("operation_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("analysis_operation_id_missing"))?
+                .to_string();
+            loop {
+                let status = command_handlers::run_analysis_status(operation_id.clone())?;
+                let state = status
+                    .get("result")
+                    .and_then(|v| v.get("status"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                if state != "running" && state != "queued" && state != "starting" {
+                    break Ok(status);
+                }
+                thread::sleep(Duration::from_millis(1000));
+            }
+        },
         "analysis:retry-global-synthesis-local" | "retry_global_synthesis_local" => {
             let run_id = args
                 .get(2)
@@ -81,6 +113,9 @@ pub(crate) fn dispatch(args: &[String]) -> Result<serde_json::Value> {
         "finary:session-browser-complete-local" | "finary_session_browser_complete_local" => command_handlers::invoke_command(command),
         "finary:session-browser-playwright-local" | "finary_session_browser_playwright_local" => command_handlers::invoke_command(command),
         "finary:session-browser-reuse-local" | "finary_session_browser_reuse_local" => command_handlers::invoke_command(command),
+        "finary:login-local" | "finary_login_local" => command_handlers::invoke_command("finary:login-local"),
+        "finary:snapshot-local" | "finary_snapshot_local" => command_handlers::invoke_command(command),
+        "finary:accounts-local" | "finary_accounts_local" => command_handlers::invoke_command(command),
         "codex:session-status-local" | "codex_session_status_local" => command_handlers::invoke_command(command),
         "codex:session-login-local" | "codex_session_login_local" => command_handlers::invoke_command(command),
         "codex:session-logout-local" | "codex_session_logout_local" => command_handlers::invoke_command(command),
@@ -97,6 +132,7 @@ pub(crate) fn dispatch(args: &[String]) -> Result<serde_json::Value> {
                 "health",
                 "db:init",
                 "analysis:run-start-local",
+                "analysis:run-start-wait-local [account]",
                 "analysis:retry-global-synthesis-local <run_id>",
                 "analysis:run-status-local <operation_id>",
                 "dashboard:snapshot-local",
@@ -107,6 +143,7 @@ pub(crate) fn dispatch(args: &[String]) -> Result<serde_json::Value> {
                 "runtime:settings-reset-local",
                 "stack:health-local",
                 "analysis_run_start_local",
+                "analysis_run_start_wait_local [account]",
                 "retry_global_synthesis_local <run_id>",
                 "analysis_run_status_local <operation_id>",
                 "dashboard_snapshot_local",
@@ -123,6 +160,9 @@ pub(crate) fn dispatch(args: &[String]) -> Result<serde_json::Value> {
                 "finary:session-browser-complete-local",
                 "finary:session-browser-playwright-local",
                 "finary:session-browser-reuse-local",
+                "finary:login-local",
+                "finary:snapshot-local",
+                "finary:accounts-local",
                 "finary_session_status_local",
                 "finary_session_connect_local",
                 "finary_session_refresh_local",

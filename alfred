@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -d "$ROOT/../../.rustup" ]; then
+  export RUSTUP_HOME="${RUSTUP_HOME:-$ROOT/../../.rustup}"
+fi
+if [ -d "$ROOT/../../.cargo" ]; then
+  export CARGO_HOME="${CARGO_HOME:-$ROOT/../../.cargo}"
+fi
+CONFIG_FILE="${ALFRED_CONFIG_FILE:-$ROOT/.alfred-cli.env}"
+
+if [ -f "$CONFIG_FILE" ]; then
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+fi
+
+export ALFRED_DATA_DIR="${ALFRED_DATA_DIR:-$HOME/.alfred-desktop}"
+export ALFRED_REPORTS_DIR="${ALFRED_REPORTS_DIR:-$ALFRED_DATA_DIR/reports}"
+
+usage() {
+  cat <<'EOF'
+Alfred Desktop CLI
+
+Usage:
+  ./alfred config show
+  ./alfred config doctor
+  ./alfred config set-backend-bin <path>
+  ./alfred config set-data-dir <path>
+  ./alfred config reset
+  ./alfred reports list
+  ./alfred reports latest
+  ./alfred reports show <path>
+  ./alfred analysis start [account]   # exact name or alias (PEA Bourse, PEA PME)
+  ./alfred analysis status <operation_id>
+  ./alfred dashboard snapshot
+  ./alfred finary login
+  ./alfred finary snapshot
+  ./alfred finary accounts
+  ./alfred health
+EOF
+}
+
+resolve_backend() {
+  if [ -n "${ALFRED_BACKEND_BIN:-}" ] && [ -x "${ALFRED_BACKEND_BIN:-}" ]; then
+    printf '%s\n' "$ALFRED_BACKEND_BIN"
+    return 0
+  fi
+  for candidate in \
+    "${CARGO_HOME:-$HOME/.cargo}/bin/cargo" \
+    "$ROOT/../../.cargo/bin/cargo" \
+    "$HOME/.cargo/bin/cargo"
+  do
+    if [ -x "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  if command -v cargo >/dev/null 2>&1; then
+    printf '%s\n' "cargo"
+    return 0
+  fi
+  return 1
+}
+
+run_backend() {
+  backend="$(resolve_backend || true)"
+  if [ -n "$backend" ]; then
+    if [ "$(basename "$backend")" = "cargo" ]; then
+      "$backend" run --quiet --manifest-path "$ROOT/src-tauri/Cargo.toml" -- "$@"
+      return
+    fi
+    "$backend" "$@"
+    return
+  fi
+  echo "No backend found. Set ALFRED_BACKEND_BIN to a compiled Alfred backend, or install cargo." >&2
+  exit 1
+}
+
+pretty_json() {
+  python3 - <<'PY' "$1"
+import json, sys
+path = sys.argv[1]
+with open(path, 'r', encoding='utf-8') as f:
+    data = json.load(f)
+print(json.dumps(data, ensure_ascii=False, indent=2))
+PY
+}
+
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+  help|-h|--help)
+    usage
+    ;;
+  config)
+    sub="${1:-show}"
+    shift || true
+    case "$sub" in
+      show)
+        api_secret_state="<unset>"
+        if [ -n "${ALFRED_API_SECRET:-}" ]; then
+          api_secret_state="<set>"
+        fi
+        cat <<EOF
+CONFIG_FILE=$CONFIG_FILE
+ALFRED_DATA_DIR=${ALFRED_DATA_DIR}
+ALFRED_REPORTS_DIR=${ALFRED_REPORTS_DIR}
+ALFRED_BACKEND_BIN=${ALFRED_BACKEND_BIN:-<unset>}
+ALFRED_API_SECRET=$api_secret_state
+EOF
+        ;;
+      doctor)
+        if command -v cargo >/dev/null 2>&1; then
+          echo "cargo: ok"
+        else
+          echo "cargo: missing"
+        fi
+        if [ -n "${ALFRED_BACKEND_BIN:-}" ] && [ -x "${ALFRED_BACKEND_BIN:-}" ]; then
+          echo "backend_bin: ok"
+        else
+          echo "backend_bin: missing"
+        fi
+        if [ -n "${ALFRED_API_SECRET:-}" ]; then
+          echo "api_secret: set"
+        else
+          echo "api_secret: missing"
+        fi
+        for pkg in gdk-3.0 gtk+-3.0 webkit2gtk-4.1; do
+          if pkg-config --modversion "$pkg" >/dev/null 2>&1; then
+            echo "pkg-config:$pkg:ok"
+          else
+            echo "pkg-config:$pkg:missing"
+          fi
+        done
+        ;;
+      set-backend-bin)
+        value="${1:-}"
+        if [ -z "$value" ]; then
+          echo "config set-backend-bin requires a path" >&2
+          exit 1
+        fi
+        printf 'ALFRED_BACKEND_BIN=%q\n' "$value" > "$CONFIG_FILE"
+        echo "saved backend bin to $CONFIG_FILE"
+        ;;
+      set-data-dir)
+        value="${1:-}"
+        if [ -z "$value" ]; then
+          echo "config set-data-dir requires a path" >&2
+          exit 1
+        fi
+        {
+          printf 'ALFRED_DATA_DIR=%q\n' "$value"
+          printf 'ALFRED_REPORTS_DIR=%q/reports\n' "$value"
+        } > "$CONFIG_FILE"
+        echo "saved data dir to $CONFIG_FILE"
+        ;;
+      reset)
+        rm -f "$CONFIG_FILE"
+        echo "removed $CONFIG_FILE"
+        ;;
+      *)
+        usage
+        exit 1
+        ;;
+    esac
+    ;;
+  reports)
+    sub="${1:-help}"
+    shift || true
+    case "$sub" in
+      list)
+        if [ -d "$ALFRED_REPORTS_DIR" ]; then
+          find "$ALFRED_REPORTS_DIR" -maxdepth 2 -type f | sort
+        else
+          echo "No reports dir: $ALFRED_REPORTS_DIR" >&2
+          exit 1
+        fi
+        ;;
+      latest)
+        latest="$ALFRED_REPORTS_DIR/latest.json"
+        if [ -f "$latest" ]; then
+          pretty_json "$latest"
+        else
+          echo "No latest report: $latest" >&2
+          exit 1
+        fi
+        ;;
+      show)
+        target="${1:-}"
+        if [ -z "$target" ]; then
+          echo "reports show requires a path" >&2
+          exit 1
+        fi
+        if [ -f "$target" ]; then
+          cat "$target"
+        elif [ -f "$ALFRED_REPORTS_DIR/$target" ]; then
+          cat "$ALFRED_REPORTS_DIR/$target"
+        else
+          echo "Report not found: $target" >&2
+          exit 1
+        fi
+        ;;
+      *)
+        usage
+        exit 1
+        ;;
+    esac
+    ;;
+  analysis)
+    sub="${1:-help}"
+    shift || true
+    case "$sub" in
+      start)
+        account="${1:-}"
+        if [ -n "$account" ]; then
+          run_backend analysis:run-start-wait-local "$account"
+        else
+          run_backend analysis:run-start-wait-local
+        fi
+        ;;
+      status)
+        op_id="${1:-}"
+        if [ -z "$op_id" ]; then
+          echo "analysis status requires an operation_id" >&2
+          exit 1
+        fi
+        run_backend analysis:run-status-local "$op_id"
+        ;;
+      *)
+        usage
+        exit 1
+        ;;
+    esac
+    ;;
+  dashboard)
+    sub="${1:-help}"
+    shift || true
+    case "$sub" in
+      snapshot)
+        run_backend dashboard:snapshot-local
+        ;;
+      overview)
+        run_backend dashboard:overview-local
+        ;;
+      details)
+        run_backend dashboard:details-local
+        ;;
+      *)
+        usage
+        exit 1
+        ;;
+    esac
+    ;;
+  finary)
+    sub="${1:-help}"
+    shift || true
+    case "$sub" in
+      login)
+        run_backend finary:login-local
+        ;;
+      snapshot)
+        run_backend finary:snapshot-local
+        ;;
+      accounts)
+        run_backend finary:accounts-local
+        ;;
+      status)
+        run_backend finary:session-status-local
+        ;;
+      connect)
+        run_backend finary:session-connect-local
+        ;;
+      browser-start)
+        run_backend finary:session-browser-start-local
+        ;;
+      browser-complete)
+        run_backend finary:session-browser-complete-local
+        ;;
+      browser-reuse)
+        run_backend finary:session-browser-reuse-local
+        ;;
+      *)
+        usage
+        exit 1
+        ;;
+    esac
+    ;;
+  health)
+    run_backend health
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac

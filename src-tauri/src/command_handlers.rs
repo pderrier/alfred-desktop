@@ -184,6 +184,30 @@ pub fn run_finary_session_browser_reuse() -> Result<serde_json::Value> {
     }))
 }
 
+pub fn run_finary_login() -> Result<serde_json::Value> {
+    Ok(json!({
+        "ok": true,
+        "action": "finary:login-local",
+        "result": finary::session_browser_reuse()?
+    }))
+}
+
+pub fn run_finary_snapshot() -> Result<serde_json::Value> {
+    Ok(json!({
+        "ok": true,
+        "action": "finary:snapshot-local",
+        "result": finary::fetch_snapshot()?
+    }))
+}
+
+pub fn run_finary_accounts() -> Result<serde_json::Value> {
+    Ok(json!({
+        "ok": true,
+        "action": "finary:accounts-local",
+        "result": finary::list_accounts()?
+    }))
+}
+
 // ── External URL ──
 
 pub(crate) fn validate_external_url(url: &str) -> Result<String> {
@@ -257,6 +281,9 @@ pub fn invoke_command(command: &str) -> Result<serde_json::Value> {
         "finary:session-browser-complete-local" | "finary_session_browser_complete_local" => run_finary_session_browser_complete(),
         "finary:session-browser-playwright-local" | "finary_session_browser_playwright_local" => run_finary_session_browser_playwright(),
         "finary:session-browser-reuse-local" | "finary_session_browser_reuse_local" => run_finary_session_browser_reuse(),
+        "finary:login-local" | "finary_login_local" => run_finary_login(),
+        "finary:snapshot-local" | "finary_snapshot_local" => run_finary_snapshot(),
+        "finary:accounts-local" | "finary_accounts_local" => run_finary_accounts(),
         "codex:ensure-local" | "ensure_codex_local" => run_ensure_codex(),
         "codex:session-status-local" | "codex_session_status_local" => run_codex_session_status(),
         "codex:session-login-local" | "codex_session_login_local" => run_codex_session_login(),

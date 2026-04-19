@@ -749,6 +749,270 @@ fn format_report_markdown(payload: &serde_json::Value) -> String {
     md
 }
 
+// ── Reports CLI ──
+
+pub fn run_reports_list() -> Result<serde_json::Value> {
+    let history = run_state::load_report_history(50)?;
+    let rows: Vec<serde_json::Value> = history
+        .iter()
+        .map(|entry| {
+            json!({
+                "run_id": entry.get("run_id").and_then(|v| v.as_str()).unwrap_or(""),
+                "saved_at": entry.get("saved_at").and_then(|v| v.as_str()).unwrap_or(""),
+                "filename": entry.get("history_filename").and_then(|v| v.as_str()).unwrap_or(""),
+            })
+        })
+        .collect();
+    Ok(json!({
+        "ok": true,
+        "action": "reports:list",
+        "count": rows.len(),
+        "reports": rows,
+    }))
+}
+
+pub fn run_reports_latest() -> Result<serde_json::Value> {
+    let report = run_state::load_latest_report()?;
+    Ok(json!({
+        "ok": true,
+        "action": "reports:latest",
+        "report": report,
+    }))
+}
+
+pub fn run_reports_show(path_or_run_id: &str) -> Result<serde_json::Value> {
+    let trimmed = path_or_run_id.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("path_or_run_id_required"));
+    }
+    // Try as a file path first
+    let as_path = std::path::PathBuf::from(trimmed);
+    if as_path.is_file() {
+        let report = crate::storage::read_json_file(&as_path)?;
+        return Ok(json!({
+            "ok": true,
+            "action": "reports:show",
+            "source": "file",
+            "report": report,
+        }));
+    }
+    // Try inside reports dir
+    let reports_dir = crate::paths::resolve_reports_dir();
+    let in_reports = reports_dir.join(trimmed);
+    if in_reports.is_file() {
+        let report = crate::storage::read_json_file(&in_reports)?;
+        return Ok(json!({
+            "ok": true,
+            "action": "reports:show",
+            "source": "reports_dir",
+            "report": report,
+        }));
+    }
+    // Try as run_id in history
+    let history_dir = crate::paths::resolve_report_history_dir();
+    if history_dir.is_dir() {
+        for entry in std::fs::read_dir(&history_dir)? {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let artifact = match crate::storage::read_json_file(&path) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if artifact.get("run_id").and_then(|v| v.as_str()) == Some(trimmed) {
+                return Ok(json!({
+                    "ok": true,
+                    "action": "reports:show",
+                    "source": "history",
+                    "report": artifact,
+                }));
+            }
+        }
+    }
+    Err(anyhow!("report_not_found:{trimmed}"))
+}
+
+// ── Line CLI ──
+
+fn load_line_memory_from_disk_or_cache() -> serde_json::Value {
+    let cached = crate::native_mcp_analysis::line_memory_read();
+    let has_real_data = cached
+        .get("by_ticker")
+        .and_then(|v| v.as_object())
+        .map(|m| !m.is_empty())
+        .unwrap_or(false);
+    if has_real_data {
+        return cached;
+    }
+    let path = crate::resolve_runtime_state_dir().join("line-memory.json");
+    if !path.exists() {
+        return json!({});
+    }
+    crate::storage::read_json_file(&path).unwrap_or_else(|_| json!({}))
+}
+
+pub fn run_line_list() -> Result<serde_json::Value> {
+    let report = run_state::load_latest_report().ok();
+    let recommendations = report
+        .as_ref()
+        .and_then(|r| r.get("payload"))
+        .and_then(|p| p.get("recommandations"))
+        .and_then(|v| v.as_array());
+
+    let rows: Vec<serde_json::Value> = if let Some(recs) = recommendations {
+        recs.iter()
+            .map(|rec| {
+                json!({
+                    "ticker": rec.get("ticker").and_then(|v| v.as_str()).unwrap_or("?"),
+                    "name": rec.get("nom").or_else(|| rec.get("name")).and_then(|v| v.as_str()).unwrap_or(""),
+                    "account": rec.get("compte").or_else(|| rec.get("account")).and_then(|v| v.as_str()).unwrap_or(""),
+                    "signal": rec.get("signal").and_then(|v| v.as_str()).unwrap_or(""),
+                    "conviction": rec.get("conviction").and_then(|v| v.as_str()).unwrap_or(""),
+                    "last_price": rec.get("cours_actuel").or_else(|| rec.get("last_price")).and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    "pru": rec.get("pru").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    "pv_pct": rec.get("pv_pct").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                })
+            })
+            .collect()
+    } else {
+        let store = load_line_memory_from_disk_or_cache();
+        let by_ticker = store.get("by_ticker").and_then(|v| v.as_object());
+        match by_ticker {
+            Some(bt) => bt
+                .iter()
+                .filter(|(k, _)| !k.starts_with('_'))
+                .map(|(ticker, entry)| {
+                    let latest_signal = entry
+                        .get("signal_history")
+                        .and_then(|v| v.as_array())
+                        .and_then(|arr| arr.last());
+                    json!({
+                        "ticker": ticker,
+                        "name": entry.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                        "signal": latest_signal.and_then(|s| s.get("signal")).and_then(|v| v.as_str()).unwrap_or(""),
+                        "conviction": latest_signal.and_then(|s| s.get("conviction")).and_then(|v| v.as_str()).unwrap_or(""),
+                        "last_price": entry.get("price_tracking").and_then(|pt| pt.get("current_price")).and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    })
+                })
+                .collect(),
+            None => Vec::new(),
+        }
+    };
+    Ok(json!({
+        "ok": true,
+        "action": "line:list",
+        "count": rows.len(),
+        "lines": rows,
+    }))
+}
+
+pub fn run_line_show(ticker: &str) -> Result<serde_json::Value> {
+    let ticker = ticker.trim().to_uppercase();
+    if ticker.is_empty() {
+        return Err(anyhow!("ticker_required"));
+    }
+    let report = run_state::load_latest_report().ok();
+    let rec = report
+        .as_ref()
+        .and_then(|r| r.get("payload"))
+        .and_then(|p| p.get("recommandations"))
+        .and_then(|v| v.as_array())
+        .and_then(|arr| {
+            arr.iter().find(|r| {
+                r.get("ticker")
+                    .and_then(|v| v.as_str())
+                    .map(|t| t.to_uppercase() == ticker)
+                    .unwrap_or(false)
+            })
+        })
+        .cloned();
+
+    let store = load_line_memory_from_disk_or_cache();
+    let memory = store
+        .get("by_ticker")
+        .and_then(|bt| bt.get(&ticker))
+        .cloned();
+
+    if rec.is_none() && memory.is_none() {
+        return Err(anyhow!("ticker_not_found:{ticker}"));
+    }
+
+    Ok(json!({
+        "ok": true,
+        "action": "line:show",
+        "ticker": ticker,
+        "recommendation": rec,
+        "line_memory": memory,
+    }))
+}
+
+pub fn run_line_memory_show(ticker: Option<&str>) -> Result<serde_json::Value> {
+    let store = load_line_memory_from_disk_or_cache();
+    let by_ticker = store.get("by_ticker").and_then(|v| v.as_object());
+
+    if let Some(t) = ticker {
+        let t = t.trim().to_uppercase();
+        if t.is_empty() {
+            return Err(anyhow!("ticker_required"));
+        }
+        let entry = by_ticker
+            .and_then(|bt| bt.get(&t))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        if entry.is_null() {
+            return Err(anyhow!("ticker_not_found:{t}"));
+        }
+        Ok(json!({
+            "ok": true,
+            "action": "line:memory-show",
+            "ticker": t,
+            "memory": entry,
+        }))
+    } else {
+        let entries: Vec<serde_json::Value> = by_ticker
+            .map(|bt| {
+                bt.iter()
+                    .filter(|(k, _)| !k.starts_with('_'))
+                    .map(|(ticker, entry)| {
+                        let signal_count = entry
+                            .get("signal_history")
+                            .and_then(|v| v.as_array())
+                            .map(|a| a.len())
+                            .unwrap_or(0);
+                        let trend = entry
+                            .get("trend")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let reanalyse_after = entry
+                            .get("reanalyse_after")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        json!({
+                            "ticker": ticker,
+                            "signal_count": signal_count,
+                            "trend": trend,
+                            "reanalyse_after": reanalyse_after,
+                            "has_key_reasoning": entry.get("key_reasoning").is_some(),
+                            "has_news_themes": entry.get("news_themes").is_some(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(json!({
+            "ok": true,
+            "action": "line:memory-show",
+            "count": entries.len(),
+            "entries": entries,
+        }))
+    }
+}
+
 pub fn run_ensure_codex() -> Result<serde_json::Value> {
     crate::codex::ensure_codex_available()
 }

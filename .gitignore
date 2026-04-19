@@ -32,3 +32,4 @@ src-tauri/codex-runtime/
 .env
 .env.local
 .claude/
+alfred-cli/target/

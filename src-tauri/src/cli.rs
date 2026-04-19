@@ -119,6 +119,25 @@ pub(crate) fn dispatch(args: &[String]) -> Result<serde_json::Value> {
         "codex:session-status-local" | "codex_session_status_local" => command_handlers::invoke_command(command),
         "codex:session-login-local" | "codex_session_login_local" => command_handlers::invoke_command(command),
         "codex:session-logout-local" | "codex_session_logout_local" => command_handlers::invoke_command(command),
+        "reports:list" | "reports_list" => command_handlers::run_reports_list(),
+        "reports:latest" | "reports_latest" => command_handlers::run_reports_latest(),
+        "reports:show" | "reports_show" => {
+            let path_or_run_id = args
+                .get(2)
+                .ok_or_else(|| anyhow!("path_or_run_id_required"))?;
+            command_handlers::run_reports_show(path_or_run_id)
+        }
+        "line:list" | "line_list" => command_handlers::run_line_list(),
+        "line:show" | "line_show" => {
+            let ticker = args
+                .get(2)
+                .ok_or_else(|| anyhow!("ticker_required"))?;
+            command_handlers::run_line_show(ticker)
+        }
+        "line:memory-show" | "line_memory_show" => {
+            let ticker = args.get(2).map(|s| s.as_str());
+            command_handlers::run_line_memory_show(ticker)
+        }
         "desktop:open-external-url" | "desktop_open_external_url" => {
             let url = args
                 .get(2)
@@ -131,10 +150,17 @@ pub(crate) fn dispatch(args: &[String]) -> Result<serde_json::Value> {
             "commands": [
                 "health",
                 "db:init",
+                "reports:list",
+                "reports:latest",
+                "reports:show <path_or_run_id>",
+                "line:list",
+                "line:show <ticker>",
+                "line:memory-show [ticker]",
                 "analysis:run-start-local",
                 "analysis:run-start-wait-local [account]",
                 "analysis:retry-global-synthesis-local <run_id>",
                 "analysis:run-status-local <operation_id>",
+                "run:by-id-local <run_id>",
                 "dashboard:snapshot-local",
                 "dashboard:overview-local",
                 "dashboard:details-local",
@@ -142,17 +168,6 @@ pub(crate) fn dispatch(args: &[String]) -> Result<serde_json::Value> {
                 "runtime:settings-update-local <settings_json>",
                 "runtime:settings-reset-local",
                 "stack:health-local",
-                "analysis_run_start_local",
-                "analysis_run_start_wait_local [account]",
-                "retry_global_synthesis_local <run_id>",
-                "analysis_run_status_local <operation_id>",
-                "dashboard_snapshot_local",
-                "dashboard_overview_local",
-                "dashboard_details_local",
-                "runtime_settings_local",
-                "runtime_settings_update_local <settings_json>",
-                "runtime_settings_reset_local",
-                "stack_health_local",
                 "finary:session-status-local",
                 "finary:session-connect-local",
                 "finary:session-refresh-local",
@@ -163,18 +178,10 @@ pub(crate) fn dispatch(args: &[String]) -> Result<serde_json::Value> {
                 "finary:login-local",
                 "finary:snapshot-local",
                 "finary:accounts-local",
-                "finary_session_status_local",
-                "finary_session_connect_local",
-                "finary_session_refresh_local",
-                "finary_session_browser_start_local",
-                "finary_session_browser_complete_local",
-                "finary_session_browser_playwright_local",
-                "finary_session_browser_reuse_local",
                 "codex:session-status-local",
                 "codex:session-login-local",
                 "codex:session-logout-local",
                 "desktop:open-external-url <url>",
-                "desktop_open_external_url <url>",
                 "help"
             ]
         })),

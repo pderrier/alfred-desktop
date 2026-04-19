@@ -20,7 +20,7 @@ export ALFRED_REPORTS_DIR="${ALFRED_REPORTS_DIR:-$ALFRED_DATA_DIR/reports}"
 
 usage() {
   cat <<'EOF'
-Alfred Desktop CLI
+Alfred CLI (headless — no GUI dependencies required)
 
 Usage:
   ./alfred config show
@@ -30,7 +30,10 @@ Usage:
   ./alfred config reset
   ./alfred reports list
   ./alfred reports latest
-  ./alfred reports show <path>
+  ./alfred reports show <path_or_run_id>
+  ./alfred line list
+  ./alfred line show <ticker>
+  ./alfred line memory-show [ticker]
   ./alfred analysis start [account]   # exact name or alias (PEA Bourse, PEA PME)
   ./alfred analysis status <operation_id>
   ./alfred dashboard snapshot
@@ -67,7 +70,7 @@ run_backend() {
   backend="$(resolve_backend || true)"
   if [ -n "$backend" ]; then
     if [ "$(basename "$backend")" = "cargo" ]; then
-      "$backend" run --quiet --manifest-path "$ROOT/src-tauri/Cargo.toml" -- "$@"
+      "$backend" run --quiet --manifest-path "$ROOT/alfred-cli/Cargo.toml" -- "$@"
       return
     fi
     "$backend" "$@"
@@ -127,13 +130,8 @@ EOF
         else
           echo "api_secret: missing"
         fi
-        for pkg in gdk-3.0 gtk+-3.0 webkit2gtk-4.1; do
-          if pkg-config --modversion "$pkg" >/dev/null 2>&1; then
-            echo "pkg-config:$pkg:ok"
-          else
-            echo "pkg-config:$pkg:missing"
-          fi
-        done
+        # Note: alfred-cli does NOT require GTK/WebKit GUI libraries.
+        # It runs headless on servers without any system GUI dependencies.
         ;;
       set-backend-bin)
         value="${1:-}"
@@ -171,35 +169,46 @@ EOF
     shift || true
     case "$sub" in
       list)
-        if [ -d "$ALFRED_REPORTS_DIR" ]; then
-          find "$ALFRED_REPORTS_DIR" -maxdepth 2 -type f | sort
-        else
-          echo "No reports dir: $ALFRED_REPORTS_DIR" >&2
-          exit 1
-        fi
+        run_backend reports:list
         ;;
       latest)
-        latest="$ALFRED_REPORTS_DIR/latest.json"
-        if [ -f "$latest" ]; then
-          pretty_json "$latest"
-        else
-          echo "No latest report: $latest" >&2
-          exit 1
-        fi
+        run_backend reports:latest
         ;;
       show)
         target="${1:-}"
         if [ -z "$target" ]; then
-          echo "reports show requires a path" >&2
+          echo "reports show requires a path or run_id" >&2
           exit 1
         fi
-        if [ -f "$target" ]; then
-          cat "$target"
-        elif [ -f "$ALFRED_REPORTS_DIR/$target" ]; then
-          cat "$ALFRED_REPORTS_DIR/$target"
-        else
-          echo "Report not found: $target" >&2
+        run_backend reports:show "$target"
+        ;;
+      *)
+        usage
+        exit 1
+        ;;
+    esac
+    ;;
+  line)
+    sub="${1:-help}"
+    shift || true
+    case "$sub" in
+      list)
+        run_backend line:list
+        ;;
+      show)
+        ticker="${1:-}"
+        if [ -z "$ticker" ]; then
+          echo "line show requires a ticker" >&2
           exit 1
+        fi
+        run_backend line:show "$ticker"
+        ;;
+      memory-show)
+        ticker="${1:-}"
+        if [ -n "$ticker" ]; then
+          run_backend line:memory-show "$ticker"
+        else
+          run_backend line:memory-show
         fi
         ;;
       *)

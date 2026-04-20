@@ -26,12 +26,22 @@ See [CHANGELOG.md](CHANGELOG.md) for the full version history.
 
 ## Features
 
-- **Portfolio sync** — connect Finary for automatic brokerage account sync, or import CSV exports
+- **Portfolio sync** — connect Finary for automatic brokerage account sync, or import CSV exports (universal LLM-driven parser handles any broker format)
 - **Market enrichment** — real-time prices, fundamentals, and news from multiple sources
 - **AI analysis** — per-position technical, fundamental, and sentiment analysis powered by OpenAI
 - **Dual LLM backend** — choose Codex (free tier, OAuth) or native OpenAI API (API key, pay-per-use)
 - **Web search** — the AI searches and reads web pages during analysis to find missing data
 - **Synthesis report** — portfolio-wide recommendations with conviction levels and action items
+- **Chat with Alfred** — drill down on any position, action, or the whole portfolio; "Discuss about it" from any card. Insights can be saved to memory and reused in the next analysis
+- **Save to Memory** — persist key reasoning, personal notes, and news themes per position; carried forward into future runs for richer context
+- **Alfred overlay** — proactive assistant that surfaces welcome messages, accuracy nudges, run-completion summaries, and errors with priority-based preemption
+- **Accuracy nudge** — Alfred flags when a past recommendation has aged badly (price moved 10%+ against the signal)
+- **Signal scorecard** — "Was I Right?" accuracy tracker per position, based on signal history
+- **Run diff / "What Changed"** — highlights signal upgrades/downgrades and price moves between consecutive runs
+- **Theme concentration risk** — detects when 3+ positions share a news theme and warns in the synthesis and UI
+- **Stale position alerts** — sidebar badge and overdue markers when positions need reanalysis
+- **Onboarding wizard** — chat-based guided setup on first launch (portfolio source, LLM backend, first run)
+- **Export to Obsidian/Drive** — export analysis results as markdown with YAML frontmatter, action table, and positions table
 - **Watchlist** — AI-suggested positions to monitor based on your portfolio profile
 - **Auto-update** — checks for new versions on startup with optional mandatory updates
 - **Multi-account** — manage and analyze multiple brokerage accounts independently

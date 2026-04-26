@@ -68,8 +68,15 @@ fn extract_chat_text(result: &Value) -> Result<String> {
     Err(anyhow!("chat_wizard_unexpected_response_shape"))
 }
 
-/// Route chat wizard turns through the same backend abstraction as analysis.
-fn call_via_backend(context: &str, history: &[Value], user_message: &str) -> Result<String> {
+fn call_via_backend_with_runner<F>(
+    context: &str,
+    history: &[Value],
+    user_message: &str,
+    run_prompt: F,
+) -> Result<String>
+where
+    F: Fn(&str, u64) -> Result<Value>,
+{
     let prompt = build_backend_prompt(context, history, user_message);
 
     let timeout_ms: u64 = std::env::var("CODEX_PROXY_TIMEOUT_MS")
@@ -77,13 +84,20 @@ fn call_via_backend(context: &str, history: &[Value], user_message: &str) -> Res
         .and_then(|v| v.parse().ok())
         .unwrap_or(30_000);
 
-    let result = crate::llm_backend::run_prompt(&prompt, timeout_ms, None)?;
+    let result = run_prompt(&prompt, timeout_ms)?;
     extract_chat_text(&result)
+}
+
+/// Route chat wizard turns through the same backend abstraction as analysis.
+fn call_via_backend(context: &str, history: &[Value], user_message: &str) -> Result<String> {
+    call_via_backend_with_runner(context, history, user_message, |prompt, timeout_ms| {
+        crate::llm_backend::run_prompt(prompt, timeout_ms, None)
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{build_backend_prompt, extract_chat_text};
+    use super::{build_backend_prompt, call_via_backend_with_runner, extract_chat_text};
     use serde_json::json;
 
     #[test]
@@ -119,5 +133,39 @@ mod tests {
     fn extract_chat_text_handles_plain_string_shape() {
         let v = json!("plain");
         assert_eq!(extract_chat_text(&v).expect("text"), "plain");
+    }
+
+    #[test]
+    fn call_via_backend_with_runner_handles_openai_protocol_shape() {
+        let history = vec![json!({"role":"assistant","content":"Hi"})];
+        let result =
+            call_via_backend_with_runner("ctx", &history, "question", |prompt, _timeout| {
+                assert!(prompt.contains("System: ctx"));
+                assert!(prompt.contains("assistant: Hi"));
+                Ok(json!({"choices":[{"message":{"content":"openai-like"}}]}))
+            })
+            .expect("response");
+
+        assert_eq!(result, "openai-like");
+    }
+
+    #[test]
+    fn call_via_backend_with_runner_handles_codex_protocol_shape() {
+        let result = call_via_backend_with_runner("ctx", &[], "question", |_prompt, _timeout| {
+            Ok(json!({"ok":true,"mcp_turn":true,"agent_text":"codex-like"}))
+        })
+        .expect("response");
+
+        assert_eq!(result, "codex-like");
+    }
+
+    #[test]
+    fn call_via_backend_with_runner_handles_app_server_plain_text_shape() {
+        let result = call_via_backend_with_runner("ctx", &[], "question", |_prompt, _timeout| {
+            Ok(json!("appserver-like"))
+        })
+        .expect("response");
+
+        assert_eq!(result, "appserver-like");
     }
 }

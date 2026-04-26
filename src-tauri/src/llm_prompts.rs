@@ -680,7 +680,7 @@ pub(crate) fn build_memory_section(memory: Option<&Value>) -> String {
     }
 
     // Key reasoning
-    if let Some(reasoning) = m.get("key_reasoning").and_then(|v| v.as_str()) {
+    if let Some(reasoning) = m.get("memory_narrative").or_else(|| m.get("key_reasoning")).and_then(|v| v.as_str()) {
         if !reasoning.is_empty() {
             lines.push(format!("- These: {}", truncate_str(reasoning, 400)));
         }

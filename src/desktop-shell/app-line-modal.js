@@ -15,9 +15,7 @@ const lineMemoryPositionNode = document.getElementById("line-memory-position");
 const lineMemoryMarketNode = document.getElementById("line-memory-market");
 const lineMemoryNewsNode = document.getElementById("line-memory-news");
 const lineMemoryAnalysisNode = document.getElementById("line-memory-analysis");
-const lineMemoryMemorySummaryNode = document.getElementById("line-memory-memory-summary");
-const lineMemorySignalsNode = document.getElementById("line-memory-signals");
-const lineMemoryHistoryNode = document.getElementById("line-memory-history");
+const lineMemoryNarrativeNode = document.getElementById("line-memory-narrative");
 const lineMemoryDeepNewsSummaryNode = document.getElementById("line-memory-deep-news-summary");
 const lineMemoryDeepNewsMemorySummaryNode = document.getElementById("line-memory-deep-news-memory-summary");
 const lineMemoryDeepNewsSelectedUrlNode = document.getElementById("line-memory-deep-news-selected-url");
@@ -295,15 +293,8 @@ export function buildPositionContext(rec) {
     sections.push(`Recent news: ${headlines}`);
   }
 
-  // Line memory — V1 fields
-  if (memory.llm_memory_summary) sections.push(`Memory: ${memory.llm_memory_summary}`);
-  const signals = memory.llm_strong_signals || [];
-  if (signals.length > 0) sections.push(`Signals: ${signals.join(", ")}`);
-  const keyHistory = memory.llm_key_history || [];
-  if (keyHistory.length > 0) sections.push(`History: ${keyHistory.slice(0, 5).join("; ")}`);
-
   // Line memory — V2 fields
-  if (memory.key_reasoning) sections.push(`Key reasoning: ${memory.key_reasoning}`);
+  if (memory.memory_narrative) sections.push(`Memory narrative: ${memory.memory_narrative}`);
   const sigHistory = memory.signal_history || [];
   if (sigHistory.length > 0) {
     const recent = sigHistory.slice(-3).map((entry) => {
@@ -353,7 +344,7 @@ export async function synthesizeChatForMemoryWithUI(ticker, name, chatHistory) {
 }
 
 /**
- * Synthesize a chat conversation into key_reasoning + user_note via LLM.
+ * Synthesize a chat conversation into memory_narrative + user_note via LLM.
  * Returns { keyReasoning, userNote } or null on failure.
  */
 export async function synthesizeChatForMemory(ticker, name, chatHistory) {
@@ -404,18 +395,18 @@ USER_NOTE: ...`;
 /**
  * Show an inline overlay panel where the user can persist insights
  * from a chat drill-down back into line-memory.json.
- * Fields: key_reasoning (textarea), user_note (textarea), news_themes (checkboxes).
+ * Fields: memory_narrative (textarea), user_note (textarea), news_themes (checkboxes).
  *
  * @param {Object} rec — the recommendation / position record
  * @param {Object} [prefill] — optional LLM-generated pre-fill values
- * @param {string} [prefill.keyReasoning] — suggested key reasoning text
+ * @param {string} [prefill.keyReasoning] — suggested memory narrative text
  * @param {string} [prefill.userNote] — suggested personal note text
  */
 export function showSaveToMemoryPanel(rec, prefill) {
   if (!rec) return;
   const ticker = rec.ticker || "";
   const memory = rec.lineMemory || {};
-  const existingReasoning = memory.key_reasoning || "";
+  const existingReasoning = memory.memory_narrative || "";
   const existingThemes = Array.isArray(memory.news_themes) ? memory.news_themes : [];
   // Merge existing reasoning with prefill if both present
   const prefillReasoning = prefill?.keyReasoning || "";
@@ -452,7 +443,7 @@ export function showSaveToMemoryPanel(rec, prefill) {
       </div>
       <div style="flex:1;overflow-y:auto;padding:1rem 1.2rem;display:flex;flex-direction:column;gap:1rem">
         <div>
-          <label style="display:block;font-size:0.8rem;color:var(--sea-muted,#8a9bb0);margin-bottom:0.3rem">Key Reasoning</label>
+          <label style="display:block;font-size:0.8rem;color:var(--sea-muted,#8a9bb0);margin-bottom:0.3rem">Memory</label>
           <textarea class="stm-key-reasoning" rows="4" style="width:100%;background:rgba(10,17,24,0.6);border:1px solid rgba(73,100,126,0.4);border-radius:8px;color:var(--sea-text,#e0e8f0);padding:0.5rem 0.7rem;font-size:0.85rem;resize:vertical;font-family:inherit">${escapeHtml(mergedReasoning)}</textarea>
         </div>
         <div>
@@ -493,14 +484,14 @@ export function showSaveToMemoryPanel(rec, prefill) {
 
   // Confirm: collect fields and call Tauri command
   confirmBtn.addEventListener("click", async () => {
-    const keyReasoning = reasoningEl.value.trim() || null;
+    const memoryNarrative = reasoningEl.value.trim() || null;
     const userNote = noteEl.value.trim() || null;
     const checkedThemes = [...overlay.querySelectorAll(".stm-theme-cb:checked")]
       .map((cb) => cb.value);
     const newsThemes = checkedThemes.length > 0 ? checkedThemes : null;
 
     // Nothing to save
-    if (!keyReasoning && !userNote && !newsThemes) {
+    if (!memoryNarrative && !userNote && !newsThemes) {
       close();
       return;
     }
@@ -513,7 +504,7 @@ export function showSaveToMemoryPanel(rec, prefill) {
       if (!invoke) throw new Error("Tauri not available");
       await invoke("update_line_memory_local", {
         ticker,
-        keyReasoning,
+        memoryNarrative,
         userNote,
         newsThemes,
       });
@@ -677,29 +668,19 @@ export function initLineModal() {
     renderNewsShortList(lineMemoryNewsNode, details.news || []);
     renderNewsDetail(details.news || []);
     renderAnalysisList(lineMemoryAnalysisNode, toMetricRows(details.analysis, { analyse_technique: "Technical", analyse_fondamentale: "Fundamental", analyse_sentiment: "Sentiment" }), "No analysis.");
-    if (lineMemoryMemorySummaryNode) lineMemoryMemorySummaryNode.textContent = String(memory.llm_memory_summary || "No memory.");
+    // Memory narrative (replaces former llm_memory_summary + key_reasoning)
+    const narrative = memory.memory_narrative || "";
+    if (lineMemoryNarrativeNode) lineMemoryNarrativeNode.textContent = narrative || "No memory.";
     // Notes & Discussions — user-saved insights from chat drill-downs
     const notesSection = document.getElementById("line-memory-notes-section");
-    const keyReasoningNode = document.getElementById("line-memory-key-reasoning");
     const userNoteNode = document.getElementById("line-memory-user-note");
-    const keyReasoning = memory.key_reasoning || "";
     const userNote = memory.user_note || "";
-    const hasNotes = keyReasoning || userNote;
+    const hasNotes = narrative || userNote;
     if (notesSection) notesSection.classList.toggle("hidden", !hasNotes);
-    if (keyReasoningNode) {
-      keyReasoningNode.textContent = keyReasoning || "No reasoning saved.";
-      document.getElementById("line-memory-key-reasoning-block")?.classList.toggle("hidden", !keyReasoning);
-    }
     if (userNoteNode) {
       userNoteNode.textContent = userNote || "No personal note.";
       document.getElementById("line-memory-user-note-block")?.classList.toggle("hidden", !userNote);
     }
-    const signals = memory.llm_strong_signals || [];
-    renderSimpleList(lineMemorySignalsNode, signals, "No signals.");
-    lineMemorySignalsNode?.closest("article")?.classList?.toggle("hidden", signals.length === 0);
-    const history = memory.llm_key_history || [];
-    renderSimpleList(lineMemoryHistoryNode, history, "No history.");
-    lineMemoryHistoryNode?.closest("article")?.classList?.toggle("hidden", history.length === 0);
     // "News Analysis" = LLM's deep_news_summary from this run
     const freshSummary = String(details.analysis?.deep_news_summary || "");
     const memorySummary = String(memory.deep_news_memory_summary || "");

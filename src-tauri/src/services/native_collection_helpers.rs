@@ -356,7 +356,7 @@ pub(crate) fn build_memory_for_prompt(entry: Option<&Value>, global_banned_urls:
         "signal": as_text(entry.get("signal")),
         "conviction": as_text(entry.get("conviction")),
         "signal_history": entry.get("signal_history").cloned().unwrap_or(json!([])),
-        "key_reasoning": as_text(entry.get("key_reasoning")),
+        "memory_narrative": as_text(entry.get("memory_narrative").or(entry.get("key_reasoning"))),
         "price_tracking": entry.get("price_tracking").cloned().unwrap_or(Value::Null),
         "news_themes": entry.get("news_themes").cloned().unwrap_or(json!([])),
         "trend": as_text(entry.get("trend")),

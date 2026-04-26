@@ -40,19 +40,7 @@ function normalizeLineMemory(raw = {}, fallback = {}) {
   const nested = raw && typeof raw === "object" ? raw : {};
   const base = fallback && typeof fallback === "object" ? fallback : {};
   return {
-    llm_memory_summary: asText(
-      nested?.llm_memory_summary || base?.llm_memory_summary
-    ),
-    llm_strong_signals: Array.isArray(nested?.llm_strong_signals)
-      ? nested.llm_strong_signals
-      : Array.isArray(base?.llm_strong_signals)
-        ? base.llm_strong_signals
-        : [],
-    llm_key_history: Array.isArray(nested?.llm_key_history)
-      ? nested.llm_key_history
-      : Array.isArray(base?.llm_key_history)
-        ? base.llm_key_history
-        : [],
+    // V1 fields (llm_memory_summary, llm_strong_signals, llm_key_history) removed — dead since V2
     deep_news_memory_summary: asText(
       nested?.deep_news_memory_summary || base?.deep_news_memory_summary || base?.deep_news_summary
     ),
@@ -73,7 +61,7 @@ function normalizeLineMemory(raw = {}, fallback = {}) {
       : Array.isArray(base?.signal_history)
         ? base.signal_history
         : [],
-    key_reasoning: asText(nested?.key_reasoning || base?.key_reasoning),
+    memory_narrative: asText(nested?.memory_narrative || nested?.key_reasoning || base?.memory_narrative || base?.key_reasoning),
     price_tracking: (nested?.price_tracking && typeof nested.price_tracking === "object")
       ? nested.price_tracking
       : (base?.price_tracking && typeof base.price_tracking === "object")
@@ -253,7 +241,7 @@ function buildRecommendationProvenance(rec, latestRun, { source = "recommendatio
   } else {
     labels.push("LLM recommendation");
   }
-  if (rec?.memoire_ligne || rec?.line_memory || rec?.llm_memory_summary) {
+  if (rec?.memoire_ligne || rec?.line_memory) {
     labels.push("Memory reuse");
   }
   if (rec?.line_validation?.repaired === true || rec?.validation_context?.repaired === true) {

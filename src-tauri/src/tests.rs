@@ -2370,7 +2370,7 @@ use crate::storage::read_json_file;
                 { "date": "2026-04-01", "signal": "ACHAT", "conviction": "forte", "price_at_signal": 142.5 },
                 { "date": "2026-03-15", "signal": "CONSERVER", "conviction": "moderee", "price_at_signal": 138.0 }
             ],
-            "key_reasoning": "Strong growth thesis based on margin expansion.",
+            "memory_narrative": "Strong growth thesis based on margin expansion.",
             "price_tracking": {
                 "last_signal": "ACHAT",
                 "last_signal_date": "2026-04-01",
@@ -2427,7 +2427,7 @@ use crate::storage::read_json_file;
             "signal_history": [
                 { "date": "2026-04-01", "signal": "ACHAT", "conviction": "forte", "price_at_signal": 100.0 }
             ],
-            "key_reasoning": "Short thesis."
+            "memory_narrative": "Short thesis."
         });
         let result = crate::llm_prompts::build_memory_section(Some(&partial));
         assert!(result.contains("MEMOIRE LIGNE (historique persistant):"));

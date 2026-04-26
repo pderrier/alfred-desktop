@@ -1012,7 +1012,7 @@ pub fn run_line_memory_show(ticker: Option<&str>) -> Result<serde_json::Value> {
                             "signal_count": signal_count,
                             "trend": trend,
                             "reanalyse_after": reanalyse_after,
-                            "has_key_reasoning": entry.get("key_reasoning").is_some(),
+                            "has_memory_narrative": entry.get("memory_narrative").or(entry.get("key_reasoning")).is_some(),
                             "has_news_themes": entry.get("news_themes").is_some(),
                         })
                     })

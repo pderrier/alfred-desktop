@@ -463,8 +463,9 @@ fn extract_recommendation_json(result: &Value) -> Option<Value> {
 
 /// Sync a validated recommendation into the persistent line-memory.json store.
 /// V2 schema — clean break from V1. Writes `schema_version: 2`,
-/// `signal_history`, `key_reasoning`, `news_themes`, `trend`, `price_tracking`.
+/// `signal_history`, `memory_narrative`, `news_themes`, `trend`, `price_tracking`.
 /// V1 fields (`llm_memory_summary`, `llm_strong_signals`, `llm_key_history`) are NOT written.
+/// NOTE: `memory_narrative` replaces the former `key_reasoning` field name.
 fn sync_line_memory(run_id: &str, ticker: &str, rec: &Value, current_price: f64) {
     let ticker = ticker.trim().to_uppercase();
     if ticker.is_empty() { return; }
@@ -502,8 +503,8 @@ fn sync_line_memory(run_id: &str, ticker: &str, rec: &Value, current_price: f64)
         }
     }
 
-    // ── V2: key_reasoning (first 3 sentences of synthese) ──────────
-    let key_reasoning = extract_first_sentences(&synthese, 3);
+    // ── V2: memory_narrative (first 3 sentences of synthese) ───────
+    let memory_narrative = extract_first_sentences(&synthese, 3);
 
     // ── V2: news_themes (merge from badges_keywords, cap at 15) ────
     let news_themes = merge_string_list(
@@ -552,7 +553,7 @@ fn sync_line_memory(run_id: &str, ticker: &str, rec: &Value, current_price: f64)
         "signal": signal,
         "conviction": conviction,
         "signal_history": signal_history,
-        "key_reasoning": key_reasoning,
+        "memory_narrative": memory_narrative,
         "price_tracking": price_tracking,
         "news_themes": news_themes,
         "trend": trend,
@@ -724,7 +725,7 @@ pub(crate) fn build_theme_concentration_text(concentration: &Value) -> String {
 /// Called from the "Save to Memory" panel after a Position Chat session.
 pub fn update_line_memory_fields(
     ticker: &str,
-    key_reasoning: Option<&str>,
+    memory_narrative: Option<&str>,
     user_note: Option<&str>,
     news_themes: Option<Vec<String>>,
 ) -> Result<()> {
@@ -737,7 +738,7 @@ pub fn update_line_memory_fields(
     let today = now[..10].to_string(); // safe — ASCII only
 
     // Prepare owned values for the closure (captures must be 'static-compatible)
-    let key_reasoning_owned = key_reasoning.map(|s| s.to_string());
+    let memory_narrative_owned = memory_narrative.map(|s| s.to_string());
     let user_note_owned = user_note.map(|s| s.to_string());
     let ticker_key = ticker.clone();
 
@@ -758,8 +759,8 @@ pub fn update_line_memory_fields(
             None => { crate::debug_log("update_line_memory_fields: failed to access ticker entry"); return; }
         };
 
-        if let Some(reasoning) = key_reasoning_owned {
-            entry.insert("key_reasoning".to_string(), Value::String(reasoning));
+        if let Some(reasoning) = memory_narrative_owned {
+            entry.insert("memory_narrative".to_string(), Value::String(reasoning));
         }
 
         if let Some(note) = user_note_owned {

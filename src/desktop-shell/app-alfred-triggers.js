@@ -26,13 +26,13 @@ Guide-le à travers les 3 étapes de configuration, une à la fois. Sois accueil
 
 **Étape 1 : Source du portefeuille**
 Demande à l'utilisateur comment il souhaite connecter son portefeuille :
-- **Finary** (synchronisation automatique) : il devra fournir son token de session Finary. Explique qu'il peut le trouver dans les cookies de son navigateur sur finary.com (cookie "session"). Une fois fourni, Alfred synchronisera automatiquement ses comptes.
+- **Finary** (synchronisation automatique) : Alfred ouvrira une fenêtre de connexion Finary dans le navigateur. L'utilisateur se connecte normalement sur finary.com et Alfred récupère la session automatiquement. Aucun token ou cookie à copier manuellement.
 - **Import CSV** : il peut importer un fichier CSV avec ses positions. Explique le format attendu (colonnes : ISIN ou ticker, quantité, prix d'achat). Après la configuration, il pourra utiliser le bouton "Import CSV" dans l'interface.
 
 **Étape 2 : Backend LLM (moteur d'analyse)**
 Explique les 3 modes disponibles pour l'analyse IA :
 - **Codex (gratuit)** : utilise le serveur Alfred, aucune clé API nécessaire. Bon pour commencer.
-- **Native (clé API personnelle)** : utilise directement l'API Anthropic avec sa propre clé. Plus rapide, plus de contrôle.
+- **Native (clé API personnelle)** : utilise directement l'API OpenAI avec sa propre clé. Plus rapide, plus de contrôle.
 - **Native OAuth** : utilise l'app Codex comme proxy OAuth. Pas de clé API nécessaire, authentification via navigateur.
 Recommande le mode Codex pour commencer si l'utilisateur n'est pas sûr.
 
@@ -44,7 +44,7 @@ Règles :
 - Une étape à la fois — ne submerge pas l'utilisateur.
 - Si l'utilisateur dit "skip" ou veut passer une étape, accepte et passe à la suivante.
 - Sois encourageant et montre que la configuration est simple.
-- Ne demande PAS de données sensibles autres que le token Finary (qui est nécessaire pour la synchronisation).`;
+- Ne demande PAS de données sensibles. La connexion Finary se fait via le navigateur, pas par token.`;
 
 const ONBOARDING_INITIAL_MESSAGE = `Bienvenue dans Alfred ! Je suis votre assistant de gestion de portefeuille.
 

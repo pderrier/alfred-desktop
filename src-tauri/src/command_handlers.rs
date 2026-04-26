@@ -219,19 +219,24 @@ pub(crate) fn validate_external_url(url: &str) -> Result<String> {
     if !(lower.starts_with("http://") || lower.starts_with("https://")) {
         return Err(anyhow!("external_url_invalid"));
     }
+    // Reject control characters and encoded CR/LF to reduce shell/launcher injection risk.
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err(anyhow!("external_url_invalid"));
+    }
+    if lower.contains("%0d") || lower.contains("%0a") {
+        return Err(anyhow!("external_url_invalid"));
+    }
     Ok(trimmed.to_string())
 }
 
 pub fn open_external_url(url: &str) -> Result<serde_json::Value> {
     let safe_url = validate_external_url(url)?;
     #[cfg(target_os = "windows")]
-    let status = {
-        let mut cmd = Command::new("cmd");
-        cmd.arg("/C").arg("start").arg("").arg(&safe_url);
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        cmd.status().map_err(|error| anyhow!("external_url_open_failed:{error}"))?
-    };
+    let status = Command::new("rundll32")
+        .arg("url.dll,FileProtocolHandler")
+        .arg(&safe_url)
+        .status()
+        .map_err(|error| anyhow!("external_url_open_failed:{error}"))?;
     #[cfg(target_os = "macos")]
     let status = Command::new("open")
         .arg(&safe_url)
@@ -1040,4 +1045,3 @@ pub fn run_codex_session_logout() -> Result<serde_json::Value> {
         "result": crate::codex::session_logout()?
     }))
 }
-

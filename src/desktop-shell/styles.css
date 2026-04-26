@@ -1426,6 +1426,38 @@ main {
   color: var(--sea-accent);
   cursor: pointer;
 }
+.theme-risk-detail-btn {
+  margin-top: 0.6rem;
+  font-size: 0.78rem;
+}
+.theme-risk-modal-content {
+  width: min(52rem, calc(100vw - 3rem));
+  max-height: min(82vh, 48rem);
+  overflow: auto;
+}
+.theme-risk-section {
+  margin-bottom: 0.8rem;
+}
+.theme-risk-section-title {
+  margin: 0 0 0.35rem;
+  color: var(--sea-muted, #8a9bb0);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.theme-risk-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: 0.8rem;
+}
+.theme-risk-modal-list {
+  margin: 0;
+  padding-left: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.84rem;
+}
 
 /* ── Signal Accuracy Scorecard (Phase 3b) ── */
 .scorecard-section {

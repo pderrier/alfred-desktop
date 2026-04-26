@@ -350,6 +350,133 @@ function parseTimestamp(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function normalizeThemeLabel(value) {
+  return asText(value).replace(/\s+/g, " ").trim();
+}
+
+function aggregateRisksFromRecommendations(recommendations = []) {
+  const riskMap = new Map();
+  for (const rec of recommendations) {
+    const ticker = asText(rec?.ticker).toUpperCase();
+    const risks = Array.isArray(rec?.details?.analysis?.risques)
+      ? rec.details.analysis.risques
+      : [];
+    for (const rawRisk of risks) {
+      const label = normalizeThemeLabel(rawRisk);
+      if (!label) continue;
+      if (!riskMap.has(label)) {
+        riskMap.set(label, { risk: label, count: 0, tickers: new Set() });
+      }
+      const row = riskMap.get(label);
+      row.count += 1;
+      if (ticker) row.tickers.add(ticker);
+    }
+  }
+  return [...riskMap.values()]
+    .map((entry) => ({
+      risk: entry.risk,
+      count: entry.count,
+      tickers: [...entry.tickers].sort(),
+    }))
+    .sort((a, b) => {
+      if (b.count !== a.count) return b.count - a.count;
+      return a.risk.localeCompare(b.risk);
+    });
+}
+
+function buildCrossAccountThemeView(snapshot, currentAccount = "") {
+  const runs = Array.isArray(snapshot?.runs) ? snapshot.runs : [];
+  const latestByAccount = new Map();
+  for (const run of runs) {
+    const account = asText(run?.account);
+    if (!account) continue;
+    const runTs = parseTimestamp(run?.updated_at || run?.saved_at || run?.created_at || run?.date) || 0;
+    const prev = latestByAccount.get(account);
+    if (!prev || runTs > prev.ts) {
+      latestByAccount.set(account, { run, ts: runTs });
+    }
+  }
+
+  const themeMap = new Map();
+  for (const [account, holder] of latestByAccount.entries()) {
+    const themes = holder?.run?.composed_payload?.theme_concentration?.themes;
+    if (!Array.isArray(themes)) continue;
+    for (const rawTheme of themes) {
+      const label = normalizeThemeLabel(rawTheme?.theme);
+      if (!label) continue;
+      if (!themeMap.has(label)) {
+        themeMap.set(label, { theme: label, totalCount: 0, accounts: new Set() });
+      }
+      const entry = themeMap.get(label);
+      entry.totalCount += asNumber(rawTheme?.count, 0) || 0;
+      entry.accounts.add(account);
+    }
+  }
+
+  const rows = [...themeMap.values()]
+    .map((entry) => ({
+      theme: entry.theme,
+      totalCount: entry.totalCount,
+      accountCount: entry.accounts.size,
+      accounts: [...entry.accounts].sort(),
+      inCurrentAccount: currentAccount ? entry.accounts.has(currentAccount) : false,
+    }))
+    .sort((a, b) => {
+      if (b.accountCount !== a.accountCount) return b.accountCount - a.accountCount;
+      if (b.totalCount !== a.totalCount) return b.totalCount - a.totalCount;
+      return a.theme.localeCompare(b.theme);
+    });
+  return rows.slice(0, 8);
+}
+
+function buildThemeRiskInsight({ snapshot, latestRun, recommendations, themeConcentration }) {
+  const themeRows = Array.isArray(themeConcentration?.themes)
+    ? [...themeConcentration.themes]
+        .map((entry) => ({
+          theme: normalizeThemeLabel(entry?.theme),
+          count: asNumber(entry?.count, 0) || 0,
+          tickers: Array.isArray(entry?.tickers) ? entry.tickers.filter(Boolean) : [],
+        }))
+        .filter((entry) => entry.theme)
+        .sort((a, b) => (b.count || 0) - (a.count || 0))
+    : [];
+  const topThemes = themeRows.slice(0, 5);
+  const riskRows = aggregateRisksFromRecommendations(recommendations);
+  const topRisks = riskRows.slice(0, 5);
+  const currentAccount = asText(latestRun?.account);
+  const globalThemes = buildCrossAccountThemeView(snapshot, currentAccount);
+  const sharedThemeCount = topThemes.filter((theme) =>
+    globalThemes.some((row) => row.theme === theme.theme && row.accountCount > 1)
+  ).length;
+
+  const highlights = [];
+  if (topThemes.length > 0) {
+    highlights.push(
+      `${topThemes.length} thème${topThemes.length > 1 ? "s" : ""} dominant${topThemes.length > 1 ? "s" : ""} (max ${topThemes[0].count} positions sur ${topThemes[0].theme}).`
+    );
+  }
+  if (topRisks.length > 0) {
+    highlights.push(
+      `${topRisks.length} risque${topRisks.length > 1 ? "s" : ""} récurrent${topRisks.length > 1 ? "s" : ""} identifié${topRisks.length > 1 ? "s" : ""}; ${topRisks[0].risk}.`
+    );
+  }
+  if (globalThemes.length > 0) {
+    highlights.push(
+      sharedThemeCount > 0
+        ? `${sharedThemeCount} thème${sharedThemeCount > 1 ? "s" : ""} est/sont aussi concentré(s) dans d'autres comptes.`
+        : "Les thèmes concentrés semblent plutôt spécifiques à ce compte."
+    );
+  }
+
+  return {
+    topThemes,
+    topRisks,
+    globalThemes,
+    sharedThemeCount,
+    highlights,
+  };
+}
+
 export function buildReportViewModel(dashboardPayload) {
   const snapshot = dashboardPayload?.snapshot || {};
   const latestRun = snapshot.latest_run || null;
@@ -387,6 +514,9 @@ export function buildReportViewModel(dashboardPayload) {
   const effectiveArtifactReport = dataSource === "artifact" ? latestReport : null;
   const effectiveArtifactPayload = effectiveArtifactReport?.payload || {};
   const effectiveRunId = latestRun?.run_id || effectiveArtifactReport?.run_id || null;
+  const themeConcentration = (latestRunIsAuthoritative
+    ? currentRunPayload.theme_concentration
+    : effectiveArtifactPayload.theme_concentration) || null;
 
   const recommendations = Array.isArray(effectiveRecommendationsSource)
     ? effectiveRecommendationsSource.map((row, index) =>
@@ -531,9 +661,13 @@ export function buildReportViewModel(dashboardPayload) {
     }),
     actionsNow,
     // Phase 2b: theme concentration from composed_payload
-    themeConcentration: (latestRunIsAuthoritative
-      ? currentRunPayload.theme_concentration
-      : effectiveArtifactPayload.theme_concentration) || null
+    themeConcentration,
+    themeRiskInsight: buildThemeRiskInsight({
+      snapshot,
+      latestRun,
+      recommendations: effectiveRecommendations,
+      themeConcentration
+    })
   };
 }
 

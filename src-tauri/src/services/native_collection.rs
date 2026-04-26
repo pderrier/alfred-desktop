@@ -1786,28 +1786,35 @@ fn build_cash_mapping_with_links(
 
         for inv in &unmatched_invs {
             let inv_lower = inv.name.to_lowercase();
-            // Find a cash account whose name contains "espece" AND contains the investment account name (or vice versa)
-            let candidate = unmatched_cash.iter().find(|(idx, ce)| {
+            // Find cash accounts whose name contains "espece"/"espèce" AND shares
+            // a significant word with the investment account name.
+            // Do NOT use "same institution" as sole criterion — it's too loose
+            // (would match livrets, comptes chèque, etc. on the same bank).
+            let candidates: Vec<&(usize, &HoldingsEntry)> = unmatched_cash.iter().filter(|(idx, ce)| {
                 if matched_cash_indices.contains(idx) { return false; }
                 let cash_lower = ce.name.to_lowercase();
                 let is_cash_like = cash_lower.contains("esp\u{00E8}ce") || cash_lower.contains("espece");
                 if !is_cash_like { return false; }
-                // Check if the cash name contains the investment name or shares a key suffix
-                // e.g., "Compte espèces PEA" contains "PEA", and inv.name is "PEA" or "Plan Epargne en Action"
                 let inv_words: Vec<&str> = inv_lower.split_whitespace().collect();
                 let cash_words: Vec<&str> = cash_lower.split_whitespace().collect();
-                // Match if any significant word (>2 chars) from inv appears in cash name
                 inv_words.iter().any(|w| w.len() > 2 && cash_lower.contains(w))
                 || cash_words.iter().any(|w| w.len() > 2 && w != &"compte" && w != &"especes" && w != &"esp\u{00E8}ces" && inv_lower.contains(w))
-                // Same institution check
-                || (!inv.institution_name.is_empty() && inv.institution_name == ce.institution_name)
-            });
-            if let Some((idx, ce)) = candidate {
+            }).collect();
+            if candidates.len() == 1 {
+                // Exactly one "espèce" cash account matches → safe auto-pair
+                let (idx, ce) = candidates[0];
                 result.insert(inv.name.clone(), ce.fiats_sum);
                 matched_cash_indices.insert(*idx);
                 crate::debug_log(&format!(
                     "finary_cash_mapping: matched '{}' → cash {:.2} (semantic name match → '{}')",
                     inv.name, ce.fiats_sum, ce.name
+                ));
+            } else if candidates.len() > 1 {
+                // Multiple cash accounts with the same name (e.g. 2× "Compte espèce PEA")
+                // → ambiguous, let the wizard handle it
+                crate::debug_log(&format!(
+                    "finary_cash_mapping: '{}' has {} semantic candidates — flagging ambiguous",
+                    inv.name, candidates.len()
                 ));
             }
         }

@@ -1223,11 +1223,28 @@ async function refreshCashLinksSettings() {
       li.className = "memory-item";
       li.style.gap = "0.6rem";
       li.innerHTML = `
-        <div class="memory-header">
-          <span class="memory-label">${escapeHtml(investmentName)}</span>
-          <span class="memory-value">${escapeHtml(cashName)}</span>
+        <div class="memory-header" style="display:flex;align-items:center;justify-content:space-between;">
+          <div>
+            <span class="memory-label">${escapeHtml(investmentName)}</span>
+            <span class="memory-value">${escapeHtml(cashName)}</span>
+          </div>
+          <button class="btn-icon cash-link-delete" title="Remove this link" style="font-size:0.8rem;opacity:0.6;cursor:pointer;background:none;border:none;color:var(--text-secondary);">✕</button>
         </div>
       `;
+      li.querySelector(".cash-link-delete")?.addEventListener("click", async () => {
+        try {
+          const p = await tauriInv("get_user_preferences_local") || {};
+          if (p.cash_account_links) {
+            delete p.cash_account_links[investmentName];
+            if (Object.keys(p.cash_account_links).length === 0) delete p.cash_account_links;
+          }
+          await tauriInv("save_user_preferences_local", { prefs: p });
+          await refreshCashLinksSettings();
+          showToast(`Removed link for ${investmentName}`, "success");
+        } catch (err) {
+          showToast(`Failed: ${err?.message || err}`, "error");
+        }
+      });
       settingsCashLinksNode.appendChild(li);
     }
   } catch {
@@ -1508,12 +1525,15 @@ settingsCashLinksResetBtn?.addEventListener("click", async () => {
     delete nextPrefs.cash_account_links;
     await tauriInv("save_user_preferences_local", { prefs: nextPrefs });
     try {
+      // Invalidate cached snapshot so the next sync re-fetches from Finary
+      // and re-computes cash mapping with the now-empty preferences.
+      await tauriInv("finary_invalidate_snapshot_local");
       await tauriInv("finary_sync_snapshot_local");
       await refreshDashboard();
     } catch { /* non-blocking */ }
     await refreshCashLinksSettings();
     cashWizardShownThisSession = false;
-    showToast("Cash account links reset", "success");
+    showToast("Cash account links reset — next analysis will re-detect mappings", "success");
   } catch (error) {
     showToast(`Reset links failed: ${formatBridgeError(error)}`, "error");
   }

@@ -1288,6 +1288,20 @@ fn get_latest_local_finary_snapshot() -> Result<Option<Value>> {
         .cloned())
 }
 
+/// Clear the cached Finary snapshot so the next sync forces a fresh API fetch
+/// and re-computes cash mapping from scratch.
+pub fn invalidate_finary_snapshot_cache() -> Result<()> {
+    let mut store = read_source_snapshot_store()?;
+    if let Some(obj) = store.as_object_mut() {
+        if let Some(latest) = obj.get_mut("latest_by_source").and_then(|v| v.as_object_mut()) {
+            latest.remove(LOCAL_FINARY_SOURCE_ID);
+        }
+    }
+    write_source_snapshot_store(&store)?;
+    crate::debug_log("finary_sync: invalidated cached snapshot — next sync will re-fetch from API");
+    Ok(())
+}
+
 fn local_day_key(raw: &str) -> String {
     raw.get(0..10).unwrap_or_default().to_string()
 }

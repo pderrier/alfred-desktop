@@ -407,6 +407,17 @@ async fn finary_sync_snapshot_local() -> Result<serde_json::Value, String> {
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn finary_invalidate_snapshot_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(|| -> Result<serde_json::Value, anyhow::Error> {
+        native_collection::invalidate_finary_snapshot_cache()?;
+        Ok(serde_json::json!({ "ok": true }))
+    })
+        .await
+        .map_err(|e| format!("finary_invalidate_snapshot_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
 // ── CSV import preview ──────────────────────────────────────────────────
 
 #[tauri::command]
@@ -614,6 +625,7 @@ fn run_tauri_app() -> anyhow::Result<()> {
             storage_clear_log_local,
             check_api_auth_local,
             finary_sync_snapshot_local,
+            finary_invalidate_snapshot_local,
             preview_csv_import_local,
             check_openai_api_key_local,
             check_for_update_local,

@@ -164,6 +164,8 @@ const runOperations = createRunOperationsController({
       if (event?.run_id) {
         activeRunId = event.run_id;
         setLiveRunActiveId(event.run_id);
+        // Auto-select the running entry in the sidebar
+        renderSidebar(latestDashboardPayload);
       }
     }
     if (event?.type === "run.progress" && event?.run_id) {
@@ -800,7 +802,9 @@ function updateAnalysisEta(completedCount, totalCount) {
   // Average of recent completions (last 10 for smoothing)
   const recent = lineTimingHistory.slice(-10);
   const avgMs = recent.reduce((sum, d) => sum + d, 0) / recent.length;
-  const etaMs = remaining * avgMs;
+  // Account for parallelization — lineTimingStart.size = lines currently in-flight
+  const concurrency = Math.max(lineTimingStart.size, 1);
+  const etaMs = (remaining * avgMs) / concurrency;
   const etaMin = Math.ceil(etaMs / 60000);
   const etaLabel = etaMin <= 1 ? "< 1 min" : `~${etaMin} min`;
   progressNode.textContent = `Analyzing ${completedCount} of ${totalCount} positions (${etaLabel} remaining)`;

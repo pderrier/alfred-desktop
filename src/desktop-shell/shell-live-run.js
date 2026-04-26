@@ -172,9 +172,12 @@ export function renderLivePositions(lineStatus, dashboardPayload) {
     row.classList.add(lineRowClass(status));
     const signalCell = row.querySelector("td:nth-child(8)");
     if (signalCell) {
-      // Don't overwrite signal badge with "Done" chip if line already completed
       const hasSignalBadge = signalCell.querySelector(".signal-badge");
-      if (!(status === "done" && hasSignalBadge)) {
+      // If done with recommendation data, show signal badge instead of "Done" chip
+      const rec = typeof raw === "object" ? raw?.recommendation : null;
+      if (status === "done" && rec?.signal) {
+        if (!hasSignalBadge) signalCell.innerHTML = renderSignalBadge(rec.signal);
+      } else if (!(status === "done" && hasSignalBadge)) {
         signalCell.innerHTML = renderLiveStatusChip(raw);
       }
     }
@@ -365,7 +368,15 @@ export function renderPipelineBar(stage) {
     failed: "done"
   };
   const key = stageMap[String(stage || "").trim().toLowerCase()] || "collecting";
-  pipelineActiveKeys = new Set([key]);
+  // Only use orchestration stage as fallback — line-status-derived stages
+  // (set by updatePipelineFromLineStatus) are more accurate/real-time.
+  // Orchestration stage can advance the bar forward but never regress it.
+  const STEP_RANK = { collecting: 0, analyzing: 1, synthesis: 2, done: 3 };
+  const newRank = STEP_RANK[key] ?? 0;
+  const currentMax = Math.max(...[...pipelineActiveKeys].map((k) => STEP_RANK[k] ?? 0), -1);
+  if (newRank >= currentMax) {
+    pipelineActiveKeys = new Set([key]);
+  }
   renderPipelineBarInner();
 }
 

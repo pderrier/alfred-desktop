@@ -4,6 +4,7 @@
  */
 import { escapeHtml } from "/desktop-shell/ui-display-utils.js";
 import { openChatWizard } from "/desktop-shell/app-chat-wizard.js";
+import { openDiscussionHistoryModal, saveDiscussionThread } from "/desktop-shell/discussion-memory.js";
 
 // ── DOM nodes ────────────────────────────────────────────────────
 
@@ -558,6 +559,8 @@ export function initLineModal() {
       title: `Ask about ${ticker}`,
       systemContext: buildPositionContext(rec),
       initialMessage: `I can answer questions about your ${label} position. The current recommendation is ${signal} (${conviction}). What would you like to know?`,
+      discussionScope: `line:${ticker}`,
+      discussionMetadata: { ticker, name },
       returnHistoryOnClose: true,
       onDone: async (history) => {
         // Called directly from Done button — bypasses promise chain
@@ -566,6 +569,15 @@ export function initLineModal() {
         const prefill = hadConversation
           ? await synthesizeChatForMemoryWithUI(ticker, name, history)
           : null;
+        if (prefill?.keyReasoning || prefill?.userNote) {
+          saveDiscussionThread({
+            scope: `line:${ticker}`,
+            title: `Line ${ticker}`,
+            summary: prefill?.keyReasoning || "",
+            note: prefill?.userNote || "",
+            metadata: { ticker, name },
+          });
+        }
         showSaveToMemoryPanel(rec, prefill);
       },
     });
@@ -586,6 +598,29 @@ export function initLineModal() {
     const ticker = rec?.ticker || "N/A";
     if (lineMemoryModalSubtitleNode) lineMemoryModalSubtitleNode.textContent = `${ticker}${rec?.name ? ` - ${rec.name}` : ""}`;
     if (lineMemorySummaryNode) lineMemorySummaryNode.textContent = String(rec?.summary || "No recommendation available.");
+    let previousBtn = document.getElementById("line-memory-previous-discussions-btn");
+    const askBtnNode = document.getElementById("line-memory-ask-btn");
+    if (!previousBtn && askBtnNode?.parentElement) {
+      previousBtn = document.createElement("button");
+      previousBtn.id = "line-memory-previous-discussions-btn";
+      previousBtn.type = "button";
+      previousBtn.className = "ghost-btn";
+      previousBtn.style.cssText = "margin-top:0.4rem";
+      previousBtn.textContent = "Previous discussions";
+      askBtnNode.parentElement.appendChild(previousBtn);
+    }
+    previousBtn?.replaceWith(previousBtn?.cloneNode(true));
+    previousBtn = document.getElementById("line-memory-previous-discussions-btn");
+    previousBtn?.addEventListener("click", () => {
+      openDiscussionHistoryModal({
+        scopePrefix: `line:${ticker}`,
+        title: `Previous discussions — ${ticker}`,
+        onApplyInsight: (insight) => {
+          const noteNode = document.getElementById("line-memory-user-note");
+          if (noteNode) noteNode.textContent = insight;
+        }
+      });
+    });
     // Reanalyse date
     const reanalyseNode = document.getElementById("line-memory-reanalyse");
     if (reanalyseNode) {

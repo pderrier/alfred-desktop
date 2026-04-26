@@ -10,6 +10,7 @@ import {
 import { buildRunAnalysisOptions } from "/desktop-shell/report-view-model.js";
 import { formatBridgeError, isErrorCritical, extractErrorCode } from "/shared/run-operations-controller.js";
 import { openCashMatchingWizard, openChatWizard } from "/desktop-shell/app-chat-wizard.js";
+import { openDiscussionHistoryModal, buildDiscussionGuidance } from "/desktop-shell/discussion-memory.js";
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -40,6 +41,7 @@ const wizardRunModeHelpNode = document.getElementById("wizard-run-mode-help");
 const wizardRunSubmitBtn = document.getElementById("wizard-run-submit-btn");
 const wizardCsvInputsNode = document.getElementById("wizard-csv-inputs");
 const wizardFinaryConnectBtn = document.getElementById("wizard-finary-connect-btn");
+const wizardPreviousDiscussionsBtn = document.getElementById("wizard-previous-discussions-btn");
 const wizardCsvTextNode = document.getElementById("wizard-csv-text");
 const wizardCsvPathNode = document.getElementById("wizard-csv-path");
 const wizardCsvFileInput = document.getElementById("wizard-csv-file");
@@ -390,6 +392,20 @@ export function initWizard(deps) {
 
   // ── Event wiring ─────────────────────────────────────────────
 
+
+  wizardPreviousDiscussionsBtn?.addEventListener("click", () => {
+    openDiscussionHistoryModal({
+      scopePrefix: "wizard:",
+      title: "Previous wizard discussions",
+      onApplyInsight: (insight) => {
+        if (!agentGuidelinesInputNode) return;
+        const current = String(agentGuidelinesInputNode.value || "").trim();
+        agentGuidelinesInputNode.value = current ? `${current}
+${insight}` : insight;
+      },
+    });
+  });
+
   wizardCloseBtn?.addEventListener("click", close);
   wizardRunModeNode?.addEventListener("change", setWizardStep);
   wizardAnalysisModeNode?.addEventListener("change", () => {
@@ -427,6 +443,8 @@ export function initWizard(deps) {
         return;
       }
       const guidelines = agentGuidelinesInputNode?.value || "";
+      const discussionGuidance = buildDiscussionGuidance("wizard:", 10);
+      const mergedGuidelines = [guidelines, discussionGuidance].filter(Boolean).join("\n\n");
       const analysisMode = wizardAnalysisModeNode?.value || "full_run";
 
       // ── CSV preview + chat confirmation flow ─────────────────────
@@ -492,6 +510,8 @@ export function initWizard(deps) {
                   title: format === "unknown" ? "Identify CSV Format" : "Confirm CSV Import",
                   systemContext,
                   initialMessage,
+                  discussionScope: "wizard:csv_confirmation",
+                  discussionMetadata: { format, account },
                   extractResult: (history) => {
                     const lastUserMsg = [...history].reverse().find(m => m.role === "user");
                     const text = (lastUserMsg?.content || "").toLowerCase().trim();
@@ -524,7 +544,7 @@ export function initWizard(deps) {
         source, account,
         csvText: wizardCsvTextNode?.value || "",
         csvExportPath: wizardCsvPathNode?.value || "",
-        agentGuidelines: guidelines,
+        agentGuidelines: mergedGuidelines,
         runMode: analysisMode
       });
       if (account && guidelines) saveGuidelinesForAccount(account, guidelines);

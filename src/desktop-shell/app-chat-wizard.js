@@ -27,7 +27,7 @@ import { escapeHtml } from "/desktop-shell/ui-display-utils.js";
  * @returns {Promise<any|null>} — resolves with result on confirm, null on cancel (or history if returnHistoryOnClose)
  */
 export function openChatWizard(config) {
-  const { title, systemContext, initialMessage, extractResult, returnHistoryOnClose, onDone } = config;
+  const { title, systemContext, initialMessage, extractResult, returnHistoryOnClose, onDone, discussionScope, discussionMetadata } = config;
 
   return new Promise((resolve) => {
     // ── State ───────────────────────────────────────────────
@@ -410,6 +410,8 @@ Does this mapping look correct? You can say "yes" to confirm, or tell me which a
     title: "Link Cash Accounts",
     systemContext,
     initialMessage,
+    discussionScope: "wizard:cash_matching",
+    discussionMetadata: { investmentCount: investmentAccounts.length, cashCount: cashAccounts.length },
     extractResult: (history) => extractCashMapping(history, investmentAccounts, cashAccounts),
   });
 }

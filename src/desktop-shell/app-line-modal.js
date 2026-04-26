@@ -597,6 +597,40 @@ export function initLineModal() {
     const details = rec?.details || {};
     const ticker = rec?.ticker || "N/A";
     if (lineMemoryModalSubtitleNode) lineMemoryModalSubtitleNode.textContent = `${ticker}${rec?.name ? ` - ${rec.name}` : ""}`;
+    // KPI strip — position metrics at a glance
+    const kpiStrip = document.getElementById("line-memory-kpi-strip");
+    if (kpiStrip) {
+      const pos = details.position || {};
+      const qty = pos.quantite;
+      const pru = pos.prix_revient;
+      const price = pos.prix_actuel ?? details.market?.prix_actuel;
+      const pvPct = pos.plus_moins_value_pct;
+      const total = pos.valorisation ?? ((typeof qty === "number" && typeof price === "number") ? qty * price : null);
+      const signal = rec?.signal || "";
+      const signalNode = document.getElementById("lm-kpi-signal");
+      if (signalNode) {
+        signalNode.textContent = signal;
+        signalNode.className = "lm-kpi-signal";
+        const su = signal.toUpperCase();
+        if (su.includes("ACHAT") || su === "BUY") signalNode.classList.add("signal-buy");
+        else if (su.includes("VENT") || su === "SELL") signalNode.classList.add("signal-sell");
+        else if (su.includes("RENFOR") || su === "REINFORCE") signalNode.classList.add("signal-reinforce");
+        else signalNode.classList.add("signal-hold");
+      }
+      const fmt = (v) => v != null && Number.isFinite(v) ? v.toLocaleString("fr-FR", { maximumFractionDigits: 2 }) : "—";
+      const fmtPct = (v) => v != null && Number.isFinite(v) ? `${v >= 0 ? "+" : ""}${v.toFixed(1)}%` : "—";
+      const el = (id) => document.getElementById(id);
+      if (el("lm-kpi-qty")) el("lm-kpi-qty").textContent = fmt(qty);
+      if (el("lm-kpi-pru")) el("lm-kpi-pru").textContent = fmt(pru);
+      if (el("lm-kpi-price")) el("lm-kpi-price").textContent = fmt(price);
+      const pvNode = el("lm-kpi-pv");
+      if (pvNode) {
+        pvNode.textContent = fmtPct(pvPct);
+        pvNode.style.color = pvPct >= 0 ? "#4ade80" : "#f87171";
+      }
+      if (el("lm-kpi-total")) el("lm-kpi-total").textContent = total != null ? fmt(total) + " \u20ac" : "—";
+      kpiStrip.classList.remove("hidden");
+    }
     if (lineMemorySummaryNode) lineMemorySummaryNode.textContent = String(rec?.summary || "No recommendation available.");
     let previousBtn = document.getElementById("line-memory-previous-discussions-btn");
     const askBtnNode = document.getElementById("line-memory-ask-btn");

@@ -124,9 +124,11 @@ function normalizeAnalysisDetails(rec, latestRun) {
       ? {
           nom: asText(row?.nom),
           quantite: row?.quantite ?? null,
+          prix_revient: row?.prix_revient ?? null,
           poids_pct: row?.poids_pct ?? null,
           prix_actuel: row?.prix_actuel ?? null,
-          plus_moins_value_pct: row?.plus_moins_value_pct ?? null
+          plus_moins_value_pct: row?.plus_moins_value_pct ?? null,
+          valorisation: row?.valorisation ?? null
         }
       : null,
     market:

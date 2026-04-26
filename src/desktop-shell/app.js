@@ -511,6 +511,18 @@ function renderActionsNow(items = [], recommendations = []) {
         }
       });
     }
+    // Click on card body (not Ask button) → open line detail modal
+    card.style.cursor = "pointer";
+    card.addEventListener("click", (e) => {
+      if (e.target.closest(".action-ask-btn") || e.target.closest(".action-expand")) return;
+      const ticker = action.ticker || "";
+      const rec = ticker
+        ? recommendations.find((r) => r.ticker === ticker)
+        : null;
+      if (rec && window.__openLineMemoryModal) {
+        window.__openLineMemoryModal(rec);
+      }
+    });
     actionsNowNode.appendChild(card);
   }
 }

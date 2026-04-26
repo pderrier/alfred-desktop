@@ -168,6 +168,10 @@ Set `ALFRED_API_URL` to your instance URL once deployed.
 - [Node.js](https://nodejs.org/) 18+ (for Tauri CLI and Codex bundling)
 - [Rust](https://rustup.rs/) 1.75+
 - An OpenAI account (API key or Codex access)
+- Native system libraries required by Tauri/WebKit:
+  - **Ubuntu/Debian:** `sudo apt-get update && sudo apt-get install -y pkg-config libglib2.0-dev libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev`
+  - **Fedora:** `sudo dnf install -y pkgconf-pkg-config glib2-devel gtk3-devel webkit2gtk4.1-devel libappindicator-gtk3-devel librsvg2-devel`
+  - **Arch:** `sudo pacman -S --needed pkgconf glib2 gtk3 webkit2gtk libappindicator-gtk3 librsvg`
 
 ## Getting started
 
@@ -178,6 +182,9 @@ npm install
 # Run in development mode
 npm run dev
 
+# Run Rust tests
+cargo test --manifest-path src-tauri/Cargo.toml
+
 # Build for production (Windows)
 powershell -ExecutionPolicy Bypass -File scripts/prepare-codex-bundle.ps1
 npm run build:windows
@@ -186,6 +193,12 @@ npm run build:windows
 bash scripts/prepare-codex-bundle.sh
 npm run build:macos
 ```
+
+If `cargo test` fails with:
+
+`The system library glib-2.0 required by crate glib-sys was not found`
+
+install the Linux packages above (notably `pkg-config` + `libglib2.0-dev` on Debian/Ubuntu), then retry.
 
 ## Configuration
 

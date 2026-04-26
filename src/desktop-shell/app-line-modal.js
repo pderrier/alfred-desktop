@@ -322,7 +322,9 @@ export function buildPositionContext(rec) {
   if (newsThemes.length > 0) sections.push(`Active themes: ${newsThemes.slice(0, 5).join(", ")}`);
   if (memory.trend) sections.push(`Trend: ${memory.trend}`);
 
-  return `The user is inspecting their ${ticker}${name ? ` (${name})` : ""} position. Here is the full analysis context:\n\n${sections.join("\n")}\n\nYou are a portfolio analysis assistant. Answer questions about this position based on the context above. This is a read-only discussion — you cannot change recommendations or portfolio state. Be concise and specific. Only answer questions related to the portfolio, positions, and financial analysis. Politely decline any off-topic requests.`;
+  return `The user is inspecting their ${ticker}${name ? ` (${name})` : ""} position. Here is the full analysis context:\n\n${sections.join("\n")}\n\nYou are a portfolio analysis assistant. Answer questions about this position based on the context above. This is a read-only discussion — you cannot change recommendations or portfolio state. Be concise and specific. Only answer questions related to the portfolio, positions, and financial analysis. Politely decline any off-topic requests.
+
+Important: this is a chat flow. If useful context is still missing (latest report snapshot, line-memory history, deep-news memory, or related portfolio context), fetch it with available MCP/CLI tools before answering instead of asking the user to paste it. Mention briefly when you used a tool.`;
 }
 
 // ── LLM chat synthesis for save pre-fill ────────────────────────

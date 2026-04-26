@@ -2,12 +2,12 @@
 //!
 //! Provides a simple multi-turn conversation interface. The frontend sends
 //! a system context (describing the decision to make) plus the user's message,
-//! and receives the LLM's text response. No tool use, no streaming — just a
-//! quick text exchange suitable for short wizard interactions.
+//! and receives the LLM's text response. No streaming — just a quick text
+//! exchange suitable for short wizard interactions, while keeping the same
+//! backend/tool behavior as the main analysis runtime.
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
-use std::time::Duration;
 
 /// Tauri command: send a message to the LLM in a chat wizard context.
 ///
@@ -21,84 +21,19 @@ pub fn chat_wizard_send_impl(
     history: Vec<Value>,
     user_message: String,
 ) -> Result<Value> {
-    // Build messages array: system + history + user
-    let mut messages: Vec<Value> = Vec::new();
-    messages.push(json!({ "role": "system", "content": context }));
-    for msg in &history {
-        messages.push(msg.clone());
-    }
-    messages.push(json!({ "role": "user", "content": user_message }));
-
-    // Try native OpenAI first, then codex backend
+    // Route through the regular backend pipeline for all backends.
     let backend = crate::llm_backend::current_backend_name();
-    crate::debug_log(&format!("chat_wizard: sending via {backend}, {} history messages", history.len()));
+    crate::debug_log(&format!(
+        "chat_wizard: sending via {backend}, {} history messages",
+        history.len()
+    ));
 
-    let response_text = match backend.as_str() {
-        "native" | "openai" => call_openai_chat(&messages)?,
-        "native-oauth" => call_via_app_server_chat(&context, &history, &user_message)?,
-        _ => call_via_backend(&context, &history, &user_message)?,
-    };
+    let response_text = call_via_backend(&context, &history, &user_message)?;
 
     Ok(json!({ "response": response_text }))
 }
 
-/// Direct OpenAI Chat Completions call (simple, no tools, no streaming).
-fn call_openai_chat(messages: &[Value]) -> Result<String> {
-    let key = std::env::var("OPENAI_API_KEY")
-        .or_else(|_| crate::runtime_settings::string_direct("openai_api_key"))
-        .map_err(|_| anyhow!("openai_api_key_missing"))?;
-    let key = key.trim().to_string();
-    if key.is_empty() {
-        return Err(anyhow!("openai_api_key_missing"));
-    }
-
-    let base = std::env::var("OPENAI_API_BASE")
-        .or_else(|_| crate::runtime_settings::string_direct("openai_api_base"))
-        .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-    let base = base.trim().trim_end_matches('/').to_string();
-
-    let model = std::env::var("ALFRED_MODEL")
-        .or_else(|_| crate::runtime_settings::string_direct("openai_model"))
-        .unwrap_or_else(|_| "gpt-4.1-mini".to_string());
-    let model = model.trim().to_string();
-
-    let body = json!({
-        "model": model,
-        "temperature": 0.3,
-        "max_tokens": 2048,
-        "messages": messages
-    });
-
-    let url = format!("{base}/chat/completions");
-    let response = ureq::post(&url)
-        .timeout(Duration::from_secs(30))
-        .set("Authorization", &format!("Bearer {key}"))
-        .set("Content-Type", "application/json")
-        .send_json(&body)
-        .map_err(|e| anyhow!("chat_wizard_openai_failed:{e}"))?;
-
-    let parsed: Value = response.into_json()
-        .map_err(|e| anyhow!("chat_wizard_parse_failed:{e}"))?;
-
-    let content = parsed
-        .get("choices")
-        .and_then(|c| c.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|choice| choice.get("message"))
-        .and_then(|msg| msg.get("content"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    if content.is_empty() {
-        return Err(anyhow!("chat_wizard_empty_response"));
-    }
-
-    Ok(content)
-}
-
-/// Native-oauth chat: flatten conversation and send via app-server (no API key needed).
-fn call_via_app_server_chat(context: &str, history: &[Value], user_message: &str) -> Result<String> {
+fn build_backend_prompt(context: &str, history: &[Value], user_message: &str) -> String {
     let mut prompt = format!("System: {context}\n\n");
     for msg in history {
         let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
@@ -106,34 +41,13 @@ fn call_via_app_server_chat(context: &str, history: &[Value], user_message: &str
         prompt.push_str(&format!("{role}: {content}\n\n"));
     }
     prompt.push_str(&format!("user: {user_message}\n\nassistant:"));
-
-    let text = crate::codex::run_simple_prompt(&prompt, None)?;
-    if text.trim().is_empty() {
-        return Err(anyhow!("chat_wizard_empty_response"));
-    }
-    Ok(text)
+    prompt
 }
 
-/// Fallback: flatten conversation into a single prompt for the codex backend.
-fn call_via_backend(context: &str, history: &[Value], user_message: &str) -> Result<String> {
-    let mut prompt = format!("System: {context}\n\n");
-    for msg in history {
-        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
-        let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        prompt.push_str(&format!("{role}: {content}\n\n"));
-    }
-    prompt.push_str(&format!("user: {user_message}\n\nassistant:"));
-
-    let timeout_ms: u64 = std::env::var("CODEX_PROXY_TIMEOUT_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(30_000);
-
-    let result = crate::llm_backend::run_prompt(&prompt, timeout_ms, None)?;
-
-    // Extract text from the response — try multiple shapes:
+fn extract_chat_text(result: &Value) -> Result<String> {
     // 1. OpenAI format: choices[0].message.content
-    if let Some(text) = result.get("choices")
+    if let Some(text) = result
+        .get("choices")
         .and_then(|c| c.as_array())
         .and_then(|arr| arr.first())
         .and_then(|choice| choice.get("message"))
@@ -152,4 +66,106 @@ fn call_via_backend(context: &str, history: &[Value], user_message: &str) -> Res
     }
     // 4. Fallback — should not happen, but better than raw JSON
     Err(anyhow!("chat_wizard_unexpected_response_shape"))
+}
+
+fn call_via_backend_with_runner<F>(
+    context: &str,
+    history: &[Value],
+    user_message: &str,
+    run_prompt: F,
+) -> Result<String>
+where
+    F: Fn(&str, u64) -> Result<Value>,
+{
+    let prompt = build_backend_prompt(context, history, user_message);
+
+    let timeout_ms: u64 = std::env::var("CODEX_PROXY_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30_000);
+
+    let result = run_prompt(&prompt, timeout_ms)?;
+    extract_chat_text(&result)
+}
+
+/// Route chat wizard turns through the same backend abstraction as analysis.
+fn call_via_backend(context: &str, history: &[Value], user_message: &str) -> Result<String> {
+    call_via_backend_with_runner(context, history, user_message, |prompt, timeout_ms| {
+        crate::llm_backend::run_prompt(prompt, timeout_ms, None)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_backend_prompt, call_via_backend_with_runner, extract_chat_text};
+    use serde_json::json;
+
+    #[test]
+    fn build_backend_prompt_preserves_roles_and_order() {
+        let prompt = build_backend_prompt(
+            "You are a helper.",
+            &[
+                json!({"role":"assistant","content":"Hello"}),
+                json!({"role":"user","content":"Need context"}),
+            ],
+            "What changed?",
+        );
+
+        assert!(prompt.starts_with("System: You are a helper."));
+        assert!(prompt.contains("assistant: Hello"));
+        assert!(prompt.contains("user: Need context"));
+        assert!(prompt.ends_with("user: What changed?\n\nassistant:"));
+    }
+
+    #[test]
+    fn extract_chat_text_handles_openai_shape() {
+        let v = json!({"choices":[{"message":{"content":"ok"}}]});
+        assert_eq!(extract_chat_text(&v).expect("text"), "ok");
+    }
+
+    #[test]
+    fn extract_chat_text_handles_agent_text_shape() {
+        let v = json!({"ok":true,"mcp_turn":true,"agent_text":"tool answer"});
+        assert_eq!(extract_chat_text(&v).expect("text"), "tool answer");
+    }
+
+    #[test]
+    fn extract_chat_text_handles_plain_string_shape() {
+        let v = json!("plain");
+        assert_eq!(extract_chat_text(&v).expect("text"), "plain");
+    }
+
+    #[test]
+    fn call_via_backend_with_runner_handles_openai_protocol_shape() {
+        let history = vec![json!({"role":"assistant","content":"Hi"})];
+        let result =
+            call_via_backend_with_runner("ctx", &history, "question", |prompt, _timeout| {
+                assert!(prompt.contains("System: ctx"));
+                assert!(prompt.contains("assistant: Hi"));
+                Ok(json!({"choices":[{"message":{"content":"openai-like"}}]}))
+            })
+            .expect("response");
+
+        assert_eq!(result, "openai-like");
+    }
+
+    #[test]
+    fn call_via_backend_with_runner_handles_codex_protocol_shape() {
+        let result = call_via_backend_with_runner("ctx", &[], "question", |_prompt, _timeout| {
+            Ok(json!({"ok":true,"mcp_turn":true,"agent_text":"codex-like"}))
+        })
+        .expect("response");
+
+        assert_eq!(result, "codex-like");
+    }
+
+    #[test]
+    fn call_via_backend_with_runner_handles_app_server_plain_text_shape() {
+        let result = call_via_backend_with_runner("ctx", &[], "question", |_prompt, _timeout| {
+            Ok(json!("appserver-like"))
+        })
+        .expect("response");
+
+        assert_eq!(result, "appserver-like");
+    }
 }

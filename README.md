@@ -24,6 +24,10 @@
 
 See [CHANGELOG.md](CHANGELOG.md) for the full version history.
 
+## Additional docs
+
+- [AgentOS artifact instrumentation guide](docs/agentos-artifacts.md)
+
 ## Features
 
 - **Portfolio sync** — connect Finary for automatic brokerage account sync, or import CSV exports (universal LLM-driven parser handles any broker format)

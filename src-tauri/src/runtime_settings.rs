@@ -44,6 +44,19 @@ pub fn definitions_json() -> serde_json::Value {
             "whyItMatters": "Native+OAuth combines free OAuth auth with optimized local tool calls. Codex lets the AI orchestrate. Native requires a paid API key.",
             "resetLabel": "Use Codex (free tier)"
         },
+        "agentos_artifacts_enabled": {
+            "type": "integer",
+            "min": 0,
+            "max": 1,
+            "defaultValue": 0,
+            "section": "product",
+            "restartRequired": false,
+            "envName": "ALFRED_AGENTOS_ARTIFACTS_ENABLED",
+            "label": "AgentOS artifact emission",
+            "description": "Emit per-turn AgentOS decision and outcome artifacts to disk.",
+            "whyItMatters": "Keeps rollout safe by leaving instrumentation off until explicitly enabled.",
+            "resetLabel": "Disable artifacts"
+        },
         "openai_api_key": {
             "type": "text",
             "maxLength": 200,
@@ -266,6 +279,7 @@ fn normalize_value(key: &str, value: &serde_json::Value) -> Result<serde_json::V
             }
         }
         "line_analysis_concurrency" => normalize_integer(key, value, 1, 12),
+        "agentos_artifacts_enabled" => normalize_integer(key, value, 0, 1),
         "line_analysis_throttle_ms" => normalize_integer(key, value, 0, 5000),
         "collection_concurrency" => normalize_integer(key, value, 1, 12),
         "collection_throttle_ms" => normalize_integer(key, value, 0, 5000),
@@ -298,24 +312,41 @@ fn normalize_integer(
 
 fn value_from_env(key: &str) -> Option<serde_json::Value> {
     match key {
-        "shell_theme" => env::var("ALFRED_SHELL_THEME").ok().map(|value| json!(value)),
-        "line_analysis_concurrency" => env::var("ALFRED_LINE_ANALYSIS_CONCURRENCY").ok().map(|value| json!(value)),
-        "line_analysis_throttle_ms" => env::var("ALFRED_LINE_ANALYSIS_THROTTLE_MS").ok().map(|value| json!(value)),
-        "collection_concurrency" => env::var("ALFRED_COLLECTION_CONCURRENCY").ok().map(|value| json!(value)),
-        "collection_throttle_ms" => env::var("ALFRED_COLLECTION_THROTTLE_MS").ok().map(|value| json!(value)),
-        "litellm_generation_timeout_ms" => {
-            env::var("ALFRED_LITELLM_GENERATION_TIMEOUT_MS").ok().map(|value| json!(value))
-        }
-        "stack_health_timeout_ms" => env::var("ALFRED_STACK_HEALTH_TIMEOUT_MS").ok().map(|value| json!(value)),
-        "finary_connector_timeout_ms" => {
-            env::var("ALFRED_FINARY_CONNECTOR_TIMEOUT_MS").ok().map(|value| json!(value))
-        }
+        "shell_theme" => env::var("ALFRED_SHELL_THEME")
+            .ok()
+            .map(|value| json!(value)),
+        "line_analysis_concurrency" => env::var("ALFRED_LINE_ANALYSIS_CONCURRENCY")
+            .ok()
+            .map(|value| json!(value)),
+        "agentos_artifacts_enabled" => env::var("ALFRED_AGENTOS_ARTIFACTS_ENABLED")
+            .ok()
+            .map(|value| json!(value)),
+        "line_analysis_throttle_ms" => env::var("ALFRED_LINE_ANALYSIS_THROTTLE_MS")
+            .ok()
+            .map(|value| json!(value)),
+        "collection_concurrency" => env::var("ALFRED_COLLECTION_CONCURRENCY")
+            .ok()
+            .map(|value| json!(value)),
+        "collection_throttle_ms" => env::var("ALFRED_COLLECTION_THROTTLE_MS")
+            .ok()
+            .map(|value| json!(value)),
+        "litellm_generation_timeout_ms" => env::var("ALFRED_LITELLM_GENERATION_TIMEOUT_MS")
+            .ok()
+            .map(|value| json!(value)),
+        "stack_health_timeout_ms" => env::var("ALFRED_STACK_HEALTH_TIMEOUT_MS")
+            .ok()
+            .map(|value| json!(value)),
+        "finary_connector_timeout_ms" => env::var("ALFRED_FINARY_CONNECTOR_TIMEOUT_MS")
+            .ok()
+            .map(|value| json!(value)),
         "finary_connector_snapshot_timeout_ms" => {
-            env::var("ALFRED_FINARY_CONNECTOR_SNAPSHOT_TIMEOUT_MS").ok().map(|value| json!(value))
+            env::var("ALFRED_FINARY_CONNECTOR_SNAPSHOT_TIMEOUT_MS")
+                .ok()
+                .map(|value| json!(value))
         }
-        "finary_connector_snapshot_retries" => {
-            env::var("ALFRED_FINARY_CONNECTOR_SNAPSHOT_RETRIES").ok().map(|value| json!(value))
-        }
+        "finary_connector_snapshot_retries" => env::var("ALFRED_FINARY_CONNECTOR_SNAPSHOT_RETRIES")
+            .ok()
+            .map(|value| json!(value)),
         "default_run_mode" => match env::var("ALFRED_PORTFOLIO_SOURCE").ok() {
             Some(raw) if raw.trim() == "csv" => Some(json!("csv")),
             _ => None,
@@ -350,8 +381,14 @@ pub fn string_direct(key: &str) -> Result<String, ()> {
 fn build_advanced_payload() -> serde_json::Value {
     let endpoints = vec![
         ("Control plane", "native (built-in)".to_string()),
-        ("LLM generation", env::var("ALFRED_LITELLM_BASE_URL").unwrap_or_else(|_| "native (built-in)".to_string())),
-        ("Codex CLI", env::var("CODEX_PROXY_CLI_CMD").unwrap_or_else(|_| "auto-detected".to_string())),
+        (
+            "LLM generation",
+            env::var("ALFRED_LITELLM_BASE_URL").unwrap_or_else(|_| "native (built-in)".to_string()),
+        ),
+        (
+            "Codex CLI",
+            env::var("CODEX_PROXY_CLI_CMD").unwrap_or_else(|_| "auto-detected".to_string()),
+        ),
         ("Enrichment", "native (built-in)".to_string()),
         ("Portfolio MCP", "native (built-in)".to_string()),
         ("Finary", "native (built-in, browser CDP)".to_string()),
@@ -368,16 +405,39 @@ fn build_advanced_payload() -> serde_json::Value {
     .collect::<Vec<_>>();
 
     let credentials = vec![
-        ("llm_token", "LLM API token", vec!["ALFRED_LLM_TOKEN"], "Managed externally"),
-        ("alphavantage_api_key", "AlphaVantage API key", vec!["ALPHAVANTAGE_API_KEY"], "Managed externally"),
-        ("finary_login", "Finary login", vec!["FINARY_EMAIL", "FINARY_PASSWORD"], "Managed externally"),
-        ("finary_mfa_code", "Finary MFA code", vec!["FINARY_MFA_CODE"], "Provided when needed"),
+        (
+            "llm_token",
+            "LLM API token",
+            vec!["ALFRED_LLM_TOKEN"],
+            "Managed externally",
+        ),
+        (
+            "alphavantage_api_key",
+            "AlphaVantage API key",
+            vec!["ALPHAVANTAGE_API_KEY"],
+            "Managed externally",
+        ),
+        (
+            "finary_login",
+            "Finary login",
+            vec!["FINARY_EMAIL", "FINARY_PASSWORD"],
+            "Managed externally",
+        ),
+        (
+            "finary_mfa_code",
+            "Finary MFA code",
+            vec!["FINARY_MFA_CODE"],
+            "Provided when needed",
+        ),
     ]
     .into_iter()
     .map(|(id, label, env_names, managed_label)| {
-        let configured = env_names
-            .iter()
-            .all(|name| env::var(name).ok().map(|value| !value.trim().is_empty()).unwrap_or(false));
+        let configured = env_names.iter().all(|name| {
+            env::var(name)
+                .ok()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+        });
         json!({
             "id": id,
             "label": label,
@@ -427,10 +487,11 @@ pub fn save_user_preferences(prefs: &serde_json::Value) -> Result<()> {
     if let (Some(existing_obj), Some(new_obj)) = (existing.as_object_mut(), prefs.as_object()) {
         for (key, new_val) in new_obj {
             if key == "guidelines_by_account" {
-                let existing_guidelines = existing_obj
-                    .entry(key.clone())
-                    .or_insert_with(|| json!({}));
-                if let (Some(eg), Some(ng)) = (existing_guidelines.as_object_mut(), new_val.as_object()) {
+                let existing_guidelines =
+                    existing_obj.entry(key.clone()).or_insert_with(|| json!({}));
+                if let (Some(eg), Some(ng)) =
+                    (existing_guidelines.as_object_mut(), new_val.as_object())
+                {
                     for (acct, guideline) in ng {
                         eg.insert(acct.clone(), guideline.clone());
                     }
@@ -442,7 +503,6 @@ pub fn save_user_preferences(prefs: &serde_json::Value) -> Result<()> {
     }
     crate::storage::write_json_file(&path, &existing)
 }
-
 
 pub fn get_payload() -> Result<serde_json::Value> {
     let definitions = definitions_json();

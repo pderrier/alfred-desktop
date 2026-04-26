@@ -2099,7 +2099,20 @@ fn resolve_native_snapshot(
             "degradation_reason": "latest_finary_snapshot_requested"
         })))
     } else {
-        Err(anyhow!("source_snapshot_not_found:finary_local_default"))
+        // No cached snapshot available — try a fresh fetch as last resort
+        crate::debug_log("finary_sync: no cached snapshot for run_on_latest — falling back to fresh fetch");
+        match fetch_finary_snapshot(run_id, request_fn) {
+            Ok(snapshot) => {
+                let normalized = normalize_finary_snapshot(&snapshot);
+                persist_local_finary_snapshot(&normalized)?;
+                Ok((normalized, "success".to_string(), json!({
+                    "used_latest_snapshot": false,
+                    "latest_snapshot_saved_at": null,
+                    "degradation_reason": null
+                })))
+            }
+            Err(_) => Err(anyhow!("source_snapshot_not_found:finary_local_default"))
+        }
     }
 }
 

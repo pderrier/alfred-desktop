@@ -45,7 +45,7 @@ fn get_fresh_token() -> Result<String> {
 const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 /// Refresh the __session JWT using the long-lived __client cookie via Clerk REST API.
-fn refresh_clerk_token() -> Result<String> {
+pub(crate) fn refresh_clerk_token() -> Result<String> {
     let client_cookie = resolve_client_cookie()?;
     if client_cookie.is_empty() {
         return Err(anyhow!("clerk_refresh_no_client_cookie"));
@@ -721,4 +721,3 @@ pub fn list_accounts() -> Result<Value> {
     let count = summary.len();
     Ok(json!({ "accounts": summary, "count": count }))
 }
-

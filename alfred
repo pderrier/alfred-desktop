@@ -40,6 +40,7 @@ Usage:
   ./alfred finary login
   ./alfred finary snapshot
   ./alfred finary accounts
+  ./alfred finary refresh-token    # Rafraîchir le token Clerk/Finary explicitement
   ./alfred health
 EOF
 }
@@ -280,6 +281,9 @@ EOF
         ;;
       connect)
         run_backend finary:session-connect-local
+        ;;
+      refresh-token)
+        run_backend finary:refresh-token-local
         ;;
       browser-start)
         run_backend finary:session-browser-start-local

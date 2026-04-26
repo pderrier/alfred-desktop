@@ -152,6 +152,15 @@ pub fn run_finary_session_refresh() -> Result<serde_json::Value> {
     }))
 }
 
+pub fn run_finary_refresh_token() -> Result<serde_json::Value> {
+    let token = crate::finary::refresh_clerk_token()?;
+    Ok(json!({
+        "ok": true,
+        "action": "finary:refresh-token-local",
+        "token": token
+    }))
+}
+
 pub fn run_finary_session_browser_start() -> Result<serde_json::Value> {
     Ok(json!({
         "ok": true,
@@ -282,6 +291,7 @@ pub fn invoke_command(command: &str) -> Result<serde_json::Value> {
         "finary:session-status-local" | "finary_session_status_local" => run_finary_session_status(),
         "finary:session-connect-local" | "finary_session_connect_local" => run_finary_session_connect(None),
         "finary:session-refresh-local" | "finary_session_refresh_local" => run_finary_session_refresh(),
+        "finary:refresh-token-local" | "finary_refresh_token_local" => run_finary_refresh_token(),
         "finary:session-browser-start-local" | "finary_session_browser_start_local" => run_finary_session_browser_start(),
         "finary:session-browser-complete-local" | "finary_session_browser_complete_local" => run_finary_session_browser_complete(),
         "finary:session-browser-playwright-local" | "finary_session_browser_playwright_local" => run_finary_session_browser_playwright(),

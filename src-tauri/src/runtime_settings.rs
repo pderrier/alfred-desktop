@@ -485,6 +485,15 @@ pub fn save_user_preferences(prefs: &serde_json::Value) -> Result<()> {
         json!({})
     };
     if let (Some(existing_obj), Some(new_obj)) = (existing.as_object_mut(), prefs.as_object()) {
+        // Remove keys that existed before but are absent in the new payload
+        // (e.g. user deleted cash_account_links via reset).
+        let keys_to_remove: Vec<String> = existing_obj.keys()
+            .filter(|k| !new_obj.contains_key(k.as_str()))
+            .cloned()
+            .collect();
+        for k in keys_to_remove {
+            existing_obj.remove(&k);
+        }
         for (key, new_val) in new_obj {
             if key == "guidelines_by_account" {
                 let existing_guidelines =

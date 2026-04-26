@@ -1601,24 +1601,23 @@ fn build_cash_mapping_with_links(
     let investment_entries: Vec<&HoldingsEntry> = entries.iter().filter(|e| e.securities_count > 0).collect();
     let cash_entries: Vec<&HoldingsEntry> = entries.iter().filter(|e| e.fiats_sum > 0.0 && e.securities_count == 0).collect();
 
-    // Build name → entry lookup for saved links resolution.
-    // Use compound key `institution::name` for disambiguation when duplicate names exist.
-    let mut cash_by_name: HashMap<String, &HoldingsEntry> = HashMap::new();
-    let mut cash_name_counts: HashMap<&str, usize> = HashMap::new();
+    // Build name → entries lookup for saved links resolution.
+    // When duplicate cash names exist (e.g. two "Compte espèce PEA" from different connections),
+    // we keep ALL entries and disambiguate by connection_id at match time.
+    let mut cash_by_name: HashMap<String, Vec<&HoldingsEntry>> = HashMap::new();
     for e in &cash_entries {
-        *cash_name_counts.entry(e.name.as_str()).or_insert(0) += 1;
+        cash_by_name.entry(e.name.clone()).or_default().push(*e);
+        // Also insert with compound key for explicit disambiguation
+        let compound = format!("{}::{}", e.institution_name, e.name);
+        cash_by_name.entry(compound).or_default().push(*e);
     }
-    for e in &cash_entries {
-        // Always insert by plain name (last one wins for unambiguous lookups)
-        cash_by_name.insert(e.name.clone(), *e);
-        // If duplicate names exist, also insert with compound key for disambiguation
-        if cash_name_counts.get(e.name.as_str()).copied().unwrap_or(0) > 1 {
-            let compound = format!("{}::{}", e.institution_name, e.name);
+    // Log duplicates
+    for (name, entries) in &cash_by_name {
+        if !name.contains("::") && entries.len() > 1 {
             crate::debug_log(&format!(
-                "finary_cash_mapping: duplicate cash name '{}' — adding compound key '{}'",
-                e.name, compound
+                "finary_cash_mapping: duplicate cash name '{}' — {} entries, will disambiguate by connection_id",
+                name, entries.len()
             ));
-            cash_by_name.insert(compound, *e);
         }
     }
 
@@ -1632,7 +1631,8 @@ fn build_cash_mapping_with_links(
     let mut ambiguous_groups: Vec<Value> = Vec::new();
 
     // Strategy 0: Apply persisted cash_account_links from user preferences.
-    // Check both plain name and compound key (`institution::name`) formats.
+    // When multiple cash entries share the same name, disambiguate by connection_id
+    // (prefer the cash entry on the same Finary connection as the investment account).
     for inv in &investment_entries {
         if let Some(cash_name) = saved_links.get(&inv.name) {
             // User explicitly dismissed cash mapping for this account — assign zero cash
@@ -1644,28 +1644,41 @@ fn build_cash_mapping_with_links(
                 ));
                 continue;
             }
-            // Try exact match first, then compound key with institution prefix
-            let cash_entry = cash_by_name.get(cash_name.as_str())
+            // Find candidate cash entries: try exact name, then compound key
+            let candidates = cash_by_name.get(cash_name.as_str())
                 .or_else(|| {
-                    // If the saved link uses a compound key like "Bourso::Compte espèce PEA"
                     if cash_name.contains("::") {
                         cash_by_name.get(cash_name.as_str())
                     } else {
-                        // Try building a compound key from the investment's institution
                         let compound = format!("{}::{}", inv.institution_name, cash_name);
                         cash_by_name.get(compound.as_str())
                     }
                 });
-            if let Some(cash_entry) = cash_entry {
-                result.insert(inv.name.clone(), cash_entry.fiats_sum);
-                // Mark the cash entry as matched
-                if let Some(idx) = cash_entries.iter().position(|e| e.name == cash_entry.name && e.institution_name == cash_entry.institution_name) {
-                    matched_cash_indices.insert(idx);
+            if let Some(candidates) = candidates {
+                // Disambiguate: prefer the cash entry sharing the same connection_id
+                let cash_entry = if candidates.len() > 1 {
+                    if let Some(inv_conn) = inv.connection_id {
+                        candidates.iter()
+                            .find(|c| c.connection_id == Some(inv_conn))
+                            .or_else(|| candidates.first())
+                            .copied()
+                    } else {
+                        candidates.first().copied()
+                    }
+                } else {
+                    candidates.first().copied()
+                };
+                if let Some(cash_entry) = cash_entry {
+                    result.insert(inv.name.clone(), cash_entry.fiats_sum);
+                    // Mark the specific cash entry as matched (by index, using all fields to be precise)
+                    if let Some(idx) = cash_entries.iter().position(|e| std::ptr::eq(*e, cash_entry)) {
+                        matched_cash_indices.insert(idx);
+                    }
+                    crate::debug_log(&format!(
+                        "finary_cash_mapping: matched '{}' (conn={:?}) → cash {:.2} (user preference → '{}', cash conn={:?})",
+                        inv.name, inv.connection_id, cash_entry.fiats_sum, cash_name, cash_entry.connection_id
+                    ));
                 }
-                crate::debug_log(&format!(
-                    "finary_cash_mapping: matched '{}' → cash {:.2} (user preference → '{}')",
-                    inv.name, cash_entry.fiats_sum, cash_name
-                ));
             }
         }
     }
@@ -2844,6 +2857,33 @@ mod tests {
         assert!(
             result.ambiguous_groups.is_empty(),
             "__none__ sentinel should prevent heuristic fallthrough"
+        );
+    }
+
+    #[test]
+    fn build_cash_mapping_duplicate_cash_names_disambiguated_by_connection_id() {
+        use std::collections::HashMap;
+        // Two investment accounts (PEA and PEA-PME) on different connections,
+        // each with a "Compte espèce PEA" cash account on their respective connection.
+        let accounts = vec![
+            make_account("Plan Epargne en Action", Some(100), 28, 0.0, "Crédit Agricole"),
+            make_account("Plan d'Epargne en Actions PME", Some(200), 5, 0.0, "Crédit Agricole"),
+            make_account("Compte espèce PEA", Some(100), 0, 3853.37, "Crédit Agricole"),
+            make_account("Compte espèce PEA", Some(200), 0, 0.82, "Crédit Agricole"),
+        ];
+        let mut saved_links = HashMap::new();
+        saved_links.insert("Plan Epargne en Action".to_string(), "Compte espèce PEA".to_string());
+        saved_links.insert("Plan d'Epargne en Actions PME".to_string(), "Compte espèce PEA".to_string());
+        let result = build_cash_mapping_with_links(&accounts, &saved_links);
+        assert_eq!(
+            result.mapping.get("Plan Epargne en Action").copied(),
+            Some(3853.37),
+            "PEA should get the cash from conn=100 (3853.37), not conn=200 (0.82)"
+        );
+        assert_eq!(
+            result.mapping.get("Plan d'Epargne en Actions PME").copied(),
+            Some(0.82),
+            "PEA-PME should get the cash from conn=200 (0.82)"
         );
     }
 

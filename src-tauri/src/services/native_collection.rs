@@ -1288,17 +1288,23 @@ fn get_latest_local_finary_snapshot() -> Result<Option<Value>> {
         .cloned())
 }
 
-/// Clear the cached Finary snapshot so the next sync forces a fresh API fetch
-/// and re-computes cash mapping from scratch.
+/// Mark the cached Finary snapshot as stale so the next sync forces a fresh
+/// API fetch and re-computes cash mapping. The old snapshot is KEPT as a
+/// fallback in case the re-fetch fails (e.g. expired Finary session).
 pub fn invalidate_finary_snapshot_cache() -> Result<()> {
     let mut store = read_source_snapshot_store()?;
-    if let Some(obj) = store.as_object_mut() {
-        if let Some(latest) = obj.get_mut("latest_by_source").and_then(|v| v.as_object_mut()) {
-            latest.remove(LOCAL_FINARY_SOURCE_ID);
+    if let Some(entry) = store
+        .get_mut("latest_by_source")
+        .and_then(|v| v.get_mut(LOCAL_FINARY_SOURCE_ID))
+    {
+        // Set saved_at to an old date so same_local_day() returns false,
+        // forcing a re-fetch while keeping the snapshot as fallback.
+        if let Some(obj) = entry.as_object_mut() {
+            obj.insert("saved_at".to_string(), json!("2000-01-01T00:00:00.000Z"));
         }
     }
     write_source_snapshot_store(&store)?;
-    crate::debug_log("finary_sync: invalidated cached snapshot — next sync will re-fetch from API");
+    crate::debug_log("finary_sync: marked cached snapshot as stale — next sync will re-fetch from API");
     Ok(())
 }
 

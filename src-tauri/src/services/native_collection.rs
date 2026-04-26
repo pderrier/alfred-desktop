@@ -1582,11 +1582,13 @@ fn build_cash_mapping_with_links(
     let mut entries: Vec<HoldingsEntry> = Vec::new();
     for acct in holdings_accounts {
         let name = acct.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-        let connection_id = acct.get("connection_id").and_then(|v| v.as_i64())
+        let connection_id = acct.get("connection_id")
+            .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok())))
             .or_else(|| acct.get("institution_connection")
-                .and_then(|ic| ic.get("id"))
-                .and_then(|v| v.as_i64()));
-        let correlation_id = acct.get("correlation_id").and_then(|v| v.as_i64());
+                .and_then(|ic| ic.get("correlation_id"))
+                .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))));
+        let correlation_id = acct.get("correlation_id")
+            .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok())));
         let institution_name = acct.get("institution")
             .and_then(|v| v.get("name"))
             .and_then(|v| v.as_str())
@@ -2918,6 +2920,31 @@ mod tests {
             Some(0.82),
             "PEA-PME should get the cash from conn=200 (0.82)"
         );
+    }
+
+    #[test]
+    fn build_cash_mapping_string_connection_id_parsed_correctly() {
+        // Finary returns connection_id as a JSON string, not a number
+        let accounts = vec![
+            json!({"name": "PEA", "connection_id": "12345", "correlation_id": "100", "securities": [{"symbol": "X"}], "fiats": [], "institution": {"name": "CA"}}),
+            json!({"name": "Compte espèce PEA", "connection_id": "12345", "correlation_id": "101", "securities": [], "fiats": [{"current_value": 500.0, "currency": {"code": "EUR"}}], "institution": {"name": "CA"}}),
+        ];
+        let result = build_cash_mapping(&accounts);
+        assert_eq!(result.mapping.get("PEA").copied(), Some(500.0), "string connection_id should be parsed and matched");
+        assert!(result.ambiguous_groups.is_empty(), "1:1 match should not be ambiguous");
+    }
+
+    #[test]
+    fn build_cash_mapping_string_connection_id_nm_flagged_ambiguous() {
+        // 2 investment + 2 cash on the same string connection_id → ambiguous
+        let accounts = vec![
+            json!({"name": "PEA", "connection_id": "99", "correlation_id": "10", "securities": [{"symbol": "X"}], "fiats": [], "institution": {"name": "CA"}}),
+            json!({"name": "PEA-PME", "connection_id": "99", "correlation_id": "20", "securities": [{"symbol": "Y"}], "fiats": [], "institution": {"name": "CA"}}),
+            json!({"name": "Compte espèce PEA", "connection_id": "99", "correlation_id": "11", "securities": [], "fiats": [{"current_value": 0.82, "currency": {"code": "EUR"}}], "institution": {"name": "CA"}}),
+            json!({"name": "Compte espèce PEA", "connection_id": "99", "correlation_id": "21", "securities": [], "fiats": [{"current_value": 3252.0, "currency": {"code": "EUR"}}], "institution": {"name": "CA"}}),
+        ];
+        let result = build_cash_mapping(&accounts);
+        assert!(!result.ambiguous_groups.is_empty(), "2:2 N:M on same connection should be flagged ambiguous");
     }
 
     #[test]

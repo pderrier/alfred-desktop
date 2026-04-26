@@ -105,6 +105,7 @@ const settingsAlfredSuggestionsNode = document.getElementById("settings-alfred-s
 const settingsCashLinksNode = document.getElementById("settings-cash-links");
 const settingsCashLinksRefreshBtn = document.getElementById("settings-cash-links-refresh-btn");
 const settingsCashLinksResetBtn = document.getElementById("settings-cash-links-reset-btn");
+const settingsCashLinksRelinkBtn = document.getElementById("settings-cash-links-relink-btn");
 
 // ── State ────────────────────────────────────────────────────────
 
@@ -1558,6 +1559,25 @@ settingsCashLinksResetBtn?.addEventListener("click", async () => {
     showToast("Cash account links reset — next analysis will re-detect mappings", "success");
   } catch (error) {
     showToast(`Reset links failed: ${formatBridgeError(error)}`, "error");
+  }
+});
+settingsCashLinksRelinkBtn?.addEventListener("click", async () => {
+  try {
+    const tauriInv = window?.__TAURI__?.core?.invoke;
+    if (!tauriInv) return;
+    const finaryMeta = getLatestDashboardPayload()?.snapshot?.latest_finary_snapshot || {};
+    const groups = Array.isArray(finaryMeta.ambiguous_cash_groups)
+      ? finaryMeta.ambiguous_cash_groups
+      : [];
+    if (groups.length === 0) {
+      showToast("No ambiguous cash groups found — try refreshing your data first", "info");
+      return;
+    }
+    cashWizardShownThisSession = false;
+    await checkAmbiguousCashGroups(finaryMeta);
+    await refreshCashLinksSettings();
+  } catch (error) {
+    showToast(`Re-link failed: ${formatBridgeError(error)}`, "error");
   }
 });
 settingsShellThemeNode?.addEventListener("change", () => setThemeMode(settingsShellThemeNode.value));

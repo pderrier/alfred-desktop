@@ -658,39 +658,108 @@ async function renderRunDiff(recommendations = []) {
 
 // ── Theme Concentration (Phase 2b) ──────────────────────────────
 
-function renderThemeConcentration(themeConcentration) {
+function openThemeRiskModal(insight) {
+  const existing = document.getElementById("theme-risk-modal");
+  if (existing) existing.remove();
+
+  const topThemes = Array.isArray(insight?.topThemes) ? insight.topThemes : [];
+  const topRisks = Array.isArray(insight?.topRisks) ? insight.topRisks : [];
+  const globalThemes = Array.isArray(insight?.globalThemes) ? insight.globalThemes : [];
+  const highlights = Array.isArray(insight?.highlights) ? insight.highlights : [];
+
+  const overlay = document.createElement("div");
+  overlay.id = "theme-risk-modal";
+  overlay.className = "error-modal-overlay";
+  overlay.innerHTML = `
+    <div class="error-modal-content theme-risk-modal-content">
+      <h3 class="error-modal-title">Themes & Risks details</h3>
+      <div class="theme-risk-section">
+        <p class="theme-risk-section-title">Highlights</p>
+        <ul class="theme-risk-modal-list">
+          ${highlights.length > 0
+            ? highlights.map((line) => `<li>${escapeHtml(line)}</li>`).join("")
+            : "<li class=\"empty-hint\">No highlights available.</li>"}
+        </ul>
+      </div>
+      <div class="theme-risk-grid">
+        <div class="theme-risk-section">
+          <p class="theme-risk-section-title">Top themes</p>
+          <ul class="theme-risk-modal-list">
+            ${topThemes.length > 0
+              ? topThemes.map((entry) => `<li><strong>${escapeHtml(entry.theme)}</strong> · ${entry.count} positions${entry.tickers?.length ? ` · ${escapeHtml(entry.tickers.join(", "))}` : ""}</li>`).join("")
+              : "<li class=\"empty-hint\">No concentrated themes found.</li>"}
+          </ul>
+        </div>
+        <div class="theme-risk-section">
+          <p class="theme-risk-section-title">Top risks</p>
+          <ul class="theme-risk-modal-list">
+            ${topRisks.length > 0
+              ? topRisks.map((entry) => `<li><strong>${escapeHtml(entry.risk)}</strong> · ${entry.count} mention${entry.count > 1 ? "s" : ""}${entry.tickers?.length ? ` · ${escapeHtml(entry.tickers.join(", "))}` : ""}</li>`).join("")
+              : "<li class=\"empty-hint\">No recurring risks found.</li>"}
+          </ul>
+        </div>
+      </div>
+      <div class="theme-risk-section">
+        <p class="theme-risk-section-title">Cross-account view</p>
+        <ul class="theme-risk-modal-list">
+          ${globalThemes.length > 0
+            ? globalThemes.map((row) => `<li><strong>${escapeHtml(row.theme)}</strong> · ${row.accountCount} account${row.accountCount > 1 ? "s" : ""}${row.inCurrentAccount ? " · current account" : ""}</li>`).join("")
+            : "<li class=\"empty-hint\">No multi-account theme data available yet.</li>"}
+        </ul>
+      </div>
+      <div style="display:flex;justify-content:flex-end;margin-top:0.7rem">
+        <button class="error-modal-dismiss">Close</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  const close = () => overlay.remove();
+  overlay.querySelector(".error-modal-dismiss")?.addEventListener("click", close);
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) close();
+  });
+}
+
+function renderThemeConcentration(themeConcentration, themeRiskInsight) {
   // Remove any existing concentration card
   const existing = document.getElementById("theme-concentration-card");
   if (existing) existing.remove();
 
-  if (!themeConcentration) return;
-  const themes = themeConcentration.themes;
-  if (!Array.isArray(themes) || themes.length === 0) return;
+  const themes = Array.isArray(themeConcentration?.themes) ? themeConcentration.themes : [];
+  const highlights = Array.isArray(themeRiskInsight?.highlights) ? themeRiskInsight.highlights : [];
+  if (themes.length === 0 && highlights.length === 0) return;
 
   const card = document.createElement("section");
   card.id = "theme-concentration-card";
   card.className = "card theme-concentration-card";
 
   const title = document.createElement("h2");
-  title.textContent = "Theme Concentration Risk";
+  title.textContent = "Themes & Risks";
   card.appendChild(title);
 
   const intro = document.createElement("p");
   intro.className = "theme-concentration-intro";
-  intro.textContent = `${themes.length} theme${themes.length > 1 ? "s" : ""} shared by 3+ positions — potential concentration risk.`;
+  intro.textContent = "Condensed highlights only. Open details for full context and cross-account comparison.";
   card.appendChild(intro);
 
   const list = document.createElement("ul");
   list.className = "theme-concentration-list";
-  for (const entry of themes) {
+  const highlightLines = highlights.length > 0
+    ? highlights
+    : [`${themes.length} theme${themes.length > 1 ? "s" : ""} shared by 3+ positions — potential concentration risk.`];
+  for (const line of highlightLines.slice(0, 3)) {
     const li = document.createElement("li");
-    const themeLabel = escapeHtml(entry.theme || "?");
-    const count = entry.count || 0;
-    const tickers = (entry.tickers || []).map((t) => escapeHtml(t)).join(", ");
-    li.innerHTML = `<span class="theme-slug">${themeLabel}</span> <span class="theme-count">(${count} positions)</span>: <span class="theme-tickers">${tickers}</span>`;
+    li.innerHTML = `<span class="theme-slug">\u2728 Insight</span> <span class="theme-tickers">${escapeHtml(line)}</span>`;
     list.appendChild(li);
   }
   card.appendChild(list);
+
+  const detailBtn = document.createElement("button");
+  detailBtn.className = "ghost-btn theme-risk-detail-btn";
+  detailBtn.type = "button";
+  detailBtn.textContent = "Open themes/risks details";
+  detailBtn.addEventListener("click", () => openThemeRiskModal(themeRiskInsight || {}));
+  card.appendChild(detailBtn);
 
   // Insert between synthesis card and actions-now card
   const actionsCard = actionsNowNode?.closest(".actions-now-card");
@@ -757,7 +826,7 @@ function renderReport(payload) {
   // Phase 4a: run diff view — scoped to tickers in this run's portfolio
   renderRunDiff(model.recommendations);
   // Phase 2b: theme concentration risk card
-  renderThemeConcentration(model.themeConcentration);
+  renderThemeConcentration(model.themeConcentration, model.themeRiskInsight);
   // Watchlist opportunities summary
   const watchlistSummaryNode = document.getElementById("watchlist-summary");
   if (watchlistSummaryNode) {

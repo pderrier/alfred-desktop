@@ -41,7 +41,7 @@ function normalizeLineMemory(raw = {}, fallback = {}) {
   const base = fallback && typeof fallback === "object" ? fallback : {};
   return {
     llm_memory_summary: asText(
-      nested?.llm_memory_summary || base?.llm_memory_summary || base?.summary || base?.synthese
+      nested?.llm_memory_summary || base?.llm_memory_summary
     ),
     llm_strong_signals: Array.isArray(nested?.llm_strong_signals)
       ? nested.llm_strong_signals

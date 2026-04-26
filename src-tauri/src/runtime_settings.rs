@@ -485,16 +485,19 @@ pub fn save_user_preferences(prefs: &serde_json::Value) -> Result<()> {
         json!({})
     };
     if let (Some(existing_obj), Some(new_obj)) = (existing.as_object_mut(), prefs.as_object()) {
-        // Remove keys that existed before but are absent in the new payload
-        // (e.g. user deleted cash_account_links via reset).
-        let keys_to_remove: Vec<String> = existing_obj.keys()
-            .filter(|k| !new_obj.contains_key(k.as_str()))
-            .cloned()
-            .collect();
-        for k in keys_to_remove {
-            existing_obj.remove(&k);
+        // Explicit key deletion: if a key is set to JSON null, remove it from disk.
+        // This allows callers to explicitly delete keys (e.g. reset cash_account_links)
+        // without the merge-only logic silently preserving them.
+        // Callers that just want to add/update keys send non-null values as usual.
+        for (key, val) in new_obj {
+            if val.is_null() {
+                existing_obj.remove(key);
+            }
         }
         for (key, new_val) in new_obj {
+            if new_val.is_null() {
+                continue; // Already handled above
+            }
             if key == "guidelines_by_account" {
                 let existing_guidelines =
                     existing_obj.entry(key.clone()).or_insert_with(|| json!({}));

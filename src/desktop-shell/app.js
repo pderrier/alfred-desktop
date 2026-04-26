@@ -1528,10 +1528,8 @@ settingsCashLinksResetBtn?.addEventListener("click", async () => {
   try {
     const tauriInv = window?.__TAURI__?.core?.invoke;
     if (!tauriInv) return;
-    const prefs = await tauriInv("get_user_preferences_local") || {};
-    const nextPrefs = { ...prefs };
-    delete nextPrefs.cash_account_links;
-    await tauriInv("save_user_preferences_local", { prefs: nextPrefs });
+    // Send null to explicitly delete the key from disk (merge-safe).
+    await tauriInv("save_user_preferences_local", { prefs: { cash_account_links: null } });
     try {
       // Invalidate cached snapshot so the next sync re-fetches from Finary
       // and re-computes cash mapping with the now-empty preferences.

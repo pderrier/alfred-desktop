@@ -483,14 +483,14 @@ async fn chat_wizard_send_local(
 #[tauri::command]
 async fn update_line_memory_local(
     ticker: String,
-    key_reasoning: Option<String>,
+    memory_narrative: Option<String>,
     user_note: Option<String>,
     news_themes: Option<Vec<String>>,
 ) -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         native_mcp_analysis::update_line_memory_fields(
             &ticker,
-            key_reasoning.as_deref(),
+            memory_narrative.as_deref(),
             user_note.as_deref(),
             news_themes,
         )?;

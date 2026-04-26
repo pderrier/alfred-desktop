@@ -60,11 +60,7 @@ function buildPositionContext(rec) {
     sections.push(`Recent news: ${headlines}`);
   }
 
-  if (memory.llm_memory_summary) sections.push(`Memory: ${memory.llm_memory_summary}`);
-  const signals = memory.llm_strong_signals || [];
-  if (signals.length > 0) sections.push(`Signals: ${signals.join(", ")}`);
-  const keyHistory = memory.llm_key_history || [];
-  if (keyHistory.length > 0) sections.push(`History: ${keyHistory.slice(0, 5).join("; ")}`);
+  if (memory.memory_narrative) sections.push(`Memory narrative: ${memory.memory_narrative}`);
 
   return `The user is inspecting their ${ticker}${name ? ` (${name})` : ""} position. Here is the full analysis context:\n\n${sections.join("\n")}\n\nYou are a portfolio analysis assistant. Answer questions about this position based on the context above. This is a read-only discussion — you cannot change recommendations or portfolio state. Be concise and specific. Only answer questions related to the portfolio, positions, and financial analysis. Politely decline any off-topic requests.`;
 }
@@ -140,18 +136,14 @@ test("buildPositionContext: news headlines included (max 5)", () => {
   assert.ok(!result.includes("Article 6"));
 });
 
-test("buildPositionContext: line memory fields included when present", () => {
+test("buildPositionContext: memory_narrative included when present", () => {
   const result = buildPositionContext({
     ticker: "MC",
     lineMemory: {
-      llm_memory_summary: "Strong performer since Q2",
-      llm_strong_signals: ["momentum", "volume"],
-      llm_key_history: ["Q1 beat", "Dividend raised", "CEO replaced"]
+      memory_narrative: "Strong growth thesis based on margin expansion."
     }
   });
-  assert.ok(result.includes("Memory: Strong performer since Q2"));
-  assert.ok(result.includes("Signals: momentum, volume"));
-  assert.ok(result.includes("History: Q1 beat; Dividend raised; CEO replaced"));
+  assert.ok(result.includes("Memory narrative: Strong growth thesis based on margin expansion."));
 });
 
 test("buildPositionContext: empty/missing lineMemory does not add phantom sections", () => {

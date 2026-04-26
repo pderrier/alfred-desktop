@@ -124,7 +124,6 @@
       "deep_news_summary": "LVMH: resultats solides au T4 avec une croissance organique de 8%.",
       "deep_news_selected_url": "https://reuters.com/lvmh-results",
       "deep_news_seen_urls": ["https://reuters.com/lvmh-results"],
-      "llm_memory_summary": "MC analyse le 2026-04-10T10:20:00Z. Signal CONSERVER.",
       "reanalyse_after": "2026-07-15",
       "reanalyse_reason": "prochains resultats semestriels"
     },
@@ -147,7 +146,6 @@
       "deep_news_summary": "Schneider Electric: nouveaux contrats datacenter annonces.",
       "deep_news_selected_url": "https://reuters.com/schneider-datacenters",
       "deep_news_seen_urls": ["https://reuters.com/schneider-datacenters"],
-      "llm_memory_summary": "SU analyse le 2026-04-10T10:22:00Z. Signal RENFORCER.",
       "reanalyse_after": "2026-07-15",
       "reanalyse_reason": "prochains resultats semestriels"
     },
@@ -170,7 +168,6 @@
       "deep_news_summary": "Air Liquide: signature de nouveaux contrats hydrogene en Europe.",
       "deep_news_selected_url": "https://reuters.com/airliquide-hydrogen",
       "deep_news_seen_urls": ["https://reuters.com/airliquide-hydrogen"],
-      "llm_memory_summary": "AI analyse le 2026-04-10T10:24:00Z. Signal CONSERVER.",
       "reanalyse_after": "2026-07-15",
       "reanalyse_reason": "prochains resultats semestriels"
     },
@@ -193,7 +190,6 @@
       "deep_news_summary": "L'Oreal: lancement reussi de nouveaux produits premium.",
       "deep_news_selected_url": "https://reuters.com/loreal-launch",
       "deep_news_seen_urls": ["https://reuters.com/loreal-launch"],
-      "llm_memory_summary": "OR analyse le 2026-04-10T10:26:00Z. Signal CONSERVER.",
       "reanalyse_after": "2026-07-15",
       "reanalyse_reason": "prochains resultats semestriels"
     },
@@ -216,7 +212,6 @@
       "deep_news_summary": "Danone: nouvelles mesures de restructuration annoncees.",
       "deep_news_selected_url": "https://reuters.com/danone-restructuring",
       "deep_news_seen_urls": ["https://reuters.com/danone-restructuring"],
-      "llm_memory_summary": "BN analyse le 2026-04-10T10:28:00Z. Signal ALLEGER.",
       "reanalyse_after": "2026-06-15",
       "reanalyse_reason": "plan strategique nouveau CEO"
     },
@@ -239,7 +234,6 @@
       "deep_news_summary": "BNP Paribas: resultats T1 solides, dividende maintenu.",
       "deep_news_selected_url": "https://reuters.com/bnp-results",
       "deep_news_seen_urls": ["https://reuters.com/bnp-results"],
-      "llm_memory_summary": "BNP analyse le 2026-04-10T10:30:00Z. Signal CONSERVER.",
       "reanalyse_after": "2026-07-15",
       "reanalyse_reason": "prochains resultats semestriels"
     }

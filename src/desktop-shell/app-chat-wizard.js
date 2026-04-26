@@ -105,6 +105,42 @@ export function openChatWizard(config) {
       return bubble;
     }
 
+    function showTypingIndicator() {
+      const bubble = document.createElement("div");
+      bubble.className = "cw-typing-indicator";
+      bubble.style.cssText = `
+        align-self:flex-start;
+        padding:0.6rem 1.2rem;
+        border-radius:12px;
+        background:rgba(73,100,126,0.25);
+        display:flex;gap:0.3rem;align-items:center;
+      `;
+      for (let i = 0; i < 3; i++) {
+        const dot = document.createElement("span");
+        dot.style.cssText = `
+          width:6px;height:6px;border-radius:50%;
+          background:var(--sea-text,#e0e8f0);opacity:0.4;
+          animation:cw-bounce 1.2s ease-in-out ${i * 0.2}s infinite;
+        `;
+        bubble.appendChild(dot);
+      }
+      messagesDiv.appendChild(bubble);
+      messagesDiv.scrollTop = messagesDiv.scrollHeight;
+      // Inject keyframes once
+      if (!document.getElementById("cw-typing-keyframes")) {
+        const style = document.createElement("style");
+        style.id = "cw-typing-keyframes";
+        style.textContent = `@keyframes cw-bounce{0%,60%,100%{opacity:0.3;transform:translateY(0)}30%{opacity:1;transform:translateY(-4px)}}`;
+        document.head.appendChild(style);
+      }
+      return bubble;
+    }
+
+    function removeTypingIndicator() {
+      const el = messagesDiv.querySelector(".cw-typing-indicator");
+      if (el) el.remove();
+    }
+
     function showConfirmReject() {
       const actionsDiv = overlay.querySelector(".cw-actions");
       if (actionsDiv) actionsDiv.style.display = "flex";
@@ -162,6 +198,7 @@ export function openChatWizard(config) {
       // User bubble
       addBubble("user", text);
       history.push({ role: "user", content: text });
+      showTypingIndicator();
 
       // Call backend
       try {
@@ -174,6 +211,7 @@ export function openChatWizard(config) {
           userMessage: text,
         });
 
+        removeTypingIndicator();
         const response = result?.response || "(no response)";
         addBubble("assistant", response);
         history.push({ role: "assistant", content: response });
@@ -188,6 +226,7 @@ export function openChatWizard(config) {
           }
         }
       } catch (err) {
+        removeTypingIndicator();
         addBubble("assistant", `Error: ${err?.message || err}`);
       }
 

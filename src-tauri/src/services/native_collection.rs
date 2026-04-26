@@ -1737,22 +1737,16 @@ fn build_cash_mapping_with_links(
                     invs[0].name, cash_amount, cid
                 ));
             } else {
-                // N investments + M cash accounts — ambiguous case
-                // Use correlation_id heuristic as temporary fallback
-                let mut sorted_invs: Vec<&&HoldingsEntry> = invs.iter().collect();
-                let mut sorted_cashes: Vec<&(usize, &HoldingsEntry)> = cashes.iter().collect();
-                sorted_invs.sort_by_key(|e| e.correlation_id.unwrap_or(i64::MAX));
-                sorted_cashes.sort_by_key(|e| e.1.correlation_id.unwrap_or(i64::MAX));
-                for (i, inv) in sorted_invs.iter().enumerate() {
-                    if let Some(cash_pair) = sorted_cashes.get(i) {
-                        result.insert(inv.name.clone(), cash_pair.1.fiats_sum);
-                        matched_cash_indices.insert(cash_pair.0);
-                        crate::debug_log(&format!(
-                            "finary_cash_mapping: matched '{}' → cash {:.2} (connection_id={}, correlation pair, needs_confirmation)",
-                            inv.name, cash_pair.1.fiats_sum, cid
-                        ));
-                    }
-                }
+                // N investments + M cash accounts — ambiguous case.
+                // Do NOT auto-pair by correlation_id: a single Finary connection
+                // can mix PEA, livrets, comptes chèque, etc.  Blind positional
+                // pairing gives wrong results (e.g. CEL matched to PEA).
+                // Instead, leave all unmatched for Strategy 1.5 (semantic) and
+                // flag the full group as ambiguous for the wizard.
+                crate::debug_log(&format!(
+                    "finary_cash_mapping: connection_id={} has {}inv + {}cash — skipping auto-pair, flagging ambiguous",
+                    cid, invs.len(), cashes.len()
+                ));
                 // Record this as an ambiguous group for the frontend
                 let inv_json: Vec<Value> = invs.iter().map(|e| json!({
                     "name": e.name,
@@ -2833,9 +2827,11 @@ mod tests {
             make_account("Cash CTO", Some(200), 0, 150.0, "Bourso"),
         ];
         let result = build_cash_mapping(&accounts);
-        // Ambiguous: 2 investments + 2 cash accounts in same connection — correlation heuristic used
-        assert_eq!(result.ambiguous_groups.len(), 1,
+        // N:M should NOT auto-pair — mapping stays empty, group flagged ambiguous
+        assert!(result.mapping.is_empty(), "N:M should not auto-pair");
+        assert!(!result.ambiguous_groups.is_empty(),
             "N:M group should be recorded as ambiguous");
+        // First ambiguous group is the connection-level one
         let group = &result.ambiguous_groups[0];
         assert_eq!(group["connection_id"], 200);
         assert!(group["needs_confirmation"].as_bool().unwrap_or(false));

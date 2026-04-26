@@ -122,15 +122,20 @@ export function openChatWizard(config) {
         const doneBtn = document.createElement("button");
         doneBtn.className = "cw-done-btn cmd-btn";
         doneBtn.textContent = "Done \u2014 save insights";
-        doneBtn.addEventListener("click", (e) => {
+        doneBtn.addEventListener("click", async (e) => {
           e.stopPropagation();
           jsLog(`chat-wizard: Done button clicked, history.length=${history.length} onDone=${!!onDone}`);
           if (onDone) {
-            // Call onDone directly — don't go through finish/resolve/await chain
+            // Resolve only after onDone settles to avoid races in caller fallback logic.
             cleanup();
             resolved = true;
-            onDone(history);
-            resolve(null); // resolve promise so await doesn't hang
+            try {
+              await onDone(history);
+            } catch (err) {
+              jsLog(`chat-wizard: onDone failed: ${err?.message || err}`);
+            } finally {
+              resolve(null);
+            }
           } else {
             finish(history);
           }

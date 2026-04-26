@@ -188,6 +188,22 @@
           <div class="main-run-header">
             <h2 id="account-view-label" class="main-account-label"></h2>
           </div>
+          <section class="report-kpi-strip">
+            <section class="report-kpi-grid">
+              <article class="report-kpi-card">
+                <p class="report-kpi-label">Portfolio Value</p>
+                <p id="account-view-value" class="report-kpi-value">&mdash;</p>
+              </article>
+              <article class="report-kpi-card">
+                <p class="report-kpi-label">Total PnL</p>
+                <p id="account-view-gain" class="report-kpi-value">&mdash;</p>
+              </article>
+              <article class="report-kpi-card">
+                <p class="report-kpi-label">Cash</p>
+                <p id="account-view-cash" class="report-kpi-value">&mdash;</p>
+              </article>
+            </section>
+          </section>
           <section class="card">
             <h2>Positions</h2>
             <div class="positions-table-wrap">
@@ -527,6 +543,19 @@
               Alfred suggestions
             </label>
             <p class="settings-note">When enabled, Alfred will proactively surface tips, reminders, and portfolio insights.</p>
+          </div>
+        </article>
+
+        <!-- Cash account links -->
+        <article class="settings-card">
+          <h3>Cash account links</h3>
+          <p class="settings-note">Review, edit, or reset investment ↔ cash account links confirmed by you.</p>
+          <ul id="settings-cash-links" class="line-memory-list">
+            <li class="empty-hint">Loading...</li>
+          </ul>
+          <div class="settings-storage-actions">
+            <button id="settings-cash-links-refresh-btn" class="ghost-btn" type="button">Refresh links</button>
+            <button id="settings-cash-links-reset-btn" class="ghost-btn" type="button">Reset all links</button>
           </div>
         </article>
 

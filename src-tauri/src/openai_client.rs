@@ -4,7 +4,9 @@
 //! tools and native web search. The model decides when to search.
 //! Tool calls are executed locally via `mcp_server::dispatch_tool_direct()`.
 
+use std::collections::hash_map::DefaultHasher;
 use std::env;
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -35,7 +37,9 @@ fn api_key() -> Result<String> {
             return Ok(k);
         }
     }
-    Err(anyhow!("openai_api_key_missing:set OPENAI_API_KEY or configure in settings"))
+    Err(anyhow!(
+        "openai_api_key_missing:set OPENAI_API_KEY or configure in settings"
+    ))
 }
 
 fn api_base() -> String {
@@ -119,7 +123,10 @@ fn resolve_best_model() -> Result<String> {
     }
 
     let selected = best.unwrap_or(&models[0]).to_string();
-    crate::debug_log(&format!("openai_client: auto-selected model {selected} (score={best_score}, {} available)", models.len()));
+    crate::debug_log(&format!(
+        "openai_client: auto-selected model {selected} (score={best_score}, {} available)",
+        models.len()
+    ));
     Ok(selected)
 }
 
@@ -183,10 +190,14 @@ pub fn run_prompt(
     prompt: &str,
     timeout_ms: u64,
     on_progress: Option<ProgressFn>,
+    artifacts: Option<&crate::agentos_artifacts::ArtifactContext>,
 ) -> Result<Value> {
     let key = api_key()?;
     let base = api_base();
     let model = model_name();
+    if let Some(ctx) = artifacts {
+        crate::agentos_artifacts::merge_runtime_data(ctx, json!({ "model": model }));
+    }
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let tools = build_tools();
     let dd = data_dir();
@@ -207,7 +218,9 @@ pub fn run_prompt(
     loop {
         round += 1;
         if round > MAX_TOOL_ROUNDS {
-            return Err(anyhow!("openai_client:max_tool_rounds_exceeded:{MAX_TOOL_ROUNDS}"));
+            return Err(anyhow!(
+                "openai_client:max_tool_rounds_exceeded:{MAX_TOOL_ROUNDS}"
+            ));
         }
         if Instant::now() > deadline {
             return Err(anyhow!("openai_client:timeout_exceeded:{timeout_ms}ms"));
@@ -235,9 +248,13 @@ pub fn run_prompt(
         }
 
         // Call Responses API with streaming
-        let (response_id, output_items) = call_responses_streamed(
-            &base, &key, &body, &on_progress, deadline,
-        )?;
+        let (response_id, output_items, usage) =
+            call_responses_streamed(&base, &key, &body, &on_progress, deadline, artifacts)?;
+        if let Some(ctx) = artifacts {
+            if !usage.is_null() {
+                crate::agentos_artifacts::merge_runtime_data(ctx, json!({ "token_usage": usage }));
+            }
+        }
 
         previous_response_id = Some(response_id);
 
@@ -246,12 +263,27 @@ pub fn run_prompt(
         let mut final_text = String::new();
 
         for item in &output_items {
-            let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+            let item_type = item
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             match item_type {
                 "function_call" => {
-                    let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-                    let arguments = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}").to_string();
+                    let call_id = item
+                        .get("call_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let name = item
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let arguments = item
+                        .get("arguments")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("{}")
+                        .to_string();
                     function_calls.push((call_id, name, arguments));
                 }
                 "message" => {
@@ -268,14 +300,19 @@ pub fn run_prompt(
                 }
                 "web_search_call" => {
                     // Web search executed by OpenAI — logged but no action needed
-                    let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    let status = item
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
                     crate::debug_log(&format!("openai_client: web_search_call status={status}"));
                     if let Some(ref cb) = on_progress {
                         cb(0, round, "searching the web\u{2026}");
                     }
                 }
                 _ => {
-                    crate::debug_log(&format!("openai_client: unknown output item type={item_type}"));
+                    crate::debug_log(&format!(
+                        "openai_client: unknown output item type={item_type}"
+                    ));
                 }
             }
         }
@@ -288,8 +325,34 @@ pub fn run_prompt(
             ));
             // Same behavior as Codex: try JSON extraction, fall back to success marker
             match extract_json_result(&final_text) {
-                Ok(v) => return Ok(v),
-                Err(_) => return Ok(json!({"ok": true, "mcp_turn": true, "agent_text_chars": final_text.len()})),
+                Ok(v) => {
+                    if let Some(ctx) = artifacts {
+                        crate::agentos_artifacts::record_decision(
+                            ctx,
+                            "llm.output.parse",
+                            "llm.output.parse",
+                            json!({ "json_extracted": true }),
+                            None,
+                            None,
+                        );
+                    }
+                    return Ok(v);
+                }
+                Err(_) => {
+                    if let Some(ctx) = artifacts {
+                        crate::agentos_artifacts::record_decision(
+                            ctx,
+                            "llm.output.parse",
+                            "llm.output.parse",
+                            json!({ "json_extracted": false }),
+                            None,
+                            None,
+                        );
+                    }
+                    return Ok(
+                        json!({"ok": true, "mcp_turn": true, "agent_text_chars": final_text.len()}),
+                    );
+                }
             }
         }
 
@@ -300,6 +363,22 @@ pub fn run_prompt(
                 cb(0, round, &format!("tool:{name}"));
             }
             crate::debug_log(&format!("openai_client: calling tool {name}"));
+            if let Some(ctx) = artifacts {
+                let mut hasher = DefaultHasher::new();
+                arguments.hash(&mut hasher);
+                let args_fingerprint = format!("{:016x}", hasher.finish());
+                crate::agentos_artifacts::record_decision(
+                    ctx,
+                    "llm.tool.dispatch",
+                    "llm.tool.dispatch",
+                    json!({
+                        "tool": name,
+                        "args_fingerprint": args_fingerprint,
+                    }),
+                    None,
+                    None,
+                );
+            }
 
             let args: Value = serde_json::from_str(arguments).unwrap_or(json!({}));
             let tool_result = crate::mcp_server::dispatch_tool_direct(&dd, &name, &args);
@@ -358,7 +437,8 @@ fn call_responses_streamed(
     body: &Value,
     on_progress: &Option<ProgressFn>,
     deadline: Instant,
-) -> Result<(String, Vec<Value>)> {
+    artifacts: Option<&crate::agentos_artifacts::ArtifactContext>,
+) -> Result<(String, Vec<Value>, Value)> {
     let url = format!("{base}/responses");
     let body_str = serde_json::to_string(body)?;
 
@@ -388,12 +468,33 @@ fn call_responses_streamed(
             Err(ureq::Error::Status(status, resp)) => {
                 let err_body = resp.into_string().unwrap_or_default();
                 if status == 429 || status >= 500 {
+                    let reason = format!("status_{status}");
+                    if let Some(ctx) = artifacts {
+                        crate::agentos_artifacts::record_decision(
+                            ctx,
+                            "llm.retry.policy",
+                            "llm.retry.policy",
+                            json!({ "attempt": attempt + 1, "reason": reason }),
+                            None,
+                            None,
+                        );
+                    }
                     last_err = Some(anyhow!("openai_api_error:{status}:{err_body}"));
                     continue;
                 }
                 return Err(anyhow!("openai_api_error:{status}:{err_body}"));
             }
             Err(e) => {
+                if let Some(ctx) = artifacts {
+                    crate::agentos_artifacts::record_decision(
+                        ctx,
+                        "llm.retry.policy",
+                        "llm.retry.policy",
+                        json!({ "attempt": attempt + 1, "reason": e.to_string() }),
+                        None,
+                        None,
+                    );
+                }
                 last_err = Some(anyhow!("openai_api_request_failed:{e}"));
                 continue;
             }
@@ -403,9 +504,11 @@ fn call_responses_streamed(
         let reader = BufReader::new(resp.into_reader());
         let mut response_id = String::new();
         let mut output_items: Vec<Value> = Vec::new();
+        let mut usage_payload = Value::Null;
 
         // Accumulate streamed text deltas per output item index
-        let mut text_bufs: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+        let mut text_bufs: std::collections::HashMap<u64, String> =
+            std::collections::HashMap::new();
         let mut reasoning_buf = String::new();
         // Accumulate function_call argument deltas per output item index
         let mut fn_arg_bufs: std::collections::HashMap<u64, (String, String, String)> =
@@ -427,7 +530,10 @@ fn call_responses_streamed(
                 Err(_) => continue,
             };
 
-            let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+            let event_type = event
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
 
             match event_type {
                 // Response created — capture ID
@@ -437,18 +543,33 @@ fn call_responses_streamed(
                             response_id = id.to_string();
                         }
                         if event_type == "response.completed" {
-                            if let Some(output) = resp_obj.get("output").and_then(|v| v.as_array()) {
+                            if let Some(output) = resp_obj.get("output").and_then(|v| v.as_array())
+                            {
                                 output_items = output.clone();
                             }
                             // Extract token usage and emit via progress callback
                             if let Some(usage) = resp_obj.get("usage") {
-                                let total = usage.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                                let input = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                                let output_t = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let total = usage
+                                    .get("total_tokens")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                let input = usage
+                                    .get("input_tokens")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                let output_t = usage
+                                    .get("output_tokens")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
                                 if total > 0 {
                                     if let Some(ref cb) = on_progress {
                                         cb(0, 0, &format!("tokens:{total}:{input}:{output_t}"));
                                     }
+                                    usage_payload = json!({
+                                        "total_tokens": total,
+                                        "input_tokens": input,
+                                        "output_tokens": output_t,
+                                    });
                                 }
                             }
                         }
@@ -459,16 +580,34 @@ fn call_responses_streamed(
                 "response.output_item.done" => {
                     if let Some(item) = event.get("item") {
                         // For function_call items, merge accumulated arguments
-                        let idx = event.get("output_index").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let idx = event
+                            .get("output_index")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
                         if let Some((call_id, name, args)) = fn_arg_bufs.remove(&idx) {
                             let mut item = item.clone();
-                            if item.get("call_id").and_then(|v| v.as_str()).unwrap_or_default().is_empty() {
+                            if item
+                                .get("call_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .is_empty()
+                            {
                                 item["call_id"] = json!(call_id);
                             }
-                            if item.get("name").and_then(|v| v.as_str()).unwrap_or_default().is_empty() {
+                            if item
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .is_empty()
+                            {
                                 item["name"] = json!(name);
                             }
-                            if item.get("arguments").and_then(|v| v.as_str()).unwrap_or_default().is_empty() {
+                            if item
+                                .get("arguments")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .is_empty()
+                            {
                                 item["arguments"] = json!(args);
                             }
                             output_items.push(item);
@@ -481,13 +620,23 @@ fn call_responses_streamed(
                 // Text deltas — accumulate silently (final JSON output, not useful for progress)
                 "response.output_text.delta" => {
                     if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
-                        let idx = event.get("output_index").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let idx = event
+                            .get("output_index")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
                         let buf = text_bufs.entry(idx).or_default();
                         buf.push_str(delta);
                         // Show a periodic "writing..." indicator (every ~500 chars)
                         if buf.len() % 500 < delta.len() {
                             if let Some(ref cb) = on_progress {
-                                cb(0, 0, &format!("writing ({:.1}kB)\u{2026}", buf.len() as f64 / 1024.0));
+                                cb(
+                                    0,
+                                    0,
+                                    &format!(
+                                        "writing ({:.1}kB)\u{2026}",
+                                        buf.len() as f64 / 1024.0
+                                    ),
+                                );
                             }
                         }
                     }
@@ -501,7 +650,14 @@ fn call_responses_streamed(
                         if reasoning_buf.len() % 200 < delta.len() {
                             if let Some(ref cb) = on_progress {
                                 // Show last ~60 chars of reasoning as preview
-                                let preview: String = reasoning_buf.chars().rev().take(60).collect::<String>().chars().rev().collect();
+                                let preview: String = reasoning_buf
+                                    .chars()
+                                    .rev()
+                                    .take(60)
+                                    .collect::<String>()
+                                    .chars()
+                                    .rev()
+                                    .collect();
                                 cb(0, 0, &format!("thinking: {preview}\u{2026}"));
                             }
                         }
@@ -510,16 +666,28 @@ fn call_responses_streamed(
 
                 // Function call argument deltas
                 "response.function_call_arguments.delta" => {
-                    let idx = event.get("output_index").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let idx = event
+                        .get("output_index")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
                     if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
-                        fn_arg_bufs.entry(idx).or_insert_with(|| (String::new(), String::new(), String::new())).2.push_str(delta);
+                        fn_arg_bufs
+                            .entry(idx)
+                            .or_insert_with(|| (String::new(), String::new(), String::new()))
+                            .2
+                            .push_str(delta);
                     }
                 }
                 "response.function_call_arguments.done" => {
-                    let idx = event.get("output_index").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let idx = event
+                        .get("output_index")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
                     // call_id and name come from output_item.added
                     if let Some(args) = event.get("arguments").and_then(|v| v.as_str()) {
-                        let entry = fn_arg_bufs.entry(idx).or_insert_with(|| (String::new(), String::new(), String::new()));
+                        let entry = fn_arg_bufs
+                            .entry(idx)
+                            .or_insert_with(|| (String::new(), String::new(), String::new()));
                         entry.2 = args.to_string(); // replace with final complete args
                     }
                 }
@@ -527,12 +695,28 @@ fn call_responses_streamed(
                 // Output item added — capture call_id and name for function calls
                 "response.output_item.added" => {
                     if let Some(item) = event.get("item") {
-                        let idx = event.get("output_index").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+                        let idx = event
+                            .get("output_index")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let item_type = item
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
                         if item_type == "function_call" {
-                            let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-                            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-                            fn_arg_bufs.entry(idx).or_insert_with(|| (call_id, name, String::new()));
+                            let call_id = item
+                                .get("call_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            let name = item
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            fn_arg_bufs
+                                .entry(idx)
+                                .or_insert_with(|| (call_id, name, String::new()));
                         }
                     }
                 }
@@ -551,7 +735,7 @@ fn call_responses_streamed(
         // If we didn't get output_items from response.completed, build from accumulated items
         // (output_items is already populated from output_item.done events)
 
-        return Ok((response_id, output_items));
+        return Ok((response_id, output_items, usage_payload));
     }
 
     Err(last_err.unwrap_or_else(|| anyhow!("openai_api_retries_exhausted")))
@@ -573,6 +757,7 @@ pub fn run_prompt_oauth(
     prompt: &str,
     timeout_ms: u64,
     on_progress: Option<ProgressFn>,
+    artifacts: Option<&crate::agentos_artifacts::ArtifactContext>,
 ) -> Result<Value> {
     crate::debug_log(&format!(
         "openai_client: native-oauth mode (structured MCP dispatch), timeout={timeout_ms}ms"
@@ -580,6 +765,12 @@ pub fn run_prompt_oauth(
 
     // Ensure legacy global MCP config is cleaned so -c flags take precedence
     crate::codex::ensure_mcp_config();
+    if let Some(ctx) = artifacts {
+        crate::agentos_artifacts::merge_runtime_data(
+            ctx,
+            json!({"model": "oauth-managed", "backend_path": "native-oauth"}),
+        );
+    }
 
     // Delegate to the codex app-server path which already handles:
     // - OAuth authentication (app-server session)

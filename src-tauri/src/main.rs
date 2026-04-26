@@ -16,12 +16,12 @@ mod local_db_service;
 mod local_http;
 #[path = "services/native_collection.rs"]
 mod native_collection;
-#[path = "services/native_collection_modes.rs"]
-mod native_collection_modes;
 #[path = "services/native_collection_dispatch.rs"]
 mod native_collection_dispatch;
 #[path = "services/native_collection_helpers.rs"]
 mod native_collection_helpers;
+#[path = "services/native_collection_modes.rs"]
+mod native_collection_modes;
 #[path = "services/native_line_analysis.rs"]
 mod native_line_analysis;
 // node_bridge_support removed — Playwright/Node replaced by native Rust CDP
@@ -29,35 +29,36 @@ mod native_line_analysis;
 mod sqlite_migrations;
 
 // ── Extracted domain modules ────────────────────────────────────────────────
-mod storage;
-mod paths;
-mod helpers;
-mod runtime_settings;
-mod health;
-mod run_state;
-mod run_state_cache;
-mod finary;
-mod report;
-mod analysis_ops;
-mod command_handlers;
-mod cli;
+mod agentos_artifacts;
 mod alfred_api_client;
-mod codex;
-mod enrichment;
-mod llm;
-mod llm_prompts;
-mod llm_parsing;
-mod mcp_server;
-mod mcp_progress_relay;
-mod run_stats;
-mod storage_cleanup;
-mod run_index;
-mod updater;
-mod llm_backend;
-mod openai_client;
+mod analysis_ops;
 mod chat_wizard;
+mod cli;
+mod codex;
+mod command_handlers;
+mod enrichment;
+mod finary;
+mod health;
+mod helpers;
+mod llm;
+mod llm_backend;
+mod llm_parsing;
+mod llm_prompts;
+mod mcp_progress_relay;
+mod mcp_server;
 #[path = "services/native_mcp_analysis.rs"]
 mod native_mcp_analysis;
+mod openai_client;
+mod paths;
+mod report;
+mod run_index;
+mod run_state;
+mod run_state_cache;
+mod run_stats;
+mod runtime_settings;
+mod storage;
+mod storage_cleanup;
+mod updater;
 
 use std::env;
 
@@ -78,10 +79,8 @@ pub use helpers::{debug_log, now_epoch_ms, now_iso_string, pick_json_fields};
 pub use local_http::request_http_json;
 pub use paths::{resolve_runtime_state_dir, resolve_source_snapshot_store_path};
 pub use run_state::{
-    load_run_by_id as load_run_by_id_direct,
-    patch_run_state_with as patch_run_state_direct_with,
-    set_native_run_stage,
-    update_line_status,
+    load_run_by_id as load_run_by_id_direct, patch_run_state_with as patch_run_state_direct_with,
+    set_native_run_stage, update_line_status,
 };
 pub use runtime_settings::integer_direct as runtime_setting_integer_direct;
 pub use storage::write_json_file;
@@ -91,7 +90,9 @@ pub use storage::write_json_file;
 // paths at compile time relative to the invoking module.
 
 #[tauri::command]
-async fn analysis_run_start_local(options: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
+async fn analysis_run_start_local(
+    options: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(move || command_handlers::run_analysis_start(options))
         .await
         .map_err(|e| format!("analysis_run_start_local_failed:join:{e}"))?
@@ -100,10 +101,12 @@ async fn analysis_run_start_local(options: Option<serde_json::Value>) -> Result<
 
 #[tauri::command]
 async fn retry_global_synthesis_local(run_id: String) -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || command_handlers::run_retry_global_synthesis(run_id))
-        .await
-        .map_err(|e| format!("retry_global_synthesis_local_failed:join:{e}"))?
-        .map_err(|e| e.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        command_handlers::run_retry_global_synthesis(run_id)
+    })
+    .await
+    .map_err(|e| format!("retry_global_synthesis_local_failed:join:{e}"))?
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -116,10 +119,12 @@ async fn analysis_stop_local(operation_id: String) -> Result<serde_json::Value, 
 
 #[tauri::command]
 async fn analysis_run_status_local(operation_id: String) -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || command_handlers::run_analysis_status(operation_id))
-        .await
-        .map_err(|e| format!("analysis_run_status_local_failed:join:{e}"))?
-        .map_err(|e| e.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        command_handlers::run_analysis_status(operation_id)
+    })
+    .await
+    .map_err(|e| format!("analysis_run_status_local_failed:join:{e}"))?
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -155,11 +160,15 @@ async fn runtime_settings_local() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-async fn runtime_settings_update_local(settings: serde_json::Value) -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || command_handlers::run_runtime_settings_update(settings))
-        .await
-        .map_err(|e| format!("runtime_settings_update_local_failed:join:{e}"))?
-        .map_err(|e| e.to_string())
+async fn runtime_settings_update_local(
+    settings: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        command_handlers::run_runtime_settings_update(settings)
+    })
+    .await
+    .map_err(|e| format!("runtime_settings_update_local_failed:join:{e}"))?
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -195,11 +204,15 @@ async fn finary_session_status_local() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-async fn finary_session_connect_local(payload: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || command_handlers::run_finary_session_connect(payload))
-        .await
-        .map_err(|e| format!("finary_session_connect_local_failed:join:{e}"))?
-        .map_err(|e| e.to_string())
+async fn finary_session_connect_local(
+    payload: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        command_handlers::run_finary_session_connect(payload)
+    })
+    .await
+    .map_err(|e| format!("finary_session_connect_local_failed:join:{e}"))?
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -259,7 +272,9 @@ async fn get_user_preferences_local() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-async fn save_user_preferences_local(prefs: serde_json::Value) -> Result<serde_json::Value, String> {
+async fn save_user_preferences_local(
+    prefs: serde_json::Value,
+) -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(move || command_handlers::run_save_user_preferences(prefs))
         .await
         .map_err(|e| format!("save_user_preferences_failed:join:{e}"))?
@@ -395,7 +410,10 @@ async fn finary_sync_snapshot_local() -> Result<serde_json::Value, String> {
 // ── CSV import preview ──────────────────────────────────────────────────
 
 #[tauri::command]
-async fn preview_csv_import_local(csv_text: String, account: String) -> Result<serde_json::Value, String> {
+async fn preview_csv_import_local(
+    csv_text: String,
+    account: String,
+) -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         native_collection::preview_csv_import(&csv_text, &account)
     })
@@ -425,13 +443,14 @@ async fn check_for_update_local() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-async fn download_update_local(url: String, sha256: Option<String>) -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        updater::download_update(&url, sha256.as_deref())
-    })
-    .await
-    .map_err(|e| format!("download_update_local_failed:join:{e}"))?
-    .map_err(|e| e.to_string())
+async fn download_update_local(
+    url: String,
+    sha256: Option<String>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || updater::download_update(&url, sha256.as_deref()))
+        .await
+        .map_err(|e| format!("download_update_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -523,11 +542,15 @@ async fn load_alfred_state_local() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-async fn export_report_markdown_local(payload: serde_json::Value) -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || command_handlers::run_export_report_markdown(payload))
-        .await
-        .map_err(|e| format!("export_report_markdown_local_failed:join:{e}"))?
-        .map_err(|e| e.to_string())
+async fn export_report_markdown_local(
+    payload: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        command_handlers::run_export_report_markdown(payload)
+    })
+    .await
+    .map_err(|e| format!("export_report_markdown_local_failed:join:{e}"))?
+    .map_err(|e| e.to_string())
 }
 
 fn run_tauri_app() -> anyhow::Result<()> {
@@ -539,7 +562,12 @@ fn run_tauri_app() -> anyhow::Result<()> {
 
             // Ensure critical data directories exist on fresh install.
             let data_dir = paths::default_data_dir();
-            for sub in &["finary-session", "reports", "report-history", "runtime-state"] {
+            for sub in &[
+                "finary-session",
+                "reports",
+                "report-history",
+                "runtime-state",
+            ] {
                 let _ = std::fs::create_dir_all(data_dir.join(sub));
             }
 

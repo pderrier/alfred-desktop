@@ -204,6 +204,26 @@ export function renderAccountView(accountName, dashboardPayload, snapshotPositio
     : (snapshot.latest_run?.portfolio?.positions || [])
         .filter((p) => (p.compte || p.account || "") === accountName);
 
+  const accountValueNode = document.getElementById("account-view-value");
+  const accountGainNode = document.getElementById("account-view-gain");
+  const accountCashNode = document.getElementById("account-view-cash");
+  const inferredValue = positions.reduce((sum, p) => sum + (Number(p.valorisation) || 0), 0);
+  const inferredGain = positions.reduce((sum, p) => sum + (Number(p.plus_moins_value) || 0), 0);
+  const totalValue = Number(acct?.total_value);
+  const totalGain = Number(acct?.total_gain);
+  const totalCash = Number(acct?.cash);
+  const value = Number.isFinite(totalValue) ? totalValue : inferredValue;
+  const gain = Number.isFinite(totalGain) ? totalGain : inferredGain;
+  const cash = Number.isFinite(totalCash) ? totalCash : 0;
+
+  if (accountValueNode) accountValueNode.textContent = formatCurrency(value);
+  if (accountGainNode) {
+    accountGainNode.textContent = formatCurrency(gain);
+    accountGainNode.classList.toggle("kpi-delta-up", gain >= 0);
+    accountGainNode.classList.toggle("kpi-delta-down", gain < 0);
+  }
+  if (accountCashNode) accountCashNode.textContent = formatCurrency(cash);
+
   const tbody = document.getElementById("account-positions-tbody");
   const empty = document.getElementById("account-positions-empty");
   if (!tbody) return;

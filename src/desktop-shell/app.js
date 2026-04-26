@@ -99,6 +99,9 @@ const settingsOpenaiApiBaseNode = document.getElementById("settings-openai-api-b
 const settingsApikeyToggleNode = document.getElementById("settings-apikey-toggle");
 const settingsApikeyStatusNode = document.getElementById("settings-apikey-status");
 const settingsAlfredSuggestionsNode = document.getElementById("settings-alfred-suggestions");
+const settingsCashLinksNode = document.getElementById("settings-cash-links");
+const settingsCashLinksRefreshBtn = document.getElementById("settings-cash-links-refresh-btn");
+const settingsCashLinksResetBtn = document.getElementById("settings-cash-links-reset-btn");
 
 // ── State ────────────────────────────────────────────────────────
 
@@ -911,6 +914,11 @@ async function checkAmbiguousCashGroups(finaryMeta) {
         }
 
         await tauriInvoke("save_user_preferences_local", { prefs });
+        try {
+          // Ensure account-level cash values immediately reflect validated links.
+          await tauriInvoke("finary_sync_snapshot_local");
+          await refreshDashboard();
+        } catch { /* non-blocking */ }
         const savedCount = Object.keys(prefs.cash_account_links || {}).length;
         showToast(`Cash mapping saved (${savedCount} link${savedCount !== 1 ? "s" : ""}) — persisted for future runs.`, "success");
       } catch (err) {
@@ -1009,6 +1017,41 @@ function renderRuntimeSettings(settings) {
         settingsAlfredSuggestionsNode.checked = true; // default on
       });
     }
+  }
+  void refreshCashLinksSettings().catch(() => {});
+}
+
+async function refreshCashLinksSettings() {
+  if (!settingsCashLinksNode) return;
+  const tauriInv = window?.__TAURI__?.core?.invoke;
+  if (!tauriInv) {
+    settingsCashLinksNode.innerHTML = "<li class=\"empty-hint\">Unavailable outside desktop runtime.</li>";
+    return;
+  }
+  try {
+    const prefs = await tauriInv("get_user_preferences_local") || {};
+    const links = prefs?.cash_account_links || {};
+    const entries = Object.entries(links);
+    if (entries.length === 0) {
+      settingsCashLinksNode.innerHTML = "<li class=\"empty-hint\">No saved links yet.</li>";
+      return;
+    }
+    settingsCashLinksNode.innerHTML = "";
+    for (const [investmentName, cashNameRaw] of entries.sort((a, b) => a[0].localeCompare(b[0]))) {
+      const cashName = cashNameRaw === "__none__" ? "No cash account" : String(cashNameRaw || "");
+      const li = document.createElement("li");
+      li.className = "memory-item";
+      li.style.gap = "0.6rem";
+      li.innerHTML = `
+        <div class="memory-header">
+          <span class="memory-label">${escapeHtml(investmentName)}</span>
+          <span class="memory-value">${escapeHtml(cashName)}</span>
+        </div>
+      `;
+      settingsCashLinksNode.appendChild(li);
+    }
+  } catch {
+    settingsCashLinksNode.innerHTML = "<li class=\"empty-hint\">Failed to load links.</li>";
   }
 }
 
@@ -1270,6 +1313,29 @@ settingsResetBtn?.addEventListener("click", async () => {
     showToast("Defaults restored", "success");
   } catch (error) {
     showToast(`Reset failed: ${formatBridgeError(error)}`, "error");
+  }
+});
+settingsCashLinksRefreshBtn?.addEventListener("click", async () => {
+  await refreshCashLinksSettings();
+  showToast("Cash links refreshed", "success");
+});
+settingsCashLinksResetBtn?.addEventListener("click", async () => {
+  try {
+    const tauriInv = window?.__TAURI__?.core?.invoke;
+    if (!tauriInv) return;
+    const prefs = await tauriInv("get_user_preferences_local") || {};
+    const nextPrefs = { ...prefs };
+    delete nextPrefs.cash_account_links;
+    await tauriInv("save_user_preferences_local", { prefs: nextPrefs });
+    try {
+      await tauriInv("finary_sync_snapshot_local");
+      await refreshDashboard();
+    } catch { /* non-blocking */ }
+    await refreshCashLinksSettings();
+    cashWizardShownThisSession = false;
+    showToast("Cash account links reset", "success");
+  } catch (error) {
+    showToast(`Reset links failed: ${formatBridgeError(error)}`, "error");
   }
 });
 settingsShellThemeNode?.addEventListener("change", () => setThemeMode(settingsShellThemeNode.value));

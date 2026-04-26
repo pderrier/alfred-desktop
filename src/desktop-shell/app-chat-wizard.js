@@ -280,10 +280,13 @@ export function openCashMatchingWizard(opts) {
     html += `
         </div>
         <div style="display:flex;gap:0.5rem;padding:0.8rem 1.2rem;border-top:1px solid rgba(73,100,126,0.3);align-items:center;justify-content:space-between">
-          <a href="#" class="cm-help-link" style="font-size:0.78rem;color:var(--sea-muted,#8a9bb0)">Need help? Ask Alfred</a>
+          <label style="display:flex;align-items:center;gap:0.45rem;font-size:0.78rem;color:var(--sea-muted,#8a9bb0)">
+            <input type="checkbox" class="cm-validation-check" />
+            I confirm this mapping
+          </label>
           <div style="display:flex;gap:0.5rem">
             <button class="cm-cancel-btn cmd-btn ghost-btn">Cancel</button>
-            <button class="cm-confirm-btn cmd-btn">Confirm</button>
+            <button class="cm-confirm-btn cmd-btn" disabled style="opacity:0.6;cursor:not-allowed">Confirm</button>
           </div>
         </div>
       </div>
@@ -314,6 +317,15 @@ export function openCashMatchingWizard(opts) {
       finish(mapping);
     });
 
+    overlay.querySelector(".cm-validation-check")?.addEventListener("change", (e) => {
+      const confirmBtn = overlay.querySelector(".cm-confirm-btn");
+      if (!confirmBtn) return;
+      const enabled = !!e?.target?.checked;
+      confirmBtn.disabled = !enabled;
+      confirmBtn.style.opacity = enabled ? "1" : "0.6";
+      confirmBtn.style.cursor = enabled ? "pointer" : "not-allowed";
+    });
+
     // Cancel
     overlay.querySelector(".cm-cancel-btn")?.addEventListener("click", () => finish(null));
     overlay.querySelector(".cm-close-btn")?.addEventListener("click", () => finish(null));
@@ -321,12 +333,6 @@ export function openCashMatchingWizard(opts) {
       if (e.target === overlay) finish(null);
     });
 
-    // Help link — fall back to LLM chat wizard
-    overlay.querySelector(".cm-help-link")?.addEventListener("click", (e) => {
-      e.preventDefault();
-      finish(null);
-      openCashMatchingWizardLlm(opts).then(resolve);
-    });
   });
 }
 

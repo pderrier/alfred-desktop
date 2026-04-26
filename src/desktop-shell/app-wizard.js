@@ -579,20 +579,14 @@ export function initWizard(deps) {
                     }
                   }
                   await tauriInvoke("save_user_preferences_local", { prefs });
+                  try {
+                    // Rebuild snapshot so cached-source analysis immediately uses validated cash links.
+                    await tauriInvoke("finary_sync_snapshot_local");
+                  } catch { /* non-blocking: mapping is still persisted for next collection */ }
                   showToast("Cash account mapping saved", "success");
                 } else {
-                  // User cancelled — save "__none__" sentinel so we don't re-prompt next session
-                  try {
-                    const prefs = await tauriInvoke("get_user_preferences_local") || {};
-                    if (!prefs.cash_account_links) prefs.cash_account_links = {};
-                    for (const inv of investmentAccounts) {
-                      if (!prefs.cash_account_links[inv.name]) {
-                        prefs.cash_account_links[inv.name] = "__none__";
-                      }
-                    }
-                    await tauriInvoke("save_user_preferences_local", { prefs });
-                  } catch { /* best effort */ }
-                  showToast("Cash mapping skipped — cash values may be zero", "warning");
+                  // User cancelled — keep mappings unresolved so we request validation again later.
+                  showToast("Cash mapping skipped — it will be requested again until confirmed.", "warning");
                 }
               }
             }

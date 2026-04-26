@@ -790,6 +790,20 @@ main {
   font-size: clamp(1.2rem, 2vw, 1.6rem);
   font-weight: 750;
 }
+.cash-link-hint {
+  margin: 0.2rem 0 0;
+  font-size: 0.68rem;
+  color: var(--text-secondary, #888);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+.cash-link-hint:hover {
+  color: var(--accent, #4a90d9);
+  text-decoration: underline;
+}
 .kpi-delta {
   display: inline-block;
   margin-left: 0.4rem;

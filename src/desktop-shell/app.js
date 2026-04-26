@@ -71,7 +71,8 @@ import {
   getSelectedAccount,
   getStashedLineStatus,
   updateSingleLineProgress,
-  accountAccentColor
+  accountAccentColor,
+  renderCashLinkHint
 } from "/desktop-shell/shell-layout.js";
 
 // ── Live DOM nodes ───────────────────────────────────────────────
@@ -802,6 +803,13 @@ function renderReport(payload) {
   if (reportValueNode) reportValueNode.textContent = formatCurrency(model.value);
   if (reportGainNode) reportGainNode.textContent = formatCurrency(model.gain);
   if (reportCashNode) reportCashNode.textContent = formatCurrency(model.cash);
+  // Show cash account link below the Cash KPI
+  const reportCashLink = document.getElementById("report-cash-link");
+  if (reportCashLink && model.account) {
+    const snapshot = payload?.snapshot || {};
+    const finaryMeta = snapshot.latest_finary_snapshot || {};
+    renderCashLinkHint(reportCashLink, model.account, finaryMeta);
+  }
   if (reportRecoCountNode) reportRecoCountNode.textContent = String(model.recommendationCount || 0);
   // Show deltas vs previous run
   renderKpiDelta("report-value", model.previousRun?.valueDelta);

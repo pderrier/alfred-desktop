@@ -181,6 +181,86 @@ export function renderSidebar(dashboardPayload) {
   }
 }
 
+/**
+ * Render a small hint below the Cash KPI showing which cash account is linked.
+ * Click opens a dropdown to select a different cash account or "No cash account".
+ */
+export function renderCashLinkHint(node, investmentName, finaryMeta) {
+  if (!node) return;
+  const invoke = window?.__TAURI__?.core?.invoke;
+  if (!invoke) { node.textContent = ""; return; }
+
+  // Get current mapping and available cash accounts
+  invoke("get_user_preferences_local").then((prefs) => {
+    const links = prefs?.cash_account_links || {};
+    const currentLink = links[investmentName];
+    const ambiguous = Array.isArray(finaryMeta?.ambiguous_cash_groups) ? finaryMeta.ambiguous_cash_groups : [];
+    // Collect all known cash account names from ambiguous groups + current link
+    const cashNames = new Set();
+    for (const g of ambiguous) {
+      for (const c of (g.cash_accounts || [])) {
+        if (c.name) cashNames.add(c.name);
+      }
+    }
+    if (currentLink && currentLink !== "__none__") cashNames.add(currentLink);
+
+    const displayName = !currentLink ? "not set" : currentLink === "__none__" ? "no cash account" : currentLink;
+    node.textContent = `\u2192 ${displayName}`;
+    node.title = `Cash account: ${displayName}. Click to change.`;
+
+    // Remove old listener by replacing node
+    const fresh = node.cloneNode(true);
+    node.parentNode.replaceChild(fresh, node);
+    fresh.addEventListener("click", () => {
+      // Build a simple inline dropdown
+      if (fresh.querySelector("select")) return; // already open
+      const sel = document.createElement("select");
+      sel.style.cssText = "font-size:0.68rem;max-width:100%;margin-top:2px;";
+      const optNone = document.createElement("option");
+      optNone.value = "__none__";
+      optNone.textContent = "No cash account";
+      sel.appendChild(optNone);
+      for (const name of [...cashNames].sort()) {
+        const opt = document.createElement("option");
+        opt.value = name;
+        opt.textContent = name;
+        if (name === currentLink) opt.selected = true;
+        sel.appendChild(opt);
+      }
+      if (!currentLink || currentLink === "__none__") optNone.selected = true;
+      fresh.textContent = "";
+      fresh.appendChild(sel);
+      sel.focus();
+
+      const commit = async () => {
+        const chosen = sel.value;
+        try {
+          const p = await invoke("get_user_preferences_local") || {};
+          if (!p.cash_account_links) p.cash_account_links = {};
+          p.cash_account_links[investmentName] = chosen;
+          await invoke("save_user_preferences_local", { prefs: p });
+          // Invalidate snapshot cache so next analysis uses new mapping
+          try { await invoke("finary_invalidate_snapshot_local"); } catch {}
+          const label = chosen === "__none__" ? "no cash account" : chosen;
+          fresh.textContent = `\u2192 ${label}`;
+        } catch (err) {
+          fresh.textContent = `\u2192 error`;
+        }
+      };
+      sel.addEventListener("change", commit);
+      sel.addEventListener("blur", () => {
+        // Restore display if user clicks away without changing
+        setTimeout(() => {
+          if (fresh.querySelector("select")) {
+            const label = !currentLink ? "not set" : currentLink === "__none__" ? "no cash account" : currentLink;
+            fresh.textContent = `\u2192 ${label}`;
+          }
+        }, 150);
+      });
+    });
+  }).catch(() => { node.textContent = ""; });
+}
+
 export function renderAccountView(accountName, dashboardPayload, snapshotPositions = null) {
   const mainWelcome = document.getElementById("main-welcome");
   const mainRunView = document.getElementById("main-run-view");
@@ -223,6 +303,12 @@ export function renderAccountView(accountName, dashboardPayload, snapshotPositio
     accountGainNode.classList.toggle("kpi-delta-down", gain < 0);
   }
   if (accountCashNode) accountCashNode.textContent = formatCurrency(cash);
+
+  // Show which cash account is linked and allow editing
+  const cashLinkHint = document.getElementById("account-view-cash-link");
+  if (cashLinkHint) {
+    renderCashLinkHint(cashLinkHint, accountName, finaryMeta);
+  }
 
   const tbody = document.getElementById("account-positions-tbody");
   const empty = document.getElementById("account-positions-empty");

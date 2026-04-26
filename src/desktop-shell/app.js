@@ -392,7 +392,9 @@ function buildSynthesisContext(model) {
       .join(", ");
     sections.push(`Actions (${model.actionsNow.length}): ${actionList}`);
   }
-  return `You are a senior portfolio analyst. The user wants to discuss the portfolio-level synthesis. Answer questions about strategy, macro context, or reasoning. Be concise. Only answer questions related to the portfolio and financial analysis. Politely decline any off-topic requests.\n\n${sections.join("\n")}`;
+  return `You are a senior portfolio analyst. The user wants to discuss the portfolio-level synthesis. Answer questions about strategy, macro context, or reasoning. Be concise. Only answer questions related to the portfolio and financial analysis. Politely decline any off-topic requests.
+
+Important: this is a chat flow. If relevant context is missing (portfolio composition, line analyses, synthesis/report details, line memory, deep-news memory), fetch it with available MCP/CLI tools before answering instead of asking the user to paste it. Mention briefly when you used a tool.\n\n${sections.join("\n")}`;
 }
 
 function buildActionContext(action, recommendations) {
@@ -416,7 +418,9 @@ function buildActionContext(action, recommendations) {
     }
   }
 
-  return `You are a portfolio analysis assistant. The user wants to understand this recommended action. Answer questions about rationale, risk, timing, or sizing. Be concise. Only answer questions related to the portfolio and financial analysis. Politely decline any off-topic requests.\n\n${sections.join("\n")}`;
+  return `You are a portfolio analysis assistant. The user wants to understand this recommended action. Answer questions about rationale, risk, timing, or sizing. Be concise. Only answer questions related to the portfolio and financial analysis. Politely decline any off-topic requests.
+
+Important: this is a chat flow. If relevant context is missing (portfolio composition, line analyses, synthesis/report details, line memory, deep-news memory), fetch it with available MCP/CLI tools before answering instead of asking the user to paste it. Mention briefly when you used a tool.\n\n${sections.join("\n")}`;
 }
 
 function renderActionsNow(items = [], recommendations = []) {

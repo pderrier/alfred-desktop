@@ -36,6 +36,8 @@ import {
   truncate
 } from "/desktop-shell/ui-display-utils.js";
 import { resolveShellRefreshPlan } from "/desktop-shell/refresh-policy.js";
+import { buildGlobalPortfolioSynthesis } from "/desktop-shell/global-portfolio-synthesis.js";
+import { openDiscussionHistoryModal, saveDiscussionThread } from "/desktop-shell/discussion-memory.js";
 import {
   reduceRunActivityState
 } from "/desktop-shell/run-activity-model.js";
@@ -120,6 +122,7 @@ let refreshInFlight = false;
 let selectedReportArtifact = null;
 let selectedHistoricalRun = null;
 let selectedTimelineRunId = null;
+let globalHomeSynthesis = { status: "idle", snapshotKey: null, data: null, error: null };
 
 // ── Bridge + run operations ──────────────────────────────────────
 
@@ -476,6 +479,7 @@ function renderActionsNow(items = [], recommendations = []) {
           systemContext: buildActionContext(action, recommendations),
           initialMessage: `This is the ${action.action} recommendation for ${label} (priority ${action.priority || "N/A"}). What would you like to know?`,
           returnHistoryOnClose: true,
+          discussionScope: `run-action:${ticker || name || "unknown"}`,
           onDone: async (history) => {
             if (!rec) return;
             doneHandled = true;
@@ -483,6 +487,14 @@ function renderActionsNow(items = [], recommendations = []) {
             const prefill = hadConversation
               ? await synthesizeChatForMemoryWithUI(ticker, name, history)
               : null;
+            if (prefill?.keyReasoning || prefill?.userNote) {
+              saveDiscussionThread({
+                scope: `run-action:${ticker || name || "unknown"}`,
+                title: `Action ${ticker || name || "unknown"}`,
+                summary: prefill?.keyReasoning || "",
+                note: prefill?.userNote || "",
+              });
+            }
             showSaveToMemoryPanel(rec, prefill);
           },
         });
@@ -522,12 +534,21 @@ function injectSynthesisAskButton(synthCard, model) {
       systemContext: buildSynthesisContext(m),
       initialMessage: `This is the global synthesis for your ${account} portfolio. What would you like to explore?`,
       returnHistoryOnClose: true,
+      discussionScope: `run-synthesis:${account}`,
       onDone: async (history) => {
         doneHandled = true;
         const hadConversation = history.some((m) => m.role === "user");
         const prefill = hadConversation
           ? await synthesizeChatForMemoryWithUI("_PORTFOLIO", account, history)
           : null;
+        if (prefill?.keyReasoning || prefill?.userNote) {
+          saveDiscussionThread({
+            scope: `run-synthesis:${account}`,
+            title: `Synthesis ${account}`,
+            summary: prefill?.keyReasoning || "",
+            note: prefill?.userNote || "",
+          });
+        }
         showSaveToMemoryPanel(synthRec, prefill);
       },
     });
@@ -537,6 +558,48 @@ function injectSynthesisAskButton(synthCard, model) {
   });
   synthCard.appendChild(btn);
 }
+
+async function askAboutGlobalHomeSummary() {
+  const data = globalHomeSynthesis?.data;
+  if (!data) return;
+  const context = [
+    "You are helping the user review their cross-portfolio allocation.",
+    `Verdict: ${data.verdict}`,
+    `Total assets: ${formatCurrency(data.totalValue)}`,
+    `Cash ratio: ${data.cashWeightPct.toFixed(1)}%`,
+    `Support mix: ${(data.supportBreakdown || []).map((s) => `${s.name} ${s.weightPct.toFixed(1)}%`).join(", ")}`,
+    `Suggestions: ${(data.suggestions || []).join(" | ") || "none"}`,
+  ].join("\n");
+
+  await openChatWizard({
+    title: "Ask about portfolio-wide summary",
+    systemContext: context,
+    initialMessage: "I can help you review your global allocation and rebalancing options across all portfolios. What would you like to explore?",
+    returnHistoryOnClose: true,
+    discussionScope: "home:global_summary",
+    onDone: async (history) => {
+      const prefill = history.some((m) => m.role === "user")
+        ? await synthesizeChatForMemoryWithUI("_GLOBAL_SUMMARY", "portfolio-wide summary", history)
+        : null;
+      if (prefill?.keyReasoning || prefill?.userNote) {
+        saveDiscussionThread({
+          scope: "home:global_summary",
+          title: "Global portfolio synthesis",
+          summary: prefill?.keyReasoning || "",
+          note: prefill?.userNote || "",
+        });
+      }
+    },
+  });
+}
+
+window.__askGlobalHomeSummary = () => askAboutGlobalHomeSummary();
+window.__openGlobalSummaryDiscussions = () => {
+  openDiscussionHistoryModal({
+    scopePrefix: "home:global_summary",
+    title: "Previous discussions — portfolio-wide summary",
+  });
+};
 
 // ── Run Diff (Phase 4a) ─────────────────────────────────────────
 
@@ -748,6 +811,49 @@ function injectExportButton(model) {
   kpiStrip.appendChild(btn);
 }
 
+function computeHomeSnapshotKey(snapshot) {
+  const latestSnapshotTs = snapshot?.latest_finary_snapshot?.snapshot_at || "";
+  const latestRunId = snapshot?.latest_run?.run_id || "";
+  const latestRunTs = snapshot?.latest_run?.updated_at || "";
+  const runsCount = Array.isArray(snapshot?.runs) ? snapshot.runs.length : 0;
+  return `${latestSnapshotTs}|${latestRunId}|${latestRunTs}|${runsCount}`;
+}
+
+function scheduleGlobalHomeSynthesis(snapshot) {
+  const snapshotKey = computeHomeSnapshotKey(snapshot || {});
+  if (globalHomeSynthesis.snapshotKey === snapshotKey && globalHomeSynthesis.status !== "error") {
+    return;
+  }
+
+  globalHomeSynthesis = {
+    status: "loading",
+    snapshotKey,
+    data: globalHomeSynthesis.data,
+    error: null,
+  };
+  renderWelcome();
+
+  setTimeout(() => {
+    try {
+      const synthesized = buildGlobalPortfolioSynthesis(snapshot || {});
+      globalHomeSynthesis = {
+        status: "ready",
+        snapshotKey,
+        data: synthesized,
+        error: null,
+      };
+    } catch (error) {
+      globalHomeSynthesis = {
+        status: "error",
+        snapshotKey,
+        data: null,
+        error: String(error?.message || error || "global_synthesis_failed"),
+      };
+    }
+    renderWelcome();
+  }, 0);
+}
+
 // ── Dashboard refresh ────────────────────────────────────────────
 
 async function refreshDashboard() {
@@ -772,6 +878,7 @@ async function refreshDashboardInner() {
   });
   latestDashboardPayload = mergeDashboardPayloads(latestDashboardPayload, { ...payload, snapshot: hydratedSnapshot });
   const snapshot = latestDashboardPayload?.snapshot || {};
+  scheduleGlobalHomeSynthesis(snapshot);
 
   // Keep live run context up to date with positions (for enriching done rows)
   const positions = snapshot.latest_run?.portfolio?.positions || [];
@@ -1657,6 +1764,46 @@ function renderWelcome() {
     return;
   }
 
+
+  const globalSynthesisCard = (() => {
+    if (accounts.length === 0 && runs.length === 0) return "";
+    if (globalHomeSynthesis.status === "loading") {
+      return `
+      <div class="welcome-step welcome-global-summary">
+        <h3>Portfolio-wide summary</h3>
+        <p class="welcome-global-loading">Computing cross-portfolio allocation insights…</p>
+      </div>
+      `;
+    }
+    if (globalHomeSynthesis.status === "error") {
+      return `
+      <div class="welcome-step welcome-global-summary">
+        <h3>Portfolio-wide summary</h3>
+        <p style="color:var(--sea-muted)">Global synthesis is temporarily unavailable (${escapeHtml(globalHomeSynthesis.error || "unknown_error")}).</p>
+      </div>
+      `;
+    }
+    const data = globalHomeSynthesis.data;
+    if (!data) return "";
+    const topSupport = Array.isArray(data.supportBreakdown) ? data.supportBreakdown[0] : null;
+    const suggestions = Array.isArray(data.suggestions) ? data.suggestions.slice(0, 3) : [];
+    return `
+      <div class="welcome-step welcome-global-summary">
+        <h3>Portfolio-wide summary</h3>
+        <p style="margin-bottom:0.45rem"><strong>${escapeHtml(data.verdict)}</strong> · ${data.accountCount} account(s) · Cash ${data.cashWeightPct.toFixed(1)}%</p>
+        <p style="margin-bottom:0.45rem">Total assets: <strong>${formatCurrency(data.totalValue)}</strong> · P/L: <strong>${formatCurrency(data.totalGain)}</strong></p>
+        <p style="color:var(--sea-muted);margin-bottom:0.5rem">Top support: ${topSupport ? `${escapeHtml(topSupport.name)} (${topSupport.weightPct.toFixed(1)}%)` : "Not enough data"}</p>
+        ${suggestions.length > 0
+          ? `<ul class="welcome-global-suggestions">${suggestions.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`
+          : `<p style="color:var(--sea-muted)">No major imbalance detected across your current account and support mix.</p>`}
+        <div style="display:flex;gap:0.4rem;margin-top:0.6rem">
+          <button class="ghost-btn" type="button" onclick="window.__askGlobalHomeSummary()">💬 Ask about this</button>
+          <button class="ghost-btn" type="button" onclick="window.__openGlobalSummaryDiscussions()">Previous discussions</button>
+        </div>
+      </div>
+    `;
+  })();
+
   // ── Step 4: Has runs — show latest status per account ──
   const accountRuns = new Map();
   for (const run of runs.slice(0, 20)) {
@@ -1665,6 +1812,8 @@ function renderWelcome() {
   }
 
   if (titleNode) titleNode.textContent = accountRuns.size > 0 ? "Latest runs" : "Ready";
+
+  if (globalSynthesisCard) html += globalSynthesisCard;
 
   if (accountRuns.size > 0) {
     html += `<div class="welcome-accounts">`;

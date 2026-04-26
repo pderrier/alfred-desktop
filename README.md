@@ -8,11 +8,11 @@
 
 ## Download
 
-**[Windows installer (MSI)](https://vps-c5793aab.vps.ovh.net/alfred/release/windows/latest)** — Alfred Desktop v0.2.6 for Windows 10/11 (x64)
+**[Windows installer (MSI)](https://vps-c5793aab.vps.ovh.net/alfred/release/windows/latest)** — Alfred Desktop v0.2.7 for Windows 10/11 (x64)
 
 > Note: The installer is not code-signed yet. Windows SmartScreen may show a warning — click "More info" → "Run anyway" to proceed.
 
-**[macOS installer (DMG)](https://vps-c5793aab.vps.ovh.net/alfred/release/macos/latest)** — Alfred Desktop v0.2.6 for macOS 10.15+ (Apple Silicon)
+**[macOS installer (DMG)](https://vps-c5793aab.vps.ovh.net/alfred/release/macos/latest)** — Alfred Desktop v0.2.7 for macOS 10.15+ (Apple Silicon)
 
 > **Note: The DMG is not notarized yet.** macOS Gatekeeper will block the app on first launch. Three ways to bypass it:
 >

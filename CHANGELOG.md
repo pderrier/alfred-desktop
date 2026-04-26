@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.2.7
+
+### Cash mapping fixes
+- **Duplicate cash account names** — when multiple Finary accounts share the same name (e.g. two "Compte espèce PEA"), the mapping now disambiguates by `connection_id` instead of picking the last one
+- **Reset cash links** — actually deletes from disk (null-sentinel) and invalidates the cached Finary snapshot so the next sync re-computes mapping from scratch
+- **Cash link visible on dashboard** — each account page and run report shows which cash account is linked below the Cash KPI, with click-to-change dropdown
+- **Per-link delete in settings** — individual cash links can be removed from the settings panel
+
+### Line memory cleanup
+- **Renamed `key_reasoning` → `memory_narrative`** — the self-maintaining analysis memory field now has a clear name across Rust, JS, and UI
+- **Removed dead V1 fields** — `llm_memory_summary`, `llm_strong_signals`, `llm_key_history` removed from normalizer, modal, and HTML (never written since V2)
+- **Fixed memory/synthesis duplication** — the line detail modal no longer shows the same text in "Memory" and "Synthesis" sections
+
+### Live run UX
+- **Running run auto-selected** — sidebar highlights the active run immediately when analysis starts
+- **Signal badges on done lines** — completed lines show their actual signal (ACHAT/VENTE/CONSERVER) instead of generic "Done" when recommendation data is available
+- **Accurate ETA** — time remaining now accounts for parallelization (divides by in-flight line count)
+- **Pipeline bar no longer regresses** — the breadcrumb progress bar only advances forward, never back to "Collecting" when already analyzing
+
+### UI improvements
+- **Action cards clickable** — clicking a recommended action card opens the full position detail modal
+- **KPI strip in line modal** — position detail modal shows SIGNAL | Qty | PRU | Price | PV% | Total at the top
+- **Chat typing indicator** — animated bouncing dots appear while waiting for LLM response in chat wizard
+- **Safe preferences save** — `save_user_preferences` uses merge-only semantics; explicit null sentinel for key deletion prevents accidental data loss
+
+### Infrastructure
+- **84 Rust + 40 JS tests, 0 failures**
+
 ## v0.2.5
 
 - **Q3 Sprint 1** — foundation fixes for Alfred-D

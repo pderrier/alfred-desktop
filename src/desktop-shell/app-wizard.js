@@ -588,14 +588,16 @@ ${insight}` : insight;
                   // Strip trailing parenthesized display text (e.g. "Livret A (24,029.00 €)" → "Livret A")
                   // and resolve against known canonical names to prevent saving decorated strings.
                   const knownInvNames = investmentAccounts.map((a) => a.name);
-                  const knownCashNames = cashAccounts.map((a) => a.name);
+                  const knownCashSlugs = cashAccounts.map((a) => a.slug || a.name);
                   for (const [rawKey, rawVal] of Object.entries(wizResult)) {
                     if (rawKey === "confirmed") continue;
                     const cleanKey = resolveWizardName(rawKey, knownInvNames);
                     if (rawVal === "__none__") {
                       prefs.cash_account_links[cleanKey] = "__none__";
                     } else {
-                      prefs.cash_account_links[cleanKey] = resolveWizardName(rawVal, knownCashNames);
+                      // Value is a slug (new) or name (legacy) — save directly
+                      const isSlug = knownCashSlugs.includes(rawVal);
+                      prefs.cash_account_links[cleanKey] = isSlug ? rawVal : resolveWizardName(rawVal, knownCashSlugs);
                     }
                   }
                   await tauriInvoke("save_user_preferences_local", { prefs });

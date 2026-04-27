@@ -1096,24 +1096,24 @@ async function checkAmbiguousCashGroups(finaryMeta) {
         if (!prefs.cash_account_links) prefs.cash_account_links = {};
 
         if (result.confirmed) {
-          // User confirmed the heuristic — save inv_name → cash_name pairs
+          // User confirmed the heuristic — save inv_name → cash_slug pairs
           for (let i = 0; i < investmentAccounts.length; i++) {
             if (cashAccounts[i]) {
-              prefs.cash_account_links[investmentAccounts[i].name] = cashAccounts[i].name;
+              prefs.cash_account_links[investmentAccounts[i].name] = cashAccounts[i].slug || cashAccounts[i].name;
             }
           }
         } else {
-          // User provided explicit mapping: { inv_name: cash_name | "__none__" }
+          // User provided explicit mapping: { inv_name: cash_slug_or_name | "__none__" }
           const knownInvNames = investmentAccounts.map((a) => a.name);
-          const knownCashNames = cashAccounts.map((a) => a.name);
+          const knownCashSlugs = cashAccounts.map((a) => a.slug || a.name);
           for (const [rawKey, rawVal] of Object.entries(result)) {
             const cleanKey = findClosestName(rawKey, knownInvNames);
-            // Item 16: Handle __none__ sentinel — "no cash account" is a valid choice
             if (rawVal === "__none__") {
               prefs.cash_account_links[cleanKey] = "__none__";
             } else {
-              const cleanVal = findClosestName(rawVal, knownCashNames);
-              prefs.cash_account_links[cleanKey] = cleanVal;
+              // Value is a slug (new format) or name (legacy) — save as-is
+              const isSlug = knownCashSlugs.includes(rawVal);
+              prefs.cash_account_links[cleanKey] = isSlug ? rawVal : findClosestName(rawVal, knownCashSlugs);
             }
           }
         }

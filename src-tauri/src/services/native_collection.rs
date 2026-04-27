@@ -1571,6 +1571,7 @@ fn build_cash_mapping_with_links(
 
     struct HoldingsEntry {
         name: String,
+        slug: String,
         connection_id: Option<i64>,
         correlation_id: Option<i64>,
         institution_name: String,
@@ -1616,22 +1617,26 @@ fn build_cash_mapping_with_links(
                     .unwrap_or(0.0)
             })
             .sum();
-        entries.push(HoldingsEntry { name, connection_id, correlation_id, institution_name, securities_count, fiats_sum });
+        let slug = acct.get("slug").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        entries.push(HoldingsEntry { name, slug, connection_id, correlation_id, institution_name, securities_count, fiats_sum });
     }
 
     // Classify into investment vs cash accounts
     let investment_entries: Vec<&HoldingsEntry> = entries.iter().filter(|e| e.securities_count > 0).collect();
     let cash_entries: Vec<&HoldingsEntry> = entries.iter().filter(|e| e.fiats_sum > 0.0 && e.securities_count == 0).collect();
 
-    // Build name → entries lookup for saved links resolution.
-    // When duplicate cash names exist (e.g. two "Compte espèce PEA" from different connections),
-    // we keep ALL entries and disambiguate by connection_id at match time.
+    // Build name → entries and slug → entry lookups for saved links resolution.
     let mut cash_by_name: HashMap<String, Vec<&HoldingsEntry>> = HashMap::new();
+    let mut cash_by_slug: HashMap<String, &HoldingsEntry> = HashMap::new();
     for e in &cash_entries {
         cash_by_name.entry(e.name.clone()).or_default().push(*e);
         // Also insert with compound key for explicit disambiguation
         let compound = format!("{}::{}", e.institution_name, e.name);
         cash_by_name.entry(compound).or_default().push(*e);
+        // Slug is unique per Finary account — use for precise disambiguation
+        if !e.slug.is_empty() {
+            cash_by_slug.insert(e.slug.clone(), *e);
+        }
     }
     // Log duplicates
     for (name, entries) in &cash_by_name {
@@ -1653,12 +1658,11 @@ fn build_cash_mapping_with_links(
     let mut ambiguous_groups: Vec<Value> = Vec::new();
 
     // Strategy 0: Apply persisted cash_account_links from user preferences.
-    // When multiple cash entries share the same name, disambiguate by connection_id
-    // (prefer the cash entry on the same Finary connection as the investment account).
+    // Links can be stored as slug (precise, new format) or name (legacy).
     for inv in &investment_entries {
-        if let Some(cash_name) = saved_links.get(&inv.name) {
+        if let Some(cash_ref) = saved_links.get(&inv.name) {
             // User explicitly dismissed cash mapping for this account — assign zero cash
-            if cash_name == "__none__" {
+            if cash_ref == "__none__" {
                 result.insert(inv.name.clone(), 0.0);
                 crate::debug_log(&format!(
                     "finary_cash_mapping: '{}' → 0.00 (user dismissed — no cash account)",
@@ -1666,61 +1670,49 @@ fn build_cash_mapping_with_links(
                 ));
                 continue;
             }
-            // Find candidate cash entries: try exact name, then compound key
-            let candidates = cash_by_name.get(cash_name.as_str())
-                .or_else(|| {
-                    if cash_name.contains("::") {
-                        cash_by_name.get(cash_name.as_str())
-                    } else {
-                        let compound = format!("{}::{}", inv.institution_name, cash_name);
+            // Try slug-based lookup first (precise, new format)
+            let slug_match = cash_by_slug.get(cash_ref.as_str()).copied();
+            // Fall back to name-based lookup (legacy format)
+            let cash_entry = if let Some(entry) = slug_match {
+                Some(entry)
+            } else {
+                let candidates = cash_by_name.get(cash_ref.as_str())
+                    .or_else(|| {
+                        let compound = format!("{}::{}", inv.institution_name, cash_ref);
                         cash_by_name.get(compound.as_str())
-                    }
-                });
-            if let Some(candidates) = candidates {
-                // Disambiguate: prefer the cash entry sharing the same connection_id,
-                // then the closest correlation_id (Finary assigns nearby corr IDs
-                // to related accounts, e.g. PEA corr=3118220 ↔ espèce corr=3118218).
-                let cash_entry = if candidates.len() > 1 {
-                    // Filter to same connection first
-                    let same_conn: Vec<&&HoldingsEntry> = if let Some(inv_conn) = inv.connection_id {
-                        candidates.iter().filter(|c| c.connection_id == Some(inv_conn)).collect()
+                    });
+                candidates.and_then(|cands| {
+                    if cands.len() == 1 {
+                        cands.first().copied()
                     } else {
-                        candidates.iter().collect()
-                    };
-                    let pool = if same_conn.is_empty() { candidates.iter().collect::<Vec<_>>() } else { same_conn };
-                    if pool.len() == 1 {
-                        pool.first().copied().copied()
-                    } else if let Some(inv_corr) = inv.correlation_id {
-                        // Pick the unmatched candidate with the closest correlation_id
+                        // Multiple candidates with same name — filter to same connection,
+                        // then pick unmatched one
+                        let same_conn: Vec<&&HoldingsEntry> = if let Some(inv_conn) = inv.connection_id {
+                            cands.iter().filter(|c| c.connection_id == Some(inv_conn)).collect()
+                        } else {
+                            cands.iter().collect()
+                        };
+                        let pool = if same_conn.is_empty() { cands.iter().collect::<Vec<_>>() } else { same_conn };
                         pool.iter()
-                            .filter(|c| {
-                                // Skip already-matched cash entries
+                            .find(|c| {
                                 cash_entries.iter().position(|e| std::ptr::eq(*e, ***c))
                                     .map(|idx| !matched_cash_indices.contains(&idx))
                                     .unwrap_or(true)
                             })
-                            .min_by_key(|c| {
-                                c.correlation_id.map(|cc| (cc - inv_corr).unsigned_abs()).unwrap_or(u64::MAX)
-                            })
                             .copied()
                             .copied()
-                    } else {
-                        pool.first().copied().copied()
                     }
-                } else {
-                    candidates.first().copied()
-                };
-                if let Some(cash_entry) = cash_entry {
-                    result.insert(inv.name.clone(), cash_entry.fiats_sum);
-                    // Mark the specific cash entry as matched (by index, using all fields to be precise)
-                    if let Some(idx) = cash_entries.iter().position(|e| std::ptr::eq(*e, cash_entry)) {
-                        matched_cash_indices.insert(idx);
-                    }
-                    crate::debug_log(&format!(
-                        "finary_cash_mapping: matched '{}' (conn={:?}) → cash {:.2} (user preference → '{}', cash conn={:?})",
-                        inv.name, inv.connection_id, cash_entry.fiats_sum, cash_name, cash_entry.connection_id
-                    ));
+                })
+            };
+            if let Some(cash_entry) = cash_entry {
+                result.insert(inv.name.clone(), cash_entry.fiats_sum);
+                if let Some(idx) = cash_entries.iter().position(|e| std::ptr::eq(*e, cash_entry)) {
+                    matched_cash_indices.insert(idx);
                 }
+                crate::debug_log(&format!(
+                    "finary_cash_mapping: matched '{}' (conn={:?}) → cash {:.2} (user preference → '{}', slug='{}', cash conn={:?})",
+                    inv.name, inv.connection_id, cash_entry.fiats_sum, cash_ref, cash_entry.slug, cash_entry.connection_id
+                ));
             }
         }
     }
@@ -1776,6 +1768,7 @@ fn build_cash_mapping_with_links(
                 })).collect();
                 let cash_json: Vec<Value> = cashes.iter().map(|(_, e)| json!({
                     "name": e.name,
+                    "slug": e.slug,
                     "connection_id": e.connection_id,
                     "correlation_id": e.correlation_id,
                     "fiats_sum": e.fiats_sum,
@@ -1858,6 +1851,7 @@ fn build_cash_mapping_with_links(
             })).collect();
             let cash_json: Vec<Value> = unmatched_cash.iter().map(|(_, e)| json!({
                 "name": e.name,
+                "slug": e.slug,
                 "institution": e.institution_name,
                 "fiats_sum": e.fiats_sum,
             })).collect();
@@ -2987,40 +2981,37 @@ mod tests {
     }
 
     #[test]
-    fn build_cash_mapping_saved_links_disambiguate_by_correlation_proximity() {
+    fn build_cash_mapping_saved_links_with_slug_disambiguates_duplicates() {
         use std::collections::HashMap;
-        // Real-world case: 2 PEA on conn 100, 2 "Compte espèce PEA" on conn 100,
-        // plus 2 duplicates on conn 200 (empty). Saved links map both to same name.
-        let make = |name: &str, conn: i64, corr: i64, secs: usize, fiats: f64| -> Value {
+        // Real-world case: 2 PEA on conn 100, 2 "Compte espèce PEA" on conn 100.
+        // Saved links use slugs (unique) instead of names (ambiguous).
+        let make = |name: &str, slug: &str, conn: i64, corr: i64, secs: usize, fiats: f64| -> Value {
             let securities_arr: Vec<Value> = (0..secs).map(|_| json!({"symbol":"X"})).collect();
             let fiats_arr = if fiats > 0.0 {
                 vec![json!({"current_value": fiats, "currency": {"code":"EUR"}})]
             } else { vec![] };
-            json!({"name": name, "connection_id": conn, "correlation_id": corr,
+            json!({"name": name, "slug": slug, "connection_id": conn, "correlation_id": corr,
                    "securities": securities_arr, "fiats": fiats_arr,
                    "institution": {"name": "CA"}})
         };
         let accounts = vec![
-            make("Plan Epargne en Action", 100, 3118220, 28, 0.0),
-            make("Plan d'Epargne en Actions PME", 100, 7499637, 4, 0.0),
-            // Two cash accounts with same name on same connection, different corr
-            make("Compte espèce PEA", 100, 3118218, 0, 0.82),  // close to PEA corr=3118220
-            make("Compte espèce PEA", 100, 7499636, 0, 3252.34), // close to PME corr=7499637
-            // Duplicates on other connection (empty, no fiats)
-            make("Compte espèce PEA", 200, 6628312, 0, 0.0),
-            make("Compte espèce PEA", 200, 7499790, 0, 0.0),
+            make("Plan Epargne en Action", "pea-main", 100, 3118220, 28, 0.0),
+            make("Plan d'Epargne en Actions PME", "pea-pme", 100, 7499637, 4, 0.0),
+            make("Compte espèce PEA", "espece-pea-a", 100, 3118218, 0, 300.0),
+            make("Compte espèce PEA", "espece-pea-b", 100, 7499636, 0, 0.82),
         ];
         let mut saved_links = HashMap::new();
-        saved_links.insert("Plan Epargne en Action".to_string(), "Compte espèce PEA".to_string());
-        saved_links.insert("Plan d'Epargne en Actions PME".to_string(), "Compte espèce PEA".to_string());
+        // Slug-based links: precise, unambiguous
+        saved_links.insert("Plan Epargne en Action".to_string(), "espece-pea-a".to_string());
+        saved_links.insert("Plan d'Epargne en Actions PME".to_string(), "espece-pea-b".to_string());
         let result = build_cash_mapping_with_links(&accounts, &saved_links);
         assert_eq!(
-            result.mapping.get("Plan Epargne en Action").copied(), Some(0.82),
-            "PEA (corr=3118220) should match cash corr=3118218 (0.82€)"
+            result.mapping.get("Plan Epargne en Action").copied(), Some(300.0),
+            "PEA should match slug espece-pea-a (300€)"
         );
         assert_eq!(
-            result.mapping.get("Plan d'Epargne en Actions PME").copied(), Some(3252.34),
-            "PEA-PME (corr=7499637) should match cash corr=7499636 (3252.34€)"
+            result.mapping.get("Plan d'Epargne en Actions PME").copied(), Some(0.82),
+            "PEA-PME should match slug espece-pea-b (0.82€)"
         );
     }
 }

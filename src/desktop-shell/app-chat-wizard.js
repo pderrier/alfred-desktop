@@ -312,8 +312,9 @@ export function openCashMatchingWizard(opts) {
           <select class="cm-select" data-inv-name="${invName}" id="${selectId}" style="padding:0.5rem 0.7rem;background:rgba(10,17,24,0.6);border:1px solid rgba(73,100,126,0.4);border-radius:8px;color:var(--sea-text,#e0e8f0);font-size:0.85rem;font-family:inherit">
             ${cashAccounts.map((c) => {
               const cashLabel = `${escapeHtml(c.name)} (${formatEuro(c.fiats_sum || 0)})`;
-              const selected = heuristicMap[inv.name] === c.name ? "selected" : "";
-              return `<option value="${escapeHtml(c.name)}" ${selected}>${cashLabel}</option>`;
+              const cashValue = c.slug || c.name;
+              const selected = heuristicMap[inv.name] === cashValue ? "selected" : "";
+              return `<option value="${escapeHtml(cashValue)}" ${selected}>${cashLabel}</option>`;
             }).join("")}
             <option value="__none__"${!heuristicMap[inv.name] ? " selected" : ""}>No cash account</option>
           </select>

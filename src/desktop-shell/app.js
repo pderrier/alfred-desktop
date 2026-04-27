@@ -1070,66 +1070,56 @@ async function checkAmbiguousCashGroups(finaryMeta) {
 
   cashWizardShownThisSession = true;
 
+  // Merge all groups into a single list — one modal with all accounts
+  const allInvAccounts = [];
+  const allCashAccounts = [];
+  const seenCashSlugs = new Set();
   for (const group of groups) {
-    const investmentAccounts = group.investment_accounts || [];
-    const cashAccounts = group.cash_accounts || [];
-    if (investmentAccounts.length === 0 || cashAccounts.length === 0) continue;
-
-    // Build current heuristic mapping for display
-    const currentMapping = {};
-    for (let i = 0; i < investmentAccounts.length; i++) {
-      if (cashAccounts[i]) {
-        currentMapping[investmentAccounts[i].name] = cashAccounts[i].fiats_sum;
+    for (const inv of (group.investment_accounts || [])) allInvAccounts.push(inv);
+    for (const cash of (group.cash_accounts || [])) {
+      const key = cash.slug || cash.name;
+      if (!seenCashSlugs.has(key)) {
+        seenCashSlugs.add(key);
+        allCashAccounts.push(cash);
       }
     }
+  }
+  if (allInvAccounts.length === 0 || allCashAccounts.length === 0) return;
 
-    const result = await openCashMatchingWizard({
-      investmentAccounts,
-      cashAccounts,
-      currentMapping,
-    });
+  const result = await openCashMatchingWizard({
+    investmentAccounts: allInvAccounts,
+    cashAccounts: allCashAccounts,
+    currentMapping: {},
+  });
 
-    if (result) {
-      // Save confirmed mapping to user preferences
-      try {
-        const prefs = await tauriInvoke("get_user_preferences_local") || {};
-        if (!prefs.cash_account_links) prefs.cash_account_links = {};
+  if (result) {
+    try {
+      const prefs = await tauriInvoke("get_user_preferences_local") || {};
+      if (!prefs.cash_account_links) prefs.cash_account_links = {};
 
-        if (result.confirmed) {
-          // User confirmed the heuristic — save inv_name → cash_slug pairs
-          for (let i = 0; i < investmentAccounts.length; i++) {
-            if (cashAccounts[i]) {
-              prefs.cash_account_links[investmentAccounts[i].name] = cashAccounts[i].slug || cashAccounts[i].name;
-            }
-          }
+      const knownInvNames = allInvAccounts.map((a) => a.name);
+      const knownCashSlugs = allCashAccounts.map((a) => a.slug || a.name);
+      for (const [rawKey, rawVal] of Object.entries(result)) {
+        if (rawKey === "confirmed") continue;
+        const cleanKey = findClosestName(rawKey, knownInvNames);
+        if (rawVal === "__none__") {
+          prefs.cash_account_links[cleanKey] = "__none__";
         } else {
-          // User provided explicit mapping: { inv_name: cash_slug_or_name | "__none__" }
-          const knownInvNames = investmentAccounts.map((a) => a.name);
-          const knownCashSlugs = cashAccounts.map((a) => a.slug || a.name);
-          for (const [rawKey, rawVal] of Object.entries(result)) {
-            const cleanKey = findClosestName(rawKey, knownInvNames);
-            if (rawVal === "__none__") {
-              prefs.cash_account_links[cleanKey] = "__none__";
-            } else {
-              // Value is a slug (new format) or name (legacy) — save as-is
-              const isSlug = knownCashSlugs.includes(rawVal);
-              prefs.cash_account_links[cleanKey] = isSlug ? rawVal : findClosestName(rawVal, knownCashSlugs);
-            }
-          }
+          const isSlug = knownCashSlugs.includes(rawVal);
+          prefs.cash_account_links[cleanKey] = isSlug ? rawVal : findClosestName(rawVal, knownCashSlugs);
         }
-
-        await tauriInvoke("save_user_preferences_local", { prefs });
-        try {
-          // Invalidate cache so sync re-computes cash mapping with the new links.
-          await tauriInvoke("finary_invalidate_snapshot_local");
-          await tauriInvoke("finary_sync_snapshot_local");
-          await refreshDashboard();
-        } catch { /* non-blocking */ }
-        const savedCount = Object.keys(prefs.cash_account_links || {}).length;
-        showToast(`Cash mapping saved (${savedCount} link${savedCount !== 1 ? "s" : ""}) — persisted for future runs.`, "success");
-      } catch (err) {
-        showToast(`Failed to save cash mapping: ${err?.message || err}`, "error");
       }
+
+      await tauriInvoke("save_user_preferences_local", { prefs });
+      try {
+        await tauriInvoke("finary_invalidate_snapshot_local");
+        await tauriInvoke("finary_sync_snapshot_local");
+        await refreshDashboard();
+      } catch { /* non-blocking */ }
+      const savedCount = Object.keys(prefs.cash_account_links || {}).length;
+      showToast(`Cash mapping saved (${savedCount} link${savedCount !== 1 ? "s" : ""})`, "success");
+    } catch (err) {
+      showToast(`Failed to save cash mapping: ${err?.message || err}`, "error");
     }
   }
 }

@@ -170,7 +170,16 @@ function normalizeRecommendation(rec, index, latestRun) {
   const action = asText(rec?.action_recommandee || rec?.action || rec?.decision, "N/A");
   const type = asText(rec?.type, "position");
   const id = asText(rec?.id, `${ticker}_${index + 1}`);
-  const lineMemory = normalizeLineMemory(rec?.memoire_ligne || rec?.line_memory, rec);
+  // Hydrate from position if rec doesn't carry memoire_ligne (LLM recs don't)
+  const positionMatch = !rec?.memoire_ligne && latestRun?.portfolio?.positions
+    ? (Array.isArray(latestRun.portfolio.positions)
+        ? latestRun.portfolio.positions.find((p) => asText(p?.ticker).toUpperCase() === ticker.toUpperCase())
+        : null)
+    : null;
+  const lineMemory = normalizeLineMemory(
+    rec?.memoire_ligne || rec?.line_memory || positionMatch?.memoire_ligne,
+    rec
+  );
   return {
     id,
     lineId: asText(rec?.line_id || id, id),

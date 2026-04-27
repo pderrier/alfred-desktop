@@ -602,7 +602,8 @@ ${insight}` : insight;
                   }
                   await tauriInvoke("save_user_preferences_local", { prefs });
                   try {
-                    // Rebuild snapshot so cached-source analysis immediately uses validated cash links.
+                    // Invalidate cache, then rebuild snapshot with validated cash links.
+                    await tauriInvoke("finary_invalidate_snapshot_local");
                     await tauriInvoke("finary_sync_snapshot_local");
                   } catch { /* non-blocking: mapping is still persisted for next collection */ }
                   showToast("Cash account mapping saved", "success");

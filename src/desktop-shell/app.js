@@ -1120,7 +1120,8 @@ async function checkAmbiguousCashGroups(finaryMeta) {
 
         await tauriInvoke("save_user_preferences_local", { prefs });
         try {
-          // Ensure account-level cash values immediately reflect validated links.
+          // Invalidate cache so sync re-computes cash mapping with the new links.
+          await tauriInvoke("finary_invalidate_snapshot_local");
           await tauriInvoke("finary_sync_snapshot_local");
           await refreshDashboard();
         } catch { /* non-blocking */ }

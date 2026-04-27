@@ -1545,18 +1545,17 @@ settingsCashLinksResetBtn?.addEventListener("click", async () => {
   try {
     const tauriInv = window?.__TAURI__?.core?.invoke;
     if (!tauriInv) return;
-    // Send null to explicitly delete the key from disk (merge-safe).
+    // Block the auto-wizard BEFORE refreshDashboard so it doesn't
+    // re-save the old name-based links immediately after we clear them.
+    cashWizardShownThisSession = true;
     await tauriInv("save_user_preferences_local", { prefs: { cash_account_links: null } });
     try {
-      // Invalidate cached snapshot so the next sync re-fetches from Finary
-      // and re-computes cash mapping with the now-empty preferences.
       await tauriInv("finary_invalidate_snapshot_local");
       await tauriInv("finary_sync_snapshot_local");
       await refreshDashboard();
     } catch { /* non-blocking */ }
     await refreshCashLinksSettings();
-    cashWizardShownThisSession = false;
-    showToast("Cash account links reset — next analysis will re-detect mappings", "success");
+    showToast("Cash account links reset — use Re-link to re-assign, or run a new analysis", "success");
   } catch (error) {
     showToast(`Reset links failed: ${formatBridgeError(error)}`, "error");
   }
@@ -1565,12 +1564,21 @@ settingsCashLinksRelinkBtn?.addEventListener("click", async () => {
   try {
     const tauriInv = window?.__TAURI__?.core?.invoke;
     if (!tauriInv) return;
-    const finaryMeta = getLatestDashboardPayload()?.snapshot?.latest_finary_snapshot || {};
+    // Reset saved links first, then re-fetch snapshot so all accounts become ambiguous
+    await tauriInv("save_user_preferences_local", { prefs: { cash_account_links: null } });
+    try {
+      await tauriInv("finary_invalidate_snapshot_local");
+      await tauriInv("finary_sync_snapshot_local");
+      await refreshDashboard();
+    } catch { /* non-blocking */ }
+    // Use freshly-loaded dashboard data
+    const finaryMeta = latestDashboardPayload?.snapshot?.latest_finary_snapshot || {};
     const groups = Array.isArray(finaryMeta.ambiguous_cash_groups)
       ? finaryMeta.ambiguous_cash_groups
       : [];
     if (groups.length === 0) {
       showToast("No ambiguous cash groups found — try refreshing your data first", "info");
+      await refreshCashLinksSettings();
       return;
     }
     cashWizardShownThisSession = false;

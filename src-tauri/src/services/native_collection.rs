@@ -1000,7 +1000,7 @@ fn reconcile_transactions(transactions: &[CsvTransaction], account: &str) -> Val
 
     // Build positions from accumulators — only include positions with quantity > 0
     let acct_name = if account.is_empty() { "CSV_import" } else { account };
-    let positions: Vec<Value> = accumulators
+    let mut positions: Vec<Value> = accumulators
         .values()
         .filter(|acc| acc.quantity > 1e-9) // Filter out fully sold positions
         .map(|acc| {
@@ -1057,6 +1057,54 @@ fn reconcile_transactions(transactions: &[CsvTransaction], account: &str) -> Val
         if date_range.is_empty() { "unknown" } else { &date_range }
     ));
 
+    // Enrich positions that have no current price (CSV transaction history
+    // doesn't include market prices — fetch from the Alfred API).
+    let mut enriched_count = 0;
+    for pos in &mut positions {
+        let prix = pos.get("prix_actuel").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        if prix > 0.0 { continue; }
+        let ticker = pos.get("ticker").and_then(|v| v.as_str()).unwrap_or_default();
+        let nom = pos.get("nom").and_then(|v| v.as_str()).unwrap_or_default();
+        let isin = pos.get("isin").and_then(|v| v.as_str()).unwrap_or_default();
+        if ticker.is_empty() { continue; }
+        match crate::enrichment::fetch_market_spot(ticker, nom, isin) {
+            Ok(resp) => {
+                if let Some(market_price) = resp.get("market")
+                    .and_then(|m| m.get("prix_actuel").or_else(|| m.get("price")))
+                    .and_then(|v| v.as_f64())
+                {
+                    if market_price > 0.0 {
+                        let qty = pos.get("quantite").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let pru = pos.get("prix_revient").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let valeur = qty * market_price;
+                        let pnl = valeur - (qty * pru);
+                        let pnl_pct = if pru > 0.0 { (market_price / pru - 1.0) * 100.0 } else { 0.0 };
+                        if let Some(obj) = pos.as_object_mut() {
+                            obj.insert("prix_actuel".to_string(), json!(market_price));
+                            obj.insert("valeur_actuelle".to_string(), json!(valeur));
+                            obj.insert("plus_moins_value".to_string(), json!(pnl));
+                            obj.insert("plus_moins_value_pct".to_string(), json!(pnl_pct));
+                        }
+                        enriched_count += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                crate::debug_log(&format!("[csv-enrich] failed for {ticker}: {e}"));
+            }
+        }
+    }
+    if enriched_count > 0 {
+        crate::debug_log(&format!("[csv-enrich] enriched {enriched_count}/{} positions with market prices", positions.len()));
+    }
+
+    let valeur_totale: f64 = positions.iter()
+        .filter_map(|p| p.get("valeur_actuelle").and_then(|v| v.as_f64()))
+        .sum();
+    let plus_value_totale: f64 = positions.iter()
+        .filter_map(|p| p.get("plus_moins_value").and_then(|v| v.as_f64()))
+        .sum();
+
     json!({
         "positions": positions,
         "source": "csv_transaction_history",
@@ -1065,8 +1113,8 @@ fn reconcile_transactions(transactions: &[CsvTransaction], account: &str) -> Val
             "tickers": unique_tickers.len(),
             "date_range": date_range
         },
-        "valeur_totale": 0.0,
-        "plus_value_totale": 0.0,
+        "valeur_totale": valeur_totale,
+        "plus_value_totale": plus_value_totale,
         "liquidites": 0.0
     })
 }

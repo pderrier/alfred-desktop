@@ -1677,15 +1677,35 @@ fn build_cash_mapping_with_links(
                     }
                 });
             if let Some(candidates) = candidates {
-                // Disambiguate: prefer the cash entry sharing the same connection_id
+                // Disambiguate: prefer the cash entry sharing the same connection_id,
+                // then the closest correlation_id (Finary assigns nearby corr IDs
+                // to related accounts, e.g. PEA corr=3118220 ↔ espèce corr=3118218).
                 let cash_entry = if candidates.len() > 1 {
-                    if let Some(inv_conn) = inv.connection_id {
-                        candidates.iter()
-                            .find(|c| c.connection_id == Some(inv_conn))
-                            .or_else(|| candidates.first())
+                    // Filter to same connection first
+                    let same_conn: Vec<&&HoldingsEntry> = if let Some(inv_conn) = inv.connection_id {
+                        candidates.iter().filter(|c| c.connection_id == Some(inv_conn)).collect()
+                    } else {
+                        candidates.iter().collect()
+                    };
+                    let pool = if same_conn.is_empty() { candidates.iter().collect::<Vec<_>>() } else { same_conn };
+                    if pool.len() == 1 {
+                        pool.first().copied().copied()
+                    } else if let Some(inv_corr) = inv.correlation_id {
+                        // Pick the unmatched candidate with the closest correlation_id
+                        pool.iter()
+                            .filter(|c| {
+                                // Skip already-matched cash entries
+                                cash_entries.iter().position(|e| std::ptr::eq(*e, ***c))
+                                    .map(|idx| !matched_cash_indices.contains(&idx))
+                                    .unwrap_or(true)
+                            })
+                            .min_by_key(|c| {
+                                c.correlation_id.map(|cc| (cc - inv_corr).unsigned_abs()).unwrap_or(u64::MAX)
+                            })
+                            .copied()
                             .copied()
                     } else {
-                        candidates.first().copied()
+                        pool.first().copied().copied()
                     }
                 } else {
                     candidates.first().copied()
@@ -2963,6 +2983,44 @@ mod tests {
             result.mapping.get("PEA").copied(),
             Some(500.0),
             "empty saved_links should behave same as build_cash_mapping (1:1 auto-match)"
+        );
+    }
+
+    #[test]
+    fn build_cash_mapping_saved_links_disambiguate_by_correlation_proximity() {
+        use std::collections::HashMap;
+        // Real-world case: 2 PEA on conn 100, 2 "Compte espèce PEA" on conn 100,
+        // plus 2 duplicates on conn 200 (empty). Saved links map both to same name.
+        let make = |name: &str, conn: i64, corr: i64, secs: usize, fiats: f64| -> Value {
+            let securities_arr: Vec<Value> = (0..secs).map(|_| json!({"symbol":"X"})).collect();
+            let fiats_arr = if fiats > 0.0 {
+                vec![json!({"current_value": fiats, "currency": {"code":"EUR"}})]
+            } else { vec![] };
+            json!({"name": name, "connection_id": conn, "correlation_id": corr,
+                   "securities": securities_arr, "fiats": fiats_arr,
+                   "institution": {"name": "CA"}})
+        };
+        let accounts = vec![
+            make("Plan Epargne en Action", 100, 3118220, 28, 0.0),
+            make("Plan d'Epargne en Actions PME", 100, 7499637, 4, 0.0),
+            // Two cash accounts with same name on same connection, different corr
+            make("Compte espèce PEA", 100, 3118218, 0, 0.82),  // close to PEA corr=3118220
+            make("Compte espèce PEA", 100, 7499636, 0, 3252.34), // close to PME corr=7499637
+            // Duplicates on other connection (empty, no fiats)
+            make("Compte espèce PEA", 200, 6628312, 0, 0.0),
+            make("Compte espèce PEA", 200, 7499790, 0, 0.0),
+        ];
+        let mut saved_links = HashMap::new();
+        saved_links.insert("Plan Epargne en Action".to_string(), "Compte espèce PEA".to_string());
+        saved_links.insert("Plan d'Epargne en Actions PME".to_string(), "Compte espèce PEA".to_string());
+        let result = build_cash_mapping_with_links(&accounts, &saved_links);
+        assert_eq!(
+            result.mapping.get("Plan Epargne en Action").copied(), Some(0.82),
+            "PEA (corr=3118220) should match cash corr=3118218 (0.82€)"
+        );
+        assert_eq!(
+            result.mapping.get("Plan d'Epargne en Actions PME").copied(), Some(3252.34),
+            "PEA-PME (corr=7499637) should match cash corr=7499636 (3252.34€)"
         );
     }
 }

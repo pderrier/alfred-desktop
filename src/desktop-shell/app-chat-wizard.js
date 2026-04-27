@@ -316,7 +316,7 @@ export function openCashMatchingWizard(opts) {
               const selected = heuristicMap[inv.name] === cashValue ? "selected" : "";
               return `<option value="${escapeHtml(cashValue)}" ${selected}>${cashLabel}</option>`;
             }).join("")}
-            <option value="__none__"${!heuristicMap[inv.name] ? " selected" : ""}>No cash account</option>
+            <option value="__none__"${heuristicMap[inv.name] === "__none__" ? " selected" : ""}>No cash account</option>
           </select>
         </div>
       `;
@@ -382,19 +382,33 @@ export function openCashMatchingWizard(opts) {
 }
 
 /**
- * Build a heuristic pre-selection map: { investmentName: cashName }.
- * Uses index-based mapping from currentMapping amounts to find best match.
+ * Build a heuristic pre-selection map: { investmentName: cashSlugOrNone }.
+ * Default is "__none__" for all accounts. Only pre-selects when there's
+ * a clear "espèce" cash account whose name relates to the investment.
  */
-function buildHeuristicPreselection(investmentAccounts, cashAccounts, currentMapping) {
+function buildHeuristicPreselection(investmentAccounts, cashAccounts, _currentMapping) {
   const preselection = {};
-  if (!currentMapping) return preselection;
-  // currentMapping is { investmentName: cashAmount }
-  // Match by amount to find which cash account the heuristic chose
-  for (const [invName, cashAmount] of Object.entries(currentMapping)) {
-    const bestCash = cashAccounts.find((c) => Math.abs((c.fiats_sum || 0) - cashAmount) < 0.01);
-    if (bestCash) {
-      preselection[invName] = bestCash.name;
+  // Default everything to "no cash account"
+  for (const inv of investmentAccounts) {
+    preselection[inv.name] = "__none__";
+  }
+  // For each investment, look for a unique "espèce" cash account that
+  // shares a significant word (e.g. "PEA" in both names)
+  for (const inv of investmentAccounts) {
+    const invLower = (inv.name || "").toLowerCase();
+    const invWords = invLower.split(/\s+/).filter((w) => w.length > 2);
+    const espèceCandidates = cashAccounts.filter((c) => {
+      const cashLower = (c.name || "").toLowerCase();
+      if (!cashLower.includes("espèce") && !cashLower.includes("espece")) return false;
+      const cashWords = cashLower.split(/\s+/).filter((w) => w.length > 2 && w !== "compte" && w !== "espèces" && w !== "especes");
+      return invWords.some((w) => cashLower.includes(w))
+        || cashWords.some((w) => invLower.includes(w));
+    });
+    if (espèceCandidates.length === 1) {
+      // Exactly one espèce match → safe to pre-select
+      preselection[inv.name] = espèceCandidates[0].slug || espèceCandidates[0].name;
     }
+    // Multiple candidates (e.g. 2× "Compte espèce PEA") → leave as __none__
   }
   return preselection;
 }

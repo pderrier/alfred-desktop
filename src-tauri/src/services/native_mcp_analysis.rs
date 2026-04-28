@@ -311,6 +311,7 @@ Reponds UNIQUEMENT avec un objet JSON (pas de texte avant ou apres) contenant :
 - signal: ACHAT_FORT | ACHAT | RENFORCEMENT | CONSERVER | ALLEGEMENT | VENTE | SURVEILLANCE
 - conviction: faible | moderee | forte
 - synthese: minimum 150 caracteres (explique comme a un ami)
+- memory_narrative: 4-8 phrases, construites comme un FIL HISTORIQUE (ce qui a change depuis les derniers runs), en integrant les signaux precedents, les operations recentes (transactions/orders), et les implications pour la suite
 - analyse_technique, analyse_fondamentale, analyse_sentiment
 - raisons_principales: 3-5 raisons (array)
 - risques, catalyseurs, badges_keywords: arrays
@@ -503,8 +504,20 @@ fn sync_line_memory(run_id: &str, ticker: &str, rec: &Value, current_price: f64)
         }
     }
 
-    // ── V2: memory_narrative (first 3 sentences of synthese) ───────
-    let memory_narrative = extract_first_sentences(&synthese, 3);
+    // ── V2: memory_narrative (LLM-authored during analysis; fallback if missing) ─────
+    let trend = compute_trend(&signal_history);
+    let memory_narrative = non_empty_str(rec.get("memory_narrative"))
+        .or_else(|| non_empty_str(rec.get("key_reasoning")))
+        .unwrap_or_else(|| {
+            build_memory_narrative(
+                &current,
+                &synthese,
+                &signal,
+                &conviction,
+                &today,
+                trend,
+            )
+        });
 
     // ── V2: news_themes (merge from badges_keywords, cap at 15) ────
     let news_themes = merge_string_list(
@@ -514,7 +527,6 @@ fn sync_line_memory(run_id: &str, ticker: &str, rec: &Value, current_price: f64)
     );
 
     // ── V2: trend (computed from last 3 signal_history entries) ─────
-    let trend = compute_trend(&signal_history);
 
     // ── V2: price_tracking (accuracy vs previous signal) ───────────
     let price_tracking = compute_price_tracking(&current, current_price, &signal);
@@ -819,6 +831,68 @@ fn extract_first_sentences(text: &str, n: usize) -> String {
     sentences.join(" ")
 }
 
+/// Build an evolving narrative across runs so line memory preserves history.
+fn build_memory_narrative(
+    current: &Value,
+    synthese: &str,
+    signal: &str,
+    conviction: &str,
+    today: &str,
+    trend: &str,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    if let Some(previous_signal) = current.get("signal_history")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+    {
+        let prev_date = as_str(previous_signal.get("date"));
+        let prev_signal_name = as_str(previous_signal.get("signal"));
+        let prev_conviction = as_str(previous_signal.get("conviction"));
+        if !prev_signal_name.is_empty() {
+            parts.push(format!(
+                "Previous call ({}) was {}{}.",
+                if prev_date.is_empty() { "unknown date" } else { prev_date.as_str() },
+                prev_signal_name,
+                if prev_conviction.is_empty() { "".to_string() } else { format!(" ({prev_conviction})") },
+            ));
+        }
+    }
+
+    parts.push(format!(
+        "Current call ({today}) is {}{} with a {} trend.",
+        if signal.is_empty() { "N/A" } else { signal },
+        if conviction.is_empty() { "".to_string() } else { format!(" ({conviction})") },
+        if trend.is_empty() { "stable" } else { trend },
+    ));
+
+    let latest_delta = extract_first_sentences(synthese, 2);
+    if !latest_delta.is_empty() {
+        parts.push(format!("Latest analytical update: {latest_delta}"));
+    }
+
+    if let Some(previous_narrative) = non_empty_str(current.get("memory_narrative")) {
+        let prior_thesis = extract_first_sentences(&previous_narrative, 1);
+        if !prior_thesis.is_empty() {
+            parts.push(format!("Prior thesis snapshot: {prior_thesis}"));
+        }
+    }
+
+    if let Some(previous_run_summary) = current.get("run_history")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|entry| entry.get("synthese"))
+        .and_then(|v| v.as_str())
+    {
+        let prior_run = extract_first_sentences(previous_run_summary, 1);
+        if !prior_run.is_empty() && !latest_delta.starts_with(&prior_run) {
+            parts.push(format!("Previous run focus: {prior_run}"));
+        }
+    }
+
+    truncate(&parts.join(" "), 1400)
+}
+
 /// Compute trend from last 3 signal_history entries.
 /// - `upgrading`: signals move toward stronger buy
 /// - `downgrading`: signals move toward sell
@@ -1070,6 +1144,7 @@ Pour CHAQUE ligne ci-dessus :
    - signal: ACHAT_FORT | ACHAT | RENFORCEMENT | CONSERVER | ALLEGEMENT | VENTE | SURVEILLANCE
    - conviction: faible | moderee | forte
    - synthese: minimum 150 caracteres (explique comme a un ami)
+   - memory_narrative: 4-8 phrases, narratif historique qui relie les runs precedents, les nouveaux signaux, et l'historique des operations (transactions/orders)
    - analyse_technique, analyse_fondamentale, analyse_sentiment
    - raisons_principales: 3-5 raisons (array)
    - risques, catalyseurs, badges_keywords: arrays

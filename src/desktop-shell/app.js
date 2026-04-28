@@ -216,7 +216,11 @@ const runOperations = createRunOperationsController({
         // Item 15: Update ETA display
         updateAnalysisEta(completedCount, totalCount);
       }
-      renderTopBarProgress({ status: event.status || "running", line_progress: event.line_progress });
+      renderTopBarProgress({
+        status: event.status || "running",
+        run_id: event.run_id || activeRunId || null,
+        line_progress: event.line_progress
+      });
       renderPipelineBar(event.stage || "collecting_data");
       // Show toast for newly failed lines
       if (event?.line_status) {

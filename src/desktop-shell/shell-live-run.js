@@ -29,6 +29,8 @@ const reportSynthesisCardNode = document.getElementById("report-synthesis-card")
 let activeRunInProgress = false;
 let liveRunActiveId = null;   // run_id of the currently executing run
 let liveRunViewingId = null;  // run_id the user is currently viewing (null = active run)
+let topBarProgressRunId = null;
+let topBarProgressHighWaterPct = 0;
 
 export function setActiveRunInProgress(active) { activeRunInProgress = active; }
 export function isActiveRunInProgress() { return activeRunInProgress; }
@@ -80,6 +82,71 @@ function buildLiveRow(ticker, lineStatus) {
     <td></td>
   `;
   return tr;
+}
+
+function removeSubRow(ticker) {
+  const upper = ticker.toUpperCase();
+  const subRow = positionsTbodyNode?.querySelector(`tr.pos-sub-row[data-ticker="${upper}"]`);
+  if (subRow) subRow.remove();
+}
+
+function upsertSubRow(ticker, html) {
+  if (!positionsTbodyNode) return;
+  const upper = ticker.toUpperCase();
+  const row = positionsTbodyNode.querySelector(`tr[data-ticker="${upper}"]`);
+  if (!row) return;
+  let subRow = positionsTbodyNode.querySelector(`tr.pos-sub-row[data-ticker="${upper}"]`);
+  if (!subRow) {
+    subRow = document.createElement("tr");
+    subRow.className = "pos-sub-row";
+    subRow.dataset.ticker = upper;
+    row.insertAdjacentElement("afterend", subRow);
+  }
+  subRow.innerHTML = `<td colspan="9" class="pos-rec-row">${html}</td>`;
+}
+
+function renderCompletedLiveRow(row, upperTicker, rec) {
+  if (!row || !rec) return;
+  const pos = liveRunContext.positions.find(
+    (p) => (p.ticker || "").toUpperCase() === upperTicker
+  );
+  if (pos) {
+    const pv = pos.plus_moins_value || 0;
+    const pvPct = pos.plus_moins_value_pct || 0;
+    const pvClass = pv >= 0 ? "pos-pv-positive" : "pos-pv-negative";
+    row.innerHTML = `
+      <td><strong>${escapeHtml(upperTicker)}</strong></td>
+      <td>${escapeHtml(pos.nom || "")}</td>
+      <td class="num">${pos.quantite ?? ""}</td>
+      <td class="num">${formatNum(pos.prix_revient)}</td>
+      <td class="num">${formatNum(pos.prix_actuel)}</td>
+      <td class="num ${pvClass}">${pv >= 0 ? "+" : ""}${formatNum(pv)}</td>
+      <td class="num ${pvClass}">${pvPct >= 0 ? "+" : ""}${pvPct.toFixed(1)}%</td>
+      <td>${renderSignalBadge(rec.signal || "DONE")}</td>
+      <td></td>
+    `;
+  } else {
+    const signalCell = row.querySelector("td:nth-child(8)");
+    if (signalCell) signalCell.innerHTML = renderSignalBadge(rec.signal || "DONE");
+  }
+  row.style.cursor = "pointer";
+  row.onclick = () => {
+    if (window.__openLineMemoryModal) {
+      window.__openLineMemoryModal({
+        ticker: upperTicker,
+        signal: rec.signal,
+        conviction: rec.conviction,
+        summary: rec.synthese || rec.summary || "",
+        name: pos?.nom || "",
+        type: pos?.type || "position",
+        ...rec,
+      });
+    }
+  };
+  const signal = escapeHtml(rec.signal || "");
+  const conviction = escapeHtml(rec.conviction || "");
+  const summary = escapeHtml(truncate(rec.synthese || rec.summary || "", 120));
+  upsertSubRow(upperTicker, `${signal} · ${conviction} · ${summary}`);
 }
 
 /**
@@ -170,16 +237,12 @@ export function renderLivePositions(lineStatus, dashboardPayload) {
     const status = parseLineStatus(raw);
     row.classList.remove("line-waiting", "line-active", "line-done");
     row.classList.add(lineRowClass(status));
-    const signalCell = row.querySelector("td:nth-child(8)");
-    if (signalCell) {
-      const hasSignalBadge = signalCell.querySelector(".signal-badge");
-      // If done with recommendation data, show signal badge instead of "Done" chip
-      const rec = typeof raw === "object" ? raw?.recommendation : null;
-      if (status === "done" && rec?.signal) {
-        if (!hasSignalBadge) signalCell.innerHTML = renderSignalBadge(rec.signal);
-      } else if (!(status === "done" && hasSignalBadge)) {
-        signalCell.innerHTML = renderLiveStatusChip(raw);
-      }
+    const rec = typeof raw === "object" ? raw?.recommendation : null;
+    if (status === "done" && rec?.signal) {
+      renderCompletedLiveRow(row, ticker.toUpperCase(), rec);
+    } else {
+      const signalCell = row.querySelector("td:nth-child(8)");
+      if (signalCell) signalCell.innerHTML = renderLiveStatusChip(raw);
     }
     // Show name in name cell
     const nameCell = row.querySelector("td:nth-child(2)");
@@ -190,14 +253,9 @@ export function renderLivePositions(lineStatus, dashboardPayload) {
     // Show progress in sub-row (same row used for recommendation summary when done)
     const progressMsg = typeof raw === "object" ? (raw?.progress || "") : "";
     if ((status === "analyzing" || status === "repairing" || status === "collecting") && progressMsg) {
-      let subRow = positionsTbodyNode.querySelector(`tr.pos-sub-row[data-ticker="${ticker.toUpperCase()}"]`);
-      if (!subRow) {
-        subRow = document.createElement("tr");
-        subRow.className = "pos-sub-row";
-        subRow.dataset.ticker = ticker.toUpperCase();
-        row.insertAdjacentElement("afterend", subRow);
-      }
-      subRow.innerHTML = `<td colspan="9" class="pos-rec-row"><span class="live-progress-detail">${escapeHtml(progressMsg)}</span></td>`;
+      upsertSubRow(ticker, `<span class="live-progress-detail">${escapeHtml(progressMsg)}</span>`);
+    } else if (!(status === "done" && rec?.signal)) {
+      removeSubRow(ticker);
     }
   }
   // Add rows for tickers not yet in the table
@@ -227,71 +285,14 @@ export function updateSingleLineProgress(ticker, lineStatus) {
   const rec = typeof lineStatus === "object" ? lineStatus.recommendation : null;
 
   if (status === "done" && rec) {
-    // Fill in position data from portfolio (like final report table)
-    const pos = liveRunContext.positions.find(
-      (p) => (p.ticker || "").toUpperCase() === upperTicker
-    );
-    if (pos) {
-      const pv = pos.plus_moins_value || 0;
-      const pvPct = pos.plus_moins_value_pct || 0;
-      const pvClass = pv >= 0 ? "pos-pv-positive" : "pos-pv-negative";
-      row.innerHTML = `
-        <td><strong>${escapeHtml(upperTicker)}</strong></td>
-        <td>${escapeHtml(pos.nom || "")}</td>
-        <td class="num">${pos.quantite ?? ""}</td>
-        <td class="num">${formatNum(pos.prix_revient)}</td>
-        <td class="num">${formatNum(pos.prix_actuel)}</td>
-        <td class="num ${pvClass}">${pv >= 0 ? "+" : ""}${formatNum(pv)}</td>
-        <td class="num ${pvClass}">${pvPct >= 0 ? "+" : ""}${pvPct.toFixed(1)}%</td>
-        <td>${renderSignalBadge(rec.signal || "DONE")}</td>
-        <td></td>
-      `;
-    } else {
-      // No position data (watchlist) — just update signal
-      if (signalCell) signalCell.innerHTML = renderSignalBadge(rec.signal || "DONE");
-    }
-    // Make row clickable for inspect modal
-    row.style.cursor = "pointer";
-    row.onclick = () => {
-      if (window.__openLineMemoryModal) {
-        window.__openLineMemoryModal({
-          ticker: upperTicker,
-          signal: rec.signal,
-          conviction: rec.conviction,
-          summary: rec.synthese || rec.summary || "",
-          name: pos?.nom || "",
-          type: pos?.type || "position",
-          ...rec,
-        });
-      }
-    };
-    // Render recommendation summary in sub-row
-    let subRow = positionsTbodyNode.querySelector(`tr.pos-sub-row[data-ticker="${upperTicker}"]`);
-    if (!subRow) {
-      subRow = document.createElement("tr");
-      subRow.className = "pos-sub-row";
-      subRow.dataset.ticker = upperTicker;
-      row.insertAdjacentElement("afterend", subRow);
-    }
-    const signal = escapeHtml(rec.signal || "");
-    const conviction = escapeHtml(rec.conviction || "");
-    const summary = escapeHtml(truncate(rec.synthese || rec.summary || "", 120));
-    subRow.innerHTML = `<td colspan="9" class="pos-rec-row">${signal} \u00b7 ${conviction} \u00b7 ${summary}</td>`;
-    // Restore name in name cell
-    const nameCell2 = row.querySelector("td:nth-child(2)");
-    if (nameCell2) nameCell2.textContent = pos?.nom || "";
+    renderCompletedLiveRow(row, upperTicker, rec);
   } else {
     if (signalCell) signalCell.innerHTML = renderLiveStatusChip(lineStatus);
     // Show progress in sub-row
     if ((status === "analyzing" || status === "repairing" || status === "collecting") && progressMsg) {
-      let subRow = positionsTbodyNode.querySelector(`tr.pos-sub-row[data-ticker="${upperTicker}"]`);
-      if (!subRow) {
-        subRow = document.createElement("tr");
-        subRow.className = "pos-sub-row";
-        subRow.dataset.ticker = upperTicker;
-        row.insertAdjacentElement("afterend", subRow);
-      }
-      subRow.innerHTML = `<td colspan="9" class="pos-rec-row"><span class="live-progress-detail">${escapeHtml(progressMsg)}</span></td>`;
+      upsertSubRow(upperTicker, `<span class="live-progress-detail">${escapeHtml(progressMsg)}</span>`);
+    } else {
+      removeSubRow(upperTicker);
     }
   }
 }
@@ -301,13 +302,26 @@ export function updateSingleLineProgress(ticker, lineStatus) {
 export function renderTopBarProgress(runSummary) {
   if (!topBarProgressNode || !topBarProgressFillNode) return;
   const isRunning = runSummary?.status === "running";
+  const runId = runSummary?.run_id ? String(runSummary.run_id) : null;
   topBarProgressNode.classList.toggle("hidden", !isRunning);
   if (isRunning) {
+    // Reset the monotonic high-water mark when switching to a different run.
+    if (runId && runId !== topBarProgressRunId) {
+      topBarProgressRunId = runId;
+      topBarProgressHighWaterPct = 0;
+    }
     const lineProgress = runSummary?.line_progress || {};
     const completed = lineProgress.completed || 0;
     const total = lineProgress.total || 1;
     const pct = Math.min(100, Math.round((completed / total) * 100));
-    topBarProgressFillNode.style.width = `${pct}%`;
+    // Guard against out-of-order progress events (batch runs can emit stale snapshots):
+    // bar is monotonic within a run and never visually regresses.
+    topBarProgressHighWaterPct = Math.max(topBarProgressHighWaterPct, pct);
+    topBarProgressFillNode.style.width = `${topBarProgressHighWaterPct}%`;
+  } else {
+    // Any terminal/non-running state clears run-scoped progress memory.
+    topBarProgressRunId = null;
+    topBarProgressHighWaterPct = 0;
   }
 }
 

@@ -378,6 +378,24 @@ pub fn run_get_stale_positions() -> Result<serde_json::Value> {
 // ── Signal Scorecard (Phase 3b) ──
 
 pub fn run_get_signal_scorecard(ticker: String) -> Result<serde_json::Value> {
+    fn as_f64_loose(v: Option<&serde_json::Value>) -> Option<f64> {
+        match v {
+            Some(serde_json::Value::Number(n)) => n.as_f64(),
+            Some(serde_json::Value::String(s)) => s.trim().replace(',', ".").parse::<f64>().ok(),
+            _ => None,
+        }
+    }
+    fn classify_signal(raw: &str) -> &'static str {
+        let upper = raw.trim().to_uppercase();
+        if upper.contains("ACHAT") || upper.contains("RENFORC") || upper == "BUY" {
+            return "buy";
+        }
+        if upper.contains("VENTE") || upper.contains("VENDR") || upper.contains("ALLEG") || upper == "SELL" {
+            return "sell";
+        }
+        "neutral"
+    }
+
     let ticker = ticker.trim().to_uppercase();
     if ticker.is_empty() {
         return Ok(json!({ "ticker": "", "signals": [], "overall_accuracy_pct": 0, "scored_count": 0, "correct_count": 0, "trend": "stable" }));
@@ -419,15 +437,11 @@ pub fn run_get_signal_scorecard(ticker: String) -> Result<serde_json::Value> {
 
     // Current price from most recent signal or price_tracking
     let current_price = entry.get("price_tracking")
-        .and_then(|pt| pt.get("current_price").or_else(|| pt.get("price_at_signal")))
-        .and_then(|v| v.as_f64())
+        .and_then(|pt| as_f64_loose(pt.get("current_price").or_else(|| pt.get("price_at_signal"))))
         .or_else(|| history.first()
             .and_then(|h| h.get("price_at_signal"))
-            .and_then(|v| v.as_f64()))
+            .and_then(|v| as_f64_loose(Some(v))))
         .unwrap_or(0.0);
-
-    let buy_signals = ["ACHAT", "ACHAT_FORT", "RENFORCEMENT"];
-    let sell_signals = ["VENTE", "ALLEGEMENT"];
 
     let mut signals = Vec::new();
     let mut correct = 0usize;
@@ -437,15 +451,16 @@ pub fn run_get_signal_scorecard(ticker: String) -> Result<serde_json::Value> {
         let signal = sig.get("signal").and_then(|v| v.as_str()).unwrap_or("");
         let conviction = sig.get("conviction").and_then(|v| v.as_str()).unwrap_or("");
         let date = sig.get("date").and_then(|v| v.as_str()).unwrap_or("");
-        let price_at = sig.get("price_at_signal").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let price_at = as_f64_loose(sig.get("price_at_signal")).unwrap_or(0.0);
         let return_pct = if price_at > 0.0 { (current_price - price_at) / price_at * 100.0 } else { 0.0 };
-        let upper = signal.to_uppercase();
-        let accuracy = if buy_signals.contains(&upper.as_str()) {
-            if return_pct > 0.0 { correct += 1; "correct" } else { incorrect += 1; "incorrect" }
-        } else if sell_signals.contains(&upper.as_str()) {
-            if return_pct < 0.0 { correct += 1; "correct" } else { incorrect += 1; "incorrect" }
-        } else {
-            "neutral"
+        let accuracy = match classify_signal(signal) {
+            "buy" => {
+                if return_pct > 0.0 { correct += 1; "correct" } else { incorrect += 1; "incorrect" }
+            }
+            "sell" => {
+                if return_pct < 0.0 { correct += 1; "correct" } else { incorrect += 1; "incorrect" }
+            }
+            _ => "neutral",
         };
         signals.push(json!({
             "date": date,

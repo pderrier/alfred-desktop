@@ -926,14 +926,23 @@ fn compute_price_tracking(current: &Value, current_price: f64, current_signal: &
 /// Extract market price for a ticker from the cached run state.
 /// Used by codex path where line_data isn't directly available.
 fn extract_market_price_from_run_state(data_dir: &std::path::Path, run_id: &str, ticker: &str) -> f64 {
+    fn as_f64_loose(v: Option<&Value>) -> Option<f64> {
+        match v {
+            Some(Value::Number(n)) => n.as_f64(),
+            Some(Value::String(s)) => s.trim().replace(',', ".").parse::<f64>().ok(),
+            _ => None,
+        }
+    }
     let ticker_upper = ticker.to_uppercase();
     crate::run_state_cache::load(data_dir, run_id)
         .ok()
         .and_then(|state| {
             state.get("market")
                 .and_then(|m| m.get(&ticker_upper))
-                .and_then(|md| md.get("price").or_else(|| md.get("last_price")).or_else(|| md.get("cours")))
-                .and_then(|v| v.as_f64())
+                .and_then(|md| as_f64_loose(md.get("price")
+                    .or_else(|| md.get("last_price"))
+                    .or_else(|| md.get("cours"))
+                    .or_else(|| md.get("prix_actuel"))))
         })
         .unwrap_or(0.0)
 }
@@ -987,10 +996,19 @@ fn json_str_array(v: Option<&Value>) -> impl Iterator<Item = &str> {
 
 /// Persist extracted fundamentals, shared insights, deep news, and line memory from the recommendation.
 fn persist_line_extras(data_dir: &std::path::Path, run_id: &str, ticker: &str, line_data: &Value, rec: &Value) {
+    fn as_f64_loose(v: Option<&Value>) -> Option<f64> {
+        match v {
+            Some(Value::Number(n)) => n.as_f64(),
+            Some(Value::String(s)) => s.trim().replace(',', ".").parse::<f64>().ok(),
+            _ => None,
+        }
+    }
     // Extract current market price for V2 signal tracking
     let current_price = line_data.get("market_data")
-        .and_then(|m| m.get("price").or_else(|| m.get("last_price")).or_else(|| m.get("cours")))
-        .and_then(|v| v.as_f64())
+        .and_then(|m| as_f64_loose(m.get("price")
+            .or_else(|| m.get("last_price"))
+            .or_else(|| m.get("cours"))
+            .or_else(|| m.get("prix_actuel"))))
         .unwrap_or(0.0);
     // Sync line memory (cross-run persistent state, V2 schema)
     sync_line_memory(run_id, ticker, rec, current_price);

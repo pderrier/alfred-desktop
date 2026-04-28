@@ -316,6 +316,7 @@ Reponds UNIQUEMENT avec un objet JSON (pas de texte avant ou apres) contenant :
 - risques, catalyseurs, badges_keywords: arrays
 - action_recommandee: instruction CHIFFREE (nb titres, montant EUR, prix). Pour watchlist: prix d'entree ideal + montant suggere.
 - deep_news_summary: synthese 100-500 chars des actualites cles (OBLIGATOIRE si news disponibles)
+- deep_news_memory_summary: MEMOIRE EVOLUTIVE 140-700 chars (OBLIGATOIRE) qui fusionne memoire precedente + nouveaux insights; conserve le fil narratif multi-run, elimine les repetitions, et explicite ce qui change vs ce qui reste valide
 - deep_news_quality_score: 0-100
 - deep_news_relevance: high|medium|low
 - deep_news_staleness: fresh|recent|stale
@@ -385,6 +386,18 @@ fn run_native_line_analysis(
                 continue;
             }
         };
+
+        // Enforce an evolving deep-news memory authored by the LLM.
+        let deep_news_summary = rec.get("deep_news_summary").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let deep_news_memory_summary = rec.get("deep_news_memory_summary").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if !deep_news_summary.is_empty() && deep_news_memory_summary.is_empty() {
+            last_issues = vec!["deep_news_memory_summary_missing".to_string()];
+            crate::debug_log(&format!(
+                "native_line: {ticker} attempt {}: missing deep_news_memory_summary while deep_news_summary is present",
+                attempt + 1
+            ));
+            continue;
+        }
 
         // Validate locally
         let validation = crate::mcp_server::dispatch_tool_direct(
@@ -520,10 +533,14 @@ fn sync_line_memory(run_id: &str, ticker: &str, rec: &Value, current_price: f64)
     let price_tracking = compute_price_tracking(&current, current_price, &signal);
 
     // ── Deep news fields (preserved across V1→V2) ──────────────────
-    let deep_news_summary = non_empty_str(rec.get("deep_news_memory_summary"))
-        .or_else(|| non_empty_str(rec.get("deep_news_summary")))
-        .or_else(|| non_empty_str(current.get("deep_news_memory_summary")))
-        .unwrap_or_default();
+    let deep_news_summary = {
+        let llm_memory = non_empty_str(rec.get("deep_news_memory_summary"));
+        let fresh = non_empty_str(rec.get("deep_news_summary"));
+        let prev_memory = non_empty_str(current.get("deep_news_memory_summary"));
+        llm_memory
+            .or_else(|| compose_deep_news_memory_fallback(prev_memory.as_deref(), fresh.as_deref()))
+            .unwrap_or_default()
+    };
 
     // Run history: prepend this run (max 20)
     let mut run_history: Vec<Value> = Vec::with_capacity(21);
@@ -948,6 +965,26 @@ fn non_empty_str(v: Option<&Value>) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+fn compose_deep_news_memory_fallback(previous: Option<&str>, fresh: Option<&str>) -> Option<String> {
+    let previous = previous.unwrap_or("").trim();
+    let fresh = fresh.unwrap_or("").trim();
+    match (previous.is_empty(), fresh.is_empty()) {
+        (true, true) => None,
+        (true, false) => Some(fresh.to_string()),
+        (false, true) => Some(previous.to_string()),
+        (false, false) => {
+            if previous == fresh {
+                Some(previous.to_string())
+            } else {
+                Some(format!(
+                    "Memoire precedente: {} | Mise a jour recente: {}",
+                    previous, fresh
+                ))
+            }
+        }
+    }
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
@@ -1075,6 +1112,7 @@ Pour CHAQUE ligne ci-dessus :
    - risques, catalyseurs, badges_keywords: arrays
    - action_recommandee: instruction CHIFFREE (nb titres, montant €, prix)
    - deep_news_summary: synthese 100-500 chars des actualites cles (OBLIGATOIRE si news disponibles)
+   - deep_news_memory_summary: memoire evolutive 140-700 chars (OBLIGATOIRE) qui integre memoire precedente + nouveaux insights, sans duplication mot-a-mot
    - deep_news_quality_score: 0-100 (recence 0-35 + pertinence 0-35 + diversite 0-20 + utilite 0-10)
    - deep_news_relevance: high|medium|low
    - deep_news_staleness: fresh|recent|stale
@@ -1096,6 +1134,7 @@ Regles :
 - Analyse CHAQUE ligne. Ne saute aucune.
 - Toujours appeler validate_recommendation — ne presume pas que ton output est valide.
 - Sois concret sur les chiffres.
+- deep_news_memory_summary doit etre un narratif evolutif (ce qui change / ce qui persiste), pas une copie de deep_news_summary.
 - Les articles marques "RESUME APPROFONDI (cache)" sont deja resumes — utilise-les directement.
 - Les articles marques "A APPROFONDIR" n'ont pas de resume — lis-les via recherche web.
 - Si `activity` contient des operations recentes, commente les decisions passees (timing, prix d'achat vs cours actuel, renforcements pertinents ou non). Utilise-les pour calibrer ta recommandation."#,

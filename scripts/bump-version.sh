@@ -23,7 +23,7 @@ if ! echo "$NEW" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
 fi
 
 # Read current version from package.json
-OLD=$(grep -oP '"version":\s*"\K[^"]+' "$DIR/package.json")
+OLD=$(sed -nE 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$DIR/package.json" | head -1)
 if [ -z "$OLD" ]; then
   echo "Error: could not read current version from package.json"
   exit 1

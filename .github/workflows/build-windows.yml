@@ -18,8 +18,8 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Sync versions from tag
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: bash scripts/sync-version-from-tag.sh "${GITHUB_REF_NAME}"
+        if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+        run: bash scripts/sync-version-from-tag.sh "${{ github.ref }}"
 
       - name: Setup Node.js
         uses: actions/setup-node@v5

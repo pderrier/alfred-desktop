@@ -16,6 +16,18 @@ fi
 NEW="$1"
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
+# Cross-platform in-place sed (GNU/BSD)
+sed_in_place() {
+  local expr="$1"
+  local file="$2"
+
+  if sed --version >/dev/null 2>&1; then
+    sed -i -e "$expr" "$file"
+  else
+    sed -i '' -e "$expr" "$file"
+  fi
+}
+
 # Validate format
 if ! echo "$NEW" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
   echo "Error: version must be semver (e.g. 0.2.6), got: $NEW"
@@ -23,7 +35,7 @@ if ! echo "$NEW" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
 fi
 
 # Read current version from package.json
-OLD=$(grep -oP '"version":\s*"\K[^"]+' "$DIR/package.json")
+OLD=$(sed -nE 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$DIR/package.json" | head -1)
 if [ -z "$OLD" ]; then
   echo "Error: could not read current version from package.json"
   exit 1
@@ -37,18 +49,18 @@ fi
 echo "Bumping $OLD → $NEW"
 
 # 1. package.json
-sed -i "s/\"version\": \"$OLD\"/\"version\": \"$NEW\"/" "$DIR/package.json"
+sed_in_place "s/\"version\": \"$OLD\"/\"version\": \"$NEW\"/" "$DIR/package.json"
 
 # 2. Cargo.toml (only the package version line)
-sed -i "s/^version = \"$OLD\"/version = \"$NEW\"/" "$DIR/src-tauri/Cargo.toml"
+sed_in_place "s/^version = \"$OLD\"/version = \"$NEW\"/" "$DIR/src-tauri/Cargo.toml"
 
 # 3-5. Tauri config files
 for conf in tauri.conf.json tauri.windows.conf.json tauri.macos.conf.json; do
-  sed -i "s/\"version\": \"$OLD\"/\"version\": \"$NEW\"/" "$DIR/src-tauri/$conf"
+  sed_in_place "s/\"version\": \"$OLD\"/\"version\": \"$NEW\"/" "$DIR/src-tauri/$conf"
 done
 
 # 6. README download links
-sed -i "s/v$OLD/v$NEW/g" "$DIR/README.md"
+sed_in_place "s/v$OLD/v$NEW/g" "$DIR/README.md"
 
 # 7. Rebuild Cargo.lock
 echo "Rebuilding Cargo.lock..."

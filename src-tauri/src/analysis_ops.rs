@@ -155,6 +155,9 @@ pub fn start_analysis(options: Option<serde_json::Value>) -> Result<serde_json::
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("missing_run_id"))?
         .to_string();
+    // Start the run-narration LLM toast loop. Honors run_narration_enabled
+    // setting internally and is a no-op when disabled.
+    crate::run_narrator::start(&run_id);
     let mut worker_options = options.unwrap_or_else(|| json!({}));
     if let Some(object) = worker_options.as_object_mut() {
         object.insert("run_id".to_string(), serde_json::Value::String(run_id.clone()));
@@ -218,6 +221,14 @@ pub fn start_analysis(options: Option<serde_json::Value>) -> Result<serde_json::
             if let Some(rid) = payload.get("result").and_then(|v| v.get("run_id")).and_then(|v| v.as_str()) {
                 crate::run_state_cache::clear_run(rid);
             }
+        }
+        // Stop the run-narration loop for this run (idempotent if never started).
+        if let Some(rid) = ops_store()
+            .lock()
+            .ok()
+            .and_then(|s| s.get(&operation_id_for_thread).and_then(|r| r.run_id.clone()))
+        {
+            crate::run_narrator::stop(&rid);
         }
         // If cancelled, override outcome to aborted
         let outcome = if is_cancelled(&cancel_flag_for_thread) {

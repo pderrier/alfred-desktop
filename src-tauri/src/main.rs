@@ -52,6 +52,7 @@ mod openai_client;
 mod paths;
 mod report;
 mod run_index;
+mod run_narrator;
 mod run_state;
 mod run_state_cache;
 mod run_stats;

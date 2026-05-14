@@ -1238,14 +1238,19 @@ Regles :
 }
 
 fn build_synthesis_prompt(run_id: &str) -> String {
-    let account = crate::load_run_by_id_direct(run_id).ok()
-        .and_then(|r| r.get("account").and_then(|v| v.as_str()).map(String::from))
-        .unwrap_or_default();
+    let run_state = crate::load_run_by_id_direct(run_id).ok().unwrap_or_else(|| json!({}));
+    let account = run_state.get("account").and_then(|v| v.as_str()).map(String::from).unwrap_or_default();
     let previous_syntheses = crate::llm_prompts::build_previous_syntheses_section_public(&account);
 
     // Phase 2b: theme concentration
     let concentration = compute_theme_concentration(run_id);
     let concentration_section = build_theme_concentration_text(&concentration);
+
+    // Phase 1 cross-account section — same renderer as the native/native-oauth
+    // path so 3-mode LLM parity holds. Cross-account themes are computed at
+    // prompt build time (not collection time) so they reflect the current
+    // line_memory state.
+    let cross_account_section = build_cross_account_section_with_themes(&run_state);
 
     format!(
         r#"Tu es Alfred, un gestionnaire de portefeuille qui conseille un investisseur particulier.
@@ -1321,6 +1326,7 @@ WORKFLOW STRICT — suis ces etapes dans l'ordre :
 
 {previous_syntheses}
 {concentration_section}
+{cross_account_section}
 REGLES:
 - Ne saute AUCUNE etape (get_run_context, check_coverage, validate_synthesis, finalize_report).
 - N'appelle PAS get_line_data ni validate_recommendation — les analyses par ligne
@@ -1333,7 +1339,109 @@ Le travail d'analyse de toutes les lignes sera gache. Tu DOIS appeler
 validate_synthesis puis finalize_report. Pas d'exception."#,
         run_id = run_id,
         concentration_section = concentration_section,
+        cross_account_section = cross_account_section,
     )
+}
+
+/// Read `cross_account_context` from run_state, fold in current
+/// `cross_account_themes` aggregated from line_memory, then render the prompt
+/// section. Used by both `build_synthesis_prompt` and `build_report_prompt`.
+pub(crate) fn build_cross_account_section_with_themes(run_state: &Value) -> String {
+    let mut context = match run_state.get("cross_account_context").cloned() {
+        Some(v) if v.is_object() => v,
+        _ => return String::new(),
+    };
+    // Aggregate themes at prompt time so the section sees up-to-date line_memory.
+    let themes = aggregate_cross_account_themes(run_state);
+    if let Some(obj) = context.as_object_mut() {
+        obj.insert("cross_account_themes".to_string(), themes);
+    }
+    crate::native_collection_helpers::build_cross_account_prompt_section(&context)
+}
+
+/// Build cross-account themes by joining `line_memory.by_ticker[].news_themes`
+/// with each ticker's account (from `run_state.portfolio.positions[].compte`).
+///
+/// Output shape: `[{ theme, tickers: [..], accounts: [..] }]`. Only themes
+/// spanning ≥ 2 distinct accounts make it through — a theme present on a
+/// single account is not "cross-account" by definition.
+pub(crate) fn aggregate_cross_account_themes(run_state: &Value) -> Value {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    // Ticker → account (uppercased ticker for case-insensitive lookup)
+    let mut ticker_to_account: BTreeMap<String, String> = BTreeMap::new();
+    if let Some(positions) = run_state.get("portfolio")
+        .and_then(|p| p.get("positions"))
+        .and_then(|v| v.as_array())
+    {
+        for pos in positions {
+            let ticker = pos.get("ticker").and_then(|v| v.as_str()).unwrap_or("").to_uppercase();
+            let compte = pos.get("compte").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if !ticker.is_empty() && !compte.is_empty() {
+                ticker_to_account.insert(ticker, compte);
+            }
+        }
+    }
+
+    // Walk by_ticker themes
+    let store = line_memory_read();
+    let by_ticker = match store.get("by_ticker").and_then(|v| v.as_object()) {
+        Some(bt) => bt,
+        None => return json!([]),
+    };
+
+    // theme → { tickers: set, accounts: set }
+    #[derive(Default)]
+    struct ThemeAgg {
+        tickers: BTreeSet<String>,
+        accounts: BTreeSet<String>,
+    }
+    let mut by_theme: BTreeMap<String, ThemeAgg> = BTreeMap::new();
+
+    for (ticker, entry) in by_ticker {
+        if ticker.starts_with('_') { continue; }
+        let upper = ticker.to_uppercase();
+        let account = match ticker_to_account.get(&upper) {
+            Some(a) => a.clone(),
+            None => continue,
+        };
+        if let Some(themes) = entry.get("news_themes").and_then(|v| v.as_array()) {
+            for theme_val in themes {
+                if let Some(slug) = theme_val.as_str() {
+                    let slug = slug.trim().to_lowercase();
+                    if slug.is_empty() { continue; }
+                    let agg = by_theme.entry(slug).or_default();
+                    agg.tickers.insert(upper.clone());
+                    agg.accounts.insert(account.clone());
+                }
+            }
+        }
+    }
+
+    // Keep only themes that span ≥ 2 accounts
+    let mut result: Vec<Value> = by_theme.into_iter()
+        .filter(|(_, agg)| agg.accounts.len() >= 2)
+        .map(|(theme, agg)| {
+            json!({
+                "theme": theme,
+                "tickers": agg.tickers.into_iter().collect::<Vec<_>>(),
+                "accounts": agg.accounts.into_iter().collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    // Sort: most accounts first, then theme name
+    result.sort_by(|a, b| {
+        let an = a.get("accounts").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+        let bn = b.get("accounts").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+        bn.cmp(&an).then_with(|| {
+            let at = a.get("theme").and_then(|v| v.as_str()).unwrap_or("");
+            let bt = b.get("theme").and_then(|v| v.as_str()).unwrap_or("");
+            at.cmp(bt)
+        })
+    });
+
+    Value::Array(result)
 }
 
 // ── Batch dispatch queue ─────────────────────────────────────────

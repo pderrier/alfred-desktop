@@ -201,6 +201,12 @@ pub(crate) fn execute_refresh_synthesis_mode(
         news_quality_threshold,
         max_missing,
     );
+    // refresh_synthesis mode runs after an initial full run that already
+    // wrote cross_account_context. We preserve the existing value if present
+    // on disk instead of recomputing it here.
+    let existing_ctx = crate::load_run_by_id_direct(run_id)
+        .ok()
+        .and_then(|rs| rs.get("cross_account_context").cloned());
     let final_collection_state = build_collection_state(
         snapshot,
         &incremental_positions,
@@ -213,6 +219,7 @@ pub(crate) fn execute_refresh_synthesis_mode(
         source_ingestion_status,
         source_details,
         &hydration_totals,
+        existing_ctx.as_ref(),
     );
     crate::native_line_analysis::persist_native_collection_state(run_id, &final_collection_state)?;
     crate::run_state_cache::clear_run(run_id);

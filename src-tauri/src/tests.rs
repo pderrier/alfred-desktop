@@ -2457,3 +2457,467 @@ use crate::storage::read_json_file;
         assert_eq!(real_tickers.len(), 1);
         assert_eq!(real_tickers[0], "AAPL");
     }
+
+    // ── Phase 1: cross-account context — holdings_accounts enrichment ──
+    //
+    // The Finary API returns ~29 holdings_accounts for a typical user
+    // (PEA, CTO, livrets, comptes courants, real estate, loans, crypto…).
+    // Until Phase 1 the snapshot only kept the ~7 investment-only accounts.
+    // These tests pin the new `holdings_accounts` / `portfolio_summary`
+    // shape and confirm `snapshot.accounts` (UI contract) is unchanged.
+
+    /// Builds a Finary holdings_account JSON the way the API returns it.
+    /// Real-world reference fields observed in
+    /// `~/AppData/Roaming/alfred-desktop/debug.log` (`finary_cash_raw:` lines).
+    fn fixture_holdings_account(
+        name: &str,
+        slug: &str,
+        institution: &str,
+        total_value: f64,
+        securities: &[serde_json::Value],
+        fiats: &[(&str, f64)],
+        provider_categories: &[&str],
+    ) -> serde_json::Value {
+        let secs: Vec<serde_json::Value> = securities.to_vec();
+        let fiats_json: Vec<serde_json::Value> = fiats
+            .iter()
+            .map(|(code, amount)| json!({
+                "current_value": amount,
+                "currency": { "code": code }
+            }))
+            .collect();
+        let account_types: Vec<serde_json::Value> = provider_categories
+            .iter()
+            .map(|c| json!({ "name": c }))
+            .collect();
+        json!({
+            "name": name,
+            "slug": slug,
+            "institution": { "name": institution },
+            "total_value": total_value,
+            "total_gain": 0.0,
+            "securities": secs,
+            "fiats": fiats_json,
+            "institution_connection": {
+                "institution_provider": {
+                    "account_types": account_types
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn test_kind_classification_structural() {
+        use crate::native_collection_helpers::classify_holding_kind;
+        // Table-driven — kind is structural, independent of names/institutions.
+        // (securities_count, fiats_sum_eur, total_value) → expected kind
+        let cases = [
+            (5_usize, 0.0_f64, 12000.0_f64, "investment"),  // PEA with securities
+            (0, 5000.0, 5000.0, "cash_only"),                // Livret A
+            (0, 0.0, -50000.0, "liability"),                  // Loan
+            (3, 1500.0, -200.0, "liability"),                 // Margin underwater
+            (0, 0.0, 250000.0, "other"),                      // Real estate manual
+            (0, 0.0, 0.0, "other"),                           // Empty / dormant
+            (10, 500.0, 25000.0, "investment"),               // CTO with cash
+            // Non-EUR-only cash: fiats_sum_eur is 0 so classifies as `other`
+            // (multi-currency cash IS preserved in cash_by_currency though).
+            (0, 0.0, 1200.0, "other"),
+        ];
+        for (sec, fiat, total, expected) in cases {
+            let actual = classify_holding_kind(sec, fiat, total);
+            assert_eq!(
+                actual, expected,
+                "classify_holding_kind({sec}, {fiat}, {total}) = {actual}, want {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_institution_provider_categories_extraction() {
+        use crate::native_collection_helpers::build_holdings_metadata;
+        let holdings = vec![fixture_holdings_account(
+            "Compte Cheque", "cc-1", "Banque X",
+            850.0, &[], &[("EUR", 850.0)],
+            &["checkings", "savings"],
+        )];
+        let meta = build_holdings_metadata(&holdings);
+        assert_eq!(meta.len(), 1);
+        let cats = meta[0]["institution_provider_categories"].as_array().unwrap();
+        let cat_strs: Vec<&str> = cats.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(cat_strs, vec!["checkings", "savings"],
+            "raw provider categories must be propagated in order");
+    }
+
+    #[test]
+    fn test_cash_by_currency_multi() {
+        use crate::native_collection_helpers::{aggregate_cash_by_currency, build_holdings_metadata};
+        let holdings = vec![
+            fixture_holdings_account(
+                "Revolut EUR", "revolut-eur", "Revolut",
+                2500.0, &[], &[("EUR", 2500.0)],
+                &["checkings"],
+            ),
+            fixture_holdings_account(
+                "Revolut USD", "revolut-usd", "Revolut",
+                1000.0, &[], &[("USD", 1000.0)],
+                &["checkings"],
+            ),
+            fixture_holdings_account(
+                "Revolut JPY", "revolut-jpy", "Revolut",
+                50000.0, &[], &[("JPY", 50000.0)],
+                &["checkings"],
+            ),
+        ];
+        let meta = build_holdings_metadata(&holdings);
+        // Per-account: each entry only carries its own currency.
+        assert_eq!(meta[0]["cash_by_currency"]["EUR"], 2500.0);
+        assert!(meta[1]["cash_by_currency"].get("EUR").is_none());
+        assert_eq!(meta[1]["cash_by_currency"]["USD"], 1000.0);
+        assert_eq!(meta[2]["cash_by_currency"]["JPY"], 50000.0);
+        // Cash field (EUR only) is 0 for non-EUR accounts.
+        assert_eq!(meta[0]["cash"], 2500.0);
+        assert_eq!(meta[1]["cash"], 0.0);
+        assert_eq!(meta[2]["cash"], 0.0);
+        // kind for non-EUR-only cash falls into `other` (cash field is EUR-scoped).
+        assert_eq!(meta[1]["kind"], "other");
+        // Aggregate across the snapshot keeps every currency.
+        let agg = aggregate_cash_by_currency(&meta);
+        assert_eq!(agg["EUR"], 2500.0);
+        assert_eq!(agg["USD"], 1000.0);
+        assert_eq!(agg["JPY"], 50000.0);
+    }
+
+    #[test]
+    fn test_snapshot_portfolio_aggregates() {
+        use crate::native_collection_helpers::{build_holdings_metadata, build_portfolio_summary};
+        let holdings = vec![
+            // Investment account — PEA with securities, no cash
+            fixture_holdings_account(
+                "PEA", "pea-1", "Bourse Direct",
+                15000.0,
+                &[json!({"ticker": "MC"}), json!({"ticker": "AI"})],
+                &[],
+                &["stocks"],
+            ),
+            // Cash-only — Livret A
+            fixture_holdings_account(
+                "Livret A", "livret-a", "Banque X",
+                12000.0, &[], &[("EUR", 12000.0)],
+                &["savings"],
+            ),
+            // Liability — loan
+            fixture_holdings_account(
+                "Loan", "loan-1", "Banque X",
+                -85000.0, &[], &[],
+                &["loans"],
+            ),
+        ];
+        let meta = build_holdings_metadata(&holdings);
+        let summary = build_portfolio_summary(&meta);
+        // 15000 + 12000 - 85000 = -58000
+        assert_eq!(summary["total_value"], -58000.0);
+        assert_eq!(summary["total_cash_eur"], 12000.0);
+        assert_eq!(summary["account_count"], 3);
+        assert_eq!(summary["value_by_kind"]["investment"], 15000.0);
+        assert_eq!(summary["value_by_kind"]["cash_only"], 12000.0);
+        assert_eq!(summary["value_by_kind"]["liability"], -85000.0);
+        assert_eq!(summary["value_by_institution_provider_category"]["stocks"], 15000.0);
+        assert_eq!(summary["value_by_institution_provider_category"]["savings"], 12000.0);
+        assert_eq!(summary["value_by_institution_provider_category"]["loans"], -85000.0);
+        assert_eq!(summary["cash_by_currency"]["EUR"], 12000.0);
+    }
+
+    #[test]
+    fn test_snapshot_holdings_accounts_includes_all_kinds() {
+        // Five-holding mix mirrors what the user actually has — investment,
+        // cash-only, liability, real-estate manual, multi-currency.
+        // `build_holdings_metadata` must surface all of them with `kind`.
+        use crate::native_collection_helpers::build_holdings_metadata;
+        let holdings = vec![
+            fixture_holdings_account(
+                "PEA", "pea-1", "Bourse Direct",
+                10000.0,
+                &[json!({"ticker": "MC"})],
+                &[("EUR", 200.0)],
+                &["stocks"],
+            ),
+            fixture_holdings_account(
+                "Livret", "livret-1", "Banque X",
+                3000.0, &[], &[("EUR", 3000.0)],
+                &["savings"],
+            ),
+            fixture_holdings_account(
+                "Pret", "pret-1", "Banque X",
+                -50000.0, &[], &[],
+                &["loans"],
+            ),
+            fixture_holdings_account(
+                "Maison", "maison-1", "Manual",
+                250000.0, &[], &[],
+                &["real_estate"],
+            ),
+            fixture_holdings_account(
+                "Revolut JPY", "rev-jpy", "Revolut",
+                4000.0, &[], &[("JPY", 4000.0)],
+                &["checkings"],
+            ),
+        ];
+        let meta = build_holdings_metadata(&holdings);
+        assert_eq!(meta.len(), 5, "all five holdings must be surfaced");
+        let kinds: Vec<&str> = meta.iter()
+            .map(|e| e["kind"].as_str().unwrap_or("?"))
+            .collect();
+        assert_eq!(kinds, vec!["investment", "cash_only", "liability", "other", "other"]);
+        // PEA stock has both securities AND cash — kind=investment, cash preserved.
+        assert_eq!(meta[0]["cash"], 200.0);
+        assert_eq!(meta[0]["securities_count"], 1);
+    }
+
+    #[test]
+    fn test_cross_account_context_excludes_target() {
+        use crate::native_collection_helpers::{
+            build_cross_account_context, build_holdings_metadata, build_portfolio_summary,
+        };
+        let holdings = vec![
+            fixture_holdings_account(
+                "PEA", "pea-1", "Bourse Direct",
+                10000.0, &[json!({"ticker":"MC"})], &[], &["stocks"],
+            ),
+            fixture_holdings_account(
+                "Livret", "livret-1", "Banque X",
+                3000.0, &[], &[("EUR", 3000.0)], &["savings"],
+            ),
+            fixture_holdings_account(
+                "CTO", "cto-1", "Bourse Direct",
+                5000.0, &[json!({"ticker":"AAPL"})], &[], &["stocks"],
+            ),
+        ];
+        let meta = build_holdings_metadata(&holdings);
+        let summary = build_portfolio_summary(&meta);
+        let snapshot = json!({
+            "holdings_accounts": meta,
+            "portfolio_summary": summary,
+            "positions": [],
+        });
+        let ctx = build_cross_account_context(&snapshot, "PEA", json!([]));
+        // The target itself must NOT appear in other_accounts.
+        let others = ctx["other_accounts"].as_array().unwrap();
+        assert_eq!(others.len(), 2, "PEA excluded → 2 other accounts");
+        let names: Vec<&str> = others.iter().filter_map(|e| e["name"].as_str()).collect();
+        assert!(!names.contains(&"PEA"));
+        assert!(names.contains(&"Livret"));
+        assert!(names.contains(&"CTO"));
+        // portfolio_totals must be the full-portfolio summary
+        assert_eq!(ctx["portfolio_totals"]["account_count"], 3);
+        assert_eq!(ctx["target_account"], "PEA");
+    }
+
+    #[test]
+    fn test_cross_account_context_top_positions() {
+        use crate::native_collection_helpers::{
+            build_cross_account_context, build_holdings_metadata,
+        };
+        // CTO has 5 positions; cross_account_context must keep only the 3
+        // largest in `top_positions`, sorted by `valeur_actuelle` desc.
+        let holdings = vec![
+            fixture_holdings_account(
+                "PEA", "pea-1", "Bourse Direct",
+                10000.0, &[json!({"ticker":"MC"})], &[], &["stocks"],
+            ),
+            fixture_holdings_account(
+                "CTO", "cto-1", "Bourse Direct",
+                15000.0,
+                &[
+                    json!({"ticker":"A"}), json!({"ticker":"B"}),
+                    json!({"ticker":"C"}), json!({"ticker":"D"}),
+                    json!({"ticker":"E"}),
+                ],
+                &[],
+                &["stocks"],
+            ),
+        ];
+        let meta = build_holdings_metadata(&holdings);
+        // All positions used to compute top_positions (filtered by compte field)
+        let positions = json!([
+            {"ticker":"A","nom":"AlphaCo","compte":"CTO","valeur_actuelle":500.0},
+            {"ticker":"B","nom":"BetaCo","compte":"CTO","valeur_actuelle":3000.0},
+            {"ticker":"C","nom":"CharlieCo","compte":"CTO","valeur_actuelle":1000.0},
+            {"ticker":"D","nom":"DeltaCo","compte":"CTO","valeur_actuelle":7000.0},
+            {"ticker":"E","nom":"EchoCo","compte":"CTO","valeur_actuelle":2500.0},
+            {"ticker":"MC","nom":"LVMH","compte":"PEA","valeur_actuelle":10000.0},
+        ]);
+        let snapshot = json!({
+            "holdings_accounts": meta,
+            "portfolio_summary": {},
+            "positions": positions,
+        });
+        let ctx = build_cross_account_context(&snapshot, "PEA", json!([]));
+        let others = ctx["other_accounts"].as_array().unwrap();
+        let cto = others.iter().find(|e| e["name"] == "CTO").unwrap();
+        let tops = cto["top_positions"].as_array().expect("top_positions present");
+        assert_eq!(tops.len(), 3, "max 3 top positions");
+        // Sorted by value desc: D(7000), B(3000), E(2500)
+        let tickers: Vec<&str> = tops.iter().filter_map(|t| t["ticker"].as_str()).collect();
+        assert_eq!(tickers, vec!["D", "B", "E"]);
+        // Weights sum to total (7000+3000+2500+1000+500 = 14000 total in CTO):
+        // D = 7000/14000 = 50.0%
+        assert!((tops[0]["weight_pct"].as_f64().unwrap() - 50.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_cross_account_context_non_investment_omits_top_positions() {
+        use crate::native_collection_helpers::{
+            build_cross_account_context, build_holdings_metadata,
+        };
+        let holdings = vec![
+            fixture_holdings_account(
+                "PEA", "pea-1", "Bourse Direct",
+                10000.0, &[json!({"ticker":"MC"})], &[], &["stocks"],
+            ),
+            fixture_holdings_account(
+                "Livret", "livret-1", "Banque X",
+                3000.0, &[], &[("EUR", 3000.0)], &["savings"],
+            ),
+        ];
+        let meta = build_holdings_metadata(&holdings);
+        let snapshot = json!({
+            "holdings_accounts": meta,
+            "portfolio_summary": {},
+            "positions": [],
+        });
+        let ctx = build_cross_account_context(&snapshot, "PEA", json!([]));
+        let others = ctx["other_accounts"].as_array().unwrap();
+        let livret = others.iter().find(|e| e["name"] == "Livret").unwrap();
+        assert!(livret.get("top_positions").is_none(),
+            "non-investment accounts must omit top_positions");
+    }
+
+    #[test]
+    fn test_synthesis_prompt_contains_cross_account_section() {
+        // Both `build_synthesis_prompt` and `build_report_prompt` must render
+        // the cross-account block when run_state holds a cross_account_context.
+        // We test through `build_cross_account_prompt_section` directly since
+        // the prompt builders are private but render this helper verbatim.
+        use crate::native_collection_helpers::build_cross_account_prompt_section;
+        let context = json!({
+            "target_account": "PEA",
+            "other_accounts": [
+                {
+                    "slug": "livret-1",
+                    "name": "Livret A",
+                    "institution_name": "Banque X",
+                    "kind": "cash_only",
+                    "institution_provider_categories": ["savings"],
+                    "total_value_eur": 12000.0,
+                    "cash_by_currency": {"EUR": 12000.0},
+                },
+                {
+                    "slug": "cto-1",
+                    "name": "CTO US",
+                    "institution_name": "Broker Y",
+                    "kind": "investment",
+                    "institution_provider_categories": ["stocks"],
+                    "total_value_eur": 25000.0,
+                    "cash_by_currency": {"USD": 800.0},
+                    "top_positions": [
+                        {"ticker": "AAPL", "nom": "Apple", "weight_pct": 35.0},
+                        {"ticker": "MSFT", "nom": "Microsoft", "weight_pct": 25.0}
+                    ]
+                }
+            ],
+            "portfolio_totals": {
+                "total_value": 47000.0,
+                "total_cash_eur": 12000.0,
+                "cash_by_currency": {"EUR": 12000.0, "USD": 800.0},
+                "value_by_kind": {"investment": 35000.0, "cash_only": 12000.0},
+                "value_by_institution_provider_category": {"stocks": 35000.0, "savings": 12000.0},
+                "account_count": 3
+            },
+            "cross_account_themes": [
+                {"theme": "ai semiconductors", "tickers": ["NVDA", "AAPL"], "accounts": ["PEA", "CTO US"]}
+            ]
+        });
+        let section = build_cross_account_prompt_section(&context);
+        // Key markers — prove the section renders the right blocks
+        assert!(section.contains("Contexte cross-account"),
+            "section header present");
+        assert!(section.contains("PEA"), "target account named");
+        assert!(section.contains("Livret A"), "other account listed");
+        assert!(section.contains("CTO US"), "other account listed");
+        assert!(section.contains("kind=cash_only"), "kind exposed");
+        assert!(section.contains("kind=investment"), "kind exposed");
+        assert!(section.contains("AAPL(35%)"), "top position with weight");
+        assert!(section.contains("ai semiconductors"), "cross-account theme rendered");
+        assert!(section.contains("la synthese reste centree sur \"PEA\""),
+            "instruction line names target account");
+        // Multi-currency
+        assert!(section.contains("USD=800"), "USD cash exposed");
+        assert!(section.contains("EUR=12000"), "EUR cash exposed");
+    }
+
+    #[test]
+    fn test_cross_account_prompt_section_empty_when_no_others() {
+        // Single-account user: no other_accounts and no themes → skip section
+        // entirely to avoid prompt noise.
+        use crate::native_collection_helpers::build_cross_account_prompt_section;
+        let context = json!({
+            "target_account": "PEA",
+            "other_accounts": [],
+            "portfolio_totals": {"account_count": 1},
+            "cross_account_themes": []
+        });
+        let section = build_cross_account_prompt_section(&context);
+        assert!(section.is_empty(),
+            "single-account user → empty section, prompt unaffected");
+    }
+
+    #[test]
+    fn test_snapshot_accounts_ui_contract_unchanged() {
+        // CRITICAL byte-equality regression test: `snapshot.accounts` is the UI
+        // contract. shell-layout.js and global-portfolio-synthesis.js iterate
+        // over it expecting `{ name, total_value, total_gain, cash }`. The
+        // Phase 1 enrichment must NOT mutate this field — it adds parallel
+        // `holdings_accounts` / `portfolio_summary` fields instead.
+        //
+        // We exercise the snapshot via `normalize_finary_snapshot`, which is the
+        // last touch-point before the snapshot is persisted/consumed. The
+        // reference shape mirrors what `fetch_finary_snapshot` produces today
+        // (and what the UI has been reading for months).
+        let snapshot_with_phase1_fields = json!({
+            "total_value": 10000.0,
+            "total_gain": 500.0,
+            "cash": 1500.0,
+            "positions": [
+                {
+                    "ticker": "MC", "nom": "LVMH", "isin": "FR0000121014",
+                    "quantite": 2, "prix_actuel": 800, "valeur_actuelle": 1600,
+                    "prix_revient": 700, "plus_moins_value": 200, "plus_moins_value_pct": 14.3,
+                    "compte": "PEA"
+                }
+            ],
+            "accounts": [
+                { "name": "PEA", "cash": 1500.0, "total_value": 1600.0, "total_gain": 200.0 }
+            ],
+            "transactions": [],
+            "orders": [],
+            // New Phase 1 fields:
+            "holdings_accounts": [{"name":"PEA","slug":"pea","kind":"investment"}],
+            "portfolio_summary": {"total_value": 10000.0, "account_count": 1},
+            "cash_by_currency": {"EUR": 1500.0}
+        });
+
+        let normalized = crate::native_collection_helpers::normalize_finary_snapshot(
+            &snapshot_with_phase1_fields,
+        );
+
+        // `accounts` MUST be byte-identical to the input (no reordering, no field added).
+        let actual_accounts = serde_json::to_string(&normalized["accounts"]).unwrap();
+        let expected_accounts = serde_json::to_string(&snapshot_with_phase1_fields["accounts"]).unwrap();
+        assert_eq!(actual_accounts, expected_accounts,
+            "snapshot.accounts UI contract must be byte-identical");
+
+        // The new fields must survive normalization (consumed by synthesis prompt).
+        assert!(normalized.get("holdings_accounts").is_some());
+        assert!(normalized.get("portfolio_summary").is_some());
+        assert!(normalized.get("cash_by_currency").is_some());
+    }

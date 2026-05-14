@@ -1109,3 +1109,11 @@ pub fn run_swap_codex_to_oauth() -> Result<serde_json::Value> {
         }
     }))
 }
+
+pub fn run_codex_has_oauth_backup() -> Result<serde_json::Value> {
+    Ok(json!({
+        "ok": true,
+        "action": "codex:has-oauth-backup-local",
+        "result": { "has_backup": crate::codex::has_oauth_backup() }
+    }))
+}

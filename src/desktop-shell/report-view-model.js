@@ -476,7 +476,7 @@ function buildThemeRiskInsight({ snapshot, latestRun, recommendations, themeConc
   };
 }
 
-export function buildReportViewModel(dashboardPayload) {
+export function buildReportViewModel(dashboardPayload, extras = {}) {
   const snapshot = dashboardPayload?.snapshot || {};
   const latestRun = snapshot.latest_run || null;
   const latestRunSummary =
@@ -675,7 +675,12 @@ export function buildReportViewModel(dashboardPayload) {
       latestRun,
       recommendations: effectiveRecommendations,
       themeConcentration
-    })
+    }),
+    // v0.2.16: OAuth-availability proposal banner kind.
+    // One of "propose-native-to-codex", "propose-restore-oauth", or null.
+    // Decided at splash bootstrap (codex-fallback-policy.decideOauthProposal),
+    // rendered by app.js renderOauthProposalBanner.
+    oauthProposal: extras?.oauthProposal || null,
   };
 }
 

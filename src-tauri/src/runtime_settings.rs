@@ -83,6 +83,32 @@ pub fn definitions_json() -> serde_json::Value {
             "whyItMatters": "Caps the restore retry frequency to once per N hours when OAuth quota is still exhausted; avoids burning ~2 app-server restarts per launch.",
             "resetLabel": "Clear codex OAuth retry-after"
         },
+        "oauth_proposal_dismissed_until_ms": {
+            "type": "integer",
+            "min": 0,
+            "max": 9007199254740991_i64,
+            "defaultValue": 0,
+            "section": "product",
+            "restartRequired": false,
+            "envName": serde_json::Value::Null,
+            "label": "OAuth proposal dismiss-until (epoch ms)",
+            "description": "Internal — epoch-ms timestamp before which the in-app banner proposing a switch to ChatGPT Plus OAuth will stay hidden. Set when the user clicks 'Later' on the banner; cleared on accept or permanent dismiss.",
+            "whyItMatters": "Honors the user's 'don't ask again for a while' choice without making the banner permanently invisible.",
+            "resetLabel": "Re-enable OAuth proposal banner"
+        },
+        "oauth_proposal_permanently_dismissed": {
+            "type": "integer",
+            "min": 0,
+            "max": 1,
+            "defaultValue": 0,
+            "section": "product",
+            "restartRequired": false,
+            "envName": serde_json::Value::Null,
+            "label": "OAuth proposal permanently dismissed",
+            "description": "Internal — set to 1 when the user clicks 'Don't ask' on the OAuth-availability proposal banner. Suppresses the banner forever and also skips the OAuth probe at splash to avoid burning quota.",
+            "whyItMatters": "Respects the user's explicit decline so the app never re-pesters them.",
+            "resetLabel": "Re-enable OAuth proposal banner"
+        },
         "agentos_artifacts_enabled": {
             "type": "integer",
             "min": 0,
@@ -322,6 +348,10 @@ fn normalize_value(key: &str, value: &serde_json::Value) -> Result<serde_json::V
         "llm_backend_auto_fallback" => normalize_integer(key, value, 0, 1),
         "codex_auth_auto_fallback" => normalize_integer(key, value, 0, 1),
         "codex_auth_oauth_retry_after_ms" => normalize_integer(key, value, 0, 9007199254740991_i64),
+        "oauth_proposal_dismissed_until_ms" => {
+            normalize_integer(key, value, 0, 9007199254740991_i64)
+        }
+        "oauth_proposal_permanently_dismissed" => normalize_integer(key, value, 0, 1),
         "line_analysis_throttle_ms" => normalize_integer(key, value, 0, 5000),
         "collection_concurrency" => normalize_integer(key, value, 1, 12),
         "collection_throttle_ms" => normalize_integer(key, value, 0, 5000),

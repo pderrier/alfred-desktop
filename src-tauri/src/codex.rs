@@ -1372,6 +1372,23 @@ fn codex_auth_backup_path() -> Result<PathBuf> {
     Ok(codex_auth_path()?.with_extension("json.oauth.bak"))
 }
 
+/// Report whether an OAuth backup exists at `~/.codex/auth.json.oauth.bak`.
+///
+/// Used by the v0.2.16 OAuth-availability proposal banner: if a user is on
+/// codex+apikey *without* the auto-fallback flag set (i.e. they swapped
+/// manually or carried over from an earlier app version), we can only
+/// propose a "restore to OAuth" when this backup is present. Without it,
+/// restoring would require a fresh device-auth flow which is out of scope
+/// for the non-blocking splash banner.
+///
+/// Cheap: `Path::exists` only — no read, no parse.
+pub fn has_oauth_backup() -> bool {
+    match codex_auth_backup_path() {
+        Ok(path) => path.exists(),
+        Err(_) => false,
+    }
+}
+
 /// Read codex CLI auth mode from `auth.json`.
 /// Returns `"chatgpt"` when OAuth tokens are stored, `"apikey"` when a raw
 /// `OPENAI_API_KEY` is stored, or `"none"` when no usable credential exists.
@@ -2142,6 +2159,23 @@ mod tests {
         assert_eq!(swap_to_oauth().unwrap(), false);
         // auth.json still apikey
         assert_eq!(auth_mode().unwrap(), "apikey");
+    }
+
+    #[test]
+    fn has_oauth_backup_reports_false_when_missing() {
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = TempHome::new();
+        assert_eq!(has_oauth_backup(), false);
+    }
+
+    #[test]
+    fn has_oauth_backup_reports_true_when_present() {
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = TempHome::new();
+        let backup_path = codex_auth_backup_path().unwrap();
+        let payload = json!({ "tokens": { "access_token": "oauth-access" } });
+        fs::write(&backup_path, payload.to_string()).unwrap();
+        assert!(has_oauth_backup());
     }
 
     #[test]

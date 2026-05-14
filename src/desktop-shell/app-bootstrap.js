@@ -8,9 +8,28 @@
 import { formatBridgeError } from "/shared/run-operations-controller.js";
 import { isFinarySessionRunnable } from "/desktop-shell/run-wizard-policy.js";
 import { showToast, clearErrorToasts } from "/desktop-shell/shell-layout.js";
-import { decideFallback } from "/desktop-shell/codex-fallback-policy.js";
+import { decideFallback, decideOauthProposal } from "/desktop-shell/codex-fallback-policy.js";
 
-export { decideFallback };
+export { decideFallback, decideOauthProposal };
+
+/**
+ * Cross-bootstrap state shared with the report renderer.
+ *
+ * The v0.2.16 OAuth-availability proposal is decided during the splash
+ * bootstrap (we already pay for the codex probe there) but rendered later
+ * in the report area. The renderer reads this module-level value at draw
+ * time; the action handlers (`Switch` / `Later` / `Don't ask`) mutate it
+ * back to `null` so subsequent renders don't redraw the dismissed banner.
+ *
+ * Shape: one of "propose-native-to-codex", "propose-restore-oauth", or null.
+ */
+let pendingOauthProposal = null;
+export function getPendingOauthProposal() {
+  return pendingOauthProposal;
+}
+export function clearPendingOauthProposal() {
+  pendingOauthProposal = null;
+}
 
 export function initBootstrap(deps) {
   const {
@@ -522,6 +541,83 @@ export function initBootstrap(deps) {
         }
       }
     }
+
+    // v0.2.16: OAuth-availability proposal banner
+    //
+    // After the v0.2.14 auto-restore decision has been applied, check whether
+    // we should *propose* (non-blocking) a switch to OAuth in the report UI.
+    // This covers two gaps the auto-restore can't:
+    //   - User on `native` (paid API key): never auto-touched. Probe codex
+    //     here and offer a switch if OAuth is live.
+    //   - User on `codex` with manually-swapped apikey + auto-fallback flag=0:
+    //     auto-restore won't fire; if a backup exists we can offer to restore.
+    //
+    // Skip the probe entirely when the user has dismissed permanently or
+    // within the snooze window \u2014 burning an OAuth quota token for a banner
+    // we won't render is wasteful.
+    try {
+      const oauthDismissedUntil =
+        Number(settingsValues.oauth_proposal_dismissed_until_ms) || 0;
+      const oauthPermanentlyDismissed =
+        Number(settingsValues.oauth_proposal_permanently_dismissed) === 1;
+      const nowMs = Date.now();
+      const dismissalGate =
+        oauthPermanentlyDismissed || oauthDismissedUntil > nowMs;
+
+      // Decide whether we need a fresh probe for the proposal decision.
+      // The auto-restore path already runs the codex probe for `llmBackend
+      // === "codex"`; we can reuse it. For `llmBackend === "native"` it
+      // was NOT run in the existing flow, so we run it once here unless
+      // gated by the dismissal state.
+      let proposalProbeResult = probeResult;
+      let proposalCodexAuth = codexCurrentAuth;
+      let proposalHasBackup = false;
+      if (!dismissalGate && tauriInvoke) {
+        if (llmBackend === "native") {
+          // Probe codex (independent of the app's llm_backend) so we can
+          // tell whether OAuth is live on the codex CLI side.
+          try {
+            const sanity = await bridge.getCodexSessionStatus();
+            if ((sanity?.result || sanity)?.status === "no_binary") {
+              // No codex binary -> no OAuth path to propose. Leave probe null.
+              proposalProbeResult = null;
+            } else {
+              const probeEnvelope = await tauriInvoke("probe_codex_quota_local");
+              const probe = probeEnvelope?.result || probeEnvelope;
+              proposalProbeResult = {
+                logged_in: probe?.status === "ok",
+                status: probe?.status,
+                failure_reason: probe?.failure_reason ?? null,
+              };
+              const authEnvelope = await tauriInvoke("codex_auth_mode_local");
+              proposalCodexAuth =
+                (authEnvelope?.result || authEnvelope)?.mode || "none";
+            }
+          } catch { proposalProbeResult = null; }
+        }
+        // For the codex-restore-oauth proposal we need to know whether a
+        // backup file is on disk. Cheap call (Path::exists).
+        if (llmBackend === "codex" && proposalCodexAuth === "apikey") {
+          try {
+            const envelope = await tauriInvoke("codex_has_oauth_backup_local");
+            proposalHasBackup =
+              (envelope?.result || envelope)?.has_backup === true;
+          } catch { proposalHasBackup = false; }
+        }
+      }
+
+      const proposal = decideOauthProposal({
+        llmBackend,
+        codexCurrentAuth: proposalCodexAuth,
+        hasOauthBackup: proposalHasBackup,
+        oauthProbeOk: proposalProbeResult?.logged_in === true,
+        dismissedUntilMs: oauthDismissedUntil,
+        permanentlyDismissed: oauthPermanentlyDismissed,
+        codexAuthAutoFallbackActive,
+        nowMs,
+      });
+      pendingOauthProposal = proposal.kind === "none" ? null : proposal.kind;
+    } catch { pendingOauthProposal = null; }
 
     // Check Finary
     setSplashStatus("Refreshing Finary session\u2026");

@@ -1072,6 +1072,53 @@ use crate::storage::read_json_file;
     }
 
     #[test]
+    fn runtime_settings_oauth_proposal_normalizes_and_persists() {
+        let _guard = env_lock();
+        let base_dir = std::env::temp_dir()
+            .join(format!("alfred-runtime-settings-oauth-{}", now_epoch_ms()));
+        fs::create_dir_all(&base_dir).expect("temp dir should exist");
+        let settings_path = base_dir.join("runtime-settings.json");
+        std::env::set_var("ALFRED_RUNTIME_SETTINGS_PATH", settings_path.as_os_str());
+
+        // Defaults
+        let initial =
+            crate::runtime_settings::get_payload().expect("initial settings should load");
+        assert_eq!(initial["values"]["oauth_proposal_dismissed_until_ms"], 0);
+        assert_eq!(initial["values"]["oauth_proposal_permanently_dismissed"], 0);
+
+        // Patch valid values
+        let updated = crate::runtime_settings::patch(&json!({
+            "oauth_proposal_dismissed_until_ms": 1_700_000_000_000_i64,
+            "oauth_proposal_permanently_dismissed": 1,
+        }))
+        .expect("settings update should succeed");
+        assert_eq!(
+            updated["values"]["oauth_proposal_dismissed_until_ms"],
+            1_700_000_000_000_i64
+        );
+        assert_eq!(updated["values"]["oauth_proposal_permanently_dismissed"], 1);
+
+        // Range check on the dismissed-until ms (must reject negative)
+        let err = crate::runtime_settings::patch(&json!({
+            "oauth_proposal_dismissed_until_ms": -1
+        }))
+        .err()
+        .expect("negative epoch-ms should be rejected");
+        assert!(err.to_string().contains("oauth_proposal_dismissed_until_ms"));
+
+        // Range check on the permanent-dismiss flag (must reject 2)
+        let err = crate::runtime_settings::patch(&json!({
+            "oauth_proposal_permanently_dismissed": 2
+        }))
+        .err()
+        .expect("value out of 0..=1 range should be rejected");
+        assert!(err.to_string().contains("oauth_proposal_permanently_dismissed"));
+
+        std::env::remove_var("ALFRED_RUNTIME_SETTINGS_PATH");
+        let _ = fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
     fn health_payload_ready_matches_service_health_contract() {
         assert_eq!(
             crate::health::health_payload_ready(&json!({ "ok": true }), false).expect("healthy payload"),

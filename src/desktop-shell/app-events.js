@@ -56,6 +56,15 @@ export function initEvents(deps) {
       renderPipelineBar(stage);
       renderTopBarProgress({ status: "running", line_progress });
     });
+
+    // Run narration — LLM-generated 1-sentence summary of the last 10s of events.
+    // Routed to the alfred overlay as a "run-narration" notification, which the
+    // alfred-analysis-narration trigger picks up. Empty payload or no active run → ignored.
+    window.__TAURI__.event.listen("alfred://run-narration", (event) => {
+      const { message } = event.payload || {};
+      if (!message || !getActiveRunId()) return;
+      window.__alfredOverlay?.notify?.("run-narration", { message });
+    });
   }
 
   // ── News article links → open in external browser ──

@@ -84,6 +84,10 @@ fn relay_loop(path: &PathBuf, run_id: &str, stop: &AtomicBool) {
 fn dispatch_event(run_id: &str, event: &Value) {
     let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
+    // Feed every event into the run-narration ring buffer. The narrator is a
+    // no-op when not started for this run_id, so this call is always safe.
+    crate::run_narrator::record_event(run_id, event);
+
     match event_type {
         "line_progress" => {
             let ticker = event.get("ticker").and_then(|v| v.as_str()).unwrap_or("");

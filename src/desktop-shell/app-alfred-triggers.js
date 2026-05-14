@@ -17,6 +17,7 @@
  */
 
 import { openChatWizard } from "/desktop-shell/app-chat-wizard.js";
+import { buildNarrationContext } from "/desktop-shell/app-alfred-narration-context.js";
 
 // ── Onboarding chat wizard ─────────────────────────────────────
 
@@ -462,6 +463,22 @@ export function registerDefaultTriggers(overlay) {
         actions: [] // No actions — informational only
       };
     },
+    enabled: true
+  });
+
+  // ── Item 11b: LLM-narrated mid-run commentary ────────────────────
+  // Fired by Rust run_narrator every ~10s when new SSE events arrived.
+  // Higher priority than the template trigger above so the LLM message wins
+  // when both could fire in the same window. If no run-narration event
+  // arrives (LLM disabled, degraded mode, or no new events) the template
+  // trigger keeps showing the basic counter — fully additive fallback.
+  overlay.registerTrigger({
+    id: "alfred-analysis-narration",
+    priority: 3,
+    cooldown: 9000,
+    autoFireOn: "run-narration",
+    label: "Analysis Narration",
+    contextBuilder: buildNarrationContext,
     enabled: true
   });
 

@@ -155,6 +155,16 @@ pub fn remote_fetch_sector(ticker: &str, name: &str, isin: &str) -> Result<Value
     api_get(&format!("/api/sector?ticker={}&name={}&isin={}", urlenc(ticker), urlenc(name), urlenc(isin)), TIMEOUT_SECS)
 }
 
+/// Fetch technical snapshot (SMA/RSI/MACD/ATR/52w) computed server-side from
+/// ~250 trading days of OHLC. Returns the parsed JSON envelope verbatim — the
+/// caller is responsible for unwrapping `technical_snapshot`.
+///
+/// Server endpoint may not be deployed yet — callers must handle errors
+/// gracefully (typically map to `None`).
+pub fn remote_fetch_technicals(ticker: &str) -> Result<Value> {
+    api_get(&format!("/api/market/technicals?ticker={}", urlenc(ticker)), TIMEOUT_SECS)
+}
+
 /// Fetch COT data for a ticker from the API.
 pub fn remote_fetch_cot(ticker: &str, isin: &str) -> Result<Value> {
     api_get(&format!("/api/cot?ticker={}&isin={}", urlenc(ticker), urlenc(isin)), TIMEOUT_SECS)

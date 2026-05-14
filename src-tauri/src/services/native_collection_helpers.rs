@@ -76,6 +76,64 @@ pub(crate) fn resolve_source_current_price(row: &Value) -> Option<f64> {
     row.get("prix_revient").and_then(|v| v.as_f64()).filter(|v| *v > 0.0)
 }
 
+/// Returns true when the market enrichment provider tag indicates real provider
+/// data (boursorama, google_finance, alphavantage, yahoo, …) and not the
+/// `"none"` sentinel written by `resolve_source_current_price` when every
+/// provider failed and the row's PRU was used as a last-resort price.
+///
+/// Bug A guard: `apply_collection_result` calls `sync_position_from_market`
+/// only when this returns `true`, so the PRU-fallback never overwrites the
+/// position's gain/loss fields with `0.0` (`prix_actuel == prix_revient`).
+pub(crate) fn is_real_market_source(source: &str) -> bool {
+    let s = source.trim();
+    !s.is_empty() && s != "none"
+}
+
+/// Bug A fix — re-sync `prix_actuel` / `valeur_actuelle` / `plus_moins_value(_pct)`
+/// on a position row from the freshly enriched `market` row.
+///
+/// Returns `true` when the position was updated (real provider price applied),
+/// `false` when the market row had no usable price or only the `"none"`
+/// fallback source. Caller is responsible for the source guard via
+/// `is_real_market_source` — this helper enforces it again so it stays safe
+/// when unit-tested in isolation.
+///
+/// The position contract this writes back is the one consumed by the UI
+/// (`shell-layout.js` → `portfolio.positions[]`):
+/// - `prix_actuel`           : current market price
+/// - `valeur_actuelle`       : quantite * prix_actuel
+/// - `plus_moins_value`      : valeur_actuelle - quantite * prix_revient
+/// - `plus_moins_value_pct`  : (prix_actuel / prix_revient - 1) * 100, or 0 if PRU is 0
+pub(crate) fn sync_position_from_market(position: &mut Value, market: &Value) -> bool {
+    let source = market
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if !is_real_market_source(source) {
+        return false;
+    }
+    let market_price = market
+        .get("prix_actuel")
+        .and_then(|v| v.as_f64())
+        .filter(|v| v.is_finite() && *v > 0.0);
+    let Some(price) = market_price else {
+        return false;
+    };
+    let Some(obj) = position.as_object_mut() else {
+        return false;
+    };
+    let qty = obj.get("quantite").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let pru = obj.get("prix_revient").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let valeur = qty * price;
+    let pnl = valeur - (qty * pru);
+    let pnl_pct = if pru > 0.0 { (price / pru - 1.0) * 100.0 } else { 0.0 };
+    obj.insert("prix_actuel".to_string(), json!(price));
+    obj.insert("valeur_actuelle".to_string(), json!(valeur));
+    obj.insert("plus_moins_value".to_string(), json!(pnl));
+    obj.insert("plus_moins_value_pct".to_string(), json!(pnl_pct));
+    true
+}
+
 fn score_news(articles: &[Value]) -> i64 {
     std::cmp::min(100, (articles.len() as i64) * 40)
 }
@@ -370,6 +428,13 @@ pub(crate) fn build_memory_for_prompt(entry: Option<&Value>, global_banned_urls:
         "news_themes": entry.get("news_themes").cloned().unwrap_or(json!([])),
         "trend": as_text(entry.get("trend")),
         "user_action": entry.get("user_action").cloned().unwrap_or(Value::Null),
+        // Bug B follow-up — propagate the zero-price repair flag so
+        // `build_memory_section` can skip the "prix au signal" line entirely
+        // when the persisted price history is all zeros.
+        "price_data_unavailable": entry
+            .get("price_data_unavailable")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
         // Deep news fields (preserved)
         "deep_news_memory_summary": as_text(entry.get("deep_news_memory_summary")),
         "deep_news_selected_url": if !selected_url.is_empty() && !banned_set.contains(&selected_url) { Value::String(selected_url) } else { Value::String(String::new()) },
@@ -1002,11 +1067,13 @@ fn compact_map_inline(value: &Value) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_collection_state(
     snapshot: &Value,
     positions: &[Value],
     market: &Map<String, Value>,
     news: &Map<String, Value>,
+    technicals: &Map<String, Value>,
     quality: &Value,
     collection_issues: &[Value],
     failures: &[Value],
@@ -1028,6 +1095,10 @@ pub(crate) fn build_collection_state(
         "orders": snapshot.get("orders").cloned().unwrap_or_else(|| json!([])),
         "market": Value::Object(market.clone()),
         "news": Value::Object(news.clone()),
+        // Server-computed 250d technicals (SMA/RSI/MACD/ATR/52w). Parallel to
+        // `market` — never replaces it. Empty map when the endpoint is
+        // unavailable; consumers fall back to "non disponible".
+        "technicals": Value::Object(technicals.clone()),
         "quality": quality.clone(),
         "collection_issues": {
             "count": collection_issues.len(),

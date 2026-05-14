@@ -670,6 +670,16 @@ fn tool_get_line_data(data_dir: &Path, params: &Value) -> Result<Value> {
         })
         .unwrap_or(Value::Null);
 
+    // Technical snapshot (250d SMA/RSI/MACD/ATR) — populated by the collection
+    // worker. The server endpoint may not be deployed yet → expect Null in
+    // that case. The prompt builders render "TECHNIQUE : non disponible"
+    // when this is missing.
+    let technical_snapshot = run_state
+        .get("technicals")
+        .and_then(|t| t.get(&ticker).or_else(|| t.get(&ticker.to_lowercase())))
+        .cloned()
+        .unwrap_or(Value::Null);
+
     // News for this ticker — cap at 5 articles, prioritize cached deep summaries
     let news = {
         let raw = run_state
@@ -743,6 +753,20 @@ fn tool_get_line_data(data_dir: &Path, params: &Value) -> Result<Value> {
         }),
     );
 
+    // Build per-block collection_quality sub-object (additive — never modifies
+    // existing fields per the snapshot UI contract). The UI reads this to
+    // render per-block freshness badges (✓ frais / ⚠ stale / ✗ indispo).
+    // The LLM also reads this to weight evidence quality.
+    let collection_quality = build_collection_quality(
+        &market_data,
+        &technical_snapshot,
+        &news,
+        &shared_insights,
+        &sector_slug,
+        &cot_data,
+        &line_memory,
+    );
+
     Ok(json!({
         "line_id": line_id,
         "line_type": line_type,
@@ -760,7 +784,148 @@ fn tool_get_line_data(data_dir: &Path, params: &Value) -> Result<Value> {
         "activity": activity,
         "line_memory": line_memory,
         "quality": quality,
+        // ── Additive fields (snapshot UI contract: never replaces existing) ──
+        "technical_snapshot": technical_snapshot,
+        "collection_quality": collection_quality,
     }))
+}
+
+/// Build the per-block `collection_quality` sub-object surfaced in the line
+/// modal UI and consumed by the LLM. Each block reports `{source, as_of,
+/// quality}` (+ optional extras like `samples` for technical or `count` for
+/// news). Missing data → `quality: "unavailable"`.
+///
+/// Quality enum: `"fresh" | "stale" | "degraded" | "unavailable"`.
+/// - `fresh`     — server reports it directly, OR data is present and recent
+/// - `stale`     — present but older than the freshness window
+/// - `degraded`  — present but partial (e.g. < 60 OHLC samples)
+/// - `unavailable` — block returned no usable data
+fn build_collection_quality(
+    market: &Value,
+    technical: &Value,
+    news: &Value,
+    insights: &Value,
+    sector_slug: &str,
+    cot: &Value,
+    line_memory: &Value,
+) -> Value {
+    let now = now_iso();
+
+    // Spot: derive from market_data
+    let spot_source = market.get("source").and_then(|v| v.as_str()).unwrap_or("");
+    let has_price = market.get("prix_actuel").and_then(|v| v.as_f64()).is_some();
+    let spot = json!({
+        "source": if spot_source.is_empty() { Value::Null } else { json!(spot_source) },
+        "as_of": now.clone(),
+        "quality": if has_price { "fresh" } else { "unavailable" },
+    });
+
+    // Fundamentals: derive from market_data (same row exposes PER, margin, etc.)
+    let has_pe = market.get("pe_ratio").and_then(|v| v.as_f64()).is_some();
+    let has_margin = market.get("profit_margin").and_then(|v| v.as_f64()).is_some();
+    let has_growth = market.get("revenue_growth").and_then(|v| v.as_f64()).is_some();
+    let has_debt = market.get("debt_to_equity").and_then(|v| v.as_f64()).is_some();
+    let fundamentals_count = [has_pe, has_margin, has_growth, has_debt]
+        .iter()
+        .filter(|b| **b)
+        .count();
+    let fundamentals_quality = match fundamentals_count {
+        4 => "fresh",
+        2..=3 => "degraded",
+        1 => "degraded",
+        _ => "unavailable",
+    };
+    let fundamentals = json!({
+        "source": if spot_source.is_empty() { Value::Null } else { json!(spot_source) },
+        "as_of": now.clone(),
+        "quality": fundamentals_quality,
+    });
+
+    // Technical: from technical_snapshot envelope itself
+    let technical_block = if technical.is_object() {
+        let server_quality = technical.get("quality").and_then(|v| v.as_str());
+        let server_source = technical.get("source").and_then(|v| v.as_str()).unwrap_or("alphavantage:daily");
+        let server_as_of = technical.get("as_of").and_then(|v| v.as_str()).unwrap_or(&now);
+        let samples = technical.get("samples").and_then(|v| v.as_u64()).unwrap_or(0);
+        json!({
+            "source": server_source,
+            "as_of": server_as_of,
+            "quality": server_quality.unwrap_or(if samples >= 200 { "fresh" } else if samples >= 60 { "degraded" } else { "unavailable" }),
+            "samples": samples,
+        })
+    } else {
+        json!({
+            "source": Value::Null,
+            "as_of": Value::Null,
+            "quality": "unavailable",
+        })
+    };
+
+    // News: from articles count
+    let articles_count = news
+        .get("articles")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let news_quality = if articles_count == 0 {
+        "unavailable"
+    } else if articles_count < 2 {
+        "degraded"
+    } else {
+        "fresh"
+    };
+    let news_block = json!({
+        "source": "searxng",
+        "as_of": now.clone(),
+        "quality": news_quality,
+        "count": articles_count,
+    });
+
+    // Sector + COT: derived from sector_slug presence
+    let sector_quality = if sector_slug.is_empty() {
+        "unavailable"
+    } else if cot.is_object() {
+        "fresh"
+    } else {
+        "degraded"
+    };
+    let sector_cot = json!({
+        "source": "cached",
+        "as_of": now.clone(),
+        "quality": sector_quality,
+    });
+
+    // Insights: derived from shared_insights presence
+    let insights_block = json!({
+        "source": "shared",
+        "as_of": now.clone(),
+        "quality": if insights.is_object() && !insights.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+            "fresh"
+        } else {
+            "unavailable"
+        },
+    });
+
+    // Memory: line_memory presence
+    let memory_block = json!({
+        "source": "local",
+        "as_of": now.clone(),
+        "quality": if line_memory.is_object() && !line_memory.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+            "fresh"
+        } else {
+            "unavailable"
+        },
+    });
+
+    json!({
+        "spot": spot,
+        "fundamentals": fundamentals,
+        "technical": technical_block,
+        "news": news_block,
+        "sector_cot": sector_cot,
+        "insights": insights_block,
+        "memory": memory_block,
+    })
 }
 
 fn tool_validate_recommendation(data_dir: &Path, params: &Value) -> Result<Value> {

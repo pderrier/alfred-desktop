@@ -21,6 +21,12 @@ pub(crate) struct CollectionResult {
     pub(crate) issues: Vec<Value>,
     pub(crate) quality: Value,
     pub(crate) hydration_diag: Value,
+    /// Technical snapshot fetched from the server-side `/market/technicals`
+    /// endpoint. `None` when the endpoint is unavailable (404, transport
+    /// error) or returns no `indicators`. Stored on the result so it can be
+    /// persisted into run_state alongside `market` and consumed by both
+    /// `tool_get_line_data` (codex) and `build_native_line_prompt` (native).
+    pub(crate) technical_snapshot: Option<Value>,
 }
 
 struct CollectionTask {
@@ -142,9 +148,16 @@ fn process_collection_task(config: &CollectionWorkerConfig, task: CollectionTask
         config.news_quality_threshold,
         config.max_missing_market_fields,
     );
-    // Shared insights are fetched on-demand by the MCP server's get_line_data tool
-    // (direct API call), not stored in run_state. Deep news enrichment is done
-    // server-side in the /api/news handler.
+    // Technical snapshot — 250d SMA/RSI/MACD/ATR computed server-side. Fetched
+    // sequentially within the worker; a cheap 404 is the common case while the
+    // VPS endpoint is being rolled out, so this adds negligible latency.
+    // Shared insights / sector / COT remain fetched on-demand by the MCP
+    // server's get_line_data tool (direct API calls), not stored in run_state.
+    let technical_snapshot = if ticker.is_empty() {
+        None
+    } else {
+        crate::enrichment::fetch_technical_snapshot(&ticker)
+    };
     CollectionResult {
         index: task.index,
         ticker,
@@ -155,6 +168,7 @@ fn process_collection_task(config: &CollectionWorkerConfig, task: CollectionTask
         issues,
         quality,
         hydration_diag,
+        technical_snapshot,
     }
 }
 

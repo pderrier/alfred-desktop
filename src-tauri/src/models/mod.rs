@@ -21,6 +21,65 @@ pub struct Position {
     pub position_type: Option<String>,
 }
 
+// ── Technical snapshot (250-day OHLC indicators) ────────────────
+//
+// Mirrors the JSON returned by GET /market/technicals?ticker=X on the VPS.
+// All numeric fields are `Option<f64>` because providers may return partial
+// data (e.g. fresh listings without 200-day history). The desktop never
+// computes these values — it only deserializes them.
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Macd {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signal: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hist: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TechnicalIndicators {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sma_20: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sma_50: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sma_200: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rsi_14: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub macd: Option<Macd>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub atr_14: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub high_52w: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub low_52w: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_vs_sma_200_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_vs_high_52w_pct: Option<f64>,
+    /// "up" | "down" | "sideways"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trend_signal: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TechnicalSnapshot {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub samples: Option<u64>,
+    /// "fresh" | "stale" | "degraded" | "unavailable"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality: Option<String>,
+    #[serde(default)]
+    pub indicators: TechnicalIndicators,
+}
+
 // ── Enrichment issue ────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

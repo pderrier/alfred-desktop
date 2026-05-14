@@ -9,6 +9,7 @@ use std::env;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -16,11 +17,19 @@ use serde_json::{json, Value};
 
 use crate::llm_backend::ProgressFn;
 
-const DEFAULT_MODEL: &str = "gpt-4.1";
+/// Last-resort default if /v1/models is unreachable AND no override is set.
+/// gpt-5 is widely available on accounts with API access; gpt-4.1 was a
+/// poor fallback because it lags newer models on schema compliance.
+const DEFAULT_MODEL: &str = "gpt-5";
 const DEFAULT_API_BASE: &str = "https://api.openai.com/v1";
 const MAX_TOOL_ROUNDS: usize = 30;
 const MAX_RETRIES: usize = 4;
 const RETRY_BASE_MS: u64 = 500;
+const MODEL_DISCOVERY_TIMEOUT_SECS: u64 = 30;
+
+/// Process-lifetime cache for the auto-selected model. `/v1/models` is
+/// hit at most once per process, not once per line analysis.
+static AUTO_SELECTED_MODEL: OnceLock<String> = OnceLock::new();
 
 // ── Configuration ─────────────────────────────────────────────────
 
@@ -59,6 +68,9 @@ fn api_base() -> String {
 }
 
 /// Resolve model: explicit override > user setting > auto-detect best available.
+///
+/// Auto-detection is cached for the process lifetime via `AUTO_SELECTED_MODEL`,
+/// so repeated calls (one per line analysis) don't re-hit `/v1/models`.
 fn model_name() -> String {
     if let Ok(m) = env::var("ALFRED_MODEL") {
         let t = m.trim().to_string();
@@ -72,28 +84,46 @@ fn model_name() -> String {
             return t;
         }
     }
-    // Auto-detect: query /v1/models and pick the best one
-    if let Ok(best) = resolve_best_model() {
-        return best;
-    }
-    DEFAULT_MODEL.to_string()
+    // Auto-detect, cached for process lifetime. OnceLock::get_or_init blocks
+    // concurrent callers until the first resolution completes.
+    AUTO_SELECTED_MODEL
+        .get_or_init(|| match resolve_best_model() {
+            Ok(model) => model,
+            Err(err) => {
+                crate::debug_log(&format!(
+                    "openai_client: auto-select failed ({err}), falling back to {DEFAULT_MODEL}"
+                ));
+                DEFAULT_MODEL.to_string()
+            }
+        })
+        .clone()
 }
 
 /// Query /v1/models and pick the best available model.
 /// Same ranking logic as the Codex backend: gpt-5.x > o4 > o3 > gpt-4.x
+///
+/// Every failure path logs explicitly so silent fallback to the default
+/// model is observable in the debug log.
 fn resolve_best_model() -> Result<String> {
-    let key = api_key()?;
+    let key = api_key().map_err(|e| {
+        crate::debug_log(&format!("openai_client: resolve_best_model api_key error: {e}"));
+        e
+    })?;
     let base = api_base();
 
     let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(MODEL_DISCOVERY_TIMEOUT_SECS))
         .build();
 
     let resp = agent
         .get(&format!("{base}/models"))
         .set("Authorization", &format!("Bearer {key}"))
         .call()
-        .map_err(|e| anyhow!("model_list_failed:{e}"))?;
+        .map_err(|e| {
+            let err = anyhow!("model_list_failed:{e}");
+            crate::debug_log(&format!("openai_client: /v1/models request failed: {e}"));
+            err
+        })?;
 
     let body: Value = resp.into_json().unwrap_or(json!({}));
     let models: Vec<String> = body
@@ -108,21 +138,11 @@ fn resolve_best_model() -> Result<String> {
         .unwrap_or_default();
 
     if models.is_empty() {
+        crate::debug_log("openai_client: /v1/models returned empty data array");
         return Err(anyhow!("no_models_available"));
     }
 
-    let mut best: Option<&str> = None;
-    let mut best_score: i32 = -1;
-
-    for model in &models {
-        let score = model_score(model);
-        if score > best_score {
-            best_score = score;
-            best = Some(model);
-        }
-    }
-
-    let selected = best.unwrap_or(&models[0]).to_string();
+    let (selected, best_score) = pick_best_model(&models);
     crate::debug_log(&format!(
         "openai_client: auto-selected model {selected} (score={best_score}, {} available)",
         models.len()
@@ -130,14 +150,37 @@ fn resolve_best_model() -> Result<String> {
     Ok(selected)
 }
 
+/// Pick the highest-scoring model from a list. Pure, testable.
+/// Returns (selected_model, best_score). Falls back to the first model
+/// in the list if none score above 0.
+fn pick_best_model(models: &[String]) -> (String, i32) {
+    let mut best: Option<&str> = None;
+    let mut best_score: i32 = -1;
+    for model in models {
+        let score = model_score(model);
+        if score > best_score {
+            best_score = score;
+            best = Some(model);
+        }
+    }
+    (
+        best.unwrap_or_else(|| models[0].as_str()).to_string(),
+        best_score,
+    )
+}
+
 /// Score a model name for ranking. Higher is better.
+/// gpt-5.x ranks above gpt-4.x; minor versions (5.1, 5.2) outrank 5.0.
 fn model_score(name: &str) -> i32 {
     if name.starts_with("gpt-5") {
-        let version: f32 = name
+        // Parse version: "gpt-5" -> 5.0, "gpt-5.1" -> 5.1, "gpt-5.2-mini" -> 5.2
+        // Use the FIRST hyphen-separated token after "gpt-" as the version string,
+        // accepting decimals (e.g. "5.2"). Multiply by 10 to keep an int score.
+        let version_str = name
             .strip_prefix("gpt-")
             .and_then(|s| s.split('-').next())
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(5.0);
+            .unwrap_or("5");
+        let version: f32 = version_str.parse().unwrap_or(5.0);
         (version * 10.0) as i32
     } else if name.starts_with("gpt-4.1") {
         41
@@ -808,4 +851,66 @@ fn extract_json_result(text: &str) -> Result<Value> {
         return Ok(v);
     }
     Err(anyhow!("openai_client:no_json_in_response"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_score_orders_gpt5_minor_versions() {
+        assert!(model_score("gpt-5.2") > model_score("gpt-5.1"));
+        assert!(model_score("gpt-5.1") > model_score("gpt-5"));
+        assert!(model_score("gpt-5") > model_score("gpt-4.1"));
+        assert!(model_score("gpt-4.1") > model_score("o4-mini"));
+        assert!(model_score("o4-mini") > model_score("o3-mini"));
+        assert!(model_score("o3-mini") > model_score("gpt-4o"));
+        assert!(model_score("gpt-4o") > model_score("text-embedding-ada-002"));
+    }
+
+    #[test]
+    fn model_score_handles_suffixed_variants() {
+        // Suffixes like "-mini", "-turbo", "-preview" should not lower the score
+        // below the base family — the family prefix decides ranking.
+        assert_eq!(model_score("gpt-5.2-mini"), model_score("gpt-5.2"));
+        assert_eq!(model_score("gpt-5-turbo"), model_score("gpt-5"));
+    }
+
+    #[test]
+    fn pick_best_model_selects_highest_version() {
+        let models = vec![
+            "gpt-3.5-turbo".to_string(),
+            "gpt-4.1".to_string(),
+            "gpt-5".to_string(),
+            "gpt-5.1".to_string(),
+            "gpt-5.2".to_string(),
+            "o3-mini".to_string(),
+            "text-embedding-3-small".to_string(),
+        ];
+        let (selected, score) = pick_best_model(&models);
+        assert_eq!(selected, "gpt-5.2");
+        assert_eq!(score, model_score("gpt-5.2"));
+    }
+
+    #[test]
+    fn pick_best_model_handles_only_legacy_models() {
+        // No gpt-5 family available — should pick the highest of what's there.
+        let models = vec!["gpt-4o".to_string(), "gpt-4.1".to_string()];
+        let (selected, _score) = pick_best_model(&models);
+        assert_eq!(selected, "gpt-4.1");
+    }
+
+    #[test]
+    fn pick_best_model_falls_back_to_first_when_all_zero() {
+        // No recognized model families — should pick first to avoid panic.
+        let models = vec!["unknown-1".to_string(), "unknown-2".to_string()];
+        let (selected, _score) = pick_best_model(&models);
+        assert_eq!(selected, "unknown-1");
+    }
+
+    #[test]
+    fn default_model_is_gpt5() {
+        // Regression guard: the last-resort fallback must NOT be gpt-4.1 again.
+        assert_eq!(DEFAULT_MODEL, "gpt-5");
+    }
 }

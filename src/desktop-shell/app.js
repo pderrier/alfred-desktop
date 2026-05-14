@@ -845,10 +845,16 @@ function renderReport(payload) {
     injectSynthesisAskButton(synthCard, model);
   }
   if (reportProvenanceNode) {
-    reportProvenanceNode.textContent = Array.isArray(model.provenanceSummary) && model.provenanceSummary.length > 0
+    const provenanceText = Array.isArray(model.provenanceSummary) && model.provenanceSummary.length > 0
       ? `Provenance: ${model.provenanceSummary.join(" · ")}`
       : "";
+    reportProvenanceNode.textContent = provenanceText;
   }
+  // Surface synthesis validation warnings as a non-blocking notice — we always
+  // show the run; the badge just signals that the validator caught quality
+  // issues (priority_invalid, too_many_actions, etc.) so the user knows the
+  // model output wasn't 100% schema-compliant.
+  renderValidationWarnings(model.validationWarnings, model.validationWarningCount);
   renderActionsNow(model.actionsNow, model.recommendations);
   // Item 12: Export button
   injectExportButton(model);
@@ -879,6 +885,56 @@ function renderReport(payload) {
 }
 
 // ── Export button (Item 12) ──────────────────────────────────────
+
+function renderValidationWarnings(warnings, count) {
+  // Render a non-blocking warning notice on the synthesis card when the
+  // synthesis validator caught quality issues. We always render the run
+  // (see report-view-model.js artifactState logic); this notice exists so
+  // the user knows the output wasn't 100% schema-compliant — typically
+  // happens when a weaker model (e.g. gpt-4.1 fallback) ignores the
+  // priority/cap constraints. The codes come from validate_synthesis
+  // (Rust `report.rs`) — e.g. `actions_immediates_too_many`,
+  // `actions_immediates_invalid:5:priority_invalid`.
+  const host = document.getElementById("report-synthesis-card");
+  if (!host) return;
+  host.querySelector(".validation-warnings-notice")?.remove();
+  if (!Array.isArray(warnings) || warnings.length === 0 || count === 0) return;
+
+  const notice = document.createElement("div");
+  notice.className = "validation-warnings-notice";
+  notice.style.cssText =
+    "margin-top:0.6rem;padding:0.5rem 0.7rem;border-radius:6px;" +
+    "background:rgba(240,180,120,0.12);border-left:3px solid #f0b478;" +
+    "font-size:0.74rem;color:#bfd0df;line-height:1.4";
+  // Human-friendly summary line + collapsible details
+  const summary = document.createElement("div");
+  summary.innerHTML =
+    `<strong style="color:#f0b478">⚠ ${count} validation warning${count > 1 ? "s" : ""}</strong>` +
+    ` — the LLM output had minor schema issues; the analysis is shown anyway. ` +
+    `<button type="button" class="ghost-btn validation-warnings-toggle" ` +
+    `style="margin-left:0.4rem;padding:0.05rem 0.4rem;font-size:0.7rem">Details</button>`;
+  notice.appendChild(summary);
+
+  const details = document.createElement("ul");
+  details.className = "validation-warnings-list";
+  details.style.cssText = "margin:0.4rem 0 0 1.2rem;padding:0;display:none";
+  warnings.forEach((code) => {
+    const li = document.createElement("li");
+    li.style.cssText = "font-family:ui-monospace,monospace;font-size:0.7rem;color:#9bb0c0";
+    li.textContent = code;
+    details.appendChild(li);
+  });
+  notice.appendChild(details);
+
+  const toggle = notice.querySelector(".validation-warnings-toggle");
+  toggle?.addEventListener("click", () => {
+    const showing = details.style.display !== "none";
+    details.style.display = showing ? "none" : "block";
+    toggle.textContent = showing ? "Details" : "Hide";
+  });
+
+  host.appendChild(notice);
+}
 
 function injectExportButton(model) {
   // Insert into the KPI strip section (tab-overview-panel)

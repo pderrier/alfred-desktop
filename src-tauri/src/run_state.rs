@@ -58,12 +58,42 @@ pub fn build_run_summary(payload: &serde_json::Value, metadata: Option<&fs::Meta
         .and_then(|v| v.as_array())
         .map(|rows| rows.len())
         .unwrap_or(0);
-    let has_partial_artifacts = pending_recommendations > 0
+    // A run only has "partial artifacts" when it is genuinely incomplete:
+    // either the orchestration is still running/failed/aborted, OR the
+    // synthesis text is missing/empty. A completed run with non-empty
+    // synthese_marche MUST NOT advertise partial artifacts — otherwise the
+    // UI shows "Partial latest-run artifact" on successful runs.
+    let orch_status = orchestration
+        .and_then(|obj| obj.get("status"))
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.get("status").and_then(|v| v.as_str()))
+        .unwrap_or("unknown");
+    let is_incomplete_status = matches!(
+        orch_status,
+        "running" | "failed" | "aborted" | "unknown" | ""
+    );
+    let synthesis_text = payload
+        .get("synthese_marche")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            payload
+                .get("composed_payload")
+                .and_then(|v| v.get("synthese_marche"))
+                .and_then(|v| v.as_str())
+        })
+        .map(str::trim)
+        .unwrap_or("");
+    let synthesis_present = !synthesis_text.is_empty();
+    let has_any_artifacts = pending_recommendations > 0
         || collected_positions > 0
         || payload
             .get("composed_payload")
             .map(|v| v.is_object())
             .unwrap_or(false);
+    // Partial = there ARE artifacts AND (run not finished OR no synthesis yet).
+    // Completed/completed_degraded runs with synthesis → not partial.
+    let has_partial_artifacts =
+        has_any_artifacts && (is_incomplete_status || !synthesis_present);
     let updated_at = metadata
         .map(|stats| resolve_run_updated_at(payload, stats))
         .or_else(|| {
@@ -73,6 +103,24 @@ pub fn build_run_summary(payload: &serde_json::Value, metadata: Option<&fs::Meta
                 .map(|v| v.to_string())
         })
         .unwrap_or_default();
+    // Surface synthesis validation warnings so the UI can show them as a
+    // quality indicator (instead of dropping/labeling the run as failed). The
+    // `validation_corrections.global` array is persisted by `report.rs` at
+    // compose time and lists items like `actions_immediates_too_many`,
+    // `actions_immediates_invalid:5:priority_invalid`, etc. We surface just
+    // the count + the raw codes so the JS layer can render a non-blocking
+    // notice without having to re-read the full corrections object.
+    let validation_warnings: Vec<String> = payload
+        .get("validation_corrections")
+        .and_then(|v| v.get("global"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let validation_warning_count = validation_warnings.len();
     Some(json!({
         "run_id": run_id,
         "account": payload.get("account").cloned().unwrap_or(serde_json::Value::Null),
@@ -89,7 +137,9 @@ pub fn build_run_summary(payload: &serde_json::Value, metadata: Option<&fs::Meta
         "collected_positions_count": collected_positions,
         "pending_recommendations_count": pending_recommendations,
         "collection_progress": orchestration.and_then(|obj| obj.get("collection_progress")).cloned(),
-        "line_progress": orchestration.and_then(|obj| obj.get("line_progress")).cloned()
+        "line_progress": orchestration.and_then(|obj| obj.get("line_progress")).cloned(),
+        "validation_warnings": validation_warnings,
+        "validation_warning_count": validation_warning_count
     }))
 }
 
@@ -1031,4 +1081,132 @@ pub fn discover_running_stage(
     candidates.into_iter().next().map(|(_, run_id, status, stage, cp, lp, ec, em, ls)| {
         (run_id, status, stage, cp, lp, ec, em, ls)
     })
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn flag(payload: &serde_json::Value) -> bool {
+        build_run_summary(payload, None)
+            .and_then(|s| s.get("partial_artifacts_available").and_then(|v| v.as_bool()))
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn completed_run_with_synthesis_is_not_partial() {
+        // Bug repro: a successful run with 33 lines, synthesis present, must NOT
+        // advertise partial artifacts. Was the symptom in 0.2.14.
+        let payload = json!({
+            "run_id": "r1",
+            "orchestration": {"status": "completed", "stage": "completed"},
+            "portfolio": {"positions": [{"ticker": "MC"}, {"ticker": "VZ"}]},
+            "pending_recommandations": [{"ticker": "MC"}, {"ticker": "VZ"}],
+            "synthese_marche": "Le portefeuille presente une exposition tech equilibree...",
+        });
+        assert!(!flag(&payload));
+    }
+
+    #[test]
+    fn completed_degraded_run_with_synthesis_is_not_partial() {
+        let payload = json!({
+            "run_id": "r1",
+            "orchestration": {"status": "completed_degraded", "stage": "completed_degraded"},
+            "portfolio": {"positions": [{"ticker": "MC"}]},
+            "pending_recommandations": [{"ticker": "MC"}],
+            "synthese_marche": "Synthese disponible malgre quelques lignes manquantes.",
+        });
+        assert!(!flag(&payload));
+    }
+
+    #[test]
+    fn completed_run_without_synthesis_is_partial() {
+        // Edge case: status says completed but synthesis text never landed
+        // (shouldn't happen, but we want to flag it loudly).
+        let payload = json!({
+            "run_id": "r1",
+            "orchestration": {"status": "completed"},
+            "pending_recommandations": [{"ticker": "MC"}],
+        });
+        assert!(flag(&payload));
+    }
+
+    #[test]
+    fn running_run_with_collected_positions_is_partial() {
+        let payload = json!({
+            "run_id": "r1",
+            "orchestration": {"status": "running", "stage": "collecting"},
+            "portfolio": {"positions": [{"ticker": "MC"}]},
+        });
+        assert!(flag(&payload));
+    }
+
+    #[test]
+    fn failed_run_with_recs_is_partial() {
+        let payload = json!({
+            "run_id": "r1",
+            "orchestration": {"status": "failed"},
+            "pending_recommandations": [{"ticker": "MC"}],
+        });
+        assert!(flag(&payload));
+    }
+
+    #[test]
+    fn aborted_run_with_recs_is_partial() {
+        let payload = json!({
+            "run_id": "r1",
+            "orchestration": {"status": "aborted"},
+            "pending_recommandations": [{"ticker": "MC"}],
+        });
+        assert!(flag(&payload));
+    }
+
+    #[test]
+    fn empty_run_is_not_partial() {
+        // No artifacts at all → nothing partial to show.
+        let payload = json!({
+            "run_id": "r1",
+            "orchestration": {"status": "running"},
+        });
+        assert!(!flag(&payload));
+    }
+
+    #[test]
+    fn missing_status_with_artifacts_is_partial() {
+        // Defensive: an orchestration without a status field but with
+        // partial data must still be flagged as partial.
+        let payload = json!({
+            "run_id": "r1",
+            "pending_recommandations": [{"ticker": "MC"}],
+        });
+        assert!(flag(&payload));
+    }
+
+    #[test]
+    fn synthesis_in_composed_payload_counts() {
+        // Some flows persist synthesis only under composed_payload.synthese_marche
+        // before lifting it to the top level. Either path means "complete".
+        let payload = json!({
+            "run_id": "r1",
+            "orchestration": {"status": "completed"},
+            "pending_recommandations": [{"ticker": "MC"}],
+            "composed_payload": {
+                "synthese_marche": "Synthese composee disponible.",
+            },
+        });
+        assert!(!flag(&payload));
+    }
+
+    #[test]
+    fn whitespace_only_synthesis_does_not_count_as_complete() {
+        let payload = json!({
+            "run_id": "r1",
+            "orchestration": {"status": "completed"},
+            "pending_recommandations": [{"ticker": "MC"}],
+            "synthese_marche": "   \n  ",
+        });
+        // Empty/whitespace synthesis on a "completed" run is suspicious — flag it.
+        assert!(flag(&payload));
+    }
 }

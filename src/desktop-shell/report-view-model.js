@@ -638,6 +638,15 @@ export function buildReportViewModel(dashboardPayload) {
           : artifactState === "final"
             ? "Report"
             : "No report",
+    // Quality warnings from the synthesis validator. Surfaced as a
+    // non-blocking notice in the UI — we always show the run, but flag
+    // when validation caught quality issues (e.g. priority_invalid,
+    // actions_immediates_too_many). Source: run_state.rs build_run_summary
+    // pulls these from validation_corrections.global.
+    validationWarnings: Array.isArray(latestRunSummary?.validation_warnings)
+      ? latestRunSummary.validation_warnings
+      : [],
+    validationWarningCount: asNumber(latestRunSummary?.validation_warning_count, 0),
     account: asText(latestRun?.account || latestRunSummary?.account, null),
     accounts: Array.isArray(snapshot.latest_finary_snapshot?.accounts) ? snapshot.latest_finary_snapshot.accounts : [],
     provenanceSummary,

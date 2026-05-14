@@ -2674,6 +2674,204 @@ use crate::storage::read_json_file;
     }
 
     #[test]
+    fn test_cross_account_context_excludes_target() {
+        use crate::native_collection_helpers::{
+            build_cross_account_context, build_holdings_metadata, build_portfolio_summary,
+        };
+        let holdings = vec![
+            fixture_holdings_account(
+                "PEA", "pea-1", "Bourse Direct",
+                10000.0, &[json!({"ticker":"MC"})], &[], &["stocks"],
+            ),
+            fixture_holdings_account(
+                "Livret", "livret-1", "Banque X",
+                3000.0, &[], &[("EUR", 3000.0)], &["savings"],
+            ),
+            fixture_holdings_account(
+                "CTO", "cto-1", "Bourse Direct",
+                5000.0, &[json!({"ticker":"AAPL"})], &[], &["stocks"],
+            ),
+        ];
+        let meta = build_holdings_metadata(&holdings);
+        let summary = build_portfolio_summary(&meta);
+        let snapshot = json!({
+            "holdings_accounts": meta,
+            "portfolio_summary": summary,
+            "positions": [],
+        });
+        let ctx = build_cross_account_context(&snapshot, "PEA", json!([]));
+        // The target itself must NOT appear in other_accounts.
+        let others = ctx["other_accounts"].as_array().unwrap();
+        assert_eq!(others.len(), 2, "PEA excluded → 2 other accounts");
+        let names: Vec<&str> = others.iter().filter_map(|e| e["name"].as_str()).collect();
+        assert!(!names.contains(&"PEA"));
+        assert!(names.contains(&"Livret"));
+        assert!(names.contains(&"CTO"));
+        // portfolio_totals must be the full-portfolio summary
+        assert_eq!(ctx["portfolio_totals"]["account_count"], 3);
+        assert_eq!(ctx["target_account"], "PEA");
+    }
+
+    #[test]
+    fn test_cross_account_context_top_positions() {
+        use crate::native_collection_helpers::{
+            build_cross_account_context, build_holdings_metadata,
+        };
+        // CTO has 5 positions; cross_account_context must keep only the 3
+        // largest in `top_positions`, sorted by `valeur_actuelle` desc.
+        let holdings = vec![
+            fixture_holdings_account(
+                "PEA", "pea-1", "Bourse Direct",
+                10000.0, &[json!({"ticker":"MC"})], &[], &["stocks"],
+            ),
+            fixture_holdings_account(
+                "CTO", "cto-1", "Bourse Direct",
+                15000.0,
+                &[
+                    json!({"ticker":"A"}), json!({"ticker":"B"}),
+                    json!({"ticker":"C"}), json!({"ticker":"D"}),
+                    json!({"ticker":"E"}),
+                ],
+                &[],
+                &["stocks"],
+            ),
+        ];
+        let meta = build_holdings_metadata(&holdings);
+        // All positions used to compute top_positions (filtered by compte field)
+        let positions = json!([
+            {"ticker":"A","nom":"AlphaCo","compte":"CTO","valeur_actuelle":500.0},
+            {"ticker":"B","nom":"BetaCo","compte":"CTO","valeur_actuelle":3000.0},
+            {"ticker":"C","nom":"CharlieCo","compte":"CTO","valeur_actuelle":1000.0},
+            {"ticker":"D","nom":"DeltaCo","compte":"CTO","valeur_actuelle":7000.0},
+            {"ticker":"E","nom":"EchoCo","compte":"CTO","valeur_actuelle":2500.0},
+            {"ticker":"MC","nom":"LVMH","compte":"PEA","valeur_actuelle":10000.0},
+        ]);
+        let snapshot = json!({
+            "holdings_accounts": meta,
+            "portfolio_summary": {},
+            "positions": positions,
+        });
+        let ctx = build_cross_account_context(&snapshot, "PEA", json!([]));
+        let others = ctx["other_accounts"].as_array().unwrap();
+        let cto = others.iter().find(|e| e["name"] == "CTO").unwrap();
+        let tops = cto["top_positions"].as_array().expect("top_positions present");
+        assert_eq!(tops.len(), 3, "max 3 top positions");
+        // Sorted by value desc: D(7000), B(3000), E(2500)
+        let tickers: Vec<&str> = tops.iter().filter_map(|t| t["ticker"].as_str()).collect();
+        assert_eq!(tickers, vec!["D", "B", "E"]);
+        // Weights sum to total (7000+3000+2500+1000+500 = 14000 total in CTO):
+        // D = 7000/14000 = 50.0%
+        assert!((tops[0]["weight_pct"].as_f64().unwrap() - 50.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_cross_account_context_non_investment_omits_top_positions() {
+        use crate::native_collection_helpers::{
+            build_cross_account_context, build_holdings_metadata,
+        };
+        let holdings = vec![
+            fixture_holdings_account(
+                "PEA", "pea-1", "Bourse Direct",
+                10000.0, &[json!({"ticker":"MC"})], &[], &["stocks"],
+            ),
+            fixture_holdings_account(
+                "Livret", "livret-1", "Banque X",
+                3000.0, &[], &[("EUR", 3000.0)], &["savings"],
+            ),
+        ];
+        let meta = build_holdings_metadata(&holdings);
+        let snapshot = json!({
+            "holdings_accounts": meta,
+            "portfolio_summary": {},
+            "positions": [],
+        });
+        let ctx = build_cross_account_context(&snapshot, "PEA", json!([]));
+        let others = ctx["other_accounts"].as_array().unwrap();
+        let livret = others.iter().find(|e| e["name"] == "Livret").unwrap();
+        assert!(livret.get("top_positions").is_none(),
+            "non-investment accounts must omit top_positions");
+    }
+
+    #[test]
+    fn test_synthesis_prompt_contains_cross_account_section() {
+        // Both `build_synthesis_prompt` and `build_report_prompt` must render
+        // the cross-account block when run_state holds a cross_account_context.
+        // We test through `build_cross_account_prompt_section` directly since
+        // the prompt builders are private but render this helper verbatim.
+        use crate::native_collection_helpers::build_cross_account_prompt_section;
+        let context = json!({
+            "target_account": "PEA",
+            "other_accounts": [
+                {
+                    "slug": "livret-1",
+                    "name": "Livret A",
+                    "institution_name": "Banque X",
+                    "kind": "cash_only",
+                    "institution_provider_categories": ["savings"],
+                    "total_value_eur": 12000.0,
+                    "cash_by_currency": {"EUR": 12000.0},
+                },
+                {
+                    "slug": "cto-1",
+                    "name": "CTO US",
+                    "institution_name": "Broker Y",
+                    "kind": "investment",
+                    "institution_provider_categories": ["stocks"],
+                    "total_value_eur": 25000.0,
+                    "cash_by_currency": {"USD": 800.0},
+                    "top_positions": [
+                        {"ticker": "AAPL", "nom": "Apple", "weight_pct": 35.0},
+                        {"ticker": "MSFT", "nom": "Microsoft", "weight_pct": 25.0}
+                    ]
+                }
+            ],
+            "portfolio_totals": {
+                "total_value": 47000.0,
+                "total_cash_eur": 12000.0,
+                "cash_by_currency": {"EUR": 12000.0, "USD": 800.0},
+                "value_by_kind": {"investment": 35000.0, "cash_only": 12000.0},
+                "value_by_institution_provider_category": {"stocks": 35000.0, "savings": 12000.0},
+                "account_count": 3
+            },
+            "cross_account_themes": [
+                {"theme": "ai semiconductors", "tickers": ["NVDA", "AAPL"], "accounts": ["PEA", "CTO US"]}
+            ]
+        });
+        let section = build_cross_account_prompt_section(&context);
+        // Key markers — prove the section renders the right blocks
+        assert!(section.contains("Contexte cross-account"),
+            "section header present");
+        assert!(section.contains("PEA"), "target account named");
+        assert!(section.contains("Livret A"), "other account listed");
+        assert!(section.contains("CTO US"), "other account listed");
+        assert!(section.contains("kind=cash_only"), "kind exposed");
+        assert!(section.contains("kind=investment"), "kind exposed");
+        assert!(section.contains("AAPL(35%)"), "top position with weight");
+        assert!(section.contains("ai semiconductors"), "cross-account theme rendered");
+        assert!(section.contains("la synthese reste centree sur \"PEA\""),
+            "instruction line names target account");
+        // Multi-currency
+        assert!(section.contains("USD=800"), "USD cash exposed");
+        assert!(section.contains("EUR=12000"), "EUR cash exposed");
+    }
+
+    #[test]
+    fn test_cross_account_prompt_section_empty_when_no_others() {
+        // Single-account user: no other_accounts and no themes → skip section
+        // entirely to avoid prompt noise.
+        use crate::native_collection_helpers::build_cross_account_prompt_section;
+        let context = json!({
+            "target_account": "PEA",
+            "other_accounts": [],
+            "portfolio_totals": {"account_count": 1},
+            "cross_account_themes": []
+        });
+        let section = build_cross_account_prompt_section(&context);
+        assert!(section.is_empty(),
+            "single-account user → empty section, prompt unaffected");
+    }
+
+    #[test]
     fn test_snapshot_accounts_ui_contract_unchanged() {
         // CRITICAL byte-equality regression test: `snapshot.accounts` is the UI
         // contract. shell-layout.js and global-portfolio-synthesis.js iterate

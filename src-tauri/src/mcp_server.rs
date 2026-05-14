@@ -421,6 +421,21 @@ fn tool_get_run_context(data_dir: &Path, params: &Value) -> Result<Value> {
     let mut all_lines = line_ids;
     all_lines.extend(watchlist_line_ids);
 
+    // Phase 1: forward cross_account_context so the synthesis turn (codex MCP)
+    // sees the same cross-account block as the native/native-oauth paths.
+    // Themes are freshly aggregated from line_memory so the LLM sees the
+    // most recent state, not the one frozen at collection time.
+    let mut cross_account_context = run_state
+        .get("cross_account_context")
+        .cloned()
+        .unwrap_or(Value::Null);
+    if cross_account_context.is_object() {
+        let themes = crate::native_mcp_analysis::aggregate_cross_account_themes(&run_state);
+        if let Some(obj) = cross_account_context.as_object_mut() {
+            obj.insert("cross_account_themes".to_string(), themes);
+        }
+    }
+
     Ok(json!({
         "portfolio_summary": {
             "valeur_totale": portfolio.get("valeur_totale").cloned().unwrap_or(Value::Null),
@@ -431,6 +446,7 @@ fn tool_get_run_context(data_dir: &Path, params: &Value) -> Result<Value> {
         "lines": all_lines,
         "agent_guidelines": as_text(run_state.get("agent_guidelines")),
         "watchlist": watchlist_items,
+        "cross_account_context": cross_account_context,
     }))
 }
 

@@ -25,6 +25,8 @@ pub(crate) fn persist_native_collection_state(run_id: &str, collection_state: &V
                 "source_ingestion",
                 "normalization",
                 "line_memory_hydration",
+                // Phase 1: cross-account context for per-account synthesis prompt
+                "cross_account_context",
             ] {
                 if let Some(value) = collection_object.get(key) {
                     object.insert(key.to_string(), value.clone());

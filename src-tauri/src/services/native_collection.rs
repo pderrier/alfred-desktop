@@ -2192,6 +2192,7 @@ fn resolve_native_snapshot(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_collection_result(
     result: crate::native_collection_dispatch::CollectionResult,
     snapshot: &Value,
@@ -2209,6 +2210,7 @@ fn apply_collection_result(
     run_id: &str,
     mcp_dispatch: &mut crate::native_mcp_analysis::McpBatchDispatchQueue,
     collection_completed: usize,
+    cross_account_context: Option<&Value>,
 ) -> Result<()> {
     let ticker = result.ticker;
     let name = result.name;
@@ -2275,6 +2277,7 @@ fn apply_collection_result(
         source_ingestion_status,
         source_details,
         &Value::Null,
+        cross_account_context,
     );
     crate::native_line_analysis::persist_native_collection_state(run_id, &partial_collection_state)?;
     let collection_progress = json!({
@@ -2382,6 +2385,18 @@ pub(crate) fn execute_native_local_analysis_workflow_with(
     let account_gain: f64 = positions.iter()
         .map(|p| p.get("plus_moins_value").and_then(|v| v.as_f64()).unwrap_or(0.0))
         .sum();
+
+    // Phase 1 cross-account context — built from the FULL snapshot (before
+    // per-account scoping below mutates totals). Themes start empty here; the
+    // synthesis path populates them from line-memory at prompt-build time.
+    // Persisted into run_state so `tool_get_run_context` can forward it
+    // identically to the codex MCP and native/native-oauth paths.
+    let cross_account_context = crate::native_collection_helpers::build_cross_account_context(
+        &snapshot,
+        &target_account,
+        json!([]),
+    );
+
     let mut snapshot = snapshot;
     if let Some(obj) = snapshot.as_object_mut() {
         obj.insert("liquidites".to_string(), json!(account_cash));
@@ -2590,6 +2605,7 @@ pub(crate) fn execute_native_local_analysis_workflow_with(
                 &run_id,
                 &mut mcp_dispatch,
                 collection_completed,
+                Some(&cross_account_context),
             )?;
             if crate::run_state_cache::should_flush() {
                 crate::run_state_cache::flush_to_disk();
@@ -2619,6 +2635,7 @@ pub(crate) fn execute_native_local_analysis_workflow_with(
             &run_id,
             &mut mcp_dispatch,
             collection_completed,
+            Some(&cross_account_context),
         )?;
         if crate::run_state_cache::should_flush() {
             crate::run_state_cache::flush_to_disk();
@@ -2710,6 +2727,7 @@ pub(crate) fn execute_native_local_analysis_workflow_with(
         &source_ingestion_status,
         &source_details,
         &hydration_totals,
+        Some(&cross_account_context),
     );
     crate::native_line_analysis::persist_native_collection_state(&run_id, &final_collection_state)?;
     Ok(json!({

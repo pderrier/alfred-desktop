@@ -53,6 +53,8 @@ mod command_handlers;
 mod cli;
 #[path = "../../src-tauri/src/alfred_api_client.rs"]
 mod alfred_api_client;
+#[path = "../../src-tauri/src/agentos_artifacts.rs"]
+mod agentos_artifacts;
 #[path = "../../src-tauri/src/codex.rs"]
 mod codex;
 #[path = "../../src-tauri/src/enrichment.rs"]

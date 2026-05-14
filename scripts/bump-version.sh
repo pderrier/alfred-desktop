@@ -2,8 +2,10 @@
 # bump-version.sh — Single source of truth for version bumping.
 # Usage: ./scripts/bump-version.sh 0.2.6
 #
-# Updates version in all 5 manifest files + README download links.
+# Updates version in all 6 manifest files + README download links.
 # Source of truth: the version argument. No file is "primary".
+# Bumps: package.json, src-tauri/Cargo.toml, tauri.conf.json,
+#        tauri.windows.conf.json, tauri.macos.conf.json, alfred-cli/Cargo.toml.
 
 set -euo pipefail
 
@@ -59,18 +61,23 @@ for conf in tauri.conf.json tauri.windows.conf.json tauri.macos.conf.json; do
   sed_in_place "s/\"version\": \"$OLD\"/\"version\": \"$NEW\"/" "$DIR/src-tauri/$conf"
 done
 
-# 6. README download links
+# 6. alfred-cli/Cargo.toml — match the first `version = ...` line regardless
+# of its current value, so the CLI stays aligned even if it lagged behind.
+sed_in_place "0,/^version = \"[^\"]*\"/{s/^version = \"[^\"]*\"/version = \"$NEW\"/}" "$DIR/alfred-cli/Cargo.toml"
+
+# 7. README download links
 sed_in_place "s/v$OLD/v$NEW/g" "$DIR/README.md"
 
-# 7. Rebuild Cargo.lock
-echo "Rebuilding Cargo.lock..."
+# 8. Rebuild Cargo.lock files
+echo "Rebuilding Cargo.lock files..."
 (cd "$DIR/src-tauri" && cargo check --quiet 2>/dev/null) || true
+(cd "$DIR/alfred-cli" && cargo check --quiet 2>/dev/null) || true
 
 # Verify
 echo ""
 echo "Verification:"
 grep -n "\"$NEW\"" "$DIR/package.json" "$DIR/src-tauri/tauri.conf.json" "$DIR/src-tauri/tauri.windows.conf.json" "$DIR/src-tauri/tauri.macos.conf.json" | head -5
-grep -n "version = \"$NEW\"" "$DIR/src-tauri/Cargo.toml"
+grep -n "version = \"$NEW\"" "$DIR/src-tauri/Cargo.toml" "$DIR/alfred-cli/Cargo.toml"
 grep -c "v$NEW" "$DIR/README.md" | xargs -I{} echo "README.md: {} references to v$NEW"
 
 echo ""

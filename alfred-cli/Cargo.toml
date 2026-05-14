@@ -1,6 +1,6 @@
 [package]
 name = "alfred-cli"
-version = "0.2.7"
+version = "0.2.13"
 edition = "2021"
 
 [dependencies]

@@ -189,6 +189,15 @@ pub(crate) fn normalize_finary_snapshot(snapshot: &Value) -> Value {
             obj.insert("ambiguous_cash_groups".to_string(), groups.clone());
         }
     }
+    // Preserve cross-account context fields (Phase 1) — never consumed by UI,
+    // only by the per-account synthesis prompt builders.
+    for key in ["holdings_accounts", "portfolio_summary", "cash_by_currency"] {
+        if let Some(value) = snapshot.get(key) {
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert(key.to_string(), value.clone());
+            }
+        }
+    }
     result
 }
 
@@ -555,6 +564,210 @@ pub(crate) fn infer_issue_code(error: &anyhow::Error) -> String {
         .next()
         .unwrap_or("enrichment_fetch_failed")
         .to_string()
+}
+
+// ── Holdings metadata enrichment (Phase 1: cross-account context) ────────────
+//
+// Extracts an enriched per-account view of `holdings_accounts` from the Finary
+// API response. The result feeds `snapshot.holdings_accounts`, which is the
+// LLM-only view used to build cross-account context. `snapshot.accounts` (the
+// UI contract) is built separately from positions and is NOT affected.
+//
+// The `kind` field is computed structurally — no name/institution regex — so
+// the classification works generically across any Finary deployment:
+//   - `liability`   when `total_value < 0`   (loans are negative-value)
+//   - `investment`  when `securities_count > 0`
+//   - `cash_only`   when `securities_count == 0 && fiats_sum_eur > 0`
+//   - `other`       otherwise (real estate manual, non-EUR-only, etc.)
+//
+// `institution_provider_categories` is the raw list of strings observed in
+// `acct.institution_connection.institution_provider.account_types[].name`.
+// Real values observed in production: "stocks", "checkings", "savings",
+// "cryptos", "real_estate", "loans".
+pub(crate) fn build_holdings_metadata(holdings_accounts: &[Value]) -> Vec<Value> {
+    holdings_accounts.iter().map(build_holdings_entry).collect()
+}
+
+fn build_holdings_entry(acct: &Value) -> Value {
+    let name = acct.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let slug = acct.get("slug").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let institution_name = acct.get("institution")
+        .and_then(|v| v.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let securities_count = acct.get("securities")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let total_value = acct.get("total_value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let total_gain = acct.get("total_gain").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+    // Cash by currency: each `fiat` in `fiats[]` is in its local currency.
+    // Keep them separate — the LLM uses this to recommend cash sourcing.
+    let mut cash_by_currency: std::collections::HashMap<String, f64> =
+        std::collections::HashMap::new();
+    if let Some(fiats) = acct.get("fiats").and_then(|v| v.as_array()) {
+        for fiat in fiats {
+            let code = fiat.get("currency")
+                .and_then(|v| v.get("code"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("EUR")
+                .to_string();
+            let amount = fiat.get("current_value")
+                .or_else(|| fiat.get("amount"))
+                .or_else(|| fiat.get("quantity"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            *cash_by_currency.entry(code).or_insert(0.0) += amount;
+        }
+    }
+    let fiats_sum_eur = cash_by_currency.get("EUR").copied().unwrap_or(0.0);
+    let cash_eur = fiats_sum_eur;
+
+    let kind = classify_holding_kind(securities_count, fiats_sum_eur, total_value);
+
+    let institution_provider_categories: Vec<Value> = acct
+        .get("institution_connection")
+        .and_then(|ic| ic.get("institution_provider"))
+        .and_then(|ip| ip.get("account_types"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+                .map(Value::String)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Serialize `cash_by_currency` deterministically (sorted by key) for stable output.
+    let mut currency_keys: Vec<String> = cash_by_currency.keys().cloned().collect();
+    currency_keys.sort();
+    let mut cash_by_currency_obj = serde_json::Map::new();
+    for code in &currency_keys {
+        cash_by_currency_obj.insert(code.clone(), json!(cash_by_currency[code]));
+    }
+
+    json!({
+        "name": name,
+        "slug": slug,
+        "institution_name": institution_name,
+        "kind": kind,
+        "institution_provider_categories": institution_provider_categories,
+        "total_value": total_value,
+        "total_gain": total_gain,
+        "securities_count": securities_count,
+        "cash": cash_eur,
+        "cash_by_currency": Value::Object(cash_by_currency_obj),
+    })
+}
+
+/// Structural classification of a Finary holdings_account into a coarse kind.
+///
+/// Rules apply in order — `liability` wins over `investment` (a margin/loan
+/// account with negative net value is still a liability). `cash_only` requires
+/// strictly positive EUR cash (other-currency-only accounts fall into `other`).
+pub(crate) fn classify_holding_kind(
+    securities_count: usize,
+    fiats_sum_eur: f64,
+    total_value: f64,
+) -> &'static str {
+    if total_value < 0.0 {
+        return "liability";
+    }
+    if securities_count > 0 {
+        return "investment";
+    }
+    if fiats_sum_eur > 0.0 {
+        return "cash_only";
+    }
+    "other"
+}
+
+/// Aggregate portfolio-level summary from holdings metadata.
+///
+/// Tie-break for `value_by_institution_provider_category`: when a holdings
+/// account exposes multiple categories (rare in practice), the account's full
+/// value is attributed to the FIRST category in the `account_types[]` list.
+/// Documented in `docs/finary-snapshot-schema.md`.
+pub(crate) fn build_portfolio_summary(holdings_metadata: &[Value]) -> Value {
+    let mut total_value = 0.0_f64;
+    let mut total_cash_eur = 0.0_f64;
+    let mut cash_by_currency: std::collections::HashMap<String, f64> =
+        std::collections::HashMap::new();
+    let mut value_by_kind: std::collections::HashMap<String, f64> =
+        std::collections::HashMap::new();
+    let mut value_by_category: std::collections::HashMap<String, f64> =
+        std::collections::HashMap::new();
+
+    for entry in holdings_metadata {
+        let value = entry.get("total_value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let cash_eur = entry.get("cash").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let kind = entry.get("kind").and_then(|v| v.as_str()).unwrap_or("other").to_string();
+
+        total_value += value;
+        total_cash_eur += cash_eur;
+        *value_by_kind.entry(kind).or_insert(0.0) += value;
+
+        if let Some(map) = entry.get("cash_by_currency").and_then(|v| v.as_object()) {
+            for (code, amount) in map {
+                let amt = amount.as_f64().unwrap_or(0.0);
+                if amt != 0.0 {
+                    *cash_by_currency.entry(code.clone()).or_insert(0.0) += amt;
+                }
+            }
+        }
+
+        if let Some(categories) = entry.get("institution_provider_categories").and_then(|v| v.as_array()) {
+            if let Some(first) = categories.first().and_then(|v| v.as_str()) {
+                *value_by_category.entry(first.to_string()).or_insert(0.0) += value;
+            }
+        }
+    }
+
+    // Deterministic serialization (sorted keys) for stable diffs and tests.
+    let to_sorted_map = |map: std::collections::HashMap<String, f64>| -> Value {
+        let mut keys: Vec<String> = map.keys().cloned().collect();
+        keys.sort();
+        let mut obj = serde_json::Map::new();
+        for k in &keys {
+            obj.insert(k.clone(), json!(map[k]));
+        }
+        Value::Object(obj)
+    };
+
+    json!({
+        "total_value": total_value,
+        "total_cash_eur": total_cash_eur,
+        "cash_by_currency": to_sorted_map(cash_by_currency),
+        "value_by_kind": to_sorted_map(value_by_kind),
+        "value_by_institution_provider_category": to_sorted_map(value_by_category),
+        "account_count": holdings_metadata.len(),
+    })
+}
+
+/// Aggregate `cash_by_currency` across all holdings entries.
+/// Used to enrich snapshot top-level with multi-currency cash visibility,
+/// while keeping `snapshot.cash` (EUR only) for backward compatibility.
+pub(crate) fn aggregate_cash_by_currency(holdings_metadata: &[Value]) -> Value {
+    let mut totals: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    for entry in holdings_metadata {
+        if let Some(map) = entry.get("cash_by_currency").and_then(|v| v.as_object()) {
+            for (code, amount) in map {
+                let amt = amount.as_f64().unwrap_or(0.0);
+                if amt != 0.0 {
+                    *totals.entry(code.clone()).or_insert(0.0) += amt;
+                }
+            }
+        }
+    }
+    let mut keys: Vec<String> = totals.keys().cloned().collect();
+    keys.sort();
+    let mut obj = serde_json::Map::new();
+    for k in &keys {
+        obj.insert(k.clone(), json!(totals[k]));
+    }
+    Value::Object(obj)
 }
 
 pub(crate) fn build_collection_state(

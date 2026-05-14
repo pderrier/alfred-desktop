@@ -12,9 +12,9 @@ use crate::{
 };
 
 use crate::native_collection_helpers::{
-    as_array, as_text, build_collection_state, diagnose_run_quality, extract_with_pattern,
-    infer_issue_code, normalize_csv_snapshot, normalize_finary_snapshot,
-    parse_fr_number, parse_number_with_format,
+    aggregate_cash_by_currency, as_array, as_text, build_collection_state, build_holdings_metadata,
+    build_portfolio_summary, diagnose_run_quality, extract_with_pattern, infer_issue_code,
+    normalize_csv_snapshot, normalize_finary_snapshot, parse_fr_number, parse_number_with_format,
     HttpRequestFn,
 };
 
@@ -1512,6 +1512,14 @@ fn fetch_finary_snapshot(run_id: &str, _request_fn: HttpRequestFn) -> Result<Val
         json!({ "name": name, "total_value": value, "total_gain": gain, "cash": acct_cash })
     }).collect();
 
+    // Phase 1 cross-account context: enrich snapshot with full holdings_accounts
+    // view (~29 accounts vs the 7 investment-only ones above). This is consumed
+    // by the per-account synthesis prompt, never by the UI — `snapshot.accounts`
+    // stays byte-identical to the legacy shape.
+    let holdings_metadata = build_holdings_metadata(&holdings_accounts);
+    let portfolio_summary = build_portfolio_summary(&holdings_metadata);
+    let cash_by_currency = aggregate_cash_by_currency(&holdings_metadata);
+
     let mut snapshot = json!({
         "run_id": run_id,
         "positions": positions,
@@ -1520,7 +1528,10 @@ fn fetch_finary_snapshot(run_id: &str, _request_fn: HttpRequestFn) -> Result<Val
         "orders": extract_result_list(&orders),
         "total_value": total_value,
         "total_gain": total_gain,
-        "cash": cash
+        "cash": cash,
+        "cash_by_currency": cash_by_currency,
+        "holdings_accounts": holdings_metadata,
+        "portfolio_summary": portfolio_summary
     });
     // Include ambiguous cash groups that need user confirmation
     if !cash_result.ambiguous_groups.is_empty() {

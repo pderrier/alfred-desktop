@@ -186,7 +186,143 @@ function renderNewsDetail(newsItems) {
 
 // ── Collection detail ────────────────────────────────────────────
 
-function renderCollectionDetail(details) {
+/**
+ * Render the freshness label for an ISO timestamp ("aujourd'hui", "il y a 2h",
+ * "J-1", "J-3", "J-12"). Exported for unit tests.
+ *
+ * @param {string|null|undefined} asOf ISO-8601 timestamp
+ * @param {Date} [now=new Date()] reference time (test injection)
+ * @returns {string} short label, empty when input is missing/invalid
+ */
+export function formatFreshness(asOf, now) {
+  const ref = now instanceof Date ? now : new Date();
+  if (!asOf) return "";
+  const t = new Date(asOf).getTime();
+  if (!Number.isFinite(t)) return "";
+  const diffMs = ref.getTime() - t;
+  if (diffMs < 0) return "aujourd'hui";
+  const hours = diffMs / 3600000;
+  if (hours < 1) return "il y a <1h";
+  if (hours < 6) return `il y a ${Math.round(hours)}h`;
+  const sameDay = ref.toDateString() === new Date(t).toDateString();
+  if (sameDay) return "aujourd'hui";
+  const days = Math.floor(diffMs / 86400000);
+  if (days <= 1) return "J-1";
+  if (days <= 14) return `J-${days}`;
+  if (days <= 60) return `${Math.round(days / 7)}w`;
+  return `${Math.round(days / 30)}mo`;
+}
+
+/**
+ * Map a quality enum (fresh|stale|degraded|unavailable) to the CSS class
+ * used by `.collection-quality-dot.<class>`. Exported for unit tests.
+ *
+ * @param {string|null|undefined} quality
+ * @returns {string} CSS class (defaults to "unavailable" for unknown input)
+ */
+export function qualityDot(quality) {
+  const q = String(quality || "").toLowerCase();
+  if (q === "fresh") return "fresh";
+  if (q === "stale") return "stale";
+  if (q === "degraded") return "degraded";
+  return "unavailable";
+}
+
+const QUALITY_GLYPH = {
+  fresh: "\u2713",        // check
+  stale: "\u26a0",        // warning
+  degraded: "\u26a0",     // warning
+  unavailable: "\u2717"   // cross
+};
+
+const QUALITY_LABEL_FR = {
+  fresh: "frais",
+  stale: "stale",
+  degraded: "partiel",
+  unavailable: "indispo"
+};
+
+function renderQualityBadgeRow(label, block) {
+  if (!block || typeof block !== "object") return "";
+  const q = qualityDot(block.quality);
+  const glyph = QUALITY_GLYPH[q] || QUALITY_GLYPH.unavailable;
+  const qLabel = QUALITY_LABEL_FR[q] || q;
+  const source = block.source ? escapeHtml(String(block.source)) : "\u2014";
+  const age = formatFreshness(block.as_of);
+  const extras = [];
+  if (typeof block.count === "number" && block.count > 0) extras.push(`${block.count} articles`);
+  if (typeof block.samples === "number" && block.samples > 0) extras.push(`${block.samples}d`);
+  const tail = extras.length > 0 ? ` \u00b7 ${escapeHtml(extras.join(" \u00b7 "))}` : "";
+  return `<div class="collection-quality-row" data-block="${escapeHtml(label)}">
+    <span class="collection-quality-dot ${q}" aria-hidden="true">${glyph}</span>
+    <span class="collection-quality-label">${escapeHtml(label)}</span>
+    <span class="collection-quality-meta">${source}${age ? ` \u00b7 ${escapeHtml(age)}` : ""}${tail} \u00b7 <span class="cq-status cq-${q}">${escapeHtml(qLabel)}</span></span>
+  </div>`;
+}
+
+/**
+ * Build the 7-row per-block quality block. Exported for unit tests.
+ * Returns "" when collectionQuality is missing (caller falls back to legacy
+ * single-source badge).
+ */
+export function renderCollectionQualityBadges(collectionQuality) {
+  if (!collectionQuality || typeof collectionQuality !== "object") return "";
+  const blocks = [
+    ["Spot", collectionQuality.spot],
+    ["Fondamentaux", collectionQuality.fundamentals],
+    ["Technique", collectionQuality.technical],
+    ["News", collectionQuality.news],
+    ["Secteur/COT", collectionQuality.sector_cot],
+    ["Insights", collectionQuality.insights],
+    ["Memoire", collectionQuality.memory]
+  ];
+  return `<div class="collection-quality-grid">${blocks.map(([label, block]) => renderQualityBadgeRow(label, block)).join("")}</div>`;
+}
+
+/**
+ * Render TECHNIQUE indicator-rows from a `technical_snapshot` envelope.
+ * Returns "" when the snapshot is missing (caller skips group entirely).
+ * Exported for unit tests.
+ */
+export function renderTechnicalIndicatorRows(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") return "";
+  const ind = snapshot.indicators;
+  if (!ind || typeof ind !== "object") return "";
+  const rows = [];
+  const fmt = (v, digits = 2) =>
+    typeof v === "number" && Number.isFinite(v) ? v.toFixed(digits) : "n/a";
+  const pct = (v) =>
+    typeof v === "number" && Number.isFinite(v) ? `${v >= 0 ? "+" : ""}${v.toFixed(1)}%` : "n/a";
+
+  const addRow = (label, valueText, present) => {
+    const dotClass = present ? "present" : "missing";
+    rows.push(`<div class="indicator-row">
+      <span class="indicator-dot ${dotClass}"></span>
+      <span class="indicator-label">${escapeHtml(label)}</span>
+      <span class="indicator-value">${escapeHtml(valueText)}</span>
+    </div>`);
+  };
+
+  const vsSma200 = ind.current_vs_sma_200_pct;
+  addRow("vs SMA200", pct(vsSma200), typeof vsSma200 === "number");
+  addRow("RSI(14)", fmt(ind.rsi_14, 0), typeof ind.rsi_14 === "number");
+  const hist = ind.macd?.hist;
+  addRow("MACD hist", fmt(hist, 2), typeof hist === "number");
+  addRow("ATR(14)", fmt(ind.atr_14, 2), typeof ind.atr_14 === "number");
+  const hi = ind.high_52w;
+  const lo = ind.low_52w;
+  const hiLoText = (typeof hi === "number" && typeof lo === "number")
+    ? `${fmt(hi, 2)} / ${fmt(lo, 2)}`
+    : "n/a";
+  addRow("52w hi/lo", hiLoText, typeof hi === "number" && typeof lo === "number");
+  const trend = String(ind.trend_signal || "");
+  const trendLabel = trend === "up" ? "haussier" : trend === "down" ? "baissier" : trend === "sideways" ? "lateral" : "n/a";
+  addRow("Tendance", trendLabel, trend !== "");
+
+  return `<div class="collection-tech-header">Technique</div>${rows.join("")}`;
+}
+
+export function renderCollectionDetail(details) {
   const panel = document.getElementById("line-memory-collection-detail");
   const grid = document.getElementById("line-memory-indicators-grid");
   const issuesNode = document.getElementById("line-memory-collection-issues");
@@ -195,10 +331,8 @@ function renderCollectionDetail(details) {
   const market = details?.market || {};
   const quality = details?.quality || {};
   const issues = details?.enrichmentIssues || [];
-  const source = details?.marketSource || "unknown";
-  const sourceParts = source.split(":");
-  const sourceProvider = sourceParts[0] || "unknown";
-  const sourceType = sourceParts[1] || "";
+  const collectionQuality = details?.collectionQuality || null;
+  const technicalSnapshot = details?.technicalSnapshot || null;
 
   const indicators = [
     { key: "prix_actuel", label: "Spot Price", value: market.prix_actuel, unit: "\u20ac" },
@@ -208,22 +342,40 @@ function renderCollectionDetail(details) {
     { key: "debt_to_equity", label: "Debt / Equity", value: market.debt_to_equity, unit: "x" }
   ];
 
-  grid.innerHTML = `<div class="collection-source-badge">${escapeHtml(sourceProvider)}${sourceType ? ` <span class="source-type">${escapeHtml(sourceType)}</span>` : ""}</div>` +
-    indicators.map((ind) => {
-      const present = ind.value !== null && ind.value !== undefined;
-      const dotClass = present ? "present" : "missing";
-      const valueText = present
-        ? `${typeof ind.value === "number" ? ind.value.toFixed(2) : ind.value}${ind.unit || ""}`
-        : "n/a";
-      return `<div class="indicator-row">
-        <span class="indicator-dot ${dotClass}"></span>
-        <span class="indicator-label">${ind.label}</span>
-        <span class="indicator-value">${valueText}</span>
-      </div>`;
-    }).join("") +
-    (quality.news_quality_score != null
-      ? `<div class="indicator-row"><span class="indicator-dot ${quality.news_quality_score >= 60 ? "present" : "missing"}"></span><span class="indicator-label">News Quality</span><span class="indicator-value">${quality.news_quality_score}/100</span></div>`
-      : "");
+  // Header: per-block quality badges (new) OR legacy single source badge.
+  // Fallback keeps the modal usable when `collection_quality` is absent
+  // (older run_state without the field, serde error, etc.).
+  let header;
+  if (collectionQuality) {
+    header = renderCollectionQualityBadges(collectionQuality);
+  } else {
+    const source = details?.marketSource || "unknown";
+    const sourceParts = source.split(":");
+    const sourceProvider = sourceParts[0] || "unknown";
+    const sourceType = sourceParts[1] || "";
+    header = `<div class="collection-source-badge">${escapeHtml(sourceProvider)}${sourceType ? ` <span class="source-type">${escapeHtml(sourceType)}</span>` : ""}</div>`;
+  }
+
+  const fundamentalsBlock = indicators.map((ind) => {
+    const present = ind.value !== null && ind.value !== undefined;
+    const dotClass = present ? "present" : "missing";
+    const valueText = present
+      ? `${typeof ind.value === "number" ? ind.value.toFixed(2) : ind.value}${ind.unit || ""}`
+      : "n/a";
+    return `<div class="indicator-row">
+      <span class="indicator-dot ${dotClass}"></span>
+      <span class="indicator-label">${ind.label}</span>
+      <span class="indicator-value">${valueText}</span>
+    </div>`;
+  }).join("");
+
+  const newsQualityRow = quality.news_quality_score != null
+    ? `<div class="indicator-row"><span class="indicator-dot ${quality.news_quality_score >= 60 ? "present" : "missing"}"></span><span class="indicator-label">News Quality</span><span class="indicator-value">${quality.news_quality_score}/100</span></div>`
+    : "";
+
+  const technicalBlock = renderTechnicalIndicatorRows(technicalSnapshot);
+
+  grid.innerHTML = header + fundamentalsBlock + newsQualityRow + technicalBlock;
 
   if (issuesNode) {
     issuesNode.innerHTML = issues.length > 0

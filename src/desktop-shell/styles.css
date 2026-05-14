@@ -2213,6 +2213,73 @@ main {
   border-bottom: 1px solid rgba(142, 202, 230, 0.15);
   margin-bottom: 0.2rem;
 }
+
+/* ── Per-block collection quality badges ─────────────────────────
+   Replaces the single `.collection-source-badge` when the LLM/server
+   provides per-source freshness via `collection_quality`. */
+.collection-quality-grid {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  padding: 0.25rem 0 0.4rem;
+  border-bottom: 1px solid rgba(142, 202, 230, 0.15);
+  margin-bottom: 0.25rem;
+}
+.collection-quality-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.7rem;
+  line-height: 1.25;
+}
+.collection-quality-dot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 0.85rem;
+  height: 0.85rem;
+  border-radius: 50%;
+  font-size: 0.6rem;
+  font-weight: 700;
+  flex-shrink: 0;
+  color: rgba(10, 17, 24, 0.95);
+}
+.collection-quality-dot.fresh       { background: #2f8f5d; color: #fff; }
+.collection-quality-dot.stale       { background: #d1a445; color: #1a1208; }
+.collection-quality-dot.degraded    { background: #d1a445; color: #1a1208; }
+.collection-quality-dot.unavailable { background: #ba4b3a; color: #fff; }
+.collection-quality-label {
+  font-weight: 600;
+  color: var(--sea-ink, #d9e4ee);
+  letter-spacing: 0.02em;
+  min-width: 6.5rem;
+}
+.collection-quality-meta {
+  color: var(--sea-muted, #8a9bb0);
+  font-size: 0.68rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cq-status { font-weight: 600; }
+.cq-status.cq-fresh       { color: #6abf8d; }
+.cq-status.cq-stale       { color: #d1a445; }
+.cq-status.cq-degraded    { color: #d1a445; }
+.cq-status.cq-unavailable { color: #d97a6a; }
+
+/* ── Technique sub-header inside .indicators-grid ──────────────── */
+.collection-tech-header {
+  grid-column: 1 / -1;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #8ecae6;
+  padding: 0.4rem 0 0.2rem;
+  margin-top: 0.2rem;
+  border-top: 1px solid rgba(142, 202, 230, 0.15);
+}
 .source-type {
   font-weight: 400;
   opacity: 0.6;

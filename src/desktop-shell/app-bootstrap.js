@@ -7,6 +7,10 @@
 
 import { formatBridgeError } from "/shared/run-operations-controller.js";
 import { isFinarySessionRunnable } from "/desktop-shell/run-wizard-policy.js";
+import { showToast, clearErrorToasts } from "/desktop-shell/shell-layout.js";
+import { decideFallback } from "/desktop-shell/codex-fallback-policy.js";
+
+export { decideFallback };
 
 export function initBootstrap(deps) {
   const {
@@ -62,6 +66,40 @@ export function initBootstrap(deps) {
       btn.textContent = "Continue anyway";
       btn.addEventListener("click", () => dismissSplash());
       setupNode.appendChild(btn);
+    }
+  }
+
+  /**
+   * Reveal the inline API-key fields on the splash connect card so the user
+   * can type their OpenAI key without leaving the splash. Used by the
+   * native-oauth -> native auto-fallback path when the saved key is empty.
+   *
+   * The validation/submit flow is already wired on the existing splash
+   * "Connect/Validate" button (handler below in this file), so we only need
+   * to un-hide the fields and bring focus to the key input.
+   */
+  function revealSplashApiKeyInput() {
+    const connectNode = document.getElementById("splash-connect");
+    const loaderNode = document.getElementById("splash-loader");
+    const backendSelector = document.getElementById("splash-backend-selector");
+    const nativeFields = document.getElementById("splash-native-fields");
+    const apiKey = document.getElementById("splash-api-key");
+    const nativeRadio = document.querySelector('input[name="splash-backend"][value="native"]');
+    const openaiBtn = document.getElementById("splash-openai-btn");
+    const openaiStatus = document.getElementById("splash-openai-status");
+
+    if (loaderNode) loaderNode.classList.add("hidden");
+    if (connectNode) connectNode.classList.remove("hidden");
+    if (backendSelector) backendSelector.classList.remove("hidden");
+    if (nativeRadio) nativeRadio.checked = true;
+    if (nativeFields) nativeFields.classList.remove("hidden");
+    if (openaiBtn) {
+      openaiBtn.textContent = "Validate";
+      openaiBtn.classList.remove("hidden");
+    }
+    if (openaiStatus) openaiStatus.textContent = "API key required";
+    if (apiKey) {
+      try { apiKey.focus(); } catch { /* focus not critical */ }
     }
   }
 
@@ -242,26 +280,48 @@ export function initBootstrap(deps) {
     let openaiOk = false;
     let finaryOk = false;
 
-    // Detect LLM backend
+    // Detect LLM backend + auto-fallback state.
+    //
+    // `runtime_settings_local` is wrapped in a Tauri envelope
+    // `{ok, action, result: {ok, settings: {values, overrides, ...}}}`.
+    // Use `bridge.getRuntimeSettings()` which unwraps to `{values, overrides, ...}`
+    // -- reading the raw invoke result is a known footgun.
     let llmBackend = "codex";
+    let settingsValues = {};
     try {
-      if (tauriInvoke) {
-        const settings = await tauriInvoke("runtime_settings_local");
-        llmBackend = settings?.values?.llm_backend || "codex";
-      }
+      const settings = await bridge.getRuntimeSettings();
+      settingsValues = settings?.values || {};
+      llmBackend = settingsValues.llm_backend || "codex";
     } catch { /* default to codex */ }
 
+    // Auto-fallback flag is stored as 0/1 integer; coerce to boolean.
+    const autoFallbackActive = Number(settingsValues.llm_backend_auto_fallback) === 1;
+
+    // Collect probe + native-key facts, then run them through the pure
+    // `decideFallback` policy so the bootstrap branch matches the unit-test
+    // expectations exactly. Side-effects (settings writes, toasts, DOM
+    // mutations) are applied below based on the resolved action.
+    let probeResult = null;
+    let nativeKeyOk = false;
+
     if (llmBackend === "native") {
-      // Native backend — validate API key
       setSplashStatus("Validating API key\u2026");
       try {
         if (tauriInvoke) {
           const result = await tauriInvoke("check_openai_api_key_local");
-          openaiOk = result?.ok === true;
+          nativeKeyOk = result?.ok === true;
         }
-      } catch { openaiOk = false; }
+      } catch { nativeKeyOk = false; }
+
+      // Only probe OAuth when we actually need it (auto-restore path).
+      if (nativeKeyOk && autoFallbackActive) {
+        try {
+          const probe = await bridge.getCodexSessionStatus();
+          probeResult = probe?.result || probe;
+        } catch { probeResult = null; }
+      }
     } else {
-      // Codex or native-oauth backend — check session
+      // Codex or native-oauth backend -- check session.
       setSplashStatus("Checking OpenAI\u2026");
       try {
         const status = await bridge.getCodexSessionStatus();
@@ -271,13 +331,70 @@ export function initBootstrap(deps) {
           try {
             if (tauriInvoke) await tauriInvoke("ensure_codex_local");
             const status2 = await bridge.getCodexSessionStatus();
-            const r2 = status2?.result || status2;
-            openaiOk = r2?.logged_in === true;
-          } catch { openaiOk = false; }
+            probeResult = status2?.result || status2;
+          } catch { probeResult = null; }
         } else {
-          openaiOk = r?.logged_in === true;
+          probeResult = r;
         }
-      } catch { openaiOk = false; }
+      } catch { probeResult = null; }
+    }
+
+    const decision = decideFallback({
+      llmBackend,
+      autoFallbackActive,
+      probeResult,
+      savedApiKey: settingsValues.openai_api_key || "",
+      nativeKeyOk,
+    });
+    openaiOk = decision.openaiOk;
+
+    if (decision.action === "auto-restore-oauth" && tauriInvoke) {
+      try {
+        await tauriInvoke("runtime_settings_update_local", {
+          settings: { llm_backend: "native-oauth", llm_backend_auto_fallback: 0 }
+        });
+        llmBackend = "native-oauth";
+        showToast("OpenAI OAuth quota restored \u2014 switched back to your ChatGPT subscription.");
+      } catch { /* not critical -- stay on native */ }
+    } else if (decision.action === "clear-fallback-flag" && tauriInvoke) {
+      try {
+        await tauriInvoke("runtime_settings_update_local", {
+          settings: { llm_backend_auto_fallback: 0 }
+        });
+      } catch { /* not critical */ }
+    } else if (decision.action === "switch-to-native" && tauriInvoke) {
+      try {
+        await tauriInvoke("runtime_settings_update_local", {
+          settings: { llm_backend: "native", llm_backend_auto_fallback: 1 }
+        });
+        llmBackend = "native";
+        showToast("OpenAI OAuth quota exhausted \u2014 falling back to your saved API key.");
+        const result = await tauriInvoke("check_openai_api_key_local");
+        openaiOk = result?.ok === true;
+      } catch {
+        openaiOk = false;
+      }
+    } else if (decision.action === "reveal-key-input") {
+      // Persist the mode switch BEFORE the connect-card render runs (further
+      // below) -- otherwise that render would re-select the "native-oauth"
+      // radio from the stale local state and clobber `revealSplashApiKeyInput`.
+      // Mirrors the "switch-to-native" path; the only difference is that we
+      // need the user to type a key before the validation step.
+      if (tauriInvoke) {
+        try {
+          await tauriInvoke("runtime_settings_update_local", {
+            settings: { llm_backend: "native", llm_backend_auto_fallback: 1 }
+          });
+        } catch { /* not critical */ }
+      }
+      llmBackend = "native";
+      showToast(
+        "OpenAI OAuth quota exhausted \u2014 enter your OpenAI API key to continue.",
+        "error"
+      );
+      revealSplashApiKeyInput();
+      // Leave openaiOk=false so the splash renders the connect card and the
+      // existing API-key validation handler takes over.
     }
 
     // Check Finary
@@ -383,13 +500,16 @@ export function initBootstrap(deps) {
         if (splashApikeyHint) splashApikeyHint.textContent = "";
 
         try {
-          // Save backend + key to settings, then validate
+          // Save backend + key to settings, then validate.
+          // Manual user action — clear the auto-fallback flag so we don't
+          // try to auto-restore to native-oauth on the next launch.
           const apiBase = splashApiBase?.value?.trim() || "";
           if (tauriInvoke) {
             await tauriInvoke("runtime_settings_update_local", {
               settings: {
                 llm_backend: "native",
                 openai_api_key: key,
+                llm_backend_auto_fallback: 0,
                 ...(apiBase ? { openai_api_base: apiBase } : {}),
               }
             });
@@ -398,6 +518,9 @@ export function initBootstrap(deps) {
           openaiOk = result?.ok === true;
           setRowStatus(openaiIconNode, openaiStatusNode, openaiBtn, openaiOk, "API key invalid");
           if (openaiOk) {
+            // Clear the persistent "OAuth quota exhausted" toast (if any) — the
+            // user has now resolved the condition by providing a working key.
+            clearErrorToasts();
             if (splashApikeyHint) splashApikeyHint.textContent = `Connected (${result.models_available} models)`;
             splashApikeyHint.style.color = "#2f8f5d";
             backendSelector?.classList.add("hidden");
@@ -416,9 +539,14 @@ export function initBootstrap(deps) {
         return;
       }
 
-      // Codex or native-oauth backend — save backend choice, then do OAuth login
+      // Codex or native-oauth backend — save backend choice, then do OAuth login.
+      // Manual user action — clear the auto-fallback flag.
       if (tauriInvoke) {
-        try { await tauriInvoke("runtime_settings_update_local", { settings: { llm_backend: selectedBackend } }); } catch {}
+        try {
+          await tauriInvoke("runtime_settings_update_local", {
+            settings: { llm_backend: selectedBackend, llm_backend_auto_fallback: 0 }
+          });
+        } catch {}
       }
       this.disabled = true;
       this.textContent = "Signing in...";
@@ -430,7 +558,12 @@ export function initBootstrap(deps) {
         openaiOk = r?.logged_in === true;
         setRowStatus(openaiIconNode, openaiStatusNode, openaiBtn, openaiOk, "not connected");
         if (hintNode) hintNode.textContent = openaiOk ? "" : "Sign-in did not complete.";
-        if (openaiOk) backendSelector?.classList.add("hidden");
+        if (openaiOk) {
+          // Clear the persistent "OAuth quota exhausted" toast (if any) — the
+          // user has now resolved the condition by signing back in.
+          clearErrorToasts();
+          backendSelector?.classList.add("hidden");
+        }
         if (!openaiOk) { this.textContent = "Connect"; this.disabled = false; }
         updateContinueBtn();
         if (openaiOk && finaryOk) dismissSplash();

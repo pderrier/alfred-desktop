@@ -375,6 +375,14 @@ async fn swap_codex_to_oauth_local() -> Result<serde_json::Value, String> {
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn codex_has_oauth_backup_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_codex_has_oauth_backup)
+        .await
+        .map_err(|e| format!("codex_has_oauth_backup_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
 // ── Application bootstrap ───────────────────────────────────────────────────
 
 /// Load env vars from `.alfred.local.env` (repo root) if it exists.
@@ -653,6 +661,7 @@ fn run_tauri_app() -> anyhow::Result<()> {
             codex_auth_mode_local,
             swap_codex_to_apikey_local,
             swap_codex_to_oauth_local,
+            codex_has_oauth_backup_local,
             account_positions_local,
             get_user_preferences_local,
             save_user_preferences_local,

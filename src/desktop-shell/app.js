@@ -11,7 +11,11 @@ import {
 import { resolveShellIntentRoute } from "/desktop-shell/shell-intent-router.js";
 import { initWizard } from "/desktop-shell/app-wizard.js";
 import { initLineModal, buildPositionContext, showSaveToMemoryPanel, synthesizeChatForMemoryWithUI } from "/desktop-shell/app-line-modal.js";
-import { initBootstrap } from "/desktop-shell/app-bootstrap.js";
+import {
+  initBootstrap,
+  getPendingOauthProposal,
+  clearPendingOauthProposal,
+} from "/desktop-shell/app-bootstrap.js";
 import { initEvents } from "/desktop-shell/app-events.js";
 import { openChatWizard, openCashMatchingWizard } from "/desktop-shell/app-chat-wizard.js";
 import {
@@ -819,7 +823,9 @@ function updateAnalysisEta(completedCount, totalCount) {
 // ── Report rendering ─────────────────────────────────────────────
 
 function renderReport(payload) {
-  const model = buildReportViewModel(payload);
+  const model = buildReportViewModel(payload, {
+    oauthProposal: getPendingOauthProposal(),
+  });
   latestReportModel = model;
   if (reportValueNode) reportValueNode.textContent = formatCurrency(model.value);
   if (reportGainNode) reportGainNode.textContent = formatCurrency(model.gain);
@@ -855,6 +861,9 @@ function renderReport(payload) {
   // issues (priority_invalid, too_many_actions, etc.) so the user knows the
   // model output wasn't 100% schema-compliant.
   renderValidationWarnings(model.validationWarnings, model.validationWarningCount);
+  // v0.2.16: non-blocking proposal banner when OAuth is available but the
+  // user is on a paid path (native key, or codex with manually-swapped apikey).
+  renderOauthProposalBanner(model.oauthProposal);
   renderActionsNow(model.actionsNow, model.recommendations);
   // Item 12: Export button
   injectExportButton(model);
@@ -934,6 +943,129 @@ function renderValidationWarnings(warnings, count) {
   });
 
   host.appendChild(notice);
+}
+
+// ── v0.2.16: OAuth-availability proposal banner ──────────────────
+//
+// Non-blocking card surfaced when the bootstrap detected that ChatGPT Plus
+// OAuth is available (codex CLI auth.json is in chatgpt mode + probe ok)
+// but the user is on a paid path (native API key, or codex with a manually-
+// swapped apikey + OAuth backup on disk). The decision tree lives in
+// `decideOauthProposal` (codex-fallback-policy.js); this function is the
+// renderer + action handlers.
+function renderOauthProposalBanner(proposal) {
+  // Anchor the banner before the synthesis card so it's the first thing
+  // the user sees on the report tab. The host id is recreated every render.
+  const anchor = document.getElementById("report-synthesis-card");
+  if (!anchor) return;
+  // Remove any prior render so we never stack duplicates.
+  document.getElementById("oauth-proposal-banner")?.remove();
+  if (!proposal) return;
+
+  const isRestore = proposal === "propose-restore-oauth";
+  const isFromNative = proposal === "propose-native-to-codex";
+  if (!isRestore && !isFromNative) return;
+
+  const banner = document.createElement("section");
+  banner.id = "oauth-proposal-banner";
+  banner.className = "card oauth-proposal-banner";
+  // Inline style to match the existing splash/validation-notice patterns
+  // (no new CSS classes required).
+  banner.style.cssText =
+    "margin:0 0 0.8rem;padding:0.75rem 0.95rem;border-radius:8px;" +
+    "background:rgba(80,150,220,0.10);border-left:3px solid #5096dc;" +
+    "color:#bfd0df;line-height:1.45";
+  const sub = isRestore
+    ? "Your OAuth subscription is back — switch your Codex auth back to ChatGPT Plus and stop paying per request."
+    : "Switching to Codex mode picks up your ChatGPT Plus subscription so you stop paying per request.";
+
+  banner.innerHTML = `
+    <div style="font-weight:600;color:#e9f1f8;font-size:0.85rem">
+      Your ChatGPT Plus subscription is ready to use
+    </div>
+    <div style="margin-top:0.25rem;font-size:0.76rem">${sub}</div>
+    <div style="margin-top:0.55rem;display:flex;gap:0.45rem;flex-wrap:wrap">
+      <button type="button" class="cmd-btn oauth-proposal-switch"
+        style="padding:0.3rem 0.85rem;font-size:0.78rem">Switch</button>
+      <button type="button" class="ghost-btn oauth-proposal-later"
+        style="padding:0.3rem 0.7rem;font-size:0.76rem">Later</button>
+      <button type="button" class="ghost-btn oauth-proposal-dismiss"
+        style="padding:0.3rem 0.7rem;font-size:0.76rem">Don't ask</button>
+    </div>
+  `;
+  anchor.parentNode?.insertBefore(banner, anchor);
+
+  const switchBtn = banner.querySelector(".oauth-proposal-switch");
+  const laterBtn = banner.querySelector(".oauth-proposal-later");
+  const dismissBtn = banner.querySelector(".oauth-proposal-dismiss");
+
+  switchBtn?.addEventListener("click", async () => {
+    const tauriInvoke = window?.__TAURI__?.core?.invoke;
+    if (!tauriInvoke) return;
+    switchBtn.disabled = true;
+    switchBtn.textContent = "Switching…";
+    try {
+      if (isFromNative) {
+        await tauriInvoke("runtime_settings_update_local", {
+          settings: { llm_backend: "codex" },
+        });
+        showToast("Switched to Codex — using your ChatGPT Plus subscription.");
+      } else {
+        // isRestore: swap codex CLI auth back to OAuth using the on-disk backup.
+        const envelope = await tauriInvoke("swap_codex_to_oauth_local");
+        const restored = (envelope?.result || envelope)?.restored === true;
+        if (!restored) {
+          showToast(
+            "Couldn't restore OAuth automatically — please re-login via the connect screen.",
+            "error"
+          );
+          switchBtn.disabled = false;
+          switchBtn.textContent = "Switch";
+          return;
+        }
+        // Clear the v0.2.14 auto-fallback flag + restore-retry throttle so the
+        // splash treats the next launch as a clean OAuth state.
+        await tauriInvoke("runtime_settings_update_local", {
+          settings: {
+            codex_auth_auto_fallback: 0,
+            codex_auth_oauth_retry_after_ms: 0,
+          },
+        });
+        showToast("Restored OAuth — Codex back on your ChatGPT subscription.");
+      }
+      clearPendingOauthProposal();
+      banner.remove();
+    } catch (err) {
+      switchBtn.disabled = false;
+      switchBtn.textContent = "Switch";
+      showToast(formatBridgeError(err), "error");
+    }
+  });
+
+  laterBtn?.addEventListener("click", async () => {
+    const tauriInvoke = window?.__TAURI__?.core?.invoke;
+    if (!tauriInvoke) return;
+    const snooze = Date.now() + 7 * 24 * 60 * 60 * 1000;
+    try {
+      await tauriInvoke("runtime_settings_update_local", {
+        settings: { oauth_proposal_dismissed_until_ms: snooze },
+      });
+    } catch { /* not critical */ }
+    clearPendingOauthProposal();
+    banner.remove();
+  });
+
+  dismissBtn?.addEventListener("click", async () => {
+    const tauriInvoke = window?.__TAURI__?.core?.invoke;
+    if (!tauriInvoke) return;
+    try {
+      await tauriInvoke("runtime_settings_update_local", {
+        settings: { oauth_proposal_permanently_dismissed: 1 },
+      });
+    } catch { /* not critical */ }
+    clearPendingOauthProposal();
+    banner.remove();
+  });
 }
 
 function injectExportButton(model) {
@@ -1056,7 +1188,9 @@ async function refreshDashboardInner() {
   renderSidebar(latestDashboardPayload);
   // During active run, positions are managed by push events — don't overwrite with stale disk data
   if (!activeRunRefresh) {
-    const viewModel = buildReportViewModel(latestDashboardPayload);
+    const viewModel = buildReportViewModel(latestDashboardPayload, {
+      oauthProposal: getPendingOauthProposal(),
+    });
     renderMainPanel(viewModel, latestDashboardPayload);
   }
   renderStatusPill(null, latestFinarySessionPayload, snapshot.latest_run_summary || null);
@@ -1505,7 +1639,9 @@ initShellLayout({
           }
         };
         renderReport(latestDashboardPayload);
-        const model = buildReportViewModel(latestDashboardPayload);
+        const model = buildReportViewModel(latestDashboardPayload, {
+          oauthProposal: getPendingOauthProposal(),
+        });
         renderMainPanel(model, latestDashboardPayload);
         renderStatusPill(null, latestFinarySessionPayload, latestDashboardPayload.snapshot.latest_run_summary);
         clearRunPipelineBar();

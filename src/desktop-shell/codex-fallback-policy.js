@@ -138,3 +138,110 @@ export function decideFallback(input) {
 
   return { action: "noop", openaiOk: false };
 }
+
+/**
+ * Decide whether to surface the v0.2.16 "OAuth ChatGPT Plus is available"
+ * banner in the report area.
+ *
+ * This is a *non-blocking* proposal — it never auto-switches the user.
+ * It exists for two cases the v0.2.14 auto-restore path does NOT cover:
+ *
+ *   1. The user is on `llm_backend === "native"` (paid API key path).
+ *      The v0.2.14 path only auto-restores when `llm_backend_auto_fallback`
+ *      is set (i.e. the app put them on native). If they chose native
+ *      explicitly, they never see a nudge — even when OAuth quota is fine.
+ *
+ *   2. The user is on `llm_backend === "codex"` with `auth.json` already
+ *      in apikey mode but `codex_auth_auto_fallback === 0` (manual swap,
+ *      or carried over from an older app version). The v0.2.14 restore
+ *      only fires when the flag is set; without it, we never propose a
+ *      switch back, even when an OAuth backup exists on disk.
+ *
+ * Proposal kinds:
+ *   - `none`                       — do not show the banner
+ *   - `propose-native-to-codex`    — user is on native; switching to codex
+ *                                    will pick up the live ChatGPT Plus auth
+ *   - `propose-restore-oauth`      — user is on codex+apikey but an OAuth
+ *                                    backup exists; we can restore it
+ *
+ * Inputs:
+ *   - `llmBackend`              current backend setting
+ *   - `codexCurrentAuth`        codex CLI's auth.json mode ("chatgpt"|"apikey"|"none")
+ *   - `hasOauthBackup`          true iff `~/.codex/auth.json.oauth.bak` exists
+ *   - `oauthProbeOk`            true iff a probe (codex_session_status or
+ *                                 codex_exec) returned with no failure_reason
+ *   - `dismissedUntilMs`        epoch-ms threshold from settings; while
+ *                                 `dismissedUntilMs > nowMs`, skip
+ *   - `permanentlyDismissed`    true iff user clicked "Don't ask"
+ *   - `codexAuthAutoFallbackActive`
+ *                               true iff the v0.2.14 flag is set; when set,
+ *                                 the auto-restore path owns recovery and
+ *                                 we must NOT show a competing banner
+ *   - `nowMs`                   current epoch-ms (injected for testability)
+ *
+ * @param {{
+ *   llmBackend: "codex"|"native"|"native-oauth",
+ *   codexCurrentAuth?: "chatgpt"|"apikey"|"none",
+ *   hasOauthBackup?: boolean,
+ *   oauthProbeOk?: boolean,
+ *   dismissedUntilMs?: number,
+ *   permanentlyDismissed?: boolean,
+ *   codexAuthAutoFallbackActive?: boolean,
+ *   nowMs?: number,
+ * }} input
+ * @returns {{ kind: "none"|"propose-native-to-codex"|"propose-restore-oauth" }}
+ */
+export function decideOauthProposal(input) {
+  const {
+    llmBackend,
+    codexCurrentAuth,
+    hasOauthBackup,
+    oauthProbeOk,
+    dismissedUntilMs,
+    permanentlyDismissed,
+    codexAuthAutoFallbackActive,
+    nowMs,
+  } = input || {};
+
+  // Explicit "don't ask" — never surface
+  if (permanentlyDismissed === true) {
+    return { kind: "none" };
+  }
+
+  // "Later" snooze active
+  const dismissedUntil = Number(dismissedUntilMs) || 0;
+  const now = Number(nowMs) || 0;
+  if (dismissedUntil > now) {
+    return { kind: "none" };
+  }
+
+  // No OAuth availability — never propose
+  if (oauthProbeOk !== true) {
+    return { kind: "none" };
+  }
+
+  if (llmBackend === "native") {
+    // OAuth is live on the codex CLI and the user is paying via API key.
+    // Propose the switch (codex mode uses the codex CLI's auth.json, which
+    // is independent of the app's llm_backend setting).
+    return { kind: "propose-native-to-codex" };
+  }
+
+  if (llmBackend === "codex") {
+    // Auto-restore (v0.2.14) owns recovery when its flag is set. Don't
+    // compete with it; the splash will swap back transparently.
+    if (codexAuthAutoFallbackActive === true) {
+      return { kind: "none" };
+    }
+    if (codexCurrentAuth === "apikey" && hasOauthBackup === true) {
+      return { kind: "propose-restore-oauth" };
+    }
+    // codex + chatgpt — already optimal. codex + apikey w/o backup —
+    // we can't propose a restore (would need full device-auth flow,
+    // out of scope for a non-blocking banner).
+    return { kind: "none" };
+  }
+
+  // native-oauth — already on the OAuth path; nothing to propose
+  return { kind: "none" };
+}

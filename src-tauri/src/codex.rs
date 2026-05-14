@@ -1296,9 +1296,41 @@ pub fn kill_all_active() {
 
 // ── Session management (OpenAI auth) ──────────────────────────────
 
+/// Classify a stringified codex error into one of the structured
+/// `failure_reason` values surfaced to the JS bootstrap layer:
+/// - `rate_limited`: OAuth quota exhausted (UsageLimitExceeded or HTTP 429)
+/// - `auth`: token invalid/expired, login required
+/// - `network`: connection / transport error, retryable
+/// - `null` (None): unknown / generic error
+///
+/// Match only specific known prefixes (`codex_*:`) and a single well-known
+/// reqwest/tokio variant (`HttpConnectionFailed`). Loose substrings like
+/// "connection" or "network" are NOT matched — they appear in unrelated
+/// user-facing messages (e.g. an account name containing "Connection") and
+/// would mis-classify generic errors as transient transport failures.
+fn classify_session_failure(err_str: &str) -> Option<&'static str> {
+    if err_str.contains("codex_rate_limited") {
+        return Some("rate_limited");
+    }
+    if err_str.contains("codex_unauthorized") {
+        return Some("auth");
+    }
+    if err_str.contains("codex_http_failed:")
+        || err_str.contains("codex_network:")
+        || err_str.contains("HttpConnectionFailed")
+    {
+        return Some("network");
+    }
+    None
+}
+
 /// Check if the user has a valid Codex/OpenAI session.
 /// Tries to start the app-server and run `model/list` — if auth fails, returns
 /// a status indicating login is required.
+///
+/// On failure, the returned payload includes a structured `failure_reason`
+/// field (`"rate_limited" | "auth" | "network" | null`) so the JS splash
+/// bootstrap can react (e.g. auto-fallback to native API key on rate-limit).
 pub fn session_status() -> Result<Value> {
     // First check: can we even find the binary?
     let binary_ok = resolve_codex_binary().is_ok();
@@ -1306,6 +1338,7 @@ pub fn session_status() -> Result<Value> {
         return Ok(json!({
             "status": "no_binary",
             "logged_in": false,
+            "failure_reason": serde_json::Value::Null,
             "message": "Codex CLI not found. Reinstall Alfred Desktop or install manually: npm install -g @openai/codex"
         }));
     }
@@ -1328,32 +1361,43 @@ pub fn session_status() -> Result<Value> {
                     Ok(json!({
                         "status": "connected",
                         "logged_in": true,
+                        "failure_reason": serde_json::Value::Null,
                         "models_available": model_count
                     }))
                 }
                 Err(e) => {
                     let err_str = e.to_string();
-                    if err_str.contains("unauthorized") || err_str.contains("Unauthorized") {
-                        Ok(json!({
-                            "status": "requires_login",
-                            "logged_in": false,
-                            "message": "OpenAI session expired or not found. Please log in."
-                        }))
-                    } else {
-                        Ok(json!({
-                            "status": "error",
-                            "logged_in": false,
-                            "message": err_str
-                        }))
-                    }
+                    let failure_reason = classify_session_failure(&err_str);
+                    let status = match failure_reason {
+                        Some("rate_limited") => "rate_limited",
+                        Some("auth") => "requires_login",
+                        _ => "error",
+                    };
+                    let message = match failure_reason {
+                        Some("rate_limited") => {
+                            "OAuth quota exhausted. Switch to API key or wait for reset.".to_string()
+                        }
+                        Some("auth") => {
+                            "OpenAI session expired or not found. Please log in.".to_string()
+                        }
+                        _ => err_str,
+                    };
+                    Ok(json!({
+                        "status": status,
+                        "logged_in": false,
+                        "failure_reason": failure_reason,
+                        "message": message
+                    }))
                 }
             }
         }
         Err(e) => {
             let err_str = e.to_string();
+            let failure_reason = classify_session_failure(&err_str);
             Ok(json!({
                 "status": "error",
                 "logged_in": false,
+                "failure_reason": failure_reason,
                 "message": err_str
             }))
         }
@@ -1575,5 +1619,55 @@ mod tests {
         let e = map_rpc_error(&err);
         assert!(e.to_string().contains("codex_rpc_error"));
         assert!(e.to_string().contains("-32600"));
+    }
+
+    #[test]
+    fn classify_failure_rate_limited() {
+        assert_eq!(
+            classify_session_failure("codex_rate_limited:quota"),
+            Some("rate_limited")
+        );
+        assert_eq!(
+            classify_session_failure("codex_rate_limited:http_429:too many"),
+            Some("rate_limited")
+        );
+    }
+
+    #[test]
+    fn classify_failure_auth() {
+        assert_eq!(
+            classify_session_failure("codex_unauthorized:invalid token"),
+            Some("auth")
+        );
+    }
+
+    #[test]
+    fn classify_failure_network() {
+        assert_eq!(
+            classify_session_failure("codex_http_failed:status=502:bad gateway"),
+            Some("network")
+        );
+        assert_eq!(
+            classify_session_failure("codex_network:dns_failure"),
+            Some("network")
+        );
+        assert_eq!(
+            classify_session_failure("HttpConnectionFailed: peer reset"),
+            Some("network")
+        );
+    }
+
+    #[test]
+    fn classify_failure_unknown() {
+        // Loose "unauthorized" / "connection" / "network" tokens must NOT match —
+        // they appear in unrelated user-facing strings and would mis-classify
+        // generic errors as transient transport failures.
+        assert_eq!(classify_session_failure("codex_rpc_error:code=-1:??"), None);
+        assert_eq!(classify_session_failure("unauthorized: token expired"), None);
+        assert_eq!(classify_session_failure("network unreachable"), None);
+        assert_eq!(
+            classify_session_failure("Account 'Connection 401' has no balance"),
+            None
+        );
     }
 }

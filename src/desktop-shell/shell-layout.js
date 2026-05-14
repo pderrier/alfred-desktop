@@ -618,6 +618,19 @@ export function showToast(message, tone = "") {
   toastContainer.appendChild(item);
 }
 
+/**
+ * Remove all persistent (error-tone) toasts currently on screen.
+ * Called when a follow-up action resolves the condition the toast was
+ * warning about — e.g. user successfully validates an API key after the
+ * "OAuth quota exhausted" toast.
+ */
+export function clearErrorToasts() {
+  if (!toastContainer) return;
+  for (const node of toastContainer.querySelectorAll(".toast-item.tone-error")) {
+    node.remove();
+  }
+}
+
 export function showErrorModal(title, message, hint) {
   let modal = document.getElementById("error-modal");
   if (!modal) {

@@ -44,6 +44,19 @@ pub fn definitions_json() -> serde_json::Value {
             "whyItMatters": "Native+OAuth combines free OAuth auth with optimized local tool calls. Codex lets the AI orchestrate. Native requires a paid API key.",
             "resetLabel": "Use Codex (free tier)"
         },
+        "llm_backend_auto_fallback": {
+            "type": "integer",
+            "min": 0,
+            "max": 1,
+            "defaultValue": 0,
+            "section": "product",
+            "restartRequired": false,
+            "envName": serde_json::Value::Null,
+            "label": "LLM backend auto-fallback flag",
+            "description": "Internal marker — set to 1 when native-oauth auto-falls back to native (API key) due to OAuth rate-limit. When set, the splash will retry OAuth on next launch and auto-restore native-oauth if the quota has returned.",
+            "whyItMatters": "Tracks transient fallback state so the user is automatically restored to their preferred OAuth mode once quota recovers.",
+            "resetLabel": "Clear auto-fallback flag"
+        },
         "agentos_artifacts_enabled": {
             "type": "integer",
             "min": 0,
@@ -280,6 +293,7 @@ fn normalize_value(key: &str, value: &serde_json::Value) -> Result<serde_json::V
         }
         "line_analysis_concurrency" => normalize_integer(key, value, 1, 12),
         "agentos_artifacts_enabled" => normalize_integer(key, value, 0, 1),
+        "llm_backend_auto_fallback" => normalize_integer(key, value, 0, 1),
         "line_analysis_throttle_ms" => normalize_integer(key, value, 0, 5000),
         "collection_concurrency" => normalize_integer(key, value, 1, 12),
         "collection_throttle_ms" => normalize_integer(key, value, 0, 5000),

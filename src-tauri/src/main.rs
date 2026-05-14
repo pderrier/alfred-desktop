@@ -343,6 +343,38 @@ async fn codex_session_logout_local() -> Result<serde_json::Value, String> {
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn probe_codex_quota_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_probe_codex_quota)
+        .await
+        .map_err(|e| format!("probe_codex_quota_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn codex_auth_mode_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_codex_auth_mode)
+        .await
+        .map_err(|e| format!("codex_auth_mode_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn swap_codex_to_apikey_local(api_key: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || command_handlers::run_swap_codex_to_apikey(api_key))
+        .await
+        .map_err(|e| format!("swap_codex_to_apikey_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn swap_codex_to_oauth_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_swap_codex_to_oauth)
+        .await
+        .map_err(|e| format!("swap_codex_to_oauth_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
 // ── Application bootstrap ───────────────────────────────────────────────────
 
 /// Load env vars from `.alfred.local.env` (repo root) if it exists.
@@ -617,6 +649,10 @@ fn run_tauri_app() -> anyhow::Result<()> {
             codex_session_status_local,
             codex_session_login_local,
             codex_session_logout_local,
+            probe_codex_quota_local,
+            codex_auth_mode_local,
+            swap_codex_to_apikey_local,
+            swap_codex_to_oauth_local,
             account_positions_local,
             get_user_preferences_local,
             save_user_preferences_local,

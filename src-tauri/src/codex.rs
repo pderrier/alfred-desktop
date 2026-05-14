@@ -1303,11 +1303,13 @@ pub fn kill_all_active() {
 /// - `network`: connection / transport error, retryable
 /// - `null` (None): unknown / generic error
 ///
-/// Match only specific known prefixes (`codex_*:`) and a single well-known
-/// reqwest/tokio variant (`HttpConnectionFailed`). Loose substrings like
-/// "connection" or "network" are NOT matched — they appear in unrelated
-/// user-facing messages (e.g. an account name containing "Connection") and
-/// would mis-classify generic errors as transient transport failures.
+/// Match only specific known prefixes (`codex_*:`), a single well-known
+/// reqwest/tokio variant (`HttpConnectionFailed`), and a small set of exact
+/// codex CLI stderr strings emitted by `codex exec` on quota exhaustion or
+/// login failure. Loose substrings like "connection" or "network" are NOT
+/// matched — they appear in unrelated user-facing messages (e.g. an account
+/// name containing "Connection") and would mis-classify generic errors as
+/// transient transport failures.
 fn classify_session_failure(err_str: &str) -> Option<&'static str> {
     if err_str.contains("codex_rate_limited") {
         return Some("rate_limited");
@@ -1321,7 +1323,334 @@ fn classify_session_failure(err_str: &str) -> Option<&'static str> {
     {
         return Some("network");
     }
+
+    // codex CLI stderr signals from `codex exec` — match exact phrases the
+    // CLI prints when the ChatGPT-subscription OAuth quota is exhausted.
+    // Keep this list tight so it can't fire on unrelated text.
+    if err_str.contains("You've hit your usage limit")
+        || err_str.contains("usage limit reached")
+        || err_str.contains("Upgrade to Pro")
+        || err_str.contains("try again at ")
+        || err_str.contains("Rate limit exceeded")
+        || err_str.contains("429 Too Many Requests")
+    {
+        return Some("rate_limited");
+    }
+
+    // codex CLI auth-required stderr signals
+    if err_str.contains("Please run `codex login`")
+        || err_str.contains("not logged in")
+        || err_str.contains("authentication required")
+        || err_str.contains("401 Unauthorized")
+    {
+        return Some("auth");
+    }
+
     None
+}
+
+// ── Internal codex auth fallback (chatgpt OAuth → apikey) ────────────
+//
+// Self-healing path for the legacy `codex` mode: when the user's ChatGPT
+// subscription quota is exhausted we keep using the same codex pipeline
+// (prompts, tools, MCP integration) but swap the codex CLI's stored auth
+// from `chatgpt` (OAuth tokens) to `apikey` (OpenAI API key). The auth
+// file ($HOME/.codex/auth.json) is backed up to `auth.json.oauth.bak`
+// so the OAuth credentials can be restored later.
+
+/// Resolve the codex CLI's auth file path: `$HOME/.codex/auth.json`.
+/// Returns an error if neither HOME nor USERPROFILE is set.
+fn codex_auth_path() -> Result<PathBuf> {
+    let home = env::var("HOME")
+        .or_else(|_| env::var("USERPROFILE"))
+        .map_err(|_| anyhow!("codex_auth_no_home"))?;
+    Ok(PathBuf::from(home).join(".codex").join("auth.json"))
+}
+
+/// Backup path used to preserve the chatgpt OAuth auth when we swap to apikey.
+fn codex_auth_backup_path() -> Result<PathBuf> {
+    Ok(codex_auth_path()?.with_extension("json.oauth.bak"))
+}
+
+/// Read codex CLI auth mode from `auth.json`.
+/// Returns `"chatgpt"` when OAuth tokens are stored, `"apikey"` when a raw
+/// `OPENAI_API_KEY` is stored, or `"none"` when no usable credential exists.
+pub fn auth_mode() -> Result<&'static str> {
+    let path = codex_auth_path()?;
+    if !path.exists() {
+        return Ok("none");
+    }
+    let content = fs::read_to_string(&path)
+        .map_err(|e| anyhow!("codex_auth_read_failed:{e}"))?;
+    if content.trim().is_empty() {
+        return Ok("none");
+    }
+    let parsed: Value = serde_json::from_str(&content)
+        .map_err(|e| anyhow!("codex_auth_parse_failed:{e}"))?;
+
+    // chatgpt OAuth: presence of a `tokens` object with an access_token
+    if let Some(tokens) = parsed.get("tokens").and_then(|v| v.as_object()) {
+        let has_access = tokens
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        let has_id = tokens
+            .get("id_token")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        if has_access || has_id {
+            return Ok("chatgpt");
+        }
+    }
+
+    // apikey mode: codex CLI writes the key at the top level as `OPENAI_API_KEY`
+    let has_apikey = parsed
+        .get("OPENAI_API_KEY")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    if has_apikey {
+        return Ok("apikey");
+    }
+
+    Ok("none")
+}
+
+/// Probe the codex CLI quota by running a tiny `codex exec` invocation.
+/// Returns `{ status, failure_reason, message }` mirroring `session_status()`
+/// so the JS layer can reuse the same decision logic.
+///
+/// Uses a fresh subprocess (no shared app-server pool) and a 30s timeout.
+pub fn probe_quota() -> Result<Value> {
+    let bin = match resolve_codex_binary() {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok(json!({
+                "status": "no_binary",
+                "failure_reason": serde_json::Value::Null,
+                "message": format!("Codex CLI not found: {e}"),
+            }));
+        }
+    };
+
+    crate::debug_log("codex: probe_quota launching 'codex exec' (1-token probe)");
+
+    let mut cmd = Command::new(bin.as_os_str());
+    // `codex exec <prompt>` is a one-shot non-interactive invocation that
+    // exercises the same auth/quota path used by the app-server.
+    cmd.args(["exec", "--skip-git-repo-check", "OK"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    prepare_codex_cmd(&mut cmd);
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow!("codex_probe_spawn_failed:{e}"))?;
+
+    // Manual 30s wait — std::process::Child has no built-in timeout.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let exit_status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow!("codex_probe_wait_failed:{e}"));
+            }
+        }
+    };
+
+    let mut stdout_buf = String::new();
+    let mut stderr_buf = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = std::io::Read::read_to_string(&mut out, &mut stdout_buf);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let _ = std::io::Read::read_to_string(&mut err, &mut stderr_buf);
+    }
+
+    match exit_status {
+        None => Ok(json!({
+            "status": "error",
+            "failure_reason": "network",
+            "message": "codex exec probe timed out after 30s",
+        })),
+        Some(status) if status.success() => Ok(json!({
+            "status": "ok",
+            "failure_reason": serde_json::Value::Null,
+            "message": "quota_ok",
+        })),
+        Some(_) => {
+            let combined = format!("{stdout_buf}\n{stderr_buf}");
+            let failure_reason = classify_session_failure(&combined);
+            let status = match failure_reason {
+                Some("rate_limited") => "rate_limited",
+                Some("auth") => "auth",
+                Some(_) => "error",
+                None => "unknown",
+            };
+            let message = match failure_reason {
+                Some("rate_limited") => "OAuth quota exhausted.".to_string(),
+                Some("auth") => "codex login required.".to_string(),
+                _ => truncate(combined.trim(), 400),
+            };
+            Ok(json!({
+                "status": status,
+                "failure_reason": failure_reason,
+                "message": message,
+            }))
+        }
+    }
+}
+
+/// Swap the codex CLI auth from chatgpt OAuth to a user-provided API key.
+///
+/// Workflow:
+/// 1. If current auth_mode is `chatgpt`, copy `auth.json` to
+///    `auth.json.oauth.bak` (idempotent — we never overwrite an existing
+///    backup with apikey state, so it always points at the OAuth snapshot).
+/// 2. Pipe the API key into `codex login --with-api-key`, which rewrites
+///    `auth.json` with `{ OPENAI_API_KEY: "…" }`.
+/// 3. Stop the app-server pool so subsequent calls re-spawn with new auth.
+pub fn swap_to_apikey(api_key: &str) -> Result<()> {
+    let key = api_key.trim();
+    if key.is_empty() {
+        return Err(anyhow!("codex_swap_empty_api_key"));
+    }
+
+    let auth_path = codex_auth_path()?;
+    let backup_path = codex_auth_backup_path()?;
+    let current_mode = auth_mode().unwrap_or("none");
+
+    // Idempotent backup: only preserve when we currently have OAuth state
+    // AND no backup yet exists. This prevents clobbering the OAuth snapshot
+    // with a stale apikey one if swap_to_apikey is called twice.
+    if current_mode == "chatgpt" && !backup_path.exists() && auth_path.exists() {
+        fs::copy(&auth_path, &backup_path)
+            .map_err(|e| anyhow!("codex_auth_backup_failed:{e}"))?;
+        crate::debug_log(&format!(
+            "codex: backed up OAuth auth -> {}",
+            backup_path.display()
+        ));
+    }
+
+    let bin = resolve_codex_binary()?;
+    crate::debug_log("codex: invoking 'codex login --with-api-key'");
+
+    let mut cmd = Command::new(bin.as_os_str());
+    cmd.args(["login", "--with-api-key"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    prepare_codex_cmd(&mut cmd);
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow!("codex_login_apikey_spawn_failed:{e}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(key.as_bytes())
+            .map_err(|e| anyhow!("codex_login_apikey_write_failed:{e}"))?;
+        // Drop closes stdin, signaling EOF to the codex CLI.
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| anyhow!("codex_login_apikey_wait_failed:{e}"))?;
+
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "codex_login_apikey_failed:exit_code={:?}:stdout={}:stderr={}",
+            output.status.code(),
+            truncate(stdout.trim(), 200),
+            truncate(stderr.trim(), 200)
+        ));
+    }
+
+    // Ensure subsequent JSON-RPC calls pick up the new auth.
+    stop_app_server();
+    crate::debug_log("codex: swap_to_apikey completed, app-server pool reset");
+    Ok(())
+}
+
+/// Restore codex CLI auth from the OAuth backup written by `swap_to_apikey`.
+/// Returns `Ok(true)` when the restore succeeded AND the codex CLI accepts
+/// the restored auth (re-init handshake passes); returns `Ok(false)` when
+/// no backup exists. Caller is expected to clear the
+/// `codex_auth_auto_fallback` flag only when this returns `true`.
+pub fn swap_to_oauth() -> Result<bool> {
+    let auth_path = codex_auth_path()?;
+    let backup_path = codex_auth_backup_path()?;
+
+    if !backup_path.exists() {
+        return Ok(false);
+    }
+
+    // Stash the current (apikey) auth so we can roll back on failure.
+    let rollback_payload = if auth_path.exists() {
+        Some(
+            fs::read(&auth_path)
+                .map_err(|e| anyhow!("codex_auth_read_failed:{e}"))?,
+        )
+    } else {
+        None
+    };
+
+    fs::copy(&backup_path, &auth_path)
+        .map_err(|e| anyhow!("codex_auth_restore_failed:{e}"))?;
+    stop_app_server();
+    crate::debug_log("codex: restored OAuth auth from backup, app-server pool reset");
+
+    // Verify the restored OAuth credentials are still accepted by spawning
+    // a fresh app-server and running an `initialize` + `model/list` handshake.
+    // This is a local-auth check (no remote call), so it's fast and cannot
+    // be tripped by an unrelated quota refresh.
+    let ok = match get_or_start_app_server() {
+        Ok(()) => {
+            let probe = with_app_server(|client| {
+                let id = client.send_request("model/list", json!({}))?;
+                client.recv_response(id, |_, _| {})
+            });
+            probe.is_ok()
+        }
+        Err(e) => {
+            crate::debug_log(&format!(
+                "codex: restored OAuth auth failed handshake: {e}"
+            ));
+            false
+        }
+    };
+
+    if ok {
+        // Successful restore — remove the backup so a future fallback
+        // re-creates it from a fresh OAuth snapshot.
+        let _ = fs::remove_file(&backup_path);
+        Ok(true)
+    } else {
+        // Rollback to apikey to keep the user functional.
+        crate::debug_log("codex: OAuth restore failed, rolling back to apikey");
+        if let Some(bytes) = rollback_payload {
+            let _ = fs::write(&auth_path, bytes);
+        } else {
+            let _ = fs::remove_file(&auth_path);
+        }
+        stop_app_server();
+        Ok(false)
+    }
 }
 
 /// Check if the user has a valid Codex/OpenAI session.
@@ -1669,5 +1998,181 @@ mod tests {
             classify_session_failure("Account 'Connection 401' has no balance"),
             None
         );
+    }
+
+    #[test]
+    fn classify_failure_codex_cli_rate_limit_stderr() {
+        // Exact stderr phrases printed by `codex exec` on quota exhaustion.
+        assert_eq!(
+            classify_session_failure("You've hit your usage limit for the day"),
+            Some("rate_limited")
+        );
+        assert_eq!(
+            classify_session_failure("error: usage limit reached, try again later"),
+            Some("rate_limited")
+        );
+        assert_eq!(
+            classify_session_failure("Upgrade to Pro for more usage"),
+            Some("rate_limited")
+        );
+        assert_eq!(
+            classify_session_failure("Please try again at 2026-05-14T18:00:00Z"),
+            Some("rate_limited")
+        );
+        assert_eq!(
+            classify_session_failure("Rate limit exceeded; back off"),
+            Some("rate_limited")
+        );
+        assert_eq!(
+            classify_session_failure("HTTP 429 Too Many Requests"),
+            Some("rate_limited")
+        );
+    }
+
+    #[test]
+    fn classify_failure_codex_cli_auth_stderr() {
+        assert_eq!(
+            classify_session_failure("Please run `codex login` to authenticate"),
+            Some("auth")
+        );
+        assert_eq!(
+            classify_session_failure("error: not logged in"),
+            Some("auth")
+        );
+        assert_eq!(
+            classify_session_failure("authentication required to call this endpoint"),
+            Some("auth")
+        );
+        assert_eq!(
+            classify_session_failure("response: 401 Unauthorized"),
+            Some("auth")
+        );
+    }
+
+    // ── auth_mode + swap round-trip tests ────────────────────────────
+    //
+    // We exercise the codex auth helpers against a temporary HOME so the
+    // real ~/.codex/auth.json is never touched. Each test reads/restores
+    // the HOME env var around its body and serializes via a mutex because
+    // HOME is process-wide.
+    use std::sync::Mutex;
+    static HOME_LOCK: Mutex<()> = Mutex::new(());
+
+    struct TempHome {
+        _dir: tempfile::TempDir,
+        prev_home: Option<String>,
+        prev_userprofile: Option<String>,
+    }
+
+    impl TempHome {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let prev_home = env::var("HOME").ok();
+            let prev_userprofile = env::var("USERPROFILE").ok();
+            // SAFETY: HOME is process-global; tests using TempHome must hold HOME_LOCK.
+            std::env::set_var("HOME", dir.path());
+            std::env::set_var("USERPROFILE", dir.path());
+            std::fs::create_dir_all(dir.path().join(".codex")).expect("mkdir .codex");
+            TempHome { _dir: dir, prev_home, prev_userprofile }
+        }
+    }
+
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            match &self.prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.prev_userprofile {
+                Some(v) => std::env::set_var("USERPROFILE", v),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+    }
+
+    #[test]
+    fn auth_mode_reports_none_when_file_missing() {
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = TempHome::new();
+        assert_eq!(auth_mode().unwrap(), "none");
+    }
+
+    #[test]
+    fn auth_mode_reports_chatgpt_when_tokens_present() {
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = TempHome::new();
+        let payload = json!({
+            "tokens": {
+                "access_token": "oauth-access-token",
+                "id_token": "oauth-id-token",
+                "refresh_token": "oauth-refresh"
+            }
+        });
+        fs::write(codex_auth_path().unwrap(), payload.to_string()).unwrap();
+        assert_eq!(auth_mode().unwrap(), "chatgpt");
+    }
+
+    #[test]
+    fn auth_mode_reports_apikey_when_only_api_key_present() {
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = TempHome::new();
+        let payload = json!({ "OPENAI_API_KEY": "sk-test-1234" });
+        fs::write(codex_auth_path().unwrap(), payload.to_string()).unwrap();
+        assert_eq!(auth_mode().unwrap(), "apikey");
+    }
+
+    #[test]
+    fn auth_mode_reports_none_for_empty_payload() {
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = TempHome::new();
+        // Empty tokens object + no api key → no usable credential.
+        let payload = json!({ "tokens": { "access_token": "" } });
+        fs::write(codex_auth_path().unwrap(), payload.to_string()).unwrap();
+        assert_eq!(auth_mode().unwrap(), "none");
+    }
+
+    #[test]
+    fn swap_to_oauth_returns_false_when_no_backup() {
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = TempHome::new();
+        // Even with an existing auth.json (apikey), no backup means we
+        // can't restore — must report false and leave the file alone.
+        let payload = json!({ "OPENAI_API_KEY": "sk-test" });
+        fs::write(codex_auth_path().unwrap(), payload.to_string()).unwrap();
+        assert_eq!(swap_to_oauth().unwrap(), false);
+        // auth.json still apikey
+        assert_eq!(auth_mode().unwrap(), "apikey");
+    }
+
+    #[test]
+    fn backup_is_created_from_chatgpt_state() {
+        // Pure file-IO portion of swap_to_apikey: simulate by calling the
+        // backup logic manually. (swap_to_apikey itself shells out to the
+        // codex binary which is unavailable in the unit-test env.)
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = TempHome::new();
+        let oauth_payload = json!({
+            "tokens": { "access_token": "oauth-access" }
+        });
+        let auth_path = codex_auth_path().unwrap();
+        let backup_path = codex_auth_backup_path().unwrap();
+        fs::write(&auth_path, oauth_payload.to_string()).unwrap();
+        assert_eq!(auth_mode().unwrap(), "chatgpt");
+
+        // Manually mirror the backup step of swap_to_apikey.
+        assert!(!backup_path.exists());
+        fs::copy(&auth_path, &backup_path).unwrap();
+        assert!(backup_path.exists());
+
+        // Now simulate codex login --with-api-key by writing apikey state.
+        let apikey_payload = json!({ "OPENAI_API_KEY": "sk-from-cli" });
+        fs::write(&auth_path, apikey_payload.to_string()).unwrap();
+        assert_eq!(auth_mode().unwrap(), "apikey");
+
+        // swap_to_oauth (file-IO portion): copies backup back. We can't
+        // run the handshake step in unit tests (no codex binary), but we
+        // can verify the file is restored correctly when only the IO runs.
+        fs::copy(&backup_path, &auth_path).unwrap();
+        assert_eq!(auth_mode().unwrap(), "chatgpt");
     }
 }

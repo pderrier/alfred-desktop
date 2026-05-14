@@ -2139,6 +2139,9 @@ async function processOnboardingResult(history) {
         settings: {
           llm_backend: "native",
           openai_api_key: apiKeyProvided,
+          // Manual switch via chat wizard — clear both auto-fallback flags.
+          llm_backend_auto_fallback: 0,
+          codex_auth_auto_fallback: 0,
         }
       });
       showToast("API key saved", "success");

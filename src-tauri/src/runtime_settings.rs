@@ -57,6 +57,32 @@ pub fn definitions_json() -> serde_json::Value {
             "whyItMatters": "Tracks transient fallback state so the user is automatically restored to their preferred OAuth mode once quota recovers.",
             "resetLabel": "Clear auto-fallback flag"
         },
+        "codex_auth_auto_fallback": {
+            "type": "integer",
+            "min": 0,
+            "max": 1,
+            "defaultValue": 0,
+            "section": "product",
+            "restartRequired": false,
+            "envName": serde_json::Value::Null,
+            "label": "Codex internal auth auto-fallback flag",
+            "description": "Internal marker — set to 1 when the codex CLI's stored auth was swapped from ChatGPT OAuth to API key due to OAuth rate-limit. When set, the splash will probe quota on next launch and auto-restore the OAuth auth if the quota has returned.",
+            "whyItMatters": "Tracks transient internal auth fallback so the user is automatically restored to their ChatGPT subscription once quota recovers.",
+            "resetLabel": "Clear codex auth fallback flag"
+        },
+        "codex_auth_oauth_retry_after_ms": {
+            "type": "integer",
+            "min": 0,
+            "max": 9007199254740991_i64,
+            "defaultValue": 0,
+            "section": "product",
+            "restartRequired": false,
+            "envName": serde_json::Value::Null,
+            "label": "Codex OAuth restore retry-after (epoch ms)",
+            "description": "Internal throttle — epoch-ms timestamp before which the splash will NOT re-attempt swap_to_oauth. Set when a restore attempt fails (OAuth still rate-limited) to avoid backup/restore/rollback thrashing on every launch.",
+            "whyItMatters": "Caps the restore retry frequency to once per N hours when OAuth quota is still exhausted; avoids burning ~2 app-server restarts per launch.",
+            "resetLabel": "Clear codex OAuth retry-after"
+        },
         "agentos_artifacts_enabled": {
             "type": "integer",
             "min": 0,
@@ -294,6 +320,8 @@ fn normalize_value(key: &str, value: &serde_json::Value) -> Result<serde_json::V
         "line_analysis_concurrency" => normalize_integer(key, value, 1, 12),
         "agentos_artifacts_enabled" => normalize_integer(key, value, 0, 1),
         "llm_backend_auto_fallback" => normalize_integer(key, value, 0, 1),
+        "codex_auth_auto_fallback" => normalize_integer(key, value, 0, 1),
+        "codex_auth_oauth_retry_after_ms" => normalize_integer(key, value, 0, 9007199254740991_i64),
         "line_analysis_throttle_ms" => normalize_integer(key, value, 0, 5000),
         "collection_concurrency" => normalize_integer(key, value, 1, 12),
         "collection_throttle_ms" => normalize_integer(key, value, 0, 5000),

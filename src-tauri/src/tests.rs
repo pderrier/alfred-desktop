@@ -2968,3 +2968,919 @@ use crate::storage::read_json_file;
         assert!(normalized.get("portfolio_summary").is_some());
         assert!(normalized.get("cash_by_currency").is_some());
     }
+
+    // ── Fix 1 — sync_position_from_market (Bug A primary fix) ───────────
+
+    #[test]
+    fn sync_position_from_market_applies_real_provider_price() {
+        // Revolut-style position whose inline `fetch_market_spot` failed
+        // during reconciliation (prix_actuel == 0). The later async
+        // enrichment returned a valid `boursorama:spot` price — that price
+        // must overwrite the position fields so the UI shows real values.
+        let mut position = json!({
+            "ticker": "AMD",
+            "quantite": 10.0,
+            "prix_actuel": 0.0,
+            "valeur_actuelle": 0.0,
+            "prix_revient": 100.0,
+            "plus_moins_value": 0.0,
+            "plus_moins_value_pct": 0.0,
+        });
+        let market = json!({
+            "prix_actuel": 150.0,
+            "source": "boursorama:spot",
+        });
+        let updated = crate::native_collection_helpers::sync_position_from_market(
+            &mut position,
+            &market,
+        );
+        assert!(updated, "real provider price must be applied");
+        assert_eq!(position["prix_actuel"].as_f64().unwrap(), 150.0);
+        assert_eq!(position["valeur_actuelle"].as_f64().unwrap(), 1500.0);
+        assert_eq!(position["plus_moins_value"].as_f64().unwrap(), 500.0);
+        assert_eq!(position["plus_moins_value_pct"].as_f64().unwrap(), 50.0);
+    }
+
+    #[test]
+    fn sync_position_from_market_rejects_pru_fallback_source() {
+        // CRITICAL guard: `resolve_source_current_price` writes the PRU
+        // into `market[ticker].prix_actuel` with `source = "none"` when every
+        // provider fails. We MUST NOT propagate that into the position fields
+        // — doing so would silently overwrite the user's holdings with a
+        // zero P&L (prix_actuel == prix_revient).
+        let mut position = json!({
+            "ticker": "TX",
+            "quantite": 5.0,
+            "prix_actuel": 0.0,
+            "valeur_actuelle": 0.0,
+            "prix_revient": 80.0,
+            "plus_moins_value": 0.0,
+            "plus_moins_value_pct": 0.0,
+        });
+        let market_with_pru_fallback = json!({
+            "prix_actuel": 80.0,
+            "source": "none",
+        });
+        let updated = crate::native_collection_helpers::sync_position_from_market(
+            &mut position,
+            &market_with_pru_fallback,
+        );
+        assert!(!updated, "source=none must be rejected");
+        assert_eq!(position["prix_actuel"].as_f64().unwrap(), 0.0);
+        assert_eq!(position["valeur_actuelle"].as_f64().unwrap(), 0.0);
+
+        // Sanity check on `is_real_market_source` directly.
+        assert!(!crate::native_collection_helpers::is_real_market_source("none"));
+        assert!(!crate::native_collection_helpers::is_real_market_source(""));
+        assert!(crate::native_collection_helpers::is_real_market_source("boursorama:spot"));
+        assert!(crate::native_collection_helpers::is_real_market_source("google_finance:spot"));
+    }
+
+    #[test]
+    fn sync_position_from_market_handles_missing_prix_revient_safely() {
+        // Watchlist-style row with no PRU. `plus_moins_value_pct` must fall
+        // back to 0 instead of dividing by zero; the other fields still get
+        // populated from the market price.
+        let mut position = json!({
+            "ticker": "RBT",
+            "quantite": 3.0,
+            "prix_actuel": 0.0,
+            "valeur_actuelle": 0.0,
+            "prix_revient": 0.0,
+        });
+        let market = json!({
+            "prix_actuel": 800.0,
+            "source": "boursorama:spot",
+        });
+        let updated = crate::native_collection_helpers::sync_position_from_market(
+            &mut position,
+            &market,
+        );
+        assert!(updated);
+        assert_eq!(position["prix_actuel"].as_f64().unwrap(), 800.0);
+        assert_eq!(position["valeur_actuelle"].as_f64().unwrap(), 2400.0);
+        assert_eq!(position["plus_moins_value"].as_f64().unwrap(), 2400.0);
+        assert_eq!(
+            position["plus_moins_value_pct"].as_f64().unwrap(),
+            0.0,
+            "no PRU must yield 0% pct, never NaN/Inf"
+        );
+
+        // Negative path: no usable market price must leave the position alone.
+        let mut position2 = json!({
+            "ticker": "RBT", "quantite": 3.0, "prix_actuel": 0.0,
+            "prix_revient": 0.0, "valeur_actuelle": 0.0,
+        });
+        let market_missing = json!({ "source": "boursorama:spot" });
+        let updated2 = crate::native_collection_helpers::sync_position_from_market(
+            &mut position2,
+            &market_missing,
+        );
+        assert!(!updated2);
+        assert_eq!(position2["prix_actuel"].as_f64().unwrap(), 0.0);
+    }
+
+    // ── Fix 3 — watchlist persist-before-LLM (Bug B) ────────────────────
+    //
+    // The actual dispatch logic is wired to a thread queue; the surface we
+    // can test deterministically is the contract: `build_collection_state`
+    // produces a state where `market[ticker]` is visible to a hypothetical
+    // `tool_get_line_data` caller BEFORE the LLM packet is emitted. Mirrors
+    // the call sequence in `apply_watchlist_collection_result`.
+
+    #[test]
+    fn watchlist_market_data_visible_in_partial_state_before_mcp_dispatch() {
+        use serde_json::Map;
+
+        // Simulate the in-flight state at the moment a watchlist drain loop
+        // is about to call mcp_dispatch.push: positions are done, market_by_ticker
+        // has just received the watchlist ticker's fresh row.
+        let snapshot = json!({
+            "accounts": [{"name": "PEA PME", "cash": 100.0}],
+            "valeur_totale": 1000.0,
+            "plus_value_totale": 50.0,
+            "liquidites": 100.0,
+            "transactions": [],
+            "orders": [],
+        });
+        let incremental_positions: Vec<serde_json::Value> = vec![json!({
+            "ticker": "MC", "nom": "LVMH", "quantite": 2.0,
+            "prix_actuel": 800.0, "valeur_actuelle": 1600.0,
+            "prix_revient": 700.0, "compte": "PEA PME",
+        })];
+        let mut market_by_ticker: Map<String, serde_json::Value> = Map::new();
+        market_by_ticker.insert("MC".into(), json!({"prix_actuel": 800.0, "source": "boursorama:spot"}));
+        // Watchlist ticker — was just drained by the dispatch queue.
+        market_by_ticker.insert("RBT".into(), json!({"prix_actuel": 800.0, "source": "boursorama:spot"}));
+        let mut news_by_ticker: Map<String, serde_json::Value> = Map::new();
+        news_by_ticker.insert("RBT".into(), json!({"articles": [], "sources": []}));
+
+        let technicals_by_ticker: Map<String, serde_json::Value> = Map::new();
+        let partial_state = crate::native_collection_helpers::build_collection_state(
+            &snapshot,
+            &incremental_positions,
+            &market_by_ticker,
+            &news_by_ticker,
+            &technicals_by_ticker,
+            &serde_json::Value::Null,
+            &[],
+            &[],
+            "finary",
+            "ok",
+            &serde_json::Value::Null,
+            &serde_json::Value::Null,
+            None,
+        );
+
+        // Contract: tool_get_line_data(watchlist:RBT) reads state.market.RBT.
+        // The partial state we hand to `persist_native_collection_state`
+        // must expose this — without the persist call before mcp_dispatch.push,
+        // it stays invisible until the final flush at end of run.
+        let market_rbt = partial_state.get("market").and_then(|m| m.get("RBT"));
+        assert!(market_rbt.is_some(), "RBT market data must be present in partial state");
+        assert_eq!(
+            market_rbt.unwrap().get("prix_actuel").and_then(|v| v.as_f64()).unwrap(),
+            800.0,
+            "RBT prix_actuel must match the freshly drained provider value"
+        );
+        assert_eq!(
+            market_rbt.unwrap().get("source").and_then(|v| v.as_str()).unwrap(),
+            "boursorama:spot",
+            "RBT source must be the real provider, not 'none'"
+        );
+
+        // Watchlist row must NOT be in positions[] (quantite=0 would inflate totals).
+        let positions = partial_state.get("portfolio")
+            .and_then(|p| p.get("positions"))
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(positions.len(), 1, "watchlist must not appear as a position");
+        assert_eq!(positions[0].get("ticker").and_then(|v| v.as_str()).unwrap(), "MC");
+    }
+
+    // ── Fix 4 — repair_line_memory_zero_prices (Bug B follow-up) ────────
+
+    #[test]
+    fn repair_line_memory_flags_only_all_zero_price_history() {
+        // Build a contaminated store that mirrors the user's actual
+        // line-memory.json content for RBT (10 entries all at price 0).
+        let mut store = json!({
+            "by_ticker": {
+                "RBT": {
+                    "schema_version": 2,
+                    "ticker": "RBT",
+                    "signal": "SURVEILLANCE",
+                    "signal_history": [
+                        { "date": "2026-05-14", "signal": "SURVEILLANCE", "price_at_signal": 0.0 },
+                        { "date": "2026-05-07", "signal": "CONSERVER", "price_at_signal": 0.0 },
+                        { "date": "2026-04-30", "signal": "CONSERVER", "price_at_signal": 0.0 },
+                    ],
+                    "price_tracking": {
+                        "current_price": 0.0,
+                        "price_at_signal": 0.0,
+                    }
+                },
+                "MC": {
+                    // Healthy ticker — must be left alone.
+                    "schema_version": 2,
+                    "ticker": "MC",
+                    "signal": "CONSERVER",
+                    "signal_history": [
+                        { "date": "2026-05-14", "signal": "CONSERVER", "price_at_signal": 800.0 }
+                    ],
+                    "price_tracking": { "current_price": 805.0, "price_at_signal": 800.0 }
+                },
+                "PARTIAL": {
+                    // Mixed history — one real price means the chain WAS healthy
+                    // at some point, so we don't flag this case.
+                    "schema_version": 2,
+                    "ticker": "PARTIAL",
+                    "signal_history": [
+                        { "date": "2026-05-14", "price_at_signal": 0.0 },
+                        { "date": "2026-05-01", "price_at_signal": 42.0 }
+                    ],
+                    "price_tracking": { "current_price": 0.0 }
+                },
+                "FRESH": {
+                    // Empty history — first analysis, no contamination possible.
+                    "schema_version": 2,
+                    "ticker": "FRESH",
+                    "signal_history": [],
+                    "price_tracking": { "current_price": 0.0 }
+                }
+            }
+        });
+
+        let outcome = crate::native_mcp_analysis::apply_zero_price_repair(&mut store);
+        assert_eq!(outcome.flagged, 1, "only RBT should be flagged");
+        assert_eq!(outcome.cleared, 0, "no entries had a stale flag to clear");
+
+        let rbt = store.get("by_ticker").and_then(|b| b.get("RBT")).unwrap();
+        assert_eq!(
+            rbt.get("price_data_unavailable").and_then(|v| v.as_bool()).unwrap(),
+            true,
+            "RBT must carry the price_data_unavailable=true flag"
+        );
+
+        // Signal history MUST be preserved — repair flags, never deletes.
+        let history = rbt.get("signal_history").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(history.len(), 3, "signal history must be preserved");
+
+        // Healthy tickers must not be touched.
+        let mc = store.get("by_ticker").and_then(|b| b.get("MC")).unwrap();
+        assert!(
+            mc.get("price_data_unavailable").is_none(),
+            "MC must not be flagged"
+        );
+        let partial = store.get("by_ticker").and_then(|b| b.get("PARTIAL")).unwrap();
+        assert!(
+            partial.get("price_data_unavailable").is_none(),
+            "partial-zero history must not be flagged (it has at least one real price)"
+        );
+        let fresh = store.get("by_ticker").and_then(|b| b.get("FRESH")).unwrap();
+        assert!(
+            fresh.get("price_data_unavailable").is_none(),
+            "empty-history first analysis must not be flagged"
+        );
+
+        // Idempotent — running again must not double-count.
+        let outcome2 = crate::native_mcp_analysis::apply_zero_price_repair(&mut store);
+        assert_eq!(outcome2.flagged, 0, "second pass must not re-flag");
+        assert_eq!(outcome2.cleared, 0, "second pass must not clear anything");
+    }
+
+    #[test]
+    fn build_memory_section_skips_zero_price_when_flagged() {
+        // When `price_data_unavailable=true` propagates into the memory
+        // payload, `build_memory_section` must NOT render `prix: 0.00€` —
+        // that's the bogus price the LLM was reading as a "no quote
+        // available" signal.
+        let memory_unavailable = json!({
+            "schema_version": 2,
+            "signal_history": [{"date": "2026-05-14", "signal": "SURVEILLANCE"}],
+            "price_tracking": {
+                "last_signal": "SURVEILLANCE",
+                "last_signal_date": "2026-05-14",
+                "price_at_signal": 0.0,
+                "return_since_signal_pct": 0.0,
+                "current_price": 0.0,
+                "signal_accuracy": "unknown",
+            },
+            "conviction": "moyenne",
+            "price_data_unavailable": true,
+        });
+        let rendered = crate::llm_prompts::build_memory_section(Some(&memory_unavailable));
+        assert!(
+            !rendered.contains("0.00\u{20ac}"),
+            "must not render bogus 0.00€ price when price_data_unavailable=true\nGot: {rendered}"
+        );
+        assert!(
+            rendered.contains("indisponible"),
+            "must surface the indisponible marker so the LLM understands the gap\nGot: {rendered}"
+        );
+
+        // Sanity — healthy memory still renders the price.
+        let memory_healthy = json!({
+            "schema_version": 2,
+            "signal_history": [{"date": "2026-05-14", "signal": "CONSERVER"}],
+            "price_tracking": {
+                "last_signal": "CONSERVER",
+                "last_signal_date": "2026-05-14",
+                "price_at_signal": 800.0,
+                "return_since_signal_pct": 0.6,
+                "current_price": 805.0,
+                "signal_accuracy": "correct",
+            },
+            "conviction": "forte",
+            "price_data_unavailable": false,
+        });
+        let rendered_healthy = crate::llm_prompts::build_memory_section(Some(&memory_healthy));
+        assert!(rendered_healthy.contains("800.00\u{20ac}"));
+    }
+
+    #[test]
+    fn build_memory_for_prompt_propagates_price_data_unavailable() {
+        // The flag must survive the hop from `line-memory.json` →
+        // `build_memory_for_prompt` → prompt builder. This is the contract
+        // that makes Fix 4 end-to-end.
+        let entry = json!({
+            "schema_version": 2,
+            "signal": "SURVEILLANCE",
+            "signal_history": [{"date": "2026-05-14", "price_at_signal": 0.0}],
+            "price_data_unavailable": true,
+        });
+        let prompt_view = crate::native_collection_helpers::build_memory_for_prompt(
+            Some(&entry),
+            None,
+        ).expect("prompt view must be produced");
+        assert_eq!(
+            prompt_view.get("price_data_unavailable").and_then(|v| v.as_bool()),
+            Some(true),
+            "price_data_unavailable must round-trip through build_memory_for_prompt"
+        );
+
+        // Negative case — entries without the flag must default to false.
+        let entry_no_flag = json!({
+            "schema_version": 2,
+            "signal": "CONSERVER",
+            "signal_history": [{"date": "2026-05-14", "price_at_signal": 800.0}],
+        });
+        let prompt_view2 = crate::native_collection_helpers::build_memory_for_prompt(
+            Some(&entry_no_flag),
+            None,
+        ).unwrap();
+        assert_eq!(
+            prompt_view2.get("price_data_unavailable").and_then(|v| v.as_bool()),
+            Some(false),
+        );
+    }
+
+    // ── Fix 5: signal_history dedup + distinct-date counting ─────────────
+    //
+    // Bugs the user reported on ticker ERA: three identical same-day
+    // ALLEGEMENT rows in the "Signal Accuracy" widget, scored_count counting
+    // duplicates (2/10) and trend "↘ declining" because the duplicates
+    // dominated the recent-3 window.
+
+    #[test]
+    fn sync_line_memory_dedupes_same_day_same_signal() {
+        // Three runs on the same day with the same signal must collapse into
+        // ONE signal_history entry. The freshest (date, signal, price_at_signal,
+        // run_id) wins — old entries are not promoted deeper into history.
+        let today = "2026-05-14";
+
+        let run_a = json!({
+            "date": today,
+            "signal": "ALLEGEMENT",
+            "conviction": "moyenne",
+            "price_at_signal": 59.8,
+            "run_id": "run-A",
+        });
+        let run_b = json!({
+            "date": today,
+            "signal": "ALLEGEMENT",
+            "conviction": "moyenne",
+            "price_at_signal": 59.9,
+            "run_id": "run-B",
+        });
+        let run_c = json!({
+            "date": today,
+            "signal": "ALLEGEMENT",
+            "conviction": "moyenne",
+            "price_at_signal": 60.1,
+            "run_id": "run-C",
+        });
+
+        // First run starts from no prior history.
+        let after_a = crate::native_mcp_analysis::build_signal_history(&run_a, None);
+        assert_eq!(after_a.len(), 1, "first same-day run produces one entry");
+
+        // Second same-day same-signal run replaces head, doesn't push.
+        let after_b = crate::native_mcp_analysis::build_signal_history(&run_b, Some(&after_a));
+        assert_eq!(after_b.len(), 1, "second same-day same-signal run must dedup");
+        assert_eq!(
+            after_b[0].get("run_id").and_then(|v| v.as_str()),
+            Some("run-B"),
+            "head must carry the fresher run_id (run-B replaces run-A)"
+        );
+        assert_eq!(
+            after_b[0].get("price_at_signal").and_then(|v| v.as_f64()),
+            Some(59.9),
+            "head must carry the fresher price"
+        );
+
+        // Third same-day same-signal run also dedups against the new head.
+        let after_c = crate::native_mcp_analysis::build_signal_history(&run_c, Some(&after_b));
+        assert_eq!(after_c.len(), 1, "third same-day same-signal run must still dedup");
+        assert_eq!(
+            after_c[0].get("run_id").and_then(|v| v.as_str()),
+            Some("run-C"),
+        );
+        assert_eq!(
+            after_c[0].get("price_at_signal").and_then(|v| v.as_f64()),
+            Some(60.1),
+        );
+    }
+
+    #[test]
+    fn sync_line_memory_prepends_when_signal_changes_same_day() {
+        // Same date, different signals → BOTH preserved. This is the rare
+        // mid-day strategy/news shift case — it's a legitimate new decision
+        // point, not noise.
+        let today = "2026-05-14";
+
+        let first = json!({
+            "date": today,
+            "signal": "ALLEGEMENT",
+            "conviction": "moyenne",
+            "price_at_signal": 59.9,
+            "run_id": "run-1",
+        });
+        let second = json!({
+            "date": today,
+            "signal": "ACHAT",
+            "conviction": "forte",
+            "price_at_signal": 60.5,
+            "run_id": "run-2",
+        });
+
+        let after_first = crate::native_mcp_analysis::build_signal_history(&first, None);
+        let after_second =
+            crate::native_mcp_analysis::build_signal_history(&second, Some(&after_first));
+
+        assert_eq!(
+            after_second.len(),
+            2,
+            "same-day signal change must prepend, not dedup"
+        );
+        assert_eq!(
+            after_second[0].get("signal").and_then(|v| v.as_str()),
+            Some("ACHAT"),
+            "newest entry must be at head"
+        );
+        assert_eq!(
+            after_second[1].get("signal").and_then(|v| v.as_str()),
+            Some("ALLEGEMENT"),
+            "older entry must still be present at index 1"
+        );
+
+        // And the cap at 10 still holds when a long prior history exists.
+        let mut long_history: Vec<serde_json::Value> = (0..10).map(|i| {
+            json!({
+                "date": format!("2026-05-{:02}", 4 + i),
+                "signal": "CONSERVER",
+                "price_at_signal": 50.0,
+                "run_id": format!("old-{i}"),
+            })
+        }).collect();
+        long_history.reverse(); // newest-first
+        let capped = crate::native_mcp_analysis::build_signal_history(&first, Some(&long_history));
+        assert_eq!(capped.len(), 10, "prepend with cap=10 must trim the tail");
+        assert_eq!(
+            capped[0].get("run_id").and_then(|v| v.as_str()),
+            Some("run-1"),
+        );
+    }
+
+    #[test]
+    fn scored_count_uses_distinct_dates() {
+        // Synthetic line-memory store mirroring the user's contaminated ERA
+        // history: three same-day ALLEGEMENT duplicates plus older varied
+        // signals. After dedup-by-date, scored_count must count distinct
+        // dates only.
+        let _guard = env_lock();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempdir.path().join("runtime-state");
+        std::fs::create_dir_all(&state_dir).expect("mkdir state_dir");
+        std::env::set_var("ALFRED_STATE_DIR", state_dir.as_os_str());
+        crate::native_mcp_analysis::line_memory_reset_for_tests();
+
+        // Seed a store on disk so run_get_signal_scorecard can read it.
+        let store = json!({
+            "by_ticker": {
+                "ERA": {
+                    "schema_version": 2,
+                    "ticker": "ERA",
+                    "signal_history": [
+                        // 3 same-day ALLEGEMENT duplicates (contamination)
+                        { "date": "2026-05-14", "signal": "ALLEGEMENT", "price_at_signal": 59.9 },
+                        { "date": "2026-05-14", "signal": "ALLEGEMENT", "price_at_signal": 59.9 },
+                        { "date": "2026-05-14", "signal": "ALLEGEMENT", "price_at_signal": 59.9 },
+                        // Older distinct dates — one correct sell, one incorrect sell
+                        { "date": "2026-05-11", "signal": "ALLEGEMENT", "price_at_signal": 60.0 },
+                        { "date": "2026-05-07", "signal": "ALLEGEMENT", "price_at_signal": 58.3 },
+                    ],
+                    "price_tracking": {
+                        "current_price": 59.9,
+                        "price_at_signal": 59.9,
+                    }
+                }
+            }
+        });
+        let lm_path = state_dir.join("line-memory.json");
+        std::fs::write(&lm_path, serde_json::to_string(&store).unwrap()).unwrap();
+
+        let card = crate::command_handlers::run_get_signal_scorecard("ERA".to_string())
+            .expect("scorecard");
+
+        // Three same-day duplicates collapse to ONE distinct-date bucket.
+        // 2026-05-14 ALLEGEMENT @59.9 (current=59.9) → 0% return, sell
+        //   expected <0 → incorrect.
+        // 2026-05-11 ALLEGEMENT @60.0 (current=59.9) → -0.17% return, sell
+        //   expected <0 → correct.
+        // 2026-05-07 ALLEGEMENT @58.3 (current=59.9) → +2.7% return, sell
+        //   expected <0 → incorrect.
+        // So 3 distinct dates scored, 1 correct.
+        assert_eq!(
+            card.get("scored_count").and_then(|v| v.as_u64()),
+            Some(3),
+            "scored_count must count distinct dates, not duplicates. Got: {card}"
+        );
+        assert_eq!(
+            card.get("correct_count").and_then(|v| v.as_u64()),
+            Some(1),
+            "correct_count must count distinct correct dates. Got: {card}"
+        );
+
+        std::env::remove_var("ALFRED_STATE_DIR");
+        crate::native_mcp_analysis::line_memory_reset_for_tests();
+    }
+
+    #[test]
+    fn compute_trend_buckets_by_distinct_date() {
+        // Three same-day ALLEGEMENT duplicates at the head, followed by a
+        // CONSERVER from yesterday and an ACHAT from two days ago. Without
+        // dedup, the recent-3 window is all ALLEGEMENT and the "older"
+        // window is CONSERVER/ACHAT, which would read as a downgrading
+        // trend. After bucketing by distinct (date, signal), the recent-3
+        // window is ALLEGEMENT / CONSERVER / ACHAT (3 distinct days) and the
+        // older window is empty → trend collapses to "stable".
+        let history = vec![
+            json!({ "date": "2026-05-14", "signal": "ALLEGEMENT" }),
+            json!({ "date": "2026-05-14", "signal": "ALLEGEMENT" }),
+            json!({ "date": "2026-05-14", "signal": "ALLEGEMENT" }),
+            json!({ "date": "2026-05-13", "signal": "CONSERVER" }),
+            json!({ "date": "2026-05-12", "signal": "ACHAT" }),
+        ];
+
+        // Verify the dedup helper first.
+        let bucketed =
+            crate::native_mcp_analysis::dedupe_signal_history_by_date_signal(&history);
+        assert_eq!(
+            bucketed.len(),
+            3,
+            "three same-day same-signal entries must collapse to one bucket"
+        );
+        assert_eq!(
+            bucketed[0].get("date").and_then(|v| v.as_str()),
+            Some("2026-05-14"),
+        );
+        assert_eq!(
+            bucketed[1].get("date").and_then(|v| v.as_str()),
+            Some("2026-05-13"),
+        );
+        assert_eq!(
+            bucketed[2].get("date").and_then(|v| v.as_str()),
+            Some("2026-05-12"),
+        );
+
+        // The downstream contract: with only 5 entries and 3 distinct
+        // (date, signal) buckets, compute_trend operates on the buckets, not
+        // the raw history. A history of ALLEGEMENT(sell, weak) → CONSERVER
+        // (neutral) → ACHAT(buy) reads as upgrading (weakest-buy index first,
+        // strongest last in newest→older order means newest is weaker).
+        // Either way the test guarantees: WITHOUT bucketing the result would
+        // be "stable" (all 3 recent ALLEGEMENT identical, no signal change
+        // in window). WITH bucketing, the recent-3 window contains 3 varied
+        // signals → trend reflects real movement.
+        //
+        // Concretely: newest is ALLEGEMENT(strength=2), older are
+        // CONSERVER(4) and ACHAT(6). Walking pairs newest→older gives diffs
+        // 2-4=-2 (down) then 4-6=-2 (down), so two downs, zero ups → trend
+        // = "downgrading". The point is it MUST NOT be "stable" (which it
+        // would be without bucketing, since 3 identical ALLEGEMENT in the
+        // window produces all-zero diffs).
+        let bucketed_trend = crate::native_mcp_analysis::compute_trend_for_test(&history);
+        assert_ne!(
+            bucketed_trend, "stable",
+            "without bucketing this would be stable (3 identical ALLEGEMENT). \
+             After bucketing the recent-3 window varies → trend must not be stable. Got: {bucketed_trend}"
+        );
+        assert_eq!(
+            bucketed_trend, "downgrading",
+            "ALLEGEMENT(newest) < CONSERVER < ACHAT (oldest) by signal strength → downgrading. Got: {bucketed_trend}"
+        );
+    }
+
+    // ── P1 source-bypass chain (sprint follow-up) ────────────────────────
+    //
+    // The four tests below pin the contract that closes the cascade:
+    //   1. Dispatch overwrites `source = "none"` whenever it falls back to PRU.
+    //   2. `extract_market_price_from_run_state` refuses to expose a price
+    //      from a `source == "none"` row, returning 0.0 so `sync_line_memory`
+    //      preserves `price_data_unavailable` instead of clearing it.
+    //   3. `build_signal_history` keeps the existing head's non-zero price
+    //      on a same-day same-signal replace where the new entry's price is
+    //      zero — protects accuracy/trend widgets from PRU-fallback contamination.
+    //   4. `apply_zero_price_repair` clears a stale `price_data_unavailable`
+    //      flag once the ticker's history regains a real `price_at_signal`.
+
+    #[test]
+    fn dispatch_fallback_marks_source_as_none_when_pru_used() {
+        // Simulates a partial enrichment response: provider tag came back as
+        // `boursorama:spot` but the `prix_actuel` field is null (the typical
+        // mid-day Revolut/Boursorama hiccup). The dispatch must fall back to
+        // the row's PRU AND rewrite `source` to `"none"` so every downstream
+        // guard (`is_real_market_source`, `sync_position_from_market`,
+        // `extract_market_price_from_run_state`) refuses to treat the value
+        // as authentic provider data.
+        let mut market_row = json!({
+            "source": "boursorama:spot",
+            "prix_actuel": null,
+        });
+        let source_row = json!({
+            "ticker": "TX",
+            "prix_revient": 80.0,
+            "quantite": 5.0,
+        });
+
+        crate::native_collection_dispatch::apply_pru_fallback_to_market_row(
+            &mut market_row,
+            &source_row,
+        );
+
+        assert_eq!(
+            market_row.get("prix_actuel").and_then(|v| v.as_f64()),
+            Some(80.0),
+            "PRU must be applied as the fallback price"
+        );
+        assert_eq!(
+            market_row.get("source").and_then(|v| v.as_str()),
+            Some("none"),
+            "source MUST be rewritten to 'none' — leaving 'boursorama:spot' \
+             would let the PRU bleed into position P&L and signal history"
+        );
+
+        // Negative path: when the enrichment already returned a real price,
+        // the helper is a no-op (does NOT clobber the legitimate source).
+        let mut market_row_real = json!({
+            "source": "boursorama:spot",
+            "prix_actuel": 152.5,
+        });
+        crate::native_collection_dispatch::apply_pru_fallback_to_market_row(
+            &mut market_row_real,
+            &source_row,
+        );
+        assert_eq!(
+            market_row_real.get("source").and_then(|v| v.as_str()),
+            Some("boursorama:spot"),
+            "real provider source must be preserved when prix_actuel is present"
+        );
+        assert_eq!(
+            market_row_real.get("prix_actuel").and_then(|v| v.as_f64()),
+            Some(152.5),
+            "real provider price must be preserved"
+        );
+    }
+
+    #[test]
+    fn extract_market_price_returns_zero_when_source_none() {
+        // Direct contract test on the pure-function core. The codex path
+        // reads market[ticker].prix_actuel out of the cached run state to
+        // feed `sync_line_memory(current_price = ...)`. If the market row
+        // is a PRU fallback (`source == "none"`), the extractor MUST return
+        // 0.0 so `sync_line_memory` carries `price_data_unavailable: true`
+        // forward instead of clearing it on a phantom price recovery.
+        let state = json!({
+            "market": {
+                "TX": {
+                    "source": "none",
+                    "prix_actuel": 80.0,
+                }
+            }
+        });
+        let price = crate::native_mcp_analysis::extract_market_price_from_state_value(
+            &state, "TX",
+        );
+        assert_eq!(
+            price, 0.0,
+            "source=none must yield 0.0 — PRU fallback is not a real price"
+        );
+
+        // Sanity — a real provider row returns its price normally.
+        let state_real = json!({
+            "market": {
+                "TX": {
+                    "source": "boursorama:spot",
+                    "prix_actuel": 152.5,
+                }
+            }
+        });
+        let price_real = crate::native_mcp_analysis::extract_market_price_from_state_value(
+            &state_real, "TX",
+        );
+        assert_eq!(price_real, 152.5);
+
+        // Sanity — empty/missing source is also rejected.
+        let state_empty = json!({
+            "market": {
+                "TX": {
+                    "source": "",
+                    "prix_actuel": 152.5,
+                }
+            }
+        });
+        let price_empty = crate::native_mcp_analysis::extract_market_price_from_state_value(
+            &state_empty, "TX",
+        );
+        assert_eq!(
+            price_empty, 0.0,
+            "empty source must be rejected (treated as no real provider)"
+        );
+
+        // Sanity — ticker missing from market returns 0.0.
+        let state_missing = json!({ "market": {} });
+        let price_missing = crate::native_mcp_analysis::extract_market_price_from_state_value(
+            &state_missing, "TX",
+        );
+        assert_eq!(price_missing, 0.0);
+    }
+
+    #[test]
+    fn build_signal_history_prefers_priced_head_over_zero_replacement() {
+        // Pre-existing head carries a real `price_at_signal`. A same-day
+        // same-signal re-run fires with `price_at_signal == 0.0` (the PRU
+        // fallback chain produced no real price this run). The replacement
+        // must adopt the new run_id/conviction (freshness) but keep the
+        // existing head's price (truth).
+        let today = "2026-05-14";
+
+        let prior_head = json!({
+            "date": today,
+            "signal": "SELL",
+            "conviction": "moyenne",
+            "price_at_signal": 100.0,
+            "run_id": "run-prior",
+        });
+        let prior_history = vec![prior_head];
+
+        let new_entry = json!({
+            "date": today,
+            "signal": "SELL",
+            "conviction": "forte",
+            "price_at_signal": 0.0,
+            "run_id": "run-new",
+        });
+
+        let after = crate::native_mcp_analysis::build_signal_history(
+            &new_entry, Some(&prior_history),
+        );
+
+        assert_eq!(after.len(), 1, "same-day same-signal must still dedup to one entry");
+        let head = &after[0];
+        assert_eq!(
+            head.get("price_at_signal").and_then(|v| v.as_f64()),
+            Some(100.0),
+            "existing real price MUST be preserved over a zero replacement"
+        );
+        assert_eq!(
+            head.get("run_id").and_then(|v| v.as_str()),
+            Some("run-new"),
+            "fresh run_id is adopted (the entry is still 'this run's' decision)"
+        );
+        assert_eq!(
+            head.get("conviction").and_then(|v| v.as_str()),
+            Some("forte"),
+            "fresh conviction is adopted"
+        );
+        assert_eq!(
+            head.get("signal").and_then(|v| v.as_str()),
+            Some("SELL"),
+        );
+
+        // Negative path: when the new entry has its own real price, that
+        // price MUST win (the existing rule — fresher data is better) so we
+        // don't accidentally freeze prices forever.
+        let new_with_price = json!({
+            "date": today,
+            "signal": "SELL",
+            "conviction": "forte",
+            "price_at_signal": 110.0,
+            "run_id": "run-newer",
+        });
+        let after_real = crate::native_mcp_analysis::build_signal_history(
+            &new_with_price, Some(&prior_history),
+        );
+        assert_eq!(
+            after_real[0].get("price_at_signal").and_then(|v| v.as_f64()),
+            Some(110.0),
+            "non-zero new price must overwrite — preservation only fires on zero",
+        );
+
+        // Negative path: when both prior and new have zero, the entry stays
+        // zero (nothing to preserve).
+        let prior_zero = vec![json!({
+            "date": today, "signal": "SELL", "price_at_signal": 0.0, "run_id": "run-a",
+        })];
+        let after_both_zero = crate::native_mcp_analysis::build_signal_history(
+            &new_entry, Some(&prior_zero),
+        );
+        assert_eq!(
+            after_both_zero[0].get("price_at_signal").and_then(|v| v.as_f64()),
+            Some(0.0),
+        );
+    }
+
+    #[test]
+    fn repair_line_memory_clears_flag_when_prices_recover() {
+        // RBT was previously flagged as `price_data_unavailable: true` (all
+        // signal_history[].price_at_signal == 0 and current_price == 0). A
+        // subsequent run brought a real price back into the history. An
+        // operator-triggered `repair_line_memory_local` must un-flag the
+        // ticker — the auto-clear in `sync_line_memory` only fires on a
+        // fresh analysis, so the explicit repair has to handle the reverse
+        // direction or the flag is sticky forever.
+        let mut store = json!({
+            "by_ticker": {
+                "RBT": {
+                    "schema_version": 2,
+                    "ticker": "RBT",
+                    "price_data_unavailable": true,
+                    "signal_history": [
+                        // Recovered: latest run picked up a real provider price.
+                        { "date": "2026-05-14", "signal": "CONSERVER", "price_at_signal": 815.0 },
+                        { "date": "2026-05-07", "signal": "CONSERVER", "price_at_signal": 0.0 },
+                    ],
+                    "price_tracking": {
+                        "current_price": 815.0,
+                        "price_at_signal": 815.0,
+                    }
+                },
+                "STILL_BROKEN": {
+                    // Untouched contamination — flag must stay (idempotent).
+                    "schema_version": 2,
+                    "ticker": "STILL_BROKEN",
+                    "price_data_unavailable": true,
+                    "signal_history": [
+                        { "date": "2026-05-14", "signal": "SURVEILLANCE", "price_at_signal": 0.0 },
+                    ],
+                    "price_tracking": { "current_price": 0.0 }
+                }
+            }
+        });
+
+        let outcome = crate::native_mcp_analysis::apply_zero_price_repair(&mut store);
+        assert_eq!(outcome.flagged, 0, "no fresh contamination to flag");
+        assert_eq!(outcome.cleared, 1, "RBT must be cleared exactly once");
+
+        let rbt = store.get("by_ticker").and_then(|b| b.get("RBT")).unwrap();
+        // Either the flag is gone, or it's been written to `false`. Both
+        // are acceptable downstream; we standardise on `false` so a partial
+        // read never sees the property absent and infers an unset state.
+        let flag_value = rbt
+            .get("price_data_unavailable")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        assert!(
+            !flag_value,
+            "RBT must no longer carry price_data_unavailable=true"
+        );
+
+        // Sanity — STILL_BROKEN was correctly left flagged.
+        let broken = store
+            .get("by_ticker")
+            .and_then(|b| b.get("STILL_BROKEN"))
+            .unwrap();
+        assert_eq!(
+            broken
+                .get("price_data_unavailable")
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "still-contaminated ticker must keep the flag (idempotent)"
+        );
+
+        // Running again is a no-op now that RBT has a clean `false` flag.
+        let outcome2 = crate::native_mcp_analysis::apply_zero_price_repair(&mut store);
+        assert_eq!(outcome2.flagged, 0);
+        assert_eq!(outcome2.cleared, 0, "second pass must not re-clear");
+    }

@@ -98,6 +98,13 @@ function normalizeAnalysisDetails(rec, latestRun) {
         ? latestRun.news[ticker].articles
         : []
       : [];
+  // Technical snapshot — fetched from /market/technicals during collection,
+  // stored under `technicals[ticker]` in run_state. Endpoint may not be
+  // deployed yet → `null` is the normal degraded state, NOT an error.
+  const technical =
+    runMatches && latestRun?.technicals && typeof latestRun.technicals === "object" && ticker
+      ? latestRun.technicals[ticker] || null
+      : null;
   const quality =
     runMatches && latestRun?.quality?.by_ticker && typeof latestRun.quality.by_ticker === "object" && ticker
       ? latestRun.quality.by_ticker[ticker] || null
@@ -106,6 +113,15 @@ function normalizeAnalysisDetails(rec, latestRun) {
     runMatches && Array.isArray(latestRun?.enrichment?.failures)
       ? latestRun.enrichment.failures.filter((f) => asText(f?.ticker).toUpperCase() === ticker)
       : [];
+  // Build per-block freshness/source badges from whatever metadata is
+  // available locally. Mirrors mcp_server::build_collection_quality so the
+  // UI and the LLM see the same picture. Missing data → quality:"unavailable".
+  const collectionQuality = buildCollectionQualityFromRun(latestRun, ticker, {
+    market,
+    technical,
+    newsArticles: newsRows,
+    enrichmentFailures
+  });
   return {
     line_id: lineId,
     position: row
@@ -148,6 +164,9 @@ function normalizeAnalysisDetails(rec, latestRun) {
       upstream_status: f?.upstream_status ?? null
     })),
     marketSource: market?.source || null,
+    // Additive per snapshot UI contract — never mutates existing keys.
+    technicalSnapshot: technical,
+    collectionQuality,
     analysis: {
       analyse_technique: asText(rec?.analyse_technique),
       analyse_fondamentale: asText(rec?.analyse_fondamentale),
@@ -158,6 +177,77 @@ function normalizeAnalysisDetails(rec, latestRun) {
       deep_news_summary: asText(rec?.deep_news_summary),
       deep_news_selected_url: asText(rec?.deep_news_selected_url)
     }
+  };
+}
+
+// Build the per-block collection_quality envelope on the desktop side. Mirrors
+// the Rust helper in mcp_server.rs::build_collection_quality so the freshness
+// badges shown in the line modal match what the LLM sees in tool_get_line_data.
+// Pure function — no DOM, no globals — so it can be unit-tested.
+function buildCollectionQualityFromRun(latestRun, ticker, ctx) {
+  const market = ctx?.market || {};
+  const technical = ctx?.technical || null;
+  const newsArticles = Array.isArray(ctx?.newsArticles) ? ctx.newsArticles : [];
+  const enrichmentFailures = Array.isArray(ctx?.enrichmentFailures) ? ctx.enrichmentFailures : [];
+
+  // Spot: present iff a price is known
+  const hasPrice = typeof market?.prix_actuel === "number" && Number.isFinite(market.prix_actuel);
+  const marketSource = asText(market?.source) || null;
+  const runAsOf = asText(latestRun?.updated_at || latestRun?.completed_at) || new Date().toISOString();
+  const failedScopes = new Set(enrichmentFailures.map((f) => asText(f?.scope).toLowerCase()));
+
+  const spot = {
+    source: marketSource,
+    as_of: runAsOf,
+    quality: hasPrice ? "fresh" : failedScopes.has("market") ? "unavailable" : "unavailable"
+  };
+
+  // Fundamentals: count present fields
+  const fields = ["pe_ratio", "revenue_growth", "profit_margin", "debt_to_equity"];
+  const present = fields.filter((k) => typeof market?.[k] === "number" && Number.isFinite(market[k])).length;
+  const fundamentalsQuality = present >= 4 ? "fresh" : present >= 1 ? "degraded" : "unavailable";
+  const fundamentals = { source: marketSource, as_of: runAsOf, quality: fundamentalsQuality };
+
+  // Technical: from technical_snapshot envelope; server may set quality directly
+  let technicalBlock;
+  if (technical && typeof technical === "object") {
+    const samples = typeof technical.samples === "number" ? technical.samples : 0;
+    const serverQuality = asText(technical.quality);
+    const fallbackQuality = samples >= 200 ? "fresh" : samples >= 60 ? "degraded" : "unavailable";
+    technicalBlock = {
+      source: asText(technical.source) || "alphavantage:daily",
+      as_of: asText(technical.as_of) || runAsOf,
+      quality: serverQuality || fallbackQuality,
+      samples
+    };
+  } else {
+    technicalBlock = { source: null, as_of: null, quality: "unavailable" };
+  }
+
+  // News: based on article count
+  let newsQuality;
+  if (newsArticles.length === 0) newsQuality = "unavailable";
+  else if (newsArticles.length < 2) newsQuality = "degraded";
+  else newsQuality = "fresh";
+  const news = { source: "searxng", as_of: runAsOf, quality: newsQuality, count: newsArticles.length };
+
+  // Sector/COT, insights, memory — not stored in run_state on the desktop side,
+  // so we mark them "unavailable" until the modal could be enriched with a
+  // tool_get_line_data round-trip. This matches the user expectation: the
+  // badge tells them whether the LLM had context, and from the UI's view
+  // these are fetched server-side on demand.
+  const sectorCot = { source: "cached", as_of: null, quality: "unavailable" };
+  const insights = { source: "shared", as_of: null, quality: "unavailable" };
+  const memory = { source: "local", as_of: null, quality: "unavailable" };
+
+  return {
+    spot,
+    fundamentals,
+    technical: technicalBlock,
+    news,
+    sector_cot: sectorCot,
+    insights,
+    memory
   };
 }
 

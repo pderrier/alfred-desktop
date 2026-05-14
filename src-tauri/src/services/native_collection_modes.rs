@@ -61,6 +61,7 @@ pub(crate) fn execute_refresh_synthesis_mode(
 
     let mut market_by_ticker = Map::new();
     let mut news_by_ticker = Map::new();
+    let mut technicals_by_ticker: Map<String, Value> = Map::new();
     let collection_issues = Vec::new();
     let failures = Vec::new();
     let hydration_totals = json!({
@@ -91,6 +92,9 @@ pub(crate) fn execute_refresh_synthesis_mode(
             completed += 1;
             market_by_ticker.insert(result.ticker.clone(), result.market_row.clone());
             news_by_ticker.insert(result.ticker.clone(), result.news_row.clone());
+            if let Some(snap) = result.technical_snapshot.clone() {
+                technicals_by_ticker.insert(result.ticker.clone(), snap);
+            }
             let _ = crate::update_line_status(run_id, &result.ticker, "done");
             set_native_run_stage(
                 run_id,
@@ -105,6 +109,9 @@ pub(crate) fn execute_refresh_synthesis_mode(
         completed += 1;
         market_by_ticker.insert(result.ticker.clone(), result.market_row.clone());
         news_by_ticker.insert(result.ticker.clone(), result.news_row.clone());
+        if let Some(snap) = result.technical_snapshot.clone() {
+            technicals_by_ticker.insert(result.ticker.clone(), snap);
+        }
         let _ = crate::update_line_status(run_id, &result.ticker, "done");
     }
     crate::run_state_cache::flush_to_disk();
@@ -212,6 +219,7 @@ pub(crate) fn execute_refresh_synthesis_mode(
         &incremental_positions,
         &market_by_ticker,
         &news_by_ticker,
+        &technicals_by_ticker,
         &quality,
         &collection_issues,
         &failures,

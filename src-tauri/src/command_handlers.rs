@@ -445,25 +445,56 @@ pub fn run_get_signal_scorecard(ticker: String) -> Result<serde_json::Value> {
             .and_then(|v| as_f64_loose(Some(v))))
         .unwrap_or(0.0);
 
-    let mut signals = Vec::new();
-    let mut correct = 0usize;
-    let mut incorrect = 0usize;
+    // Fix 5.2/5.3: collapse contaminated legacy histories (multiple same-day
+    // same-signal entries from before sync_line_memory dedup-on-write) into
+    // one representative per (date, signal). The history is already sorted
+    // newest-first, so the head — i.e. the freshest price for that day —
+    // wins. Counting/trend then operates on distinct dates, matching the UI
+    // semantics ("2/8 scored" reflects 8 distinct decision points, not 10
+    // duplicated rows).
+    let bucketed_history =
+        crate::native_mcp_analysis::dedupe_signal_history_by_date_signal(history);
 
-    for sig in history.iter() {
+    let mut signals = Vec::new();
+    let mut correct_dates: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut scored_dates: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for sig in bucketed_history.iter() {
         let signal = sig.get("signal").and_then(|v| v.as_str()).unwrap_or("");
         let conviction = sig.get("conviction").and_then(|v| v.as_str()).unwrap_or("");
         let date = sig.get("date").and_then(|v| v.as_str()).unwrap_or("");
         let price_at = as_f64_loose(sig.get("price_at_signal")).unwrap_or(0.0);
-        let return_pct = if price_at > 0.0 { (current_price - price_at) / price_at * 100.0 } else { 0.0 };
-        let accuracy = match classify_signal(signal) {
-            "buy" => {
-                if return_pct > 0.0 { correct += 1; "correct" } else { incorrect += 1; "incorrect" }
-            }
-            "sell" => {
-                if return_pct < 0.0 { correct += 1; "correct" } else { incorrect += 1; "incorrect" }
-            }
-            _ => "neutral",
+        // Measurable return requires a non-zero anchor price — a
+        // price_at_signal == 0 is the "indisponible" repair flag, not a real
+        // datapoint, so it must not count toward scored/incorrect.
+        let has_measurable_return = price_at > 0.0 && current_price > 0.0;
+        let return_pct = if has_measurable_return {
+            (current_price - price_at) / price_at * 100.0
+        } else {
+            0.0
         };
+        let kind = classify_signal(signal);
+        let accuracy = if has_measurable_return {
+            match kind {
+                "buy" => if return_pct > 0.0 { "correct" } else { "incorrect" },
+                "sell" => if return_pct < 0.0 { "correct" } else { "incorrect" },
+                _ => "neutral",
+            }
+        } else {
+            "neutral"
+        };
+
+        // Count distinct dates only — defensive even though bucketed_history
+        // is already deduped by (date, signal): two entries on the same date
+        // with different signals (rare, allowed by Fix 5.1) still collapse to
+        // one decision point for accuracy purposes.
+        if accuracy == "correct" || accuracy == "incorrect" {
+            scored_dates.insert(date.to_string());
+            if accuracy == "correct" {
+                correct_dates.insert(date.to_string());
+            }
+        }
+
         signals.push(json!({
             "date": date,
             "signal": signal,
@@ -475,14 +506,31 @@ pub fn run_get_signal_scorecard(ticker: String) -> Result<serde_json::Value> {
         }));
     }
 
-    let scored = correct + incorrect;
+    let scored = scored_dates.len();
+    let correct = correct_dates.len();
     let accuracy_pct = if scored > 0 { (correct as f64 / scored as f64 * 100.0).round() } else { 0.0 };
 
-    // Trend: compare recent 3 vs older
-    let recent_correct = signals.iter().take(3).filter(|s| s.get("accuracy").and_then(|v| v.as_str()) == Some("correct")).count();
-    let recent_scored = signals.iter().take(3).filter(|s| s.get("accuracy").and_then(|v| v.as_str()) != Some("neutral")).count();
-    let older_correct = signals.iter().skip(3).filter(|s| s.get("accuracy").and_then(|v| v.as_str()) == Some("correct")).count();
-    let older_scored = signals.iter().skip(3).filter(|s| s.get("accuracy").and_then(|v| v.as_str()) != Some("neutral")).count();
+    // Trend: compare recent 3 distinct-date buckets vs older. `signals` is
+    // already deduped by (date, signal), but we still walk per date to defer
+    // to dates as the natural bucket for the widget's "↘️ declining" badge.
+    let mut seen_recent_dates: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut recent_correct = 0usize;
+    let mut recent_scored = 0usize;
+    let mut older_correct = 0usize;
+    let mut older_scored = 0usize;
+    for sig in signals.iter() {
+        let date = sig.get("date").and_then(|v| v.as_str()).unwrap_or("");
+        let accuracy = sig.get("accuracy").and_then(|v| v.as_str()).unwrap_or("neutral");
+        let is_recent = seen_recent_dates.len() < 3 || seen_recent_dates.contains(date);
+        if is_recent {
+            seen_recent_dates.insert(date);
+            if accuracy == "correct" { recent_correct += 1; }
+            if accuracy != "neutral" { recent_scored += 1; }
+        } else {
+            if accuracy == "correct" { older_correct += 1; }
+            if accuracy != "neutral" { older_scored += 1; }
+        }
+    }
     let trend = if recent_scored < 2 || older_scored < 2 { "stable" }
     else {
         let recent_rate = recent_correct as f64 / recent_scored as f64;

@@ -55,6 +55,43 @@ pub fn fetch_cot(ticker: &str, isin: &str) -> Result<Value> {
     }
 }
 
+/// Fetch the 250-day technical snapshot for a ticker.
+///
+/// Returns `None` silently on any non-200 (404 = ticker unsupported / endpoint
+/// not yet deployed, 429 = rate-limited, transport errors, parse failures).
+/// The caller stores the result alongside other enrichments; downstream
+/// prompt builders render a "non disponible" fallback when `None`.
+///
+/// The returned `Value` is the inner `technical_snapshot` object — same
+/// shape as the `TechnicalSnapshot` struct in `models::`. We pass it as
+/// `Value` here to avoid eagerly typing it in the hot path (deserialization
+/// happens only when the prompt builder needs it).
+pub fn fetch_technical_snapshot(ticker: &str) -> Option<Value> {
+    match crate::alfred_api_client::remote_fetch_technicals(ticker) {
+        Ok(resp) => {
+            // Envelope may wrap as { "technical_snapshot": {...} } or be the
+            // snapshot directly — accept both.
+            let snapshot = resp
+                .get("technical_snapshot")
+                .cloned()
+                .unwrap_or_else(|| resp.clone());
+            // Require at least an `indicators` sub-object to consider it valid.
+            if snapshot.get("indicators").is_some() {
+                Some(snapshot)
+            } else {
+                crate::debug_log(&format!(
+                    "enrichment technical_snapshot empty for {ticker} — server response had no `indicators`"
+                ));
+                None
+            }
+        }
+        Err(e) => {
+            crate::debug_log(&format!("enrichment technical_snapshot unavailable for {ticker}: {e}"));
+            None
+        }
+    }
+}
+
 pub fn fetch_news(ticker: &str, name: &str, isin: &str) -> Result<Value> {
     match crate::alfred_api_client::remote_fetch_news(ticker, name, isin) {
         Ok(resp) => {

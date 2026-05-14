@@ -1069,24 +1069,39 @@ fn reconcile_transactions(transactions: &[CsvTransaction], account: &str) -> Val
         if ticker.is_empty() { continue; }
         match crate::enrichment::fetch_market_spot(ticker, nom, isin) {
             Ok(resp) => {
-                if let Some(market_price) = resp.get("market")
+                let market = resp.get("market");
+                let market_price = market
                     .and_then(|m| m.get("prix_actuel").or_else(|| m.get("price")))
-                    .and_then(|v| v.as_f64())
-                {
-                    if market_price > 0.0 {
-                        let qty = pos.get("quantite").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                        let pru = pos.get("prix_revient").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                        let valeur = qty * market_price;
-                        let pnl = valeur - (qty * pru);
-                        let pnl_pct = if pru > 0.0 { (market_price / pru - 1.0) * 100.0 } else { 0.0 };
-                        if let Some(obj) = pos.as_object_mut() {
-                            obj.insert("prix_actuel".to_string(), json!(market_price));
-                            obj.insert("valeur_actuelle".to_string(), json!(valeur));
-                            obj.insert("plus_moins_value".to_string(), json!(pnl));
-                            obj.insert("plus_moins_value_pct".to_string(), json!(pnl_pct));
-                        }
-                        enriched_count += 1;
+                    .and_then(|v| v.as_f64());
+                if let Some(market_price) = market_price.filter(|v| *v > 0.0) {
+                    let qty = pos.get("quantite").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let pru = pos.get("prix_revient").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let valeur = qty * market_price;
+                    let pnl = valeur - (qty * pru);
+                    let pnl_pct = if pru > 0.0 { (market_price / pru - 1.0) * 100.0 } else { 0.0 };
+                    if let Some(obj) = pos.as_object_mut() {
+                        obj.insert("prix_actuel".to_string(), json!(market_price));
+                        obj.insert("valeur_actuelle".to_string(), json!(valeur));
+                        obj.insert("plus_moins_value".to_string(), json!(pnl));
+                        obj.insert("plus_moins_value_pct".to_string(), json!(pnl_pct));
                     }
+                    enriched_count += 1;
+                } else {
+                    // Bug A secondary fix — diagnostic visibility. The API
+                    // returned 200 but with no usable price (likely `source =
+                    // "none"`, which means every provider chain step failed
+                    // upstream). Without this log, the previous code silently
+                    // left `prix_actuel = 0` and the later PRU-fallback ran,
+                    // making the failure invisible. Surface enough context to
+                    // diagnose the provider chain without flooding logs.
+                    let source = market
+                        .and_then(|m| m.get("source"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(missing)");
+                    crate::debug_log(&format!(
+                        "[csv-enrich] no usable price for {ticker} (isin={isin}): source={source}, market_price={:?}",
+                        market_price
+                    ));
                 }
             }
             Err(e) => {
@@ -2200,6 +2215,7 @@ fn apply_collection_result(
     incremental_positions: &mut Vec<Value>,
     market_by_ticker: &mut Map<String, Value>,
     news_by_ticker: &mut Map<String, Value>,
+    technicals_by_ticker: &mut Map<String, Value>,
     collection_issues: &mut Vec<Value>,
     failures: &mut Vec<Value>,
     hydration_totals: &mut Value,
@@ -2258,18 +2274,36 @@ fn apply_collection_result(
     }
     if result.index < positions_by_index.len() {
         positions_by_index[result.index] = Some(result.hydrated_row.clone());
+        // Bug A fix — re-sync the position's prix_actuel / valeur_actuelle /
+        // plus_moins_value(_pct) from the freshly enriched market row when a
+        // real provider returned a price. Without this, positions whose inline
+        // `fetch_market_spot` failed during `reconcile_transactions` keep
+        // `prix_actuel == 0` in run_state, even though a later async
+        // enrichment did produce a valid price. The `is_real_market_source`
+        // guard inside the helper ensures the PRU fallback (`source == "none"`)
+        // never contaminates the position fields.
+        if let Some(slot) = positions_by_index[result.index].as_mut() {
+            crate::native_collection_helpers::sync_position_from_market(
+                slot,
+                &result.market_row,
+            );
+        }
     }
     incremental_positions.clear();
     incremental_positions.extend(positions_by_index.iter().filter_map(|row| row.clone()));
     if !ticker.is_empty() {
         market_by_ticker.insert(ticker.clone(), result.market_row.clone());
         news_by_ticker.insert(ticker.clone(), result.news_row.clone());
+        if let Some(snap) = result.technical_snapshot.clone() {
+            technicals_by_ticker.insert(ticker.clone(), snap);
+        }
     }
     let partial_collection_state = build_collection_state(
         snapshot,
         incremental_positions,
         market_by_ticker,
         news_by_ticker,
+        technicals_by_ticker,
         &Value::Null,
         collection_issues,
         &[],
@@ -2302,6 +2336,70 @@ fn apply_collection_result(
     let line_type = result.hydrated_row.get("type").and_then(|v| v.as_str()).unwrap_or("position").to_string();
     mcp_dispatch.push(crate::native_mcp_analysis::McpLinePacket {
         ticker, nom: name, line_type,
+    })?;
+    Ok(())
+}
+
+/// Bug B fix — watchlist counterpart of `apply_collection_result`.
+///
+/// Watchlist rows are not real positions (`quantite=0`), so they must NOT be
+/// inserted into `positions_by_index` / `incremental_positions` (doing so would
+/// inflate the portfolio totals fed to the synthesis prompt). They DO contribute
+/// to `market_by_ticker` / `news_by_ticker`, and that fresh data must be
+/// persisted to run_state BEFORE the line is dispatched to the MCP turn —
+/// otherwise `tool_get_line_data(watchlist:TICKER)` sees `market[TICKER] == null`
+/// and the LLM emits a "no quote available" verdict on a ticker that actually
+/// has a fresh price.
+#[allow(clippy::too_many_arguments)]
+fn apply_watchlist_collection_result(
+    result: crate::native_collection_dispatch::CollectionResult,
+    snapshot: &Value,
+    incremental_positions: &[Value],
+    market_by_ticker: &mut Map<String, Value>,
+    news_by_ticker: &mut Map<String, Value>,
+    technicals_by_ticker: &mut Map<String, Value>,
+    collection_issues: &[Value],
+    portfolio_source: &str,
+    source_ingestion_status: &str,
+    source_details: &Value,
+    run_id: &str,
+    mcp_dispatch: &mut crate::native_mcp_analysis::McpBatchDispatchQueue,
+    cross_account_context: Option<&Value>,
+) -> Result<()> {
+    let wl_ticker = result.ticker.clone();
+    if !wl_ticker.is_empty() {
+        market_by_ticker.insert(wl_ticker.clone(), result.market_row.clone());
+        news_by_ticker.insert(wl_ticker.clone(), result.news_row.clone());
+        if let Some(snap) = result.technical_snapshot.clone() {
+            technicals_by_ticker.insert(wl_ticker.clone(), snap);
+        }
+    }
+    // Persist BEFORE dispatching to MCP so `tool_get_line_data` sees the fresh
+    // market/news rows for this watchlist ticker. Without this, the only place
+    // the new market data is visible is `final_collection_state` at the end of
+    // the run, which is too late — the LLM has already run.
+    let partial_collection_state = build_collection_state(
+        snapshot,
+        incremental_positions,
+        market_by_ticker,
+        news_by_ticker,
+        technicals_by_ticker,
+        &Value::Null,
+        collection_issues,
+        &[],
+        portfolio_source,
+        source_ingestion_status,
+        source_details,
+        &Value::Null,
+        cross_account_context,
+    );
+    crate::native_line_analysis::persist_native_collection_state(run_id, &partial_collection_state)?;
+    let _ = crate::update_line_status(run_id, &wl_ticker, "analyzing");
+    let nom = as_text(result.hydrated_row.get("nom"));
+    mcp_dispatch.push(crate::native_mcp_analysis::McpLinePacket {
+        ticker: wl_ticker,
+        nom,
+        line_type: "watchlist".to_string(),
     })?;
     Ok(())
 }
@@ -2499,6 +2597,7 @@ pub(crate) fn execute_native_local_analysis_workflow_with(
     let mut incremental_positions = Vec::new();
     let mut market_by_ticker = Map::new();
     let mut news_by_ticker = Map::new();
+    let mut technicals_by_ticker: Map<String, Value> = Map::new();
     let mut collection_issues = Vec::new();
     let mut failures = Vec::new();
     let mut hydration_totals = json!({
@@ -2595,6 +2694,7 @@ pub(crate) fn execute_native_local_analysis_workflow_with(
                 &mut incremental_positions,
                 &mut market_by_ticker,
                 &mut news_by_ticker,
+                &mut technicals_by_ticker,
                 &mut collection_issues,
                 &mut failures,
                 &mut hydration_totals,
@@ -2625,6 +2725,7 @@ pub(crate) fn execute_native_local_analysis_workflow_with(
             &mut incremental_positions,
             &mut market_by_ticker,
             &mut news_by_ticker,
+            &mut technicals_by_ticker,
             &mut collection_issues,
             &mut failures,
             &mut hydration_totals,
@@ -2669,14 +2770,21 @@ pub(crate) fn execute_native_local_analysis_workflow_with(
             collection_dispatch.push(positions.len() + collection_completed - positions.len(), wl_row)?;
             for result in collection_dispatch.drain_ready() {
                 collection_completed += 1;
-                let wl_ticker = result.ticker.clone();
-                market_by_ticker.insert(wl_ticker.clone(), result.market_row.clone());
-                news_by_ticker.insert(wl_ticker.clone(), result.news_row.clone());
-                let _ = crate::update_line_status(&run_id, &wl_ticker, "analyzing");
-                let nom = as_text(result.hydrated_row.get("nom"));
-                mcp_dispatch.push(crate::native_mcp_analysis::McpLinePacket {
-                    ticker: wl_ticker, nom, line_type: "watchlist".to_string(),
-                })?;
+                apply_watchlist_collection_result(
+                    result,
+                    &snapshot,
+                    &incremental_positions,
+                    &mut market_by_ticker,
+                    &mut news_by_ticker,
+                    &mut technicals_by_ticker,
+                    &collection_issues,
+                    &portfolio_source,
+                    &source_ingestion_status,
+                    &source_details,
+                    &run_id,
+                    &mut mcp_dispatch,
+                    Some(&cross_account_context),
+                )?;
                 if crate::run_state_cache::should_flush() {
                     crate::run_state_cache::flush_to_disk();
                 }
@@ -2687,14 +2795,21 @@ pub(crate) fn execute_native_local_analysis_workflow_with(
             if crate::analysis_ops::is_any_operation_cancelled_for_run(&run_id) { break; }
             if let Ok(result) = collection_dispatch.recv_blocking() {
                 collection_completed += 1;
-                let wl_ticker = result.ticker.clone();
-                market_by_ticker.insert(wl_ticker.clone(), result.market_row.clone());
-                news_by_ticker.insert(wl_ticker.clone(), result.news_row.clone());
-                let _ = crate::update_line_status(&run_id, &wl_ticker, "analyzing");
-                let nom = as_text(result.hydrated_row.get("nom"));
-                mcp_dispatch.push(crate::native_mcp_analysis::McpLinePacket {
-                    ticker: wl_ticker, nom, line_type: "watchlist".to_string(),
-                })?;
+                apply_watchlist_collection_result(
+                    result,
+                    &snapshot,
+                    &incremental_positions,
+                    &mut market_by_ticker,
+                    &mut news_by_ticker,
+                    &mut technicals_by_ticker,
+                    &collection_issues,
+                    &portfolio_source,
+                    &source_ingestion_status,
+                    &source_details,
+                    &run_id,
+                    &mut mcp_dispatch,
+                    Some(&cross_account_context),
+                )?;
                 if crate::run_state_cache::should_flush() {
                     crate::run_state_cache::flush_to_disk();
                 }
@@ -2720,6 +2835,7 @@ pub(crate) fn execute_native_local_analysis_workflow_with(
         &incremental_positions,
         &market_by_ticker,
         &news_by_ticker,
+        &technicals_by_ticker,
         &quality,
         &collection_issues,
         &failures,

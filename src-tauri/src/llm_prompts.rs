@@ -228,6 +228,7 @@ pub(crate) fn build_line_analysis_prompt(
     let section_news = build_news_section(line_context.get("news"));
     let section_shared = build_shared_insights_section(line_context.get("shared_insights"));
     let section_memory = build_memory_section(line_context.get("line_memory"));
+    let section_technical = build_technical_section(line_context.get("technical_snapshot"));
     let section_sector_cot = build_sector_cot_section(line_context.get("sector_cot"));
     let section_activity = build_activity_section(line_context.get("activity"));
     let section_data_quality = build_data_quality_section(line_context.get("market"));
@@ -243,6 +244,8 @@ pub(crate) fn build_line_analysis_prompt(
     format!(
         r#"Tu es un analyste financier qui s'adresse a un investisseur particulier non-expert. Sois factuel, concret et base sur les donnees fournies.
 
+MEMOIRE LIGNE = accountability de nos analyses precedentes (signaux et theses Alfred). TECHNIQUE = etat marche actuel calcule sur ~250 jours OHLC (independant des runs). Les deux se completent : la memoire dit ce qu'on a annonce, la technique dit ce que dit le marche.
+
 VALEUR ANALYSEE: {nom} ({ticker})
 {section_position}
 {section_market}
@@ -252,6 +255,7 @@ VALEUR ANALYSEE: {nom} ({ticker})
 {section_sector_cot}
 {section_activity}
 {section_memory}
+{section_technical}
 
 CONTEXTE PORTEFEUILLE:
 - Valeur totale: {total_value:.0}€
@@ -331,6 +335,7 @@ Reponds uniquement en JSON valide."#,
         section_news = section_news,
         section_shared = section_shared,
         section_memory = section_memory,
+        section_technical = section_technical,
         total_value = portfolio.get("valeur_totale").and_then(|v| v.as_f64()).unwrap_or(0.0),
         total_gain = portfolio.get("plus_value_totale").and_then(|v| v.as_f64()).unwrap_or(0.0),
         cash = portfolio.get("liquidites").and_then(|v| v.as_f64()).unwrap_or(0.0),
@@ -632,6 +637,154 @@ fn build_sector_cot_section(sector_cot: Option<&Value>) -> String {
     lines.join("\n")
 }
 
+/// Render the TECHNIQUE section consumed by all 4 prompt builders (codex
+/// MCP / native / native-oauth / repair). Output is identical across modes
+/// (BINDING parity contract).
+///
+/// Input is the `technical_snapshot` envelope as returned by the VPS
+/// `/market/technicals` endpoint — fields are all optional, partial data is
+/// rendered as best-effort. When the snapshot is `None` / empty / lacks
+/// `indicators`, returns a single-line fallback so the model knows the data
+/// is unavailable (vs. silently missing).
+///
+/// Style note: French, lower-case interpretation hints, consistent with
+/// `build_memory_section` and `build_data_quality_section`.
+pub(crate) fn build_technical_section(snapshot: Option<&Value>) -> String {
+    let snap = match snapshot {
+        Some(v) if v.is_object() => v,
+        _ => return "TECHNIQUE : non disponible (provider sans data pour ce ticker)".to_string(),
+    };
+    let indicators = match snap.get("indicators").and_then(|v| v.as_object()) {
+        Some(o) if !o.is_empty() => o,
+        _ => return "TECHNIQUE : non disponible (provider sans data pour ce ticker)".to_string(),
+    };
+
+    let as_of = snap.get("as_of").and_then(|v| v.as_str()).unwrap_or("date inconnue");
+    let source = snap.get("source").and_then(|v| v.as_str()).unwrap_or("provider inconnu");
+    let samples = snap.get("samples").and_then(|v| v.as_u64());
+
+    let header = match samples {
+        Some(n) => format!("TECHNIQUE (au {as_of}, source {source}, samples {n}) :"),
+        None => format!("TECHNIQUE (au {as_of}, source {source}) :"),
+    };
+
+    let mut lines = vec![header];
+
+    let sma_20 = indicators.get("sma_20").and_then(|v| v.as_f64());
+    let sma_50 = indicators.get("sma_50").and_then(|v| v.as_f64());
+    let sma_200 = indicators.get("sma_200").and_then(|v| v.as_f64());
+    let vs_sma200 = indicators.get("current_vs_sma_200_pct").and_then(|v| v.as_f64());
+    let trend = indicators.get("trend_signal").and_then(|v| v.as_str()).unwrap_or("");
+
+    // Prix vs SMA200 — paired with the explicit trend signal interpretation
+    if let Some(pct) = vs_sma200 {
+        let interp = match trend {
+            "up" => format!("uptrend confirme (close > SMA50 > SMA200{stack})", stack = stack_hint(sma_20, sma_50, sma_200, true)),
+            "down" => format!("downtrend confirme (close < SMA50 < SMA200{stack})", stack = stack_hint(sma_20, sma_50, sma_200, false)),
+            "sideways" => "tendance laterale (SMA non alignees)".to_string(),
+            _ => format!("tendance {}", if trend.is_empty() { "indeterminee" } else { trend }),
+        };
+        lines.push(format!("- Prix vs SMA200 : {pct:+.1}% ({interp})"));
+    } else if let Some(s) = sma_200 {
+        lines.push(format!("- SMA200 : {s:.2} (% delta indisponible)"));
+    }
+
+    // RSI(14)
+    if let Some(rsi) = indicators.get("rsi_14").and_then(|v| v.as_f64()) {
+        let interp = if rsi < 30.0 {
+            "survente — rebond possible"
+        } else if rsi > 70.0 {
+            "surachat — risque de correction"
+        } else {
+            "neutre, pas de survente"
+        };
+        lines.push(format!("- RSI(14) : {rsi:.0} — {interp}"));
+    }
+
+    // MACD
+    if let Some(macd) = indicators.get("macd").and_then(|v| v.as_object()) {
+        let line = macd.get("line").and_then(|v| v.as_f64());
+        let signal = macd.get("signal").and_then(|v| v.as_f64());
+        let hist = macd.get("hist").and_then(|v| v.as_f64());
+        if let (Some(l), Some(s), Some(h)) = (line, signal, hist) {
+            let interp = if h > 0.0 {
+                "momentum haussier"
+            } else if h < 0.0 {
+                "momentum baissier"
+            } else {
+                "momentum neutre"
+            };
+            lines.push(format!("- MACD : {l:.2} / signal {s:.2} / hist {h:+.2} — {interp}"));
+        }
+    }
+
+    // ATR(14)
+    if let Some(atr) = indicators.get("atr_14").and_then(|v| v.as_f64()) {
+        // Without close, fall back to absolute value; relative interpretation
+        // only when sma_200 is known (proxy for current price magnitude).
+        let interp = if let Some(price_ref) = sma_200 {
+            if price_ref > 0.0 {
+                let pct = (atr / price_ref) * 100.0;
+                if pct < 1.5 { "volatilite faible" }
+                else if pct < 3.0 { "volatilite moderee" }
+                else { "volatilite elevee" }
+            } else {
+                "volatilite (reference indisponible)"
+            }
+        } else {
+            "volatilite (reference indisponible)"
+        };
+        lines.push(format!("- ATR(14) : {atr:.2} — {interp}"));
+    }
+
+    // 52w high/low — render together when at least one is known
+    let high = indicators.get("high_52w").and_then(|v| v.as_f64());
+    let low = indicators.get("low_52w").and_then(|v| v.as_f64());
+    let from_high = indicators.get("current_vs_high_52w_pct").and_then(|v| v.as_f64());
+    if let (Some(h), Some(l)) = (high, low) {
+        let from_low_pct = if l > 0.0 && h > l {
+            Some(((h - l) / l) * 100.0) // rough proxy for "close vs low" when no current price field
+        } else {
+            None
+        };
+        // Prefer the server-provided distance-to-high when available.
+        let high_part = match from_high {
+            Some(pct) => format!("haut {h:.2} ({pct:+.1}%)"),
+            None => format!("haut {h:.2}"),
+        };
+        let low_part = match from_low_pct {
+            Some(pct) => format!("bas {l:.2} (+{pct:.1}%)"),
+            None => format!("bas {l:.2}"),
+        };
+        lines.push(format!("- 52w : {high_part}, {low_part}"));
+    } else if let Some(h) = high {
+        lines.push(format!("- 52w haut : {h:.2}"));
+    } else if let Some(l) = low {
+        lines.push(format!("- 52w bas : {l:.2}"));
+    }
+
+    if lines.len() == 1 {
+        // Header only, no indicator rendered — should be very rare given the
+        // empty-indicators guard above, but be safe.
+        return "TECHNIQUE : non disponible (provider sans data pour ce ticker)".to_string();
+    }
+
+    lines.join("\n")
+}
+
+/// Helper for the TECHNIQUE "stack" tail in the trend interpretation.
+/// Renders e.g. "; SMA20 142.3 > SMA50 138.7 > SMA200 130.1" when all three
+/// are known. Empty string otherwise — keeps the line readable.
+fn stack_hint(s20: Option<f64>, s50: Option<f64>, s200: Option<f64>, ascending: bool) -> String {
+    match (s20, s50, s200) {
+        (Some(a), Some(b), Some(c)) => {
+            let cmp = if ascending { '>' } else { '<' };
+            format!("; SMA20 {a:.2} {cmp} SMA50 {b:.2} {cmp} SMA200 {c:.2}")
+        }
+        _ => String::new(),
+    }
+}
+
 pub(crate) fn build_memory_section(memory: Option<&Value>) -> String {
     let m = match memory {
         Some(v) if v.is_object() && !v.as_object().map(|o| o.is_empty()).unwrap_or(true) => v,
@@ -649,6 +802,16 @@ pub(crate) fn build_memory_section(memory: Option<&Value>) -> String {
 
     let mut lines = vec!["MEMOIRE LIGNE (historique persistant):".to_string()];
 
+    // Bug B follow-up — when the zero-price repair has flagged this ticker,
+    // the persisted `price_at_signal` / `return_since_signal_pct` values are
+    // not real prices (every provider was failing for weeks). Render the
+    // signal WITHOUT the price/return tail so the LLM doesn't see "prix:
+    // 0.00€" and decide there is no quote available.
+    let price_data_unavailable = m
+        .get("price_data_unavailable")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     // Signal + price tracking
     if let Some(pt) = m.get("price_tracking") {
         let signal = pt.get("last_signal").and_then(|v| v.as_str()).unwrap_or("");
@@ -663,9 +826,15 @@ pub(crate) fn build_memory_section(memory: Option<&Value>) -> String {
             _ => "",
         };
         if !signal.is_empty() {
-            lines.push(format!(
-                "- Signal: {signal} ({conviction}) depuis {date} | prix: {price:.2}\u{20ac} | rendement: {ret:+.1}%{accuracy_mark}"
-            ));
+            if price_data_unavailable {
+                lines.push(format!(
+                    "- Signal: {signal} ({conviction}) depuis {date} | prix au signal indisponible (donnees marche manquantes)"
+                ));
+            } else {
+                lines.push(format!(
+                    "- Signal: {signal} ({conviction}) depuis {date} | prix: {price:.2}\u{20ac} | rendement: {ret:+.1}%{accuracy_mark}"
+                ));
+            }
         }
     }
 
@@ -712,6 +881,18 @@ pub(crate) fn build_memory_section(memory: Option<&Value>) -> String {
 }
 
 // ── Watchlist generation ─────────────────────────────────────────
+//
+// NOTE: `build_watchlist_prompt` is intentionally NOT extended with
+// `build_technical_section`. The watchlist prompt is portfolio-level — it
+// asks the model to SUGGEST 5 new tickers complementary to the existing
+// positions, based purely on diversification and account universe (PEA/CTO).
+// It receives no per-line `technical_snapshot` for the suggested tickers
+// (those tickers don't exist in `run_state` yet — they're the output, not
+// the input). Injecting an empty TECHNIQUE section here would only add a
+// "non disponible" line that the model can't act on. The 4 BINDING parity
+// builders (codex line / native line / native-oauth line / repair) all
+// inject TECHNIQUE; watchlist is a 5th builder operating at a different
+// level and is exempt.
 
 pub(crate) fn build_watchlist_prompt(positions: &[Value], portfolio: &Value, guidelines: &str, account: &str) -> String {
     let position_tickers: Vec<String> = positions
@@ -800,6 +981,7 @@ pub(crate) fn build_repair_prompt(
     let section_market = build_market_section_no_web(line_context.get("market"));
     let section_news = build_news_section(line_context.get("news"));
     let section_memory = build_memory_section(line_context.get("line_memory"));
+    let section_technical = build_technical_section(line_context.get("technical_snapshot"));
 
     let issues = validation_context
         .get("validation_issues")
@@ -821,12 +1003,15 @@ pub(crate) fn build_repair_prompt(
     format!(
         r#"Repare cette recommandation pour {ticker}.
 
+MEMOIRE LIGNE = accountability de nos analyses precedentes. TECHNIQUE = etat marche actuel (OHLC 250j). Utilise les deux pour corriger sans inventer.
+
 PROBLEMES A CORRIGER: {issues}
 
 {section_position}
 {section_market}
 {section_news}
 {section_memory}
+{section_technical}
 
 CONTEXTE PORTEFEUILLE:
 - Valeur totale: {total_value:.0}€
@@ -848,6 +1033,7 @@ JSON valide uniquement, cle "recommendation"."#,
         section_market = section_market,
         section_news = section_news,
         section_memory = section_memory,
+        section_technical = section_technical,
         rec_to_fix = rec_to_fix,
         total_value = portfolio.get("valeur_totale").and_then(|v| v.as_f64()).unwrap_or(0.0),
         total_gain = portfolio.get("plus_value_totale").and_then(|v| v.as_f64()).unwrap_or(0.0),
@@ -1123,5 +1309,225 @@ mod tests {
         let result = load_previous_syntheses(2, "PEA");
         std::env::remove_var("ALFRED_REPORT_HISTORY_DIR");
         assert!(result.is_empty(), "nonexistent dir should return empty");
+    }
+
+    // ── TECHNIQUE section rendering ─────────────────────────────────────
+
+    fn full_technical_snapshot() -> Value {
+        json!({
+            "as_of": "2026-05-15",
+            "source": "alphavantage:daily",
+            "samples": 250,
+            "quality": "fresh",
+            "indicators": {
+                "sma_20": 142.3,
+                "sma_50": 138.7,
+                "sma_200": 130.1,
+                "rsi_14": 58.2,
+                "macd": {"line": 1.42, "signal": 0.98, "hist": 0.44},
+                "atr_14": 3.21,
+                "high_52w": 152.0,
+                "low_52w": 110.5,
+                "current_vs_sma_200_pct": 9.5,
+                "current_vs_high_52w_pct": -6.4,
+                "trend_signal": "up"
+            }
+        })
+    }
+
+    #[test]
+    fn build_technical_section_full_renders_all_lines() {
+        let snap = full_technical_snapshot();
+        let s = build_technical_section(Some(&snap));
+        assert!(s.starts_with("TECHNIQUE (au 2026-05-15, source alphavantage:daily, samples 250) :"));
+        assert!(s.contains("Prix vs SMA200 : +9.5%"), "should render SMA200 delta:\n{s}");
+        assert!(s.contains("uptrend confirme"), "should render trend interpretation:\n{s}");
+        assert!(s.contains("RSI(14) : 58 — neutre"), "should render RSI with interpretation:\n{s}");
+        assert!(s.contains("MACD : 1.42 / signal 0.98 / hist +0.44 — momentum haussier"),
+            "should render MACD trio:\n{s}");
+        assert!(s.contains("ATR(14) : 3.21"), "should render ATR:\n{s}");
+        assert!(s.contains("52w : haut 152.00"), "should render 52w high:\n{s}");
+        assert!(s.contains("bas 110.50"), "should render 52w low:\n{s}");
+    }
+
+    #[test]
+    fn build_technical_section_missing_macd_renders_without_panic() {
+        let mut snap = full_technical_snapshot();
+        // Drop MACD entirely
+        snap["indicators"].as_object_mut().unwrap().remove("macd");
+        let s = build_technical_section(Some(&snap));
+        // Other indicators still present
+        assert!(s.contains("RSI(14)"), "RSI still renders:\n{s}");
+        assert!(s.contains("ATR(14)"), "ATR still renders:\n{s}");
+        // MACD line absent
+        assert!(!s.contains("MACD :"), "MACD line should be omitted:\n{s}");
+    }
+
+    #[test]
+    fn build_technical_section_none_renders_fallback() {
+        let s = build_technical_section(None);
+        assert_eq!(s, "TECHNIQUE : non disponible (provider sans data pour ce ticker)");
+    }
+
+    #[test]
+    fn build_technical_section_empty_object_renders_fallback() {
+        let v = json!({});
+        let s = build_technical_section(Some(&v));
+        assert_eq!(s, "TECHNIQUE : non disponible (provider sans data pour ce ticker)");
+    }
+
+    #[test]
+    fn build_technical_section_no_indicators_renders_fallback() {
+        // Envelope present but `indicators` is missing → still treated as
+        // unavailable, no half-rendered header.
+        let v = json!({
+            "as_of": "2026-05-15",
+            "source": "alphavantage:daily",
+            "samples": 250
+        });
+        let s = build_technical_section(Some(&v));
+        assert_eq!(s, "TECHNIQUE : non disponible (provider sans data pour ce ticker)");
+    }
+
+    #[test]
+    fn build_technical_section_rsi_extremes_interpret_correctly() {
+        let mut snap = full_technical_snapshot();
+        snap["indicators"]["rsi_14"] = json!(22.0);
+        let s_oversold = build_technical_section(Some(&snap));
+        assert!(s_oversold.contains("survente"), "RSI<30 → survente:\n{s_oversold}");
+
+        snap["indicators"]["rsi_14"] = json!(78.0);
+        let s_overbought = build_technical_section(Some(&snap));
+        assert!(s_overbought.contains("surachat"), "RSI>70 → surachat:\n{s_overbought}");
+    }
+
+    #[test]
+    fn build_technical_section_trend_sideways_renders_lateral() {
+        let mut snap = full_technical_snapshot();
+        snap["indicators"]["trend_signal"] = json!("sideways");
+        let s = build_technical_section(Some(&snap));
+        assert!(s.contains("laterale"), "sideways trend → 'laterale':\n{s}");
+    }
+
+    #[test]
+    fn technical_snapshot_serde_roundtrip() {
+        use crate::models::TechnicalSnapshot;
+        let snap = full_technical_snapshot();
+        let typed: TechnicalSnapshot = serde_json::from_value(snap.clone())
+            .expect("full snapshot should deserialize");
+        assert_eq!(typed.as_of.as_deref(), Some("2026-05-15"));
+        assert_eq!(typed.source.as_deref(), Some("alphavantage:daily"));
+        assert_eq!(typed.samples, Some(250));
+        assert_eq!(typed.quality.as_deref(), Some("fresh"));
+        assert_eq!(typed.indicators.sma_200, Some(130.1));
+        assert_eq!(typed.indicators.rsi_14, Some(58.2));
+        assert_eq!(typed.indicators.trend_signal.as_deref(), Some("up"));
+        let macd = typed.indicators.macd.as_ref().expect("macd present");
+        assert_eq!(macd.hist, Some(0.44));
+        // Roundtrip back to JSON — must be lossless on the known fields.
+        let back = serde_json::to_value(&typed).expect("serialize");
+        assert_eq!(back["as_of"], json!("2026-05-15"));
+        assert_eq!(back["indicators"]["sma_200"], json!(130.1));
+    }
+
+    #[test]
+    fn technical_snapshot_serde_partial_fields() {
+        use crate::models::TechnicalSnapshot;
+        // Realistic degraded payload — only SMA200 + RSI present
+        let partial = json!({
+            "as_of": "2026-05-14",
+            "source": "yahoo:chart",
+            "samples": 90,
+            "quality": "degraded",
+            "indicators": { "sma_200": 50.0, "rsi_14": 42.0 }
+        });
+        let typed: TechnicalSnapshot = serde_json::from_value(partial)
+            .expect("partial snapshot should deserialize");
+        assert_eq!(typed.indicators.sma_200, Some(50.0));
+        assert_eq!(typed.indicators.macd.as_ref().and_then(|m| m.hist), None);
+        assert_eq!(typed.indicators.sma_20, None);
+    }
+
+    // ── Parity test — all 4 builders inject the same TECHNIQUE section ──
+    //
+    // BINDING contract from docs/llm-mode-parity-contract.md : codex MCP /
+    // native / native-oauth (which share build_native_line_prompt) / repair
+    // must render TECHNIQUE identically for the same line_data. This test
+    // calls all 4 builders with a fixed snapshot and asserts every line of
+    // build_technical_section(snap) appears verbatim in each prompt.
+
+    #[test]
+    fn technique_section_parity_across_four_builders() {
+        let snap = full_technical_snapshot();
+        let expected = build_technical_section(Some(&snap));
+        assert!(!expected.is_empty());
+
+        let line_context = json!({
+            "ticker": "AAPL",
+            "row": {"nom": "Apple", "ticker": "AAPL", "quantite": 10},
+            "type": "position",
+            "market": {"price": 150.0, "pe_ratio": 25.0, "source": "alphavantage"},
+            "news": {"items": []},
+            "shared_insights": null,
+            "line_memory": {},
+            "sector_cot": null,
+            "activity": null,
+            "technical_snapshot": snap.clone(),
+        });
+        let run_state = json!({
+            "portfolio": {"valeur_totale": 100000.0, "liquidites": 5000.0, "plus_value_totale": 1000.0},
+            "run_id": "test-run-123",
+            "account": "PEA"
+        });
+
+        // 1. build_line_analysis_prompt (codex MCP)
+        let p_codex = build_line_analysis_prompt(&line_context, &run_state, None);
+        // 2. build_repair_prompt
+        let validation_context = json!({
+            "validation_issues": ["synthese_too_short"],
+            "recommendation_to_fix": {"ticker": "AAPL", "signal": "ACHAT"}
+        });
+        let p_repair = build_repair_prompt(&line_context, &run_state, None, &validation_context);
+
+        // Every non-empty line of the expected TECHNIQUE section must appear
+        // verbatim in each prompt. This is a stricter contract than substring
+        // because it catches accidental reordering.
+        for line in expected.lines() {
+            if line.trim().is_empty() { continue; }
+            assert!(
+                p_codex.contains(line),
+                "codex prompt missing TECHNIQUE line: {line:?}\n--- prompt ---\n{p_codex}"
+            );
+            assert!(
+                p_repair.contains(line),
+                "repair prompt missing TECHNIQUE line: {line:?}\n--- prompt ---\n{p_repair}"
+            );
+        }
+
+        // 3 + 4. native and native-oauth both go through build_native_line_prompt.
+        // It receives a different envelope shape (line_data flattened by
+        // tool_get_line_data) — `market_data` instead of `market`, but
+        // `technical_snapshot` keeps the same key. Build that envelope here.
+        let native_line_data = json!({
+            "position": line_context["row"],
+            "market_data": line_context["market"],
+            "news": line_context["news"],
+            "shared_insights": line_context["shared_insights"],
+            "line_memory": line_context["line_memory"],
+            "quality": json!({}),
+            "sector_cot": Value::Null,
+            "activity": [],
+            "technical_snapshot": snap.clone(),
+        });
+        let p_native = crate::native_mcp_analysis::build_native_line_prompt(
+            "test-run-123", "AAPL", "Apple", "position", &native_line_data,
+        );
+        for line in expected.lines() {
+            if line.trim().is_empty() { continue; }
+            assert!(
+                p_native.contains(line),
+                "native prompt missing TECHNIQUE line: {line:?}\n--- prompt ---\n{p_native}"
+            );
+        }
     }
 }

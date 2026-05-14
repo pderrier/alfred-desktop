@@ -552,6 +552,29 @@ async fn update_line_memory_local(
     .map_err(|e: anyhow::Error| e.to_string())
 }
 
+/// Bug B follow-up — one-shot maintenance: flag tickers in line-memory.json
+/// whose price_tracking history is entirely 0 (signal that the price provider
+/// was unreachable when those signals were recorded). The flag prevents
+/// downstream prompt renderers from printing `prix: 0.00€` as if it were a
+/// real price. Safe to invoke from devtools; idempotent — already-flagged
+/// entries are left untouched, fresh non-zero history clears the flag on the
+/// next sync.
+#[tauri::command]
+async fn repair_line_memory_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        native_mcp_analysis::repair_line_memory_zero_prices().map(|outcome| {
+            serde_json::json!({
+                "ok": true,
+                "flagged_tickers": outcome.flagged,
+                "cleared_tickers": outcome.cleared,
+            })
+        })
+    })
+    .await
+    .map_err(|e| format!("repair_line_memory_local_failed:join:{e}"))?
+    .map_err(|e: anyhow::Error| e.to_string())
+}
+
 #[tauri::command]
 async fn get_stale_positions_local() -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(command_handlers::run_get_stale_positions)
@@ -630,6 +653,19 @@ fn run_tauri_app() -> anyhow::Result<()> {
             }
             // Cleanup orphaned runs — uses the in-memory index so it's instant.
             run_state::cleanup_orphaned_runs();
+            // Bug B follow-up — one-shot line-memory zero-price repair, gated
+            // by the `line_memory_repaired_v1` runtime setting so it runs once
+            // per install. The repair is plain blocking I/O (reads/writes
+            // `line-memory.json`, fsync, then a settings patch) that can take
+            // hundreds of milliseconds on large memories or slow disks, so we
+            // offload it to the blocking thread-pool to keep the setup hook —
+            // and therefore window paint — non-blocking. The task is
+            // idempotent (gated by `line_memory_repaired_v1`) and errors are
+            // swallowed inside; the next launch retries on failure. App boot
+            // must never wait on this.
+            tauri::async_runtime::spawn_blocking(
+                native_mcp_analysis::maybe_run_zero_price_repair_at_startup,
+            );
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -679,6 +715,7 @@ fn run_tauri_app() -> anyhow::Result<()> {
             js_log_local,
             chat_wizard_send_local,
             update_line_memory_local,
+            repair_line_memory_local,
             get_stale_positions_local,
             get_signal_scorecard_local,
             get_run_diff_local,

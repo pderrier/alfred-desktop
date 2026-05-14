@@ -21,6 +21,12 @@ pub(crate) struct CollectionResult {
     pub(crate) issues: Vec<Value>,
     pub(crate) quality: Value,
     pub(crate) hydration_diag: Value,
+    /// Technical snapshot fetched from the server-side `/market/technicals`
+    /// endpoint. `None` when the endpoint is unavailable (404, transport
+    /// error) or returns no `indicators`. Stored on the result so it can be
+    /// persisted into run_state alongside `market` and consumed by both
+    /// `tool_get_line_data` (codex) and `build_native_line_prompt` (native).
+    pub(crate) technical_snapshot: Option<Value>,
 }
 
 struct CollectionTask {
@@ -125,13 +131,7 @@ fn process_collection_task(config: &CollectionWorkerConfig, task: CollectionTask
             config.request_fn,
         )
     };
-    if market_row.get("prix_actuel").map(|value| value.is_null()).unwrap_or(true) {
-        if let Some(price) = resolve_source_current_price(&task.row) {
-            if let Some(object) = market_row.as_object_mut() {
-                object.insert("prix_actuel".to_string(), json!(price));
-            }
-        }
-    }
+    apply_pru_fallback_to_market_row(&mut market_row, &task.row);
     let (hydrated_row, filtered_news_row, hydration_diag) =
         hydrate_row_with_line_memory(&config.line_memory_store, &task.row, &news_row);
     let quality = assess_ticker_quality(
@@ -142,9 +142,16 @@ fn process_collection_task(config: &CollectionWorkerConfig, task: CollectionTask
         config.news_quality_threshold,
         config.max_missing_market_fields,
     );
-    // Shared insights are fetched on-demand by the MCP server's get_line_data tool
-    // (direct API call), not stored in run_state. Deep news enrichment is done
-    // server-side in the /api/news handler.
+    // Technical snapshot — 250d SMA/RSI/MACD/ATR computed server-side. Fetched
+    // sequentially within the worker; a cheap 404 is the common case while the
+    // VPS endpoint is being rolled out, so this adds negligible latency.
+    // Shared insights / sector / COT remain fetched on-demand by the MCP
+    // server's get_line_data tool (direct API calls), not stored in run_state.
+    let technical_snapshot = if ticker.is_empty() {
+        None
+    } else {
+        crate::enrichment::fetch_technical_snapshot(&ticker)
+    };
     CollectionResult {
         index: task.index,
         ticker,
@@ -155,7 +162,35 @@ fn process_collection_task(config: &CollectionWorkerConfig, task: CollectionTask
         issues,
         quality,
         hydration_diag,
+        technical_snapshot,
     }
+}
+
+/// When `fetch_ticker_enrichment` returns a partial response — a real provider
+/// tag but a null `prix_actuel` — we fall back to the row's PRU (or
+/// `valeur_actuelle / quantite`) so the prompt has *some* price. Crucially we
+/// also overwrite `source` with the `"none"` sentinel so downstream guards
+/// (`is_real_market_source`, `sync_position_from_market`,
+/// `extract_market_price_from_run_state`) recognise this as a fallback rather
+/// than authentic provider data. Without that rewrite, the source field lies
+/// about its provenance and the PRU bleeds into position P&L, signal history,
+/// and the zero-price repair flag.
+pub(crate) fn apply_pru_fallback_to_market_row(market_row: &mut Value, source_row: &Value) {
+    let needs_fallback = market_row
+        .get("prix_actuel")
+        .map(|value| value.is_null())
+        .unwrap_or(true);
+    if !needs_fallback {
+        return;
+    }
+    let Some(price) = resolve_source_current_price(source_row) else {
+        return;
+    };
+    let Some(object) = market_row.as_object_mut() else {
+        return;
+    };
+    object.insert("prix_actuel".to_string(), json!(price));
+    object.insert("source".to_string(), json!("none"));
 }
 
 impl Clone for CollectionWorkerConfig {

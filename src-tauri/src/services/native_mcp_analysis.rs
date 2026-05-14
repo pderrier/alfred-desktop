@@ -956,21 +956,58 @@ fn build_memory_narrative(
 /// Note: same date with a *different* signal (rare — strategy/news shift
 /// mid-day) is treated as a legitimate new decision point and still
 /// prepends; we only dedup the exact `(date, signal)` pair.
+///
+/// Price preservation rule: on a same-day same-signal replace, if the new
+/// entry has `price_at_signal == 0.0` but the existing head carries a
+/// non-zero price, KEEP the existing head's `price_at_signal`. This guards
+/// against a fresh run where the PRU-fallback chain (see
+/// `apply_pru_fallback_to_market_row` /
+/// `extract_market_price_from_run_state`) produced a zero current price;
+/// the previously-recorded real price is more truthful than the regression
+/// to zero. `run_id`/`conviction` from the new entry are still adopted.
 pub(crate) fn build_signal_history(new_entry: &Value, prior: Option<&Vec<Value>>) -> Vec<Value> {
     const CAP: usize = 10;
     let new_date = new_entry.get("date").and_then(|v| v.as_str()).unwrap_or("");
     let new_signal = new_entry.get("signal").and_then(|v| v.as_str()).unwrap_or("");
 
-    let head_matches = prior
-        .and_then(|arr| arr.first())
+    let prior_head = prior.and_then(|arr| arr.first());
+    let head_matches = prior_head
         .map(|head| {
             head.get("date").and_then(|v| v.as_str()) == Some(new_date)
                 && head.get("signal").and_then(|v| v.as_str()) == Some(new_signal)
         })
         .unwrap_or(false);
 
+    // When the new entry would replace the head with a zero price but the
+    // existing head has a real price, splice the existing price into the
+    // replacement instead of dropping it on the floor.
+    let head_entry = if head_matches {
+        let new_price = new_entry
+            .get("price_at_signal")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let prior_price = prior_head
+            .and_then(|h| h.get("price_at_signal"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        if new_price == 0.0 && prior_price > 0.0 {
+            let mut merged = new_entry.clone();
+            if let Some(obj) = merged.as_object_mut() {
+                obj.insert(
+                    "price_at_signal".to_string(),
+                    json!(prior_price),
+                );
+            }
+            merged
+        } else {
+            new_entry.clone()
+        }
+    } else {
+        new_entry.clone()
+    };
+
     let mut out: Vec<Value> = Vec::with_capacity(CAP);
-    out.push(new_entry.clone());
+    out.push(head_entry);
     if let Some(arr) = prior {
         let skip = if head_matches { 1 } else { 0 };
         let keep = CAP - out.len();
@@ -1107,7 +1144,28 @@ fn compute_price_tracking(current: &Value, current_price: f64, current_signal: &
 
 /// Extract market price for a ticker from the cached run state.
 /// Used by codex path where line_data isn't directly available.
-fn extract_market_price_from_run_state(data_dir: &std::path::Path, run_id: &str, ticker: &str) -> f64 {
+///
+/// Sources tagged `"none"` are PRU fallbacks written by
+/// `apply_pru_fallback_to_market_row` when every provider failed. They must
+/// NOT be treated as a real current price — propagating them into
+/// `sync_line_memory` would clear the `price_data_unavailable` flag and
+/// poison `signal_history[].price_at_signal` with the cost basis. Return
+/// `0.0` so the caller carries the flag forward instead.
+pub(crate) fn extract_market_price_from_run_state(
+    data_dir: &std::path::Path,
+    run_id: &str,
+    ticker: &str,
+) -> f64 {
+    let ticker_upper = ticker.to_uppercase();
+    let Ok(state) = crate::run_state_cache::load(data_dir, run_id) else {
+        return 0.0;
+    };
+    extract_market_price_from_state_value(&state, &ticker_upper)
+}
+
+/// Pure-function core of `extract_market_price_from_run_state`, exposed for
+/// unit tests so we don't have to round-trip through the run-state cache.
+pub(crate) fn extract_market_price_from_state_value(state: &Value, ticker_upper: &str) -> f64 {
     fn as_f64_loose(v: Option<&Value>) -> Option<f64> {
         match v {
             Some(Value::Number(n)) => n.as_f64(),
@@ -1115,18 +1173,25 @@ fn extract_market_price_from_run_state(data_dir: &std::path::Path, run_id: &str,
             _ => None,
         }
     }
-    let ticker_upper = ticker.to_uppercase();
-    crate::run_state_cache::load(data_dir, run_id)
-        .ok()
-        .and_then(|state| {
-            state.get("market")
-                .and_then(|m| m.get(&ticker_upper))
-                .and_then(|md| as_f64_loose(md.get("price")
-                    .or_else(|| md.get("last_price"))
-                    .or_else(|| md.get("cours"))
-                    .or_else(|| md.get("prix_actuel"))))
-        })
-        .unwrap_or(0.0)
+    let Some(market_row) = state.get("market").and_then(|m| m.get(ticker_upper)) else {
+        return 0.0;
+    };
+    let source = market_row
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if !crate::native_collection_helpers::is_real_market_source(source) {
+        // PRU fallback or missing source — refuse to expose this as a price.
+        return 0.0;
+    }
+    as_f64_loose(
+        market_row
+            .get("price")
+            .or_else(|| market_row.get("last_price"))
+            .or_else(|| market_row.get("cours"))
+            .or_else(|| market_row.get("prix_actuel")),
+    )
+    .unwrap_or(0.0)
 }
 
 fn as_str(v: Option<&Value>) -> String {
@@ -2233,53 +2298,87 @@ pub(crate) fn ticker_needs_zero_price_repair(entry: &Value) -> bool {
     })
 }
 
-/// One-shot repair. Returns the number of tickers flagged. Pure transform on
-/// the store value so it can be exercised directly from tests.
-pub fn apply_zero_price_repair(store: &mut Value) -> usize {
+/// Outcome of a repair pass — separates new flags from cleared flags so the
+/// Tauri command result is informative (operator can see "0 flagged, 4
+/// cleared" instead of just "0").
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ZeroPriceRepairOutcome {
+    pub flagged: usize,
+    pub cleared: usize,
+}
+
+impl ZeroPriceRepairOutcome {
+    pub fn changed(&self) -> bool {
+        self.flagged > 0 || self.cleared > 0
+    }
+}
+
+/// One-shot repair. Returns `(flagged, cleared)`. Pure transform on the store
+/// value so it can be exercised directly from tests.
+///
+/// Two branches now:
+/// 1. Entry NOT flagged but `ticker_needs_zero_price_repair` matches → set
+///    `price_data_unavailable: true`.
+/// 2. Entry currently flagged but `ticker_needs_zero_price_repair` no longer
+///    matches (prices recovered, history has at least one real
+///    `price_at_signal > 0`, or `current_price > 0`) → clear the flag.
+///
+/// Without branch 2 an operator-triggered `repair_line_memory_local` could
+/// never un-flag a ticker that had healed: the auto-clear in
+/// `sync_line_memory` only fires when a fresh run happens.
+pub fn apply_zero_price_repair(store: &mut Value) -> ZeroPriceRepairOutcome {
     let by_ticker = match store
         .get_mut("by_ticker")
         .and_then(|v| v.as_object_mut())
     {
         Some(m) => m,
-        None => return 0,
+        None => return ZeroPriceRepairOutcome::default(),
     };
-    let mut flagged = 0usize;
+    let mut outcome = ZeroPriceRepairOutcome::default();
     for (_, entry) in by_ticker.iter_mut() {
-        if entry
+        let currently_flagged = entry
             .get("price_data_unavailable")
             .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
-            // Idempotent — already flagged, leave it.
-            continue;
-        }
-        if !ticker_needs_zero_price_repair(entry) {
-            continue;
-        }
-        if let Some(obj) = entry.as_object_mut() {
-            obj.insert("price_data_unavailable".to_string(), Value::Bool(true));
-            flagged += 1;
+            .unwrap_or(false);
+        let needs_flag = ticker_needs_zero_price_repair(entry);
+        if currently_flagged {
+            if needs_flag {
+                // Still contaminated — leave the flag in place (idempotent).
+                continue;
+            }
+            // Recovered — clear the flag so the next prompt build renders
+            // prices again.
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert("price_data_unavailable".to_string(), Value::Bool(false));
+                outcome.cleared += 1;
+            }
+        } else if needs_flag {
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert("price_data_unavailable".to_string(), Value::Bool(true));
+                outcome.flagged += 1;
+            }
         }
     }
-    flagged
+    outcome
 }
 
 /// Run the repair against the persisted line-memory store. Always flushes to
-/// disk if any tickers were flagged, so the change survives a process exit.
-pub fn repair_line_memory_zero_prices() -> Result<usize> {
-    let mut flagged = 0usize;
+/// disk if any tickers were touched, so the change survives a process exit.
+pub fn repair_line_memory_zero_prices() -> Result<ZeroPriceRepairOutcome> {
+    let mut outcome = ZeroPriceRepairOutcome::default();
     line_memory_patch(|store| {
-        flagged = apply_zero_price_repair(store);
+        outcome = apply_zero_price_repair(store);
     });
-    if flagged > 0 {
+    if outcome.changed() {
         line_memory_flush_now();
         crate::debug_log(&format!(
-            "repair_line_memory_zero_prices: flagged {flagged} tickers with price_data_unavailable=true"
+            "repair_line_memory_zero_prices: flagged {} tickers, cleared {} tickers",
+            outcome.flagged, outcome.cleared
         ));
     } else {
         crate::debug_log("repair_line_memory_zero_prices: no contaminated tickers found");
     }
-    Ok(flagged)
+    Ok(outcome)
 }
 
 /// Startup gate — runs the repair exactly once per install, tracked via the

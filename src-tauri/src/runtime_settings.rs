@@ -122,6 +122,19 @@ pub fn definitions_json() -> serde_json::Value {
             "whyItMatters": "Keeps rollout safe by leaving instrumentation off until explicitly enabled.",
             "resetLabel": "Disable artifacts"
         },
+        "line_memory_repaired_v1": {
+            "type": "integer",
+            "min": 0,
+            "max": 1,
+            "defaultValue": 0,
+            "section": "product",
+            "restartRequired": false,
+            "envName": serde_json::Value::Null,
+            "label": "Line-memory zero-price repair v1 ran",
+            "description": "Internal — set to 1 after the one-shot repair pass that flags tickers whose price_at_signal history is entirely 0 (price provider was unreachable for weeks). Stops downstream prompt renderers from quoting `0.00€` as a real price.",
+            "whyItMatters": "Without this flag the contaminated entries keep feeding a negative-feedback loop into the memory narrative on every run.",
+            "resetLabel": "Force the repair pass to run again"
+        },
         "openai_api_key": {
             "type": "text",
             "maxLength": 200,

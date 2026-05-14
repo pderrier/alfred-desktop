@@ -77,6 +77,14 @@ export function renderPositionsTable(viewModel, dashboardPayload) {
   for (const pos of positions) {
     const ticker = (pos.ticker || "").toUpperCase();
     const rec = recByTicker.get(ticker);
+    // When every market provider fails, `sync_position_from_market` leaves
+    // `prix_actuel = 0` and `market.source = "none"`. Rendering "0 €" /
+    // "-100%" then looks like the position is genuinely worthless — far
+    // more misleading than the previous (stale) behaviour. Detect that
+    // "no price" state on positions with a real holding (qty>0) and render
+    // an em-dash sentinel for every price-derived cell. Watchlist items
+    // legitimately carry qty=0 and must keep their existing neutral cells.
+    const priceUnavailable = isPriceUnavailable(pos);
     const pv = pos.plus_moins_value || 0;
     const pvPct = pos.plus_moins_value_pct || 0;
     const pvClass = pv >= 0 ? "pos-pv-positive" : "pos-pv-negative";
@@ -87,8 +95,10 @@ export function renderPositionsTable(viewModel, dashboardPayload) {
     tr.className = "pos-main-row";
     tr.dataset.ticker = ticker;
 
-    // Value + weight badge next to ticker
-    const valueBadge = value > 0
+    // Value + weight badge next to ticker. With no price we cannot compute
+    // a meaningful valeur_actuelle (qty * 0 = 0), so suppress the badge
+    // rather than show a misleading "0 €".
+    const valueBadge = value > 0 && !priceUnavailable
       ? ` <span class="pos-value-badge">${formatCurrency(value)} <span class="pos-weight">(${weight.toFixed(1)}%)</span></span>`
       : "";
     // Next analysis date — overdue check
@@ -104,15 +114,26 @@ export function renderPositionsTable(viewModel, dashboardPayload) {
       ? `<span class="${reanalyseCls}"${reanalyseTitle}>${reanalyseIcon} ${escapeHtml(reanalyseAfter)}</span>`
       : "";
 
+    // Price / P&L cells. With no spot price pv/pvPct are not trustworthy
+    // either (they derive from prix_actuel), so substitute the em-dash
+    // sentinel for all four price-derived cells and drop the PnL tone
+    // class — there is no sign to communicate.
+    const priceCell = priceUnavailable
+      ? `<span class="pos-price-na" title="Prix indisponible — tous les fournisseurs ont échoué">—</span>`
+      : formatNum(pos.prix_actuel);
+    const pvCellText = priceUnavailable ? "—" : `${pv >= 0 ? "+" : ""}${formatNum(pv)}`;
+    const pvPctCellText = priceUnavailable ? "—" : `${pvPct >= 0 ? "+" : ""}${pvPct.toFixed(1)}%`;
+    const pvCellClass = priceUnavailable ? "num" : `num ${pvClass}`;
+
     // Main row
     tr.innerHTML = `
       <td><strong>${escapeHtml(ticker)}</strong>${valueBadge}</td>
       <td>${escapeHtml(pos.nom || "")}</td>
       <td class="num">${pos.quantite ?? ""}</td>
       <td class="num">${formatNum(pos.prix_revient)}</td>
-      <td class="num">${formatNum(pos.prix_actuel)}</td>
-      <td class="num ${pvClass}">${pv >= 0 ? "+" : ""}${formatNum(pv)}</td>
-      <td class="num ${pvClass}">${pvPct >= 0 ? "+" : ""}${pvPct.toFixed(1)}%</td>
+      <td class="num">${priceCell}</td>
+      <td class="${pvCellClass}">${pvCellText}</td>
+      <td class="${pvCellClass}">${pvPctCellText}</td>
       <td>${renderSignalCell(rec, isRunning, stage, ticker, collectionProgress, lineProgress, latestRun?.orchestration?.status)}</td>
       <td class="num">${reanalyseCell}</td>
     `;
@@ -222,4 +243,27 @@ function formatNum(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return "—";
   return n.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 2 });
+}
+
+/**
+ * Detect the "no provider price" state.
+ *
+ * Backend contract: when every market provider fails for a ticker,
+ * `native_collection_helpers::sync_position_from_market` rejects the
+ * fallback (`source == "none"`) and leaves `position.prix_actuel = 0`.
+ * The UI must distinguish that genuinely-unknown-price state from a real
+ * zero so we don't render "0 €" / "-100%" for a live holding.
+ *
+ * Heuristic: a position with a real holding (`quantite > 0`) but a
+ * zero/null `prix_actuel` is the no-price sentinel. Watchlist items
+ * legitimately carry `quantite = 0` and must NOT trigger the sentinel.
+ *
+ * Exported so the line modal can apply the same rule consistently.
+ */
+export function isPriceUnavailable(position) {
+  if (!position || typeof position !== "object") return false;
+  const qty = Number(position.quantite);
+  if (!Number.isFinite(qty) || qty <= 0) return false;
+  const price = Number(position.prix_actuel);
+  return !Number.isFinite(price) || price === 0;
 }

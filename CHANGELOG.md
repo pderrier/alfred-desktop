@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.2.12
+
+### Cross-account context dans la synthèse par compte
+- **Snapshot enrichi (LLM only)** — nouveau champ `snapshot.holdings_accounts` exposant tous les comptes Finary (investment, cash_only, liability, other) avec `kind` structurel, `institution_provider_categories` brut, cash multi-devises (`cash_by_currency`)
+- **`snapshot.portfolio_summary`** — agrégats `value_by_kind` et `value_by_institution_provider_category` portfolio-level
+- **`run_state.cross_account_context`** — résumé compact des autres comptes (top positions, cash mobilisable, kind) + thèmes cross-account injecté dans `build_synthesis_prompt` ET `build_report_prompt` (parité 3 modes LLM)
+- **Section "Contexte cross-account"** dans les prompts — instruction explicite au LLM de rester centré sur le compte cible, et d'utiliser le contexte uniquement pour : éviter de vendre quand du cash existe ailleurs (Livret, compte courant), éviter la redondance de positions cross-account, cohérence thématique
+- **Thèmes cross-account agrégés à prompt-build-time** depuis `line-memory.json` (filtrés à ≥ 2 comptes)
+- **Contrat UI préservé** — `snapshot.accounts` reste byte-identique, pinné par `test_snapshot_accounts_ui_contract_unchanged`
+
+### Infrastructure
+- **98 tests Rust (87 → 98, +11 nouveaux), 0 failure, 0 warning nouveau**
+- Nouveaux helpers dans `native_collection_helpers.rs` : `build_holdings_metadata`, `classify_holding_kind`, `build_portfolio_summary`, `aggregate_cash_by_currency`, `build_cross_account_context`
+- Docs : `docs/finary-snapshot-schema.md` et `docs/synthesis-pipeline.md` mis à jour
+
 ## v0.2.7
 
 ### Cash mapping fixes

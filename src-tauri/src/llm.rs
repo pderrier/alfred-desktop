@@ -247,7 +247,7 @@ fn call_upstream_llm_streamed(
         "stream": true,
         "response_format": { "type": "json_object" },
         "messages": [
-            { "role": "system", "content": "Tu es un conseiller financier qui s'adresse a des investisseurs particuliers non-experts. Tu expliques les choses simplement, avec des exemples concrets et des chiffres. Tu produis uniquement du JSON valide, sans texte supplementaire." },
+            { "role": "system", "content": "Tu es un conseiller financier qui s'adresse a des investisseurs particuliers non-experts. Tu expliques les choses simplement, avec des exemples concrets et des chiffres. Tu produis uniquement du JSON valide, sans texte supplementaire. Quand les sections MEMOIRE LIGNE et TECHNIQUE sont fournies, elles se completent : MEMOIRE LIGNE = accountability des recommandations Alfred passees (historique multi-runs), TECHNIQUE = etat marche actuel calcule sur ~250 jours OHLC (independant des runs). Combine les : la memoire dit ce que nous avons annonce, la technique dit ce que dit le marche aujourd'hui." },
             { "role": "user", "content": prompt }
         ]
     });

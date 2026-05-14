@@ -103,6 +103,24 @@ where
     guard.dirty = true;
 }
 
+/// Test-only: clear the in-memory line-memory cache so the next access
+/// reloads from the (possibly freshly seeded) disk path. Keeps unit tests
+/// hermetic — without this, the singleton would bleed state across tests.
+#[cfg(test)]
+pub fn line_memory_reset_for_tests() {
+    let mut guard = lm_cache().lock().unwrap_or_else(|p| p.into_inner());
+    guard.store = lm_default_store();
+    guard.loaded = false;
+    guard.dirty = false;
+}
+
+/// Test-only: thin wrapper around the private `compute_trend` so unit tests
+/// can exercise the bucket-by-distinct-date contract directly.
+#[cfg(test)]
+pub fn compute_trend_for_test(signal_history: &[Value]) -> &'static str {
+    compute_trend(signal_history)
+}
+
 /// Flush cached line-memory to disk if dirty. Called at end of analysis run.
 pub fn line_memory_flush_now() {
     let to_write = {
@@ -222,13 +240,18 @@ fn merge_mcp_results(run_id: &str, data_dir: &str) {
 
 /// Build a per-line prompt for the native backend. Data is pre-injected.
 /// The model returns JSON only — we handle validation and persistence ourselves.
-fn build_native_line_prompt(_run_id: &str, ticker: &str, nom: &str, line_type: &str, line_data: &Value) -> String {
+pub(crate) fn build_native_line_prompt(_run_id: &str, ticker: &str, nom: &str, line_type: &str, line_data: &Value) -> String {
     let position = serde_json::to_string_pretty(&line_data["position"]).unwrap_or_default();
     let market = serde_json::to_string_pretty(&line_data["market_data"]).unwrap_or_default();
     let news = serde_json::to_string_pretty(&line_data["news"]).unwrap_or_default();
     let insights = serde_json::to_string_pretty(&line_data["shared_insights"]).unwrap_or_default();
     let memory = serde_json::to_string_pretty(&line_data["line_memory"]).unwrap_or_default();
     let quality = serde_json::to_string_pretty(&line_data["quality"]).unwrap_or_default();
+    // Reuse the shared TECHNIQUE renderer to guarantee parity across the 3
+    // LLM modes (codex / native / native-oauth) — see llm_prompts.rs.
+    let section_technical = crate::llm_prompts::build_technical_section(
+        line_data.get("technical_snapshot"),
+    );
 
     // Build activity section (recent transactions/orders for this ticker)
     let activity_section = {
@@ -279,6 +302,8 @@ fn build_native_line_prompt(_run_id: &str, ticker: &str, nom: &str, line_type: &
     format!(
         r#"Tu es Alfred, un conseiller financier bienveillant. Analyse cette ligne.
 
+MEMOIRE LIGNE = accountability de nos analyses precedentes (signaux et theses Alfred). TECHNIQUE = etat marche actuel calcule sur ~250 jours OHLC (independant des runs). Les deux se completent : la memoire dit ce qu'on a annonce, la technique dit ce que dit le marche.
+
 Ligne: {line_type}:{ticker} ({nom})
 
 === DONNEES ===
@@ -299,6 +324,8 @@ Insights partages:
 
 Memoire precedente:
 {memory}
+
+{section_technical}
 
 Qualite des donnees:
 {quality}
@@ -336,6 +363,7 @@ Les articles "RESUME APPROFONDI (cache)" sont deja resumes — utilise-les direc
         news = news,
         insights = insights,
         memory = memory,
+        section_technical = section_technical,
         quality = quality,
     )
 }
@@ -501,7 +529,7 @@ fn sync_line_memory(run_id: &str, ticker: &str, rec: &Value, current_price: f64)
     let conviction = as_str(rec.get("conviction"));
     let synthese = as_str(rec.get("synthese"));
 
-    // ── V2: signal_history (prepend, cap at 10) ────────────────────
+    // ── V2: signal_history (dedup same-day same-signal, else prepend, cap at 10) ──
     let new_signal_entry = json!({
         "date": today,
         "signal": signal,
@@ -510,12 +538,8 @@ fn sync_line_memory(run_id: &str, ticker: &str, rec: &Value, current_price: f64)
         "run_id": run_id,
     });
 
-    let mut signal_history: Vec<Value> = vec![new_signal_entry];
-    if let Some(arr) = current.get("signal_history").and_then(|v| v.as_array()) {
-        for item in arr.iter().take(9) {
-            signal_history.push(item.clone());
-        }
-    }
+    let prior = current.get("signal_history").and_then(|v| v.as_array());
+    let signal_history = build_signal_history(&new_signal_entry, prior);
 
     // ── V2: memory_narrative (LLM-authored during analysis; fallback if missing) ─────
     let trend = compute_trend(&signal_history);
@@ -573,6 +597,18 @@ fn sync_line_memory(run_id: &str, ticker: &str, rec: &Value, current_price: f64)
         .map(|s| s.to_string())
         .collect();
 
+    // Bug B follow-up — clear the zero-price repair flag as soon as a real
+    // price comes in. If the new run also has current_price == 0, carry the
+    // flag forward so the next prompt build still suppresses the bogus
+    // "prix: 0.00€" line.
+    let price_data_unavailable = if current_price > 0.0 {
+        false
+    } else {
+        current.get("price_data_unavailable")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    };
+
     // Build the V2 ticker entry — NO V1 fields
     let entry = json!({
         "schema_version": 2,
@@ -584,6 +620,7 @@ fn sync_line_memory(run_id: &str, ticker: &str, rec: &Value, current_price: f64)
         "signal_history": signal_history,
         "memory_narrative": memory_narrative,
         "price_tracking": price_tracking,
+        "price_data_unavailable": price_data_unavailable,
         "news_themes": news_themes,
         "trend": trend,
         "deep_news_memory_summary": truncate(&deep_news_summary, 2400),
@@ -910,15 +947,69 @@ fn build_memory_narrative(
     truncate(&parts.join(" "), 1400)
 }
 
+/// Build the next-run `signal_history` array. If the prior head entry has
+/// the same `(date, signal)` as the new entry, REPLACE it (a same-day re-run
+/// with an unchanged signal must not produce a duplicate row in the widget —
+/// the new entry's price/run_id is fresher). Otherwise prepend the new
+/// entry. Cap at 10.
+///
+/// Note: same date with a *different* signal (rare — strategy/news shift
+/// mid-day) is treated as a legitimate new decision point and still
+/// prepends; we only dedup the exact `(date, signal)` pair.
+pub(crate) fn build_signal_history(new_entry: &Value, prior: Option<&Vec<Value>>) -> Vec<Value> {
+    const CAP: usize = 10;
+    let new_date = new_entry.get("date").and_then(|v| v.as_str()).unwrap_or("");
+    let new_signal = new_entry.get("signal").and_then(|v| v.as_str()).unwrap_or("");
+
+    let head_matches = prior
+        .and_then(|arr| arr.first())
+        .map(|head| {
+            head.get("date").and_then(|v| v.as_str()) == Some(new_date)
+                && head.get("signal").and_then(|v| v.as_str()) == Some(new_signal)
+        })
+        .unwrap_or(false);
+
+    let mut out: Vec<Value> = Vec::with_capacity(CAP);
+    out.push(new_entry.clone());
+    if let Some(arr) = prior {
+        let skip = if head_matches { 1 } else { 0 };
+        let keep = CAP - out.len();
+        for item in arr.iter().skip(skip).take(keep) {
+            out.push(item.clone());
+        }
+    }
+    out
+}
+
+/// Collapse a `signal_history` slice into newest-first representatives keyed
+/// by `(date, signal)`. Used so legacy contaminated histories (multiple
+/// same-day same-signal entries from before Fix 5.1) don't poison trend /
+/// accuracy windows that slice `take(3) / skip(3)`.
+pub(crate) fn dedupe_signal_history_by_date_signal(signal_history: &[Value]) -> Vec<Value> {
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut out: Vec<Value> = Vec::with_capacity(signal_history.len());
+    for entry in signal_history.iter() {
+        let date = entry.get("date").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let signal = entry.get("signal").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if seen.insert((date, signal)) {
+            out.push(entry.clone());
+        }
+    }
+    out
+}
+
 /// Compute trend from last 3 signal_history entries.
 /// - `upgrading`: signals move toward stronger buy
 /// - `downgrading`: signals move toward sell
 /// - `volatile`: alternates direction >= 2 times
 /// - `stable`: same signal repeated
 fn compute_trend(signal_history: &[Value]) -> &'static str {
-    if signal_history.len() < 2 { return "stable"; }
+    // Bucket by (date, signal) first so contaminated legacy histories with
+    // same-day duplicates don't dominate the recent-3 window.
+    let bucketed = dedupe_signal_history_by_date_signal(signal_history);
+    if bucketed.len() < 2 { return "stable"; }
 
-    let signals: Vec<i8> = signal_history.iter()
+    let signals: Vec<i8> = bucketed.iter()
         .take(3)
         .filter_map(|entry| entry.get("signal").and_then(|v| v.as_str()))
         .map(signal_strength)
@@ -2095,5 +2186,119 @@ fn codex_synthesis_fallback(run_id: &str, turn_result: &Value) -> Result<Value> 
         }))
     } else {
         Err(anyhow::anyhow!("synthesis_incomplete:no_recommendations_and_finalize_not_called"))
+    }
+}
+
+// ── Bug B follow-up — line-memory zero-price repair (one-shot) ─────
+//
+// When Bug B (or any other long-running price-provider outage) leaves a
+// ticker with `price_tracking.current_price == 0` AND every
+// `signal_history[].price_at_signal == 0`, the prompt renderer happily emits
+// `prix: 0.00€` and the LLM concludes "no usable quote", feeding the next
+// run's `memory_narrative` with the same conclusion.
+//
+// `repair_line_memory_zero_prices` walks `line-memory.json` once and tags
+// such tickers with `price_data_unavailable: true` so downstream rendering
+// (see `build_memory_section` in `llm_prompts.rs`) can skip the "prix au
+// signal" line instead of printing a zero. Signal history is preserved as-is
+// — only the metadata flag is added.
+
+/// Decide if a single ticker entry is contaminated by an all-zero price
+/// history. Caller is responsible for not flagging an entry that is already
+/// flagged (re-flagging is a no-op, but skipping is cheaper).
+pub(crate) fn ticker_needs_zero_price_repair(entry: &Value) -> bool {
+    // Skip entries the LLM hasn't built up history for yet — these are
+    // legitimate first-run states (`price_at_signal == current_price`, no
+    // contamination).
+    let history = match entry.get("signal_history").and_then(|v| v.as_array()) {
+        Some(arr) if !arr.is_empty() => arr,
+        _ => return false,
+    };
+    let current_price = entry
+        .get("price_tracking")
+        .and_then(|pt| pt.get("current_price"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    if current_price != 0.0 {
+        return false;
+    }
+    // ALL entries must have price_at_signal == 0 — a single non-zero entry
+    // means the chain was healthy at some point, so we let the existing
+    // history stand without flagging.
+    history.iter().all(|item| {
+        item.get("price_at_signal")
+            .and_then(|v| v.as_f64())
+            .map(|v| v == 0.0)
+            .unwrap_or(true)
+    })
+}
+
+/// One-shot repair. Returns the number of tickers flagged. Pure transform on
+/// the store value so it can be exercised directly from tests.
+pub fn apply_zero_price_repair(store: &mut Value) -> usize {
+    let by_ticker = match store
+        .get_mut("by_ticker")
+        .and_then(|v| v.as_object_mut())
+    {
+        Some(m) => m,
+        None => return 0,
+    };
+    let mut flagged = 0usize;
+    for (_, entry) in by_ticker.iter_mut() {
+        if entry
+            .get("price_data_unavailable")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            // Idempotent — already flagged, leave it.
+            continue;
+        }
+        if !ticker_needs_zero_price_repair(entry) {
+            continue;
+        }
+        if let Some(obj) = entry.as_object_mut() {
+            obj.insert("price_data_unavailable".to_string(), Value::Bool(true));
+            flagged += 1;
+        }
+    }
+    flagged
+}
+
+/// Run the repair against the persisted line-memory store. Always flushes to
+/// disk if any tickers were flagged, so the change survives a process exit.
+pub fn repair_line_memory_zero_prices() -> Result<usize> {
+    let mut flagged = 0usize;
+    line_memory_patch(|store| {
+        flagged = apply_zero_price_repair(store);
+    });
+    if flagged > 0 {
+        line_memory_flush_now();
+        crate::debug_log(&format!(
+            "repair_line_memory_zero_prices: flagged {flagged} tickers with price_data_unavailable=true"
+        ));
+    } else {
+        crate::debug_log("repair_line_memory_zero_prices: no contaminated tickers found");
+    }
+    Ok(flagged)
+}
+
+/// Startup gate — runs the repair exactly once per install, tracked via the
+/// `line_memory_repaired_v1` runtime setting. Errors are swallowed: a repair
+/// failure must NOT block the app from booting; the next launch will retry.
+pub fn maybe_run_zero_price_repair_at_startup() {
+    if crate::runtime_settings::integer_direct("line_memory_repaired_v1", 0) >= 1 {
+        return;
+    }
+    match repair_line_memory_zero_prices() {
+        Ok(_) => {
+            let _ = crate::runtime_settings::patch(&json!({
+                "line_memory_repaired_v1": 1
+            }));
+        }
+        Err(e) => {
+            crate::debug_log(&format!(
+                "maybe_run_zero_price_repair_at_startup: failed, will retry on next launch: {e}"
+            ));
+        }
     }
 }

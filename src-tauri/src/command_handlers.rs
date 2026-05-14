@@ -303,6 +303,8 @@ pub fn invoke_command(command: &str) -> Result<serde_json::Value> {
         "codex:session-status-local" | "codex_session_status_local" => run_codex_session_status(),
         "codex:session-login-local" | "codex_session_login_local" => run_codex_session_login(),
         "codex:session-logout-local" | "codex_session_logout_local" => run_codex_session_logout(),
+        "codex:probe-quota-local" | "probe_codex_quota_local" => run_probe_codex_quota(),
+        "codex:auth-mode-local" | "codex_auth_mode_local" => run_codex_auth_mode(),
         other => Err(anyhow!("unknown_invoke_command:{other}")),
     }
 }
@@ -1068,5 +1070,42 @@ pub fn run_codex_session_logout() -> Result<serde_json::Value> {
         "ok": true,
         "action": "codex:session-logout-local",
         "result": crate::codex::session_logout()?
+    }))
+}
+
+pub fn run_probe_codex_quota() -> Result<serde_json::Value> {
+    Ok(json!({
+        "ok": true,
+        "action": "codex:probe-quota-local",
+        "result": crate::codex::probe_quota()?
+    }))
+}
+
+pub fn run_codex_auth_mode() -> Result<serde_json::Value> {
+    Ok(json!({
+        "ok": true,
+        "action": "codex:auth-mode-local",
+        "result": { "mode": crate::codex::auth_mode()? }
+    }))
+}
+
+pub fn run_swap_codex_to_apikey(api_key: String) -> Result<serde_json::Value> {
+    crate::codex::swap_to_apikey(&api_key)?;
+    Ok(json!({
+        "ok": true,
+        "action": "codex:swap-to-apikey-local",
+        "result": { "mode": crate::codex::auth_mode().unwrap_or("apikey") }
+    }))
+}
+
+pub fn run_swap_codex_to_oauth() -> Result<serde_json::Value> {
+    let restored = crate::codex::swap_to_oauth()?;
+    Ok(json!({
+        "ok": true,
+        "action": "codex:swap-to-oauth-local",
+        "result": {
+            "restored": restored,
+            "mode": crate::codex::auth_mode().unwrap_or("none")
+        }
     }))
 }

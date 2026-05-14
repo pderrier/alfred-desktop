@@ -71,27 +71,38 @@ export function initBootstrap(deps) {
 
   /**
    * Reveal the inline API-key fields on the splash connect card so the user
-   * can type their OpenAI key without leaving the splash. Used by the
-   * native-oauth -> native auto-fallback path when the saved key is empty.
+   * can type their OpenAI key without leaving the splash.
    *
-   * The validation/submit flow is already wired on the existing splash
-   * "Connect/Validate" button (handler below in this file), so we only need
-   * to un-hide the fields and bring focus to the key input.
+   * Two callers, two semantics:
+   *  - native-oauth -> native fallback: `{ selectBackend: "native" }`
+   *    selects the native radio (the backend is being switched to native).
+   *  - codex internal-auth fallback: `{ selectBackend: "codex" }` leaves
+   *    the codex radio selected — the backend stays on codex; only the
+   *    codex CLI's internal auth will be swapped to apikey on submit.
+   *
+   * The validation/submit flow is wired on the existing splash
+   * "Connect/Validate" button (handler below in this file); this helper
+   * only un-hides the fields and brings focus to the key input.
    */
-  function revealSplashApiKeyInput() {
+  function revealSplashApiKeyInput(opts = {}) {
+    const selectBackend = opts.selectBackend || "native";
     const connectNode = document.getElementById("splash-connect");
     const loaderNode = document.getElementById("splash-loader");
     const backendSelector = document.getElementById("splash-backend-selector");
     const nativeFields = document.getElementById("splash-native-fields");
     const apiKey = document.getElementById("splash-api-key");
-    const nativeRadio = document.querySelector('input[name="splash-backend"][value="native"]');
+    const targetRadio = document.querySelector(
+      `input[name="splash-backend"][value="${selectBackend}"]`
+    );
     const openaiBtn = document.getElementById("splash-openai-btn");
     const openaiStatus = document.getElementById("splash-openai-status");
 
     if (loaderNode) loaderNode.classList.add("hidden");
     if (connectNode) connectNode.classList.remove("hidden");
     if (backendSelector) backendSelector.classList.remove("hidden");
-    if (nativeRadio) nativeRadio.checked = true;
+    if (targetRadio) targetRadio.checked = true;
+    // Native-key fields are always shown when the user needs to paste a
+    // key, regardless of which backend the radio is currently on.
     if (nativeFields) nativeFields.classList.remove("hidden");
     if (openaiBtn) {
       openaiBtn.textContent = "Validate";
@@ -263,7 +274,7 @@ export function initBootstrap(deps) {
     }
 
     // 1. Load cached dashboard (fast, local)
-    setSplashStatus("Loading cached data\u2026");
+    setSplashStatus("Loading cached dashboard\u2026");
     try {
       await refreshDashboard();
     } catch { /* no cached data yet — fine */ }
@@ -286,6 +297,7 @@ export function initBootstrap(deps) {
     // `{ok, action, result: {ok, settings: {values, overrides, ...}}}`.
     // Use `bridge.getRuntimeSettings()` which unwraps to `{values, overrides, ...}`
     // -- reading the raw invoke result is a known footgun.
+    setSplashStatus("Reading settings\u2026");
     let llmBackend = "codex";
     let settingsValues = {};
     try {
@@ -296,6 +308,8 @@ export function initBootstrap(deps) {
 
     // Auto-fallback flag is stored as 0/1 integer; coerce to boolean.
     const autoFallbackActive = Number(settingsValues.llm_backend_auto_fallback) === 1;
+    const codexAuthAutoFallbackActive =
+      Number(settingsValues.codex_auth_auto_fallback) === 1;
 
     // Collect probe + native-key facts, then run them through the pure
     // `decideFallback` policy so the bootstrap branch matches the unit-test
@@ -303,6 +317,7 @@ export function initBootstrap(deps) {
     // mutations) are applied below based on the resolved action.
     let probeResult = null;
     let nativeKeyOk = false;
+    let codexCurrentAuth = "none";
 
     if (llmBackend === "native") {
       setSplashStatus("Validating API key\u2026");
@@ -320,8 +335,38 @@ export function initBootstrap(deps) {
           probeResult = probe?.result || probe;
         } catch { probeResult = null; }
       }
+    } else if (llmBackend === "codex") {
+      // Codex (legacy) mode \u2014 probe the real CLI quota via `codex exec`. The
+      // codex pipeline keeps running on either auth (chatgpt OAuth tokens or
+      // an API key), so we also read the codex CLI's current internal auth
+      // mode so the policy can decide between swap / restore / noop.
+      setSplashStatus("Checking Codex availability\u2026");
+      try {
+        if (tauriInvoke) {
+          // Ensure the binary exists before probing \u2014 otherwise the probe
+          // returns "no_binary" and we cannot detect rate-limit state.
+          const sanity = await bridge.getCodexSessionStatus();
+          if ((sanity?.result || sanity)?.status === "no_binary") {
+            setSplashStatus("Installing Codex CLI...");
+            try { await tauriInvoke("ensure_codex_local"); } catch { /* surface later */ }
+          }
+          const probeEnvelope = await tauriInvoke("probe_codex_quota_local");
+          const probe = probeEnvelope?.result || probeEnvelope;
+          // Normalize to the {logged_in, failure_reason} shape used by
+          // decideFallback. `logged_in` is true iff the probe ran the
+          // codex exec successfully (status === "ok").
+          probeResult = {
+            logged_in: probe?.status === "ok",
+            status: probe?.status,
+            failure_reason: probe?.failure_reason ?? null,
+            message: probe?.message,
+          };
+          const authEnvelope = await tauriInvoke("codex_auth_mode_local");
+          codexCurrentAuth = (authEnvelope?.result || authEnvelope)?.mode || "none";
+        }
+      } catch { probeResult = null; }
     } else {
-      // Codex or native-oauth backend -- check session.
+      // native-oauth \u2014 same probe as before (model/list via app-server).
       setSplashStatus("Checking OpenAI\u2026");
       try {
         const status = await bridge.getCodexSessionStatus();
@@ -345,6 +390,8 @@ export function initBootstrap(deps) {
       probeResult,
       savedApiKey: settingsValues.openai_api_key || "",
       nativeKeyOk,
+      codexAuthAutoFallbackActive,
+      codexCurrentAuth,
     });
     openaiOk = decision.openaiOk;
 
@@ -395,10 +442,89 @@ export function initBootstrap(deps) {
       revealSplashApiKeyInput();
       // Leave openaiOk=false so the splash renders the connect card and the
       // existing API-key validation handler takes over.
+    } else if (decision.action === "codex-swap-to-apikey" && tauriInvoke) {
+      // Codex mode is self-healing: keep the codex pipeline, swap the codex
+      // CLI's stored auth from chatgpt OAuth to apikey using the saved key.
+      setSplashStatus("OAuth quota exhausted \u2014 switching codex to API key\u2026");
+      try {
+        await tauriInvoke("swap_codex_to_apikey_local", {
+          apiKey: settingsValues.openai_api_key || ""
+        });
+        await tauriInvoke("runtime_settings_update_local", {
+          settings: { codex_auth_auto_fallback: 1 }
+        });
+        showToast(
+          "OAuth quota exhausted \u2014 codex now using your OpenAI API key."
+        );
+        codexCurrentAuth = "apikey";
+        openaiOk = true;
+      } catch {
+        // Swap failed \u2014 surface as not-connected so the splash forces a
+        // visible recovery step instead of pretending we succeeded.
+        openaiOk = false;
+      }
+    } else if (decision.action === "codex-reveal-key-input") {
+      // No saved API key \u2014 keep llm_backend=codex (the pipeline doesn't
+      // change). The validate handler below detects "codex + no auth"
+      // and runs swap_codex_to_apikey_local on submit instead of switching
+      // backends.
+      showToast(
+        "OAuth quota exhausted \u2014 paste your OpenAI API key to keep using Codex.",
+        "error"
+      );
+      revealSplashApiKeyInput({ selectBackend: "codex" });
+      // Leave openaiOk=false so the connect card stays up.
+    } else if (decision.action === "codex-restore-oauth" && tauriInvoke) {
+      // Throttle restore attempts: if a previous restore failed recently the
+      // setting `codex_auth_oauth_retry_after_ms` holds a future epoch-ms.
+      // We skip the swap until that timestamp passes -- avoids
+      // backup -> restore -> handshake -> rollback thrashing on every launch
+      // when OAuth quota is still exhausted.
+      const retryAfter = Number(settingsValues.codex_auth_oauth_retry_after_ms) || 0;
+      const now = Date.now();
+      if (retryAfter > now) {
+        // Too soon to retry. Stay on apikey, codex pipeline still works.
+        openaiOk = true;
+      } else {
+        setSplashStatus("OAuth quota restored \u2014 switching codex back\u2026");
+        try {
+          const envelope = await tauriInvoke("swap_codex_to_oauth_local");
+          const restored = (envelope?.result || envelope)?.restored === true;
+          if (restored) {
+            await tauriInvoke("runtime_settings_update_local", {
+              settings: {
+                codex_auth_auto_fallback: 0,
+                codex_auth_oauth_retry_after_ms: 0,
+              }
+            });
+            showToast(
+              "OAuth quota restored \u2014 codex back on your ChatGPT subscription."
+            );
+            codexCurrentAuth = "chatgpt";
+          } else {
+            // Restore failed (quota likely still exhausted). Throttle next
+            // attempt by 6h so we don't thrash on every launch.
+            await tauriInvoke("runtime_settings_update_local", {
+              settings: { codex_auth_oauth_retry_after_ms: now + 6 * 60 * 60 * 1000 }
+            });
+          }
+          // Either way we're "connected" \u2014 the codex pipeline still works
+          // on whichever auth we ended up with.
+          openaiOk = true;
+        } catch {
+          // Throw path (e.g. Tauri invoke failed). Throttle as well.
+          try {
+            await tauriInvoke("runtime_settings_update_local", {
+              settings: { codex_auth_oauth_retry_after_ms: now + 6 * 60 * 60 * 1000 }
+            });
+          } catch { /* not critical */ }
+          openaiOk = true;
+        }
+      }
     }
 
     // Check Finary
-    setSplashStatus("Checking Finary\u2026");
+    setSplashStatus("Refreshing Finary session\u2026");
     try {
       await refreshFinarySessionStatus();
       finaryOk = isFinarySessionRunnable(getLatestFinarySessionPayload());
@@ -406,9 +532,10 @@ export function initBootstrap(deps) {
 
     if (finaryOk) {
       // Load cached portfolio, or fetch from Finary API if no cache exists
-      setSplashStatus("Loading portfolio\u2026");
+      setSplashStatus("Syncing portfolio from Finary\u2026");
       try {
         if (tauriInvoke) await tauriInvoke("finary_sync_snapshot_local");
+        setSplashStatus("Updating dashboard\u2026");
         await refreshDashboard();
       } catch { /* will show on welcome page */ }
     }
@@ -416,7 +543,7 @@ export function initBootstrap(deps) {
     refreshWizardSourcePolicy(getLatestFinarySessionPayload());
 
     // 2b. Health check — includes auth verification when OpenAI is connected
-    setSplashStatus("Checking API\u2026");
+    setSplashStatus("Running health check\u2026");
     await refreshHealthPill(openaiOk);
 
     // 3. All OK → dismiss
@@ -488,6 +615,58 @@ export function initBootstrap(deps) {
     openaiBtn?.addEventListener("click", async function handler() {
       const selectedBackend = document.querySelector('input[name="splash-backend"]:checked')?.value || llmBackend;
 
+      // Codex internal-auth-fallback path: the splash revealed the API-key
+      // input under the codex radio (decision="codex-reveal-key-input").
+      // Detect this state by: backend=codex AND the native-fields card is
+      // visible. On submit, swap the codex CLI's internal auth chatgpt ->
+      // apikey instead of switching backends.
+      const codexNeedsApiKey =
+        selectedBackend === "codex"
+        && splashNativeFields
+        && !splashNativeFields.classList.contains("hidden");
+
+      if (codexNeedsApiKey) {
+        const key = splashApiKey?.value?.trim();
+        if (!key) {
+          if (splashApikeyHint) splashApikeyHint.textContent = "Enter your OpenAI API key above.";
+          return;
+        }
+        this.disabled = true;
+        this.textContent = "Switching codex…";
+        if (splashApikeyHint) splashApikeyHint.textContent = "";
+        try {
+          if (tauriInvoke) {
+            // Persist the key + mark the auth-fallback active BEFORE the
+            // swap so a crash mid-swap can be picked up next launch.
+            // llm_backend stays codex; llm_backend_auto_fallback is a
+            // separate (inter-mode) flag and must not be touched here.
+            await tauriInvoke("runtime_settings_update_local", {
+              settings: {
+                openai_api_key: key,
+                codex_auth_auto_fallback: 1,
+              }
+            });
+            await tauriInvoke("swap_codex_to_apikey_local", { apiKey: key });
+          }
+          openaiOk = true;
+          clearErrorToasts();
+          showToast("Codex now using your OpenAI API key.");
+          setRowStatus(openaiIconNode, openaiStatusNode, openaiBtn, true, "connected");
+          backendSelector?.classList.add("hidden");
+          if (splashApikeyHint) {
+            splashApikeyHint.textContent = "Codex internal auth swapped to API key.";
+            splashApikeyHint.style.color = "#2f8f5d";
+          }
+          updateContinueBtn();
+          if (openaiOk && finaryOk) dismissSplash();
+        } catch (error) {
+          this.textContent = "Retry";
+          this.disabled = false;
+          if (splashApikeyHint) splashApikeyHint.textContent = typeof error === "string" ? error : (error?.message || "Codex auth swap failed");
+        }
+        return;
+      }
+
       if (selectedBackend === "native") {
         // Native backend — validate API key from splash input
         const key = splashApiKey?.value?.trim();
@@ -501,8 +680,8 @@ export function initBootstrap(deps) {
 
         try {
           // Save backend + key to settings, then validate.
-          // Manual user action — clear the auto-fallback flag so we don't
-          // try to auto-restore to native-oauth on the next launch.
+          // Manual user action — clear BOTH auto-fallback flags so we don't
+          // try to auto-restore on the next launch.
           const apiBase = splashApiBase?.value?.trim() || "";
           if (tauriInvoke) {
             await tauriInvoke("runtime_settings_update_local", {
@@ -510,6 +689,7 @@ export function initBootstrap(deps) {
                 llm_backend: "native",
                 openai_api_key: key,
                 llm_backend_auto_fallback: 0,
+                codex_auth_auto_fallback: 0,
                 ...(apiBase ? { openai_api_base: apiBase } : {}),
               }
             });
@@ -540,11 +720,15 @@ export function initBootstrap(deps) {
       }
 
       // Codex or native-oauth backend — save backend choice, then do OAuth login.
-      // Manual user action — clear the auto-fallback flag.
+      // Manual user action — clear BOTH auto-fallback flags.
       if (tauriInvoke) {
         try {
           await tauriInvoke("runtime_settings_update_local", {
-            settings: { llm_backend: selectedBackend, llm_backend_auto_fallback: 0 }
+            settings: {
+              llm_backend: selectedBackend,
+              llm_backend_auto_fallback: 0,
+              codex_auth_auto_fallback: 0,
+            }
           });
         } catch {}
       }

@@ -96,15 +96,145 @@ test("native-oauth + unknown failure (null reason) -> noop", () => {
   assert.deepEqual(out, { action: "noop", openaiOk: false });
 });
 
-// ── codex (legacy mode) is never auto-switched ─────────────────────
+// ── codex (legacy mode) internal auth fallback ─────────────────────
+// New in 0.2.14: codex mode is self-healing. When the OAuth quota is
+// exhausted we swap the codex CLI's stored auth chatgpt -> apikey (the
+// codex pipeline stays the same). Auto-restore flips it back when the
+// quota returns.
 
-test("codex + rate-limited -> noop (legacy mode never auto-switches)", () => {
+test("codex + rate-limited + saved API key -> codex-swap-to-apikey", () => {
   const out = decideFallback({
     llmBackend: "codex",
     autoFallbackActive: false,
     probeResult: { logged_in: false, failure_reason: "rate_limited" },
     savedApiKey: "sk-abc",
+    nativeKeyOk: false,
+    codexAuthAutoFallbackActive: false,
+    codexCurrentAuth: "chatgpt",
+  });
+  assert.deepEqual(out, { action: "codex-swap-to-apikey", openaiOk: true });
+});
+
+test("codex + rate-limited + no API key -> codex-reveal-key-input", () => {
+  const out = decideFallback({
+    llmBackend: "codex",
+    autoFallbackActive: false,
+    probeResult: { logged_in: false, failure_reason: "rate_limited" },
+    savedApiKey: "",
+    nativeKeyOk: false,
+    codexAuthAutoFallbackActive: false,
+    codexCurrentAuth: "chatgpt",
+  });
+  assert.deepEqual(out, { action: "codex-reveal-key-input", openaiOk: false });
+});
+
+test("codex + rate-limited + whitespace-only API key -> codex-reveal-key-input", () => {
+  const out = decideFallback({
+    llmBackend: "codex",
+    autoFallbackActive: false,
+    probeResult: { logged_in: false, failure_reason: "rate_limited" },
+    savedApiKey: "   ",
+    nativeKeyOk: false,
+    codexAuthAutoFallbackActive: false,
+    codexCurrentAuth: "chatgpt",
+  });
+  assert.deepEqual(out, { action: "codex-reveal-key-input", openaiOk: false });
+});
+
+test("codex + probe ok + flag set + currentAuth=apikey -> codex-restore-oauth", () => {
+  const out = decideFallback({
+    llmBackend: "codex",
+    autoFallbackActive: false,
+    probeResult: { logged_in: true, failure_reason: null },
+    savedApiKey: "sk-abc",
     nativeKeyOk: true,
+    codexAuthAutoFallbackActive: true,
+    codexCurrentAuth: "apikey",
+  });
+  assert.deepEqual(out, { action: "codex-restore-oauth", openaiOk: true });
+});
+
+test("codex + probe ok + flag set + currentAuth=chatgpt -> noop (already restored)", () => {
+  // Defensive: if the user manually re-logged in, currentAuth is back to
+  // chatgpt — we should NOT try to restore from a (possibly stale) backup.
+  const out = decideFallback({
+    llmBackend: "codex",
+    autoFallbackActive: false,
+    probeResult: { logged_in: true, failure_reason: null },
+    savedApiKey: "sk-abc",
+    nativeKeyOk: true,
+    codexAuthAutoFallbackActive: true,
+    codexCurrentAuth: "chatgpt",
+  });
+  assert.deepEqual(out, { action: "noop", openaiOk: true });
+});
+
+test("codex + probe ok + no flag -> noop (everything is fine)", () => {
+  const out = decideFallback({
+    llmBackend: "codex",
+    autoFallbackActive: false,
+    probeResult: { logged_in: true, failure_reason: null },
+    savedApiKey: "sk-abc",
+    nativeKeyOk: false,
+    codexAuthAutoFallbackActive: false,
+    codexCurrentAuth: "chatgpt",
+  });
+  assert.deepEqual(out, { action: "noop", openaiOk: true });
+});
+
+test("codex + auth failure -> noop (let user re-login manually)", () => {
+  const out = decideFallback({
+    llmBackend: "codex",
+    autoFallbackActive: false,
+    probeResult: { logged_in: false, failure_reason: "auth" },
+    savedApiKey: "sk-abc",
+    nativeKeyOk: false,
+    codexAuthAutoFallbackActive: false,
+    codexCurrentAuth: "chatgpt",
+  });
+  assert.deepEqual(out, { action: "noop", openaiOk: false });
+});
+
+test("codex + network failure -> noop", () => {
+  const out = decideFallback({
+    llmBackend: "codex",
+    autoFallbackActive: false,
+    probeResult: { logged_in: false, failure_reason: "network" },
+    savedApiKey: "sk-abc",
+    nativeKeyOk: false,
+    codexAuthAutoFallbackActive: false,
+    codexCurrentAuth: "chatgpt",
+  });
+  assert.deepEqual(out, { action: "noop", openaiOk: false });
+});
+
+test("codex + flag set + still rate-limited -> codex-swap-to-apikey (idempotent)", () => {
+  // currentAuth is already apikey from a previous fallback; quota still
+  // not back. We re-issue the swap action (caller is idempotent) so the
+  // splash continues smoothly. Restore is gated on probeOk, so it won't
+  // fire here.
+  const out = decideFallback({
+    llmBackend: "codex",
+    autoFallbackActive: false,
+    probeResult: { logged_in: false, failure_reason: "rate_limited" },
+    savedApiKey: "sk-abc",
+    nativeKeyOk: false,
+    codexAuthAutoFallbackActive: true,
+    codexCurrentAuth: "apikey",
+  });
+  assert.deepEqual(out, { action: "codex-swap-to-apikey", openaiOk: true });
+});
+
+test("codex + missing inputs (back-compat) -> noop on failed probe", () => {
+  // Older bootstrap callers may not pass codexAuthAutoFallbackActive /
+  // codexCurrentAuth. They default to undefined which must not crash and
+  // must NOT trigger restore.
+  const out = decideFallback({
+    llmBackend: "codex",
+    autoFallbackActive: false,
+    probeResult: { logged_in: false, failure_reason: null },
+    savedApiKey: "sk-abc",
+    nativeKeyOk: false,
   });
   assert.deepEqual(out, { action: "noop", openaiOk: false });
 });

@@ -23,6 +23,7 @@ const topBarProgressNode = document.getElementById("top-bar-progress");
 const topBarProgressFillNode = document.getElementById("top-bar-progress-fill");
 const runPipelineBarNode = document.getElementById("run-pipeline-bar");
 const reportSynthesisCardNode = document.getElementById("report-synthesis-card");
+const runNarrationStatusNode = document.getElementById("run-narration-status");
 
 // ── State ────────────────────────────────────────────────────────
 
@@ -441,6 +442,30 @@ export function clearRunPipelineBar() {
   if (reportSynthesisCardNode) {
     reportSynthesisCardNode.classList.remove("synthesis-pending");
   }
+  clearNarrationDegradedBadge();
+}
+
+/**
+ * Show or hide the narration-degraded badge under the pipeline bar.
+ * Listens to `alfred://run-narration-status` (P0-2): when the Rust narrator
+ * gives up after the configured failure threshold, surface a calm amber
+ * badge so the user knows toasts are paused without confusing it with a
+ * run-level failure. Hidden on every fresh run via `clearRunPipelineBar`.
+ */
+export function setNarrationDegradedBadge(visible, reason) {
+  if (!runNarrationStatusNode) return;
+  if (visible) {
+    const text = reason ? `narration : mode dégradé (${reason})` : "narration : mode dégradé";
+    runNarrationStatusNode.textContent = text;
+    runNarrationStatusNode.classList.remove("hidden");
+  } else {
+    runNarrationStatusNode.textContent = "";
+    runNarrationStatusNode.classList.add("hidden");
+  }
+}
+
+function clearNarrationDegradedBadge() {
+  setNarrationDegradedBadge(false, "");
 }
 
 function formatNum(value) {

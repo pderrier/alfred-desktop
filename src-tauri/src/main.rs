@@ -69,10 +69,42 @@ use anyhow::anyhow;
 static APP_HANDLE: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
 
 pub fn emit_event(event: &str, payload: serde_json::Value) {
+    #[cfg(test)]
+    {
+        if let Ok(mut buf) = TEST_EVENT_CAPTURE.lock() {
+            buf.push((event.to_string(), payload.clone()));
+        }
+    }
     if let Some(handle) = APP_HANDLE.get() {
         use tauri::Emitter;
         let _ = handle.emit(event, payload);
     }
+}
+
+// ── Test-only event capture buffer ──────────────────────────────────────
+//
+// In unit tests there is no Tauri AppHandle, so `emit_event` would normally
+// be a silent no-op. To let tests assert on events the production code
+// emits (e.g. P0-2 narration-status), we mirror every emit into this
+// buffer when compiled with `cfg(test)`. Tests reset it with
+// `test_event_capture_reset()` and read it with `test_event_capture_drain()`.
+#[cfg(test)]
+static TEST_EVENT_CAPTURE: std::sync::Mutex<Vec<(String, serde_json::Value)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub fn test_event_capture_reset() {
+    if let Ok(mut buf) = TEST_EVENT_CAPTURE.lock() {
+        buf.clear();
+    }
+}
+
+#[cfg(test)]
+pub fn test_event_capture_drain() -> Vec<(String, serde_json::Value)> {
+    TEST_EVENT_CAPTURE
+        .lock()
+        .map(|mut buf| std::mem::take(&mut *buf))
+        .unwrap_or_default()
 }
 
 // ── Re-exports for service modules that still use `crate::function_name` ─────

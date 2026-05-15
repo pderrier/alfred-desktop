@@ -4197,3 +4197,240 @@ use crate::storage::read_json_file;
         // env (parallelism + isolation hygiene).
         std::env::remove_var("ALFRED_STATE_DIR");
     }
+
+    // ── P0-2: run_narrator timeout, threshold, degrade status event ──────
+    //
+    // These tests pin the bug-fix contract for v0.3.2:
+    //   * First tick must get a longer LLM timeout (≥15s) — initial narration
+    //     calls are heavy and 8s caused systematic timeouts.
+    //   * Subsequent ticks get the shorter (≥10s) timeout to stay under the
+    //     10s tick interval.
+    //   * The failure-degrade threshold is at least 10 (raised from 3) so a
+    //     burst of early timeouts can't silently kill the narrator for the
+    //     rest of the run.
+    //   * When the narrator finally enters degraded mode, it emits a status
+    //     event so the UI can surface a "narration: degraded mode" badge.
+
+    use std::sync::atomic::Ordering as TestOrdering;
+
+    /// Shared atomic-array-of-timeouts so multiple test fns can observe what
+    /// the narrator passed to the LLM. We rely on Rust's bound `fn` items
+    /// (not closures) for the LlmCall type, so all observation must go via
+    /// statics.
+    static NARRATOR_TIMEOUT_FIRST: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    static NARRATOR_TIMEOUT_SECOND: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    static NARRATOR_CALL_COUNT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn narrator_fake_capture_timeout(_prompt: &str, timeout_ms: u64) -> anyhow::Result<String> {
+        let n = NARRATOR_CALL_COUNT.fetch_add(1, TestOrdering::SeqCst);
+        if n == 0 {
+            NARRATOR_TIMEOUT_FIRST.store(timeout_ms, TestOrdering::SeqCst);
+            Ok("Premi\u{00e8}re narration.".to_string())
+        } else {
+            NARRATOR_TIMEOUT_SECOND.store(timeout_ms, TestOrdering::SeqCst);
+            Ok("Deuxi\u{00e8}me narration.".to_string())
+        }
+    }
+
+    fn narrator_record_event(run_id: &str, kind: &str, payload: serde_json::Value) {
+        let mut v = payload;
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("type".to_string(), serde_json::Value::String(kind.to_string()));
+        }
+        crate::run_narrator::record_event(run_id, &v);
+    }
+
+    #[test]
+    fn narrator_first_tick_uses_15s_timeout() {
+        let _guard = env_lock();
+        let run_id = "test_narrator_first_tick_15s";
+        crate::run_narrator::test_install_state(run_id);
+        NARRATOR_TIMEOUT_FIRST.store(0, TestOrdering::SeqCst);
+        NARRATOR_TIMEOUT_SECOND.store(0, TestOrdering::SeqCst);
+        NARRATOR_CALL_COUNT.store(0, TestOrdering::SeqCst);
+
+        // Push one event so the tick actually calls the LLM.
+        narrator_record_event(
+            run_id,
+            "line_done",
+            json!({"ticker": "AAPL", "recommendation": {"signal": "BUY"}}),
+        );
+        let fired = crate::run_narrator::tick_once(
+            run_id,
+            &(narrator_fake_capture_timeout as crate::run_narrator::LlmCall),
+        );
+        assert!(fired, "first tick should have called the LLM");
+        let observed = NARRATOR_TIMEOUT_FIRST.load(TestOrdering::SeqCst);
+        assert!(
+            observed >= 15_000,
+            "first-tick LLM timeout must be ≥15s (was 8s before P0-2 fix); observed: {observed}ms",
+        );
+
+        crate::run_narrator::test_remove_state(run_id);
+    }
+
+    #[test]
+    fn narrator_subsequent_ticks_use_10s_timeout() {
+        let _guard = env_lock();
+        let run_id = "test_narrator_subsequent_10s";
+        crate::run_narrator::test_install_state(run_id);
+        NARRATOR_TIMEOUT_FIRST.store(0, TestOrdering::SeqCst);
+        NARRATOR_TIMEOUT_SECOND.store(0, TestOrdering::SeqCst);
+        NARRATOR_CALL_COUNT.store(0, TestOrdering::SeqCst);
+
+        // First tick — primes last_narration.
+        narrator_record_event(
+            run_id,
+            "line_done",
+            json!({"ticker": "AAPL", "recommendation": {"signal": "BUY"}}),
+        );
+        assert!(crate::run_narrator::tick_once(
+            run_id,
+            &(narrator_fake_capture_timeout as crate::run_narrator::LlmCall),
+        ));
+
+        // Second tick — must use the shorter (subsequent) timeout.
+        narrator_record_event(
+            run_id,
+            "line_done",
+            json!({"ticker": "NVDA", "recommendation": {"signal": "HOLD"}}),
+        );
+        assert!(crate::run_narrator::tick_once(
+            run_id,
+            &(narrator_fake_capture_timeout as crate::run_narrator::LlmCall),
+        ));
+        let second = NARRATOR_TIMEOUT_SECOND.load(TestOrdering::SeqCst);
+        assert!(
+            (10_000..15_000).contains(&second),
+            "subsequent-tick LLM timeout must be 10s ≤ t < 15s; observed: {second}ms",
+        );
+
+        crate::run_narrator::test_remove_state(run_id);
+    }
+
+    static NARRATOR_FAIL_COUNT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn narrator_fake_always_fail(_prompt: &str, _timeout_ms: u64) -> anyhow::Result<String> {
+        NARRATOR_FAIL_COUNT.fetch_add(1, TestOrdering::SeqCst);
+        Err(anyhow::anyhow!("simulated_llm_timeout"))
+    }
+
+    fn narrator_fake_always_ok(_prompt: &str, _timeout_ms: u64) -> anyhow::Result<String> {
+        Ok("Recovered narration.".to_string())
+    }
+
+    #[test]
+    fn narrator_threshold_at_10_not_3() {
+        // After 5 consecutive failures followed by 1 success, the narrator
+        // MUST NOT be in degraded mode — the threshold was raised from 3 to
+        // at least 10 in v0.3.2 so brief outages do not permanently silence
+        // the run.
+        let _guard = env_lock();
+        let run_id = "test_narrator_threshold_10";
+        crate::run_narrator::test_install_state(run_id);
+        NARRATOR_FAIL_COUNT.store(0, TestOrdering::SeqCst);
+
+        for _ in 0..5 {
+            narrator_record_event(
+                run_id,
+                "line_progress",
+                json!({"ticker": "X", "status": "analyzing"}),
+            );
+            crate::run_narrator::tick_once(
+                run_id,
+                &(narrator_fake_always_fail as crate::run_narrator::LlmCall),
+            );
+        }
+        let snapshot = crate::run_narrator::test_state_snapshot(run_id)
+            .expect("state must still exist after 5 failures");
+        assert!(
+            !snapshot.degraded,
+            "5 failures must NOT degrade the narrator (threshold raised to ≥10 in P0-2). \
+             consecutive_failures={}, degraded={}",
+            snapshot.consecutive_failures, snapshot.degraded
+        );
+        assert_eq!(snapshot.consecutive_failures, 5);
+
+        // A subsequent success must reset the failure counter.
+        narrator_record_event(
+            run_id,
+            "line_done",
+            json!({"ticker": "X", "recommendation": {"signal": "HOLD"}}),
+        );
+        crate::run_narrator::tick_once(
+            run_id,
+            &(narrator_fake_always_ok as crate::run_narrator::LlmCall),
+        );
+        let after_success = crate::run_narrator::test_state_snapshot(run_id).unwrap();
+        assert_eq!(
+            after_success.consecutive_failures, 0,
+            "successful tick must reset consecutive_failures"
+        );
+        assert!(!after_success.degraded);
+
+        crate::run_narrator::test_remove_state(run_id);
+    }
+
+    #[test]
+    fn narrator_emits_status_event_on_degrade() {
+        // When the narrator finally enters degraded mode, it must publish
+        // exactly one `alfred://run-narration-status` Tauri event with
+        // mode="degraded" so the UI can surface a badge. Verified by hooking
+        // into the test event-capture buffer.
+        let _guard = env_lock();
+        let run_id = "test_narrator_degrade_event";
+        crate::run_narrator::test_install_state(run_id);
+        NARRATOR_FAIL_COUNT.store(0, TestOrdering::SeqCst);
+        crate::test_event_capture_reset();
+
+        // Drive the narrator past the (new ≥10) threshold by failing many
+        // ticks. We use a high upper bound to make this resilient if the
+        // threshold is later bumped further.
+        for _ in 0..15 {
+            narrator_record_event(
+                run_id,
+                "line_progress",
+                json!({"ticker": "X", "status": "analyzing"}),
+            );
+            crate::run_narrator::tick_once(
+                run_id,
+                &(narrator_fake_always_fail as crate::run_narrator::LlmCall),
+            );
+        }
+
+        let snapshot = crate::run_narrator::test_state_snapshot(run_id).unwrap();
+        assert!(
+            snapshot.degraded,
+            "after 15 failures the narrator must be degraded"
+        );
+
+        // Look for the status event in the capture buffer. The buffer is
+        // shared across parallel tests, so scope the assertion to events
+        // whose run_id matches ours.
+        let captured = crate::test_event_capture_drain();
+        let status_event = captured.iter().find(|(name, payload)| {
+            name == "alfred://run-narration-status"
+                && payload.get("run_id").and_then(|v| v.as_str()) == Some(run_id)
+        });
+        assert!(
+            status_event.is_some(),
+            "narrator must emit alfred://run-narration-status (run_id={run_id}) when entering \
+             degraded mode; captured events: {:?}",
+            captured
+                .iter()
+                .map(|(n, p)| (n.clone(), p.get("run_id").and_then(|v| v.as_str()).map(String::from)))
+                .collect::<Vec<_>>()
+        );
+        let payload = &status_event.unwrap().1;
+        assert_eq!(
+            payload.get("mode").and_then(|v| v.as_str()),
+            Some("degraded"),
+            "status event must carry mode=degraded; got payload: {payload}"
+        );
+
+        crate::run_narrator::test_remove_state(run_id);
+    }

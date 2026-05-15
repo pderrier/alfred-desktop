@@ -21,8 +21,22 @@ use serde_json::{json, Value};
 
 const RING_CAPACITY: usize = 200;
 const TICK_INTERVAL: Duration = Duration::from_secs(10);
-const LLM_TIMEOUT_MS: u64 = 8_000;
-const FAILURE_DEGRADE_THRESHOLD: u32 = 3;
+/// First-tick LLM timeout — initial narration calls are heavier (model warmup
+/// + no continuity context to anchor on), so we give them 15s. P0-2 fix:
+/// the previous flat 8s timeout caused systematic timeouts on the first 1-2
+/// ticks of every run, which then accumulated `consecutive_failures` and
+/// silently degraded the narrator for the rest of the run.
+const LLM_TIMEOUT_FIRST_MS: u64 = 15_000;
+/// Subsequent-tick LLM timeout — after at least one successful narration the
+/// model has warmed up and the prompt carries continuity context, so 10s is
+/// enough. Capped strictly below 15s so subsequent and first-tick budgets
+/// stay distinguishable (and below the 10s tick interval would oversubscribe).
+const LLM_TIMEOUT_SUBSEQUENT_MS: u64 = 10_000;
+/// Number of consecutive LLM failures before the narrator gives up for the
+/// rest of the run. P0-2 fix: raised from 3 to 10 so a brief outage at run
+/// start (3 timeouts in a row was trivially easy with the old 8s budget)
+/// can't permanently silence the narrator.
+const FAILURE_DEGRADE_THRESHOLD: u32 = 10;
 const MAX_EVENTS_IN_PROMPT: usize = 20;
 
 /// One recorded SSE event with the moment it landed.
@@ -196,12 +210,14 @@ pub fn stop(run_id: &str) {
     }
 }
 
-/// LLM call function — extracted so tests can inject a fake.
-/// Returns the narration text (non-empty) on success, or an error.
-type LlmCall = fn(&str) -> Result<String>;
+/// LLM call function — extracted so tests can inject a fake. Takes the prompt
+/// and the timeout-in-milliseconds the narrator picked for this tick (varies
+/// between first and subsequent ticks per P0-2 fix). Returns the narration
+/// text (non-empty) on success, or an error.
+pub type LlmCall = fn(&str, u64) -> Result<String>;
 
-fn llm_call_real(prompt: &str) -> Result<String> {
-    let value = crate::llm_backend::run_prompt(prompt, LLM_TIMEOUT_MS, None)?;
+fn llm_call_real(prompt: &str, timeout_ms: u64) -> Result<String> {
+    let value = crate::llm_backend::run_prompt(prompt, timeout_ms, None)?;
     Ok(extract_text(&value))
 }
 
@@ -244,9 +260,9 @@ fn run_loop(run_id: &str, stop_flag: Arc<AtomicBool>, llm_call: LlmCall) {
     }
 }
 
-/// Run a single tick. Public(crate)-for-tests so we can drive it without a
-/// real thread. Returns true if the LLM was actually called this tick.
-pub(crate) fn tick_once(run_id: &str, llm_call: &LlmCall) -> bool {
+/// Run a single tick. `pub` for tests so we can drive it without a real
+/// thread. Returns true if the LLM was actually called this tick.
+pub fn tick_once(run_id: &str, llm_call: &LlmCall) -> bool {
     // Bail early if the narrator was removed (stop) or marked degraded.
     {
         let Ok(guard) = narrators().lock() else { return false };
@@ -276,8 +292,17 @@ pub(crate) fn tick_once(run_id: &str, llm_call: &LlmCall) -> bool {
         })
         .unwrap_or((None, None));
 
+    // P0-2: first tick (no prior narration to anchor on) gets a longer
+    // budget. Any tick after the first successful narration uses the
+    // shorter budget.
+    let timeout_ms = if last_narration.is_none() {
+        LLM_TIMEOUT_FIRST_MS
+    } else {
+        LLM_TIMEOUT_SUBSEQUENT_MS
+    };
+
     let prompt = build_narration_prompt(&events, last_narration.as_deref(), progress.as_ref());
-    match llm_call(&prompt) {
+    match llm_call(&prompt, timeout_ms) {
         Ok(text) if !text.trim().is_empty() => {
             let cleaned = text.trim().to_string();
             on_success(run_id, &cleaned);
@@ -309,22 +334,40 @@ fn on_success(run_id: &str, narration: &str) {
 }
 
 fn on_failure(run_id: &str, reason: &str) {
+    // Track whether THIS failure was the one that flipped the run into
+    // degraded mode, so we can emit the status event exactly once outside
+    // the narrators() lock (event listeners shouldn't be blocked on it).
+    let mut just_degraded = false;
+    let mut failure_count: u32 = 0;
     if let Ok(mut guard) = narrators().lock() {
         if let Some(state) = guard.get_mut(run_id) {
             state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+            failure_count = state.consecutive_failures;
             if state.consecutive_failures >= FAILURE_DEGRADE_THRESHOLD && !state.degraded {
                 state.degraded = true;
-                crate::debug_log(&format!(
-                    "run_narrator: run {run_id} entering degraded mode after {} consecutive failures (last reason: {reason})",
-                    state.consecutive_failures
-                ));
-            } else {
-                crate::debug_log(&format!(
-                    "run_narrator: run {run_id} LLM failure #{} ({reason})",
-                    state.consecutive_failures
-                ));
+                just_degraded = true;
             }
         }
+    }
+    if just_degraded {
+        crate::debug_log(&format!(
+            "run_narrator: run {run_id} entering degraded mode after {failure_count} consecutive failures (last reason: {reason})"
+        ));
+        // P0-2: surface degraded state to the UI so it can show a
+        // "narration: mode dégradé" badge instead of silently going dark.
+        crate::emit_event(
+            "alfred://run-narration-status",
+            json!({
+                "run_id": run_id,
+                "mode": "degraded",
+                "consecutive_failures": failure_count,
+                "reason": reason,
+            }),
+        );
+    } else {
+        crate::debug_log(&format!(
+            "run_narrator: run {run_id} LLM failure #{failure_count} ({reason})"
+        ));
     }
 }
 
@@ -736,7 +779,7 @@ mod tests {
         install_state(run_id);
         static CALLS: AtomicUsize = AtomicUsize::new(0);
         CALLS.store(0, Ordering::SeqCst);
-        fn fake(_p: &str) -> Result<String> {
+        fn fake(_p: &str, _t: u64) -> Result<String> {
             CALLS.fetch_add(1, Ordering::SeqCst);
             Ok("nope".to_string())
         }
@@ -756,7 +799,7 @@ mod tests {
         );
         static CALLS: AtomicUsize = AtomicUsize::new(0);
         CALLS.store(0, Ordering::SeqCst);
-        fn fake(_p: &str) -> Result<String> {
+        fn fake(_p: &str, _t: u64) -> Result<String> {
             CALLS.fetch_add(1, Ordering::SeqCst);
             Ok("  Alfred vient de valider AAPL en BUY haute conviction.  ".to_string())
         }
@@ -785,7 +828,7 @@ mod tests {
             run_id,
             &make_event("line_done", json!({"ticker": "AAPL", "recommendation": {"signal": "BUY"}})),
         );
-        fn fake_first(_p: &str) -> Result<String> {
+        fn fake_first(_p: &str, _t: u64) -> Result<String> {
             Ok("Premi\u{00e8}re narration sur AAPL.".to_string())
         }
         assert!(tick_once(run_id, &(fake_first as LlmCall)));
@@ -797,7 +840,7 @@ mod tests {
             &make_event("line_done", json!({"ticker": "NVDA", "recommendation": {"signal": "HOLD"}})),
         );
         static SEEN_PROMPT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
-        fn fake_second(p: &str) -> Result<String> {
+        fn fake_second(p: &str, _t: u64) -> Result<String> {
             *SEEN_PROMPT.lock().unwrap() = p.to_string();
             Ok("Deuxi\u{00e8}me narration.".to_string())
         }
@@ -820,19 +863,24 @@ mod tests {
     }
 
     #[test]
-    fn test_three_failures_enter_degraded() {
-        let run_id = "test_failures";
+    fn test_failure_threshold_enters_degraded_at_configured_count() {
+        // Renamed from `test_three_failures_enter_degraded` after P0-2 raised
+        // the threshold from 3 to 10. The test now asserts the contract in
+        // terms of the threshold constant itself, so future bumps don't
+        // require rewriting the test.
+        let run_id = "test_failure_threshold";
         install_state(run_id);
         static CALLS: AtomicUsize = AtomicUsize::new(0);
         CALLS.store(0, Ordering::SeqCst);
-        fn always_fail(_p: &str) -> Result<String> {
+        fn always_fail(_p: &str, _t: u64) -> Result<String> {
             CALLS.fetch_add(1, Ordering::SeqCst);
             Err(anyhow::anyhow!("simulated_llm_timeout"))
         }
 
-        for _ in 0..4 {
-            // Each tick needs at least one event in the buffer, otherwise
-            // tick_once returns early without calling the LLM.
+        let threshold = FAILURE_DEGRADE_THRESHOLD;
+        // Drive past the threshold by one to confirm the post-degrade tick
+        // is a no-op (no LLM call).
+        for _ in 0..(threshold + 1) {
             record_event(
                 run_id,
                 &make_event("line_progress", json!({"ticker": "X", "status": "analyzing"})),
@@ -840,19 +888,56 @@ mod tests {
             tick_once(run_id, &(always_fail as LlmCall));
         }
 
-        // 3 failures should have triggered degradation; the 4th tick must NOT
-        // have called the LLM — so total CALLS == 3.
+        // The narrator should have stopped calling the LLM as soon as it
+        // hit the threshold — so total CALLS == threshold (the +1 iteration
+        // was a no-op).
         assert_eq!(
-            CALLS.load(Ordering::SeqCst),
-            3,
-            "after 3 failures, the narrator must stop calling the LLM"
+            CALLS.load(Ordering::SeqCst) as u32,
+            threshold,
+            "after {threshold} failures, the narrator must stop calling the LLM"
         );
 
         let guard = narrators().lock().unwrap();
         let state = guard.get(run_id).unwrap();
         assert!(state.degraded);
-        assert_eq!(state.consecutive_failures, 3);
+        assert_eq!(state.consecutive_failures, threshold);
         drop(guard);
         remove_state(run_id);
     }
+}
+
+// ── Test-only helpers (cfg(test)) ────────────────────────────────────────
+//
+// Exposed at module scope so integration-style tests in tests.rs (outside
+// this module's private `tests` submodule) can drive the narrator without
+// spawning a real thread or relying on the runtime_settings store.
+
+/// Snapshot of narrator state for assertions in tests outside this module.
+#[cfg(test)]
+pub struct NarratorSnapshot {
+    pub consecutive_failures: u32,
+    pub degraded: bool,
+}
+
+#[cfg(test)]
+pub fn test_install_state(run_id: &str) {
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let mut guard = narrators().lock().unwrap();
+    guard.insert(run_id.to_string(), NarratorState::new(stop_flag));
+}
+
+#[cfg(test)]
+pub fn test_remove_state(run_id: &str) {
+    let mut guard = narrators().lock().unwrap();
+    guard.remove(run_id);
+}
+
+#[cfg(test)]
+pub fn test_state_snapshot(run_id: &str) -> Option<NarratorSnapshot> {
+    let guard = narrators().lock().ok()?;
+    let state = guard.get(run_id)?;
+    Some(NarratorSnapshot {
+        consecutive_failures: state.consecutive_failures,
+        degraded: state.degraded,
+    })
 }

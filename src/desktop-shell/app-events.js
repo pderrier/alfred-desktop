@@ -9,7 +9,8 @@ import { escapeHtml } from "/desktop-shell/ui-display-utils.js";
 import {
   renderTopBarProgress,
   renderPipelineBar,
-  updateSingleLineProgress
+  updateSingleLineProgress,
+  setNarrationDegradedBadge
 } from "/desktop-shell/shell-layout.js";
 
 export function initEvents(deps) {
@@ -64,6 +65,21 @@ export function initEvents(deps) {
       const { message } = event.payload || {};
       if (!message || !getActiveRunId()) return;
       window.__alfredOverlay?.notify?.("run-narration", { message });
+    });
+
+    // Run-narration health — surfaces an amber "narration: mode dégradé"
+    // badge when the Rust narrator gives up after FAILURE_DEGRADE_THRESHOLD
+    // consecutive LLM failures (P0-2). The run itself keeps going; only
+    // the narrator toast cadence is paused. Reset on every fresh run via
+    // `clearRunPipelineBar`.
+    window.__TAURI__.event.listen("alfred://run-narration-status", (event) => {
+      const { mode, reason } = event.payload || {};
+      if (!getActiveRunId()) return;
+      if (mode === "degraded") {
+        setNarrationDegradedBadge(true, reason || "");
+      } else {
+        setNarrationDegradedBadge(false, "");
+      }
     });
   }
 

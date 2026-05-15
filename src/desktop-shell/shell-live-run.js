@@ -370,6 +370,11 @@ export function renderPipelineBar(stage) {
   // Map orchestration stages to pipeline step keys
   const stageMap = {
     starting: "collecting",
+    // P1-2: granular early-run stages all map to the "collecting" step
+    // so the pipeline bar shows progress without inventing new steps.
+    finary_fetching: "collecting",
+    snapshot_received: "collecting",
+    enriching_market: "collecting",
     collecting_data: "collecting",
     collecting_market_data: "collecting",
     analyzing_lines: "analyzing",
@@ -529,6 +534,59 @@ function updateSynthesisCardDuringRun(lineStatus, tickers) {
     synthesis.innerHTML = `<span class="synthesis-pending-label"><span class="pipeline-spinner"></span>Analyzing positions\u2026 ${done}/${total} lines complete</span>`;
   } else {
     synthesis.innerHTML = `<span class="synthesis-pending-label"><span class="pipeline-spinner"></span>All lines analyzed \u2014 waiting for global synthesis\u2026</span>`;
+  }
+}
+
+/**
+ * P1-2: progressive Market Synthesis status during the pre-LLM phase.
+ * Driven by `alfred://run-stage` events. Once line analysis starts (or
+ * any line status arrives), `updateSynthesisCardDuringRun` takes over and
+ * overwrites this. Only the early stages we know about are surfaced \u2014
+ * any other stage value is a no-op so we don't fight with the LLM
+ * streaming text writer or the pipeline bar.
+ *
+ * The card carries the same `synthesis-pending` class so the existing
+ * card styling stays consistent. Hidden automatically when the run
+ * completes via `clearRunPipelineBar` and the existing card-clear flow.
+ */
+export function updateMarketSynthesisEarlyStage(stage, payload) {
+  if (!activeRunInProgress) return;
+  const synthesis = document.getElementById("report-synthesis");
+  if (!synthesis || !reportSynthesisCardNode) return;
+  const earlyMessage = formatEarlyStageSynthesisMessage(stage, payload);
+  if (!earlyMessage) return;
+  // Don't overwrite a real LLM-streaming synthesis message \u2014 if any
+  // synthesis text has already been written (it doesn't carry the
+  // synthesis-pending-label class) we let it stand.
+  const isStillPending = !!synthesis.querySelector(".synthesis-pending-label");
+  if (!isStillPending && synthesis.textContent.trim().length > 0) return;
+  reportSynthesisCardNode.classList.add("synthesis-pending");
+  synthesis.innerHTML = `<span class="synthesis-pending-label"><span class="pipeline-spinner"></span>${earlyMessage}</span>`;
+}
+
+function formatEarlyStageSynthesisMessage(stage, payload) {
+  if (!stage) return "";
+  switch (stage) {
+    case "finary_fetching":
+      return "R\u00e9cup\u00e9ration du portefeuille\u2026";
+    case "snapshot_received": {
+      const count = payload?.snapshot_summary?.positions_count
+        ?? payload?.collection_progress?.total
+        ?? 0;
+      return count > 0
+        ? `Snapshot re\u00e7u \u2014 ${count} lignes \u00e0 analyser`
+        : "Snapshot re\u00e7u";
+    }
+    case "enriching_market": {
+      const cp = payload?.collection_progress;
+      if (cp && Number.isFinite(cp.total) && cp.total > 0) {
+        const completed = Number.isFinite(cp.completed) ? cp.completed : 0;
+        return `Cours march\u00e9 (${completed}/${cp.total})\u2026`;
+      }
+      return "R\u00e9cup\u00e9ration des cours march\u00e9\u2026";
+    }
+    default:
+      return "";
   }
 }
 

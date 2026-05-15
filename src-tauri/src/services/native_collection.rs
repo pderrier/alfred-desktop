@@ -2397,9 +2397,14 @@ fn apply_collection_result(
         "completed": collection_completed,
         "total": total_lines
     });
+    // P1-2: granular stage name for per-line collection ticks. The
+    // pipeline-bar stageMap on the JS side aliases `enriching_market` →
+    // "collecting" so the existing pipeline UI keeps working unchanged,
+    // and the new `alfred-run-stage-toast` trigger picks up these events
+    // to render "Cours marché (C/T)…" toasts.
     set_native_run_stage(
         run_id,
-        "collecting_data",
+        "enriching_market",
         Some(collection_progress.clone()),
         Some(json!({
             "completed": load_run_by_id_direct(run_id)?
@@ -2495,6 +2500,13 @@ pub(crate) fn execute_native_local_analysis_workflow_with(
     }
     let run_state = load_run_by_id_direct(&run_id)?;
     let portfolio_source = as_text(run_state.get("portfolio_source"));
+    // P1-2: surface the pre-collection Finary/CSV fetch to the user as a
+    // dedicated `finary_fetching` stage so the overlay can show
+    // "Récupération du portefeuille…" instead of a static "Démarrage…".
+    // Stage is emitted regardless of source — for CSV the fetch is the
+    // local file read, still a few hundred ms the user shouldn't stare at
+    // a blank toast surface for.
+    set_native_run_stage(&run_id, "finary_fetching", None, None)?;
     let (snapshot, source_ingestion_status, source_details) =
         match resolve_native_snapshot(&run_id, &run_state, Some(&payload), request_fn) {
             Ok(result) => result,
@@ -2503,6 +2515,31 @@ pub(crate) fn execute_native_local_analysis_workflow_with(
                 return Err(error);
             }
         };
+    // P1-2: once the snapshot is in memory, surface its size so the user
+    // sees "Snapshot reçu (N lignes)" before the per-line enrichment
+    // starts. The count here is the FULL snapshot — per-account scoping
+    // happens a few lines below. We tunnel the positions count via the
+    // `collection_progress.total` field on the run-stage event (the JS
+    // toast builder accepts either `snapshot_summary.positions_count` or
+    // `collection_progress.total`); this keeps us inside the existing
+    // typed RunOrchestration progress shape with no new event fields.
+    {
+        let snapshot_positions_count = snapshot
+            .get("positions")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0) as i64;
+        let collection_progress = json!({
+            "completed": 0,
+            "total": snapshot_positions_count,
+        });
+        set_native_run_stage(
+            &run_id,
+            "snapshot_received",
+            Some(collection_progress),
+            None,
+        )?;
+    }
 
     let target_account = as_text(run_state.get("account"));
     if target_account.is_empty() {

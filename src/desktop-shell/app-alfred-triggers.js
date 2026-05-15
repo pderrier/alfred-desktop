@@ -18,6 +18,7 @@
 
 import { openChatWizard } from "/desktop-shell/app-chat-wizard.js";
 import { buildNarrationContext } from "/desktop-shell/app-alfred-narration-context.js";
+import { buildRunStageContext } from "/desktop-shell/app-alfred-run-stage-context.js";
 
 // ── Onboarding chat wizard ─────────────────────────────────────
 
@@ -479,6 +480,28 @@ export function registerDefaultTriggers(overlay) {
     autoFireOn: "run-narration",
     label: "Analysis Narration",
     contextBuilder: buildNarrationContext,
+    enabled: true
+  });
+
+  // ── Item 11c: Early-run stage toasts (P1-2) ─────────────────────
+  //
+  // During the Finary fetch + market enrichment phase the LLM narrator has
+  // nothing to summarize yet (no SSE events from line analysis). This
+  // trigger picks up the granular Rust stages (`finary_fetching`,
+  // `snapshot_received`, `enriching_market`) and fires short toasts so the
+  // user isn't staring at a blank screen for the first ~10s of a run.
+  //
+  // Priority 1 keeps it strictly below the narration trigger (priority 3)
+  // and the template progress trigger (priority 2) — once line analysis
+  // starts those take over naturally. Cooldown 5 s caps verbosity (each
+  // batch of enrichment lines won't spam a toast every tick).
+  overlay.registerTrigger({
+    id: "alfred-run-stage-toast",
+    priority: 1,
+    cooldown: 5000,
+    autoFireOn: "run-stage",
+    label: "Run Stage",
+    contextBuilder: buildRunStageContext,
     enabled: true
   });
 

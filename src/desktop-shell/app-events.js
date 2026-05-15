@@ -10,7 +10,8 @@ import {
   renderTopBarProgress,
   renderPipelineBar,
   updateSingleLineProgress,
-  setNarrationDegradedBadge
+  setNarrationDegradedBadge,
+  updateMarketSynthesisEarlyStage
 } from "/desktop-shell/shell-layout.js";
 
 export function initEvents(deps) {
@@ -50,12 +51,31 @@ export function initEvents(deps) {
       }
     });
 
-    // Run stage changes — instant pipeline bar update
+    // Run stage changes — instant pipeline bar update + early-run toast.
+    // P1-2: the granular `finary_fetching` / `snapshot_received` /
+    // `enriching_market` stages also drive the `alfred-run-stage-toast`
+    // overlay trigger so the user has feedback during the pre-LLM phase,
+    // and the Market Synthesis card shows progressive status text via the
+    // synthesis card writer below.
     window.__TAURI__.event.listen("alfred://run-stage", (event) => {
-      const { stage, line_progress } = event.payload || {};
+      const payload = event.payload || {};
+      const { stage, line_progress, collection_progress } = payload;
       if (!stage || !getActiveRunId()) return;
       renderPipelineBar(stage);
       renderTopBarProgress({ status: "running", line_progress });
+      // Surface early-run progress in the Market Synthesis card so the
+      // user sees "Récupération Finary…" / "Snapshot reçu (N)" /
+      // "Cours marché (C/T)…" instead of static "Waiting for…" text.
+      updateMarketSynthesisEarlyStage(stage, payload);
+      // Fan out to the overlay trigger registry. The overlay picks up
+      // `run-stage` via the `alfred-run-stage-toast` trigger registered
+      // in app-alfred-triggers.js.
+      window.__alfredOverlay?.notify?.("run-stage", {
+        stage,
+        collection_progress,
+        line_progress,
+        snapshot_summary: payload.snapshot_summary,
+      });
     });
 
     // Run narration — LLM-generated 1-sentence summary of the last 10s of events.

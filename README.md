@@ -33,6 +33,8 @@ See [CHANGELOG.md](CHANGELOG.md) for the full version history.
 - **Portfolio sync** — connect Finary for automatic brokerage account sync, or import CSV exports (universal LLM-driven parser handles any broker format)
 - **Market enrichment** — real-time prices, fundamentals, and news from multiple sources
 - **AI analysis** — per-position technical, fundamental, and sentiment analysis powered by OpenAI
+- **Technical snapshot** — per-position OHLC-derived indicators (RSI, MACD, ATR, SMA200, 52-week range, trend) collected from the remote API and injected into LLM prompts; displayed as a per-block badge grid and indicator rows in the position detail modal
+- **Run narration** — Alfred provides live LLM commentary every ~10 seconds during analysis ("analyzed 8/15... just finished AAPL"), with narrative continuity across ticks
 - **Dual LLM backend** — choose Codex (free tier, OAuth) or native OpenAI API (API key, pay-per-use)
 - **Web search** — the AI searches and reads web pages during analysis to find missing data
 - **Synthesis report** — portfolio-wide recommendations with conviction levels and action items
@@ -75,6 +77,7 @@ Sign up at [platform.openai.com](https://platform.openai.com/signup). For the Co
 
 Without Finary, you can still use Alfred by importing CSV exports from your broker. The CSV parser uses a three-tier strategy: it first tries to detect known formats (Boursorama), then applies heuristic column matching for common header names, and finally falls back to LLM-assisted column mapping for unknown formats. In theory, this should handle any broker's CSV export — but it hasn't been tested with every format. If you encounter a CSV that doesn't parse correctly, please [open an issue](https://github.com/pderrier/alfred-desktop/issues) or contact the author.
 
+<!-- TODO: review for v0.3 — architecture section may need run_narrator.rs and enrichment changes documented -->
 ## Architecture
 
 Alfred Desktop is a [Tauri 2](https://v2.tauri.app/) application:
@@ -97,7 +100,7 @@ src-tauri/
     openai_client.rs # Native OpenAI Responses API client + tool-use loop
     codex.rs        # Codex app-server client (JSON-RPC over stdio)
     llm.rs          # LLM generation (line analysis, synthesis, watchlist)
-    mcp_server.rs   # 10 analysis tools (data fetch, validation, persistence)
+    mcp_server.rs   # 12 analysis tools (data fetch, validation, persistence)
     updater.rs      # Auto-update mechanism (manifest check, download, install)
     finary.rs       # Finary connector (CDP browser automation)
     enrichment.rs   # Remote API client for market data + news enrichment

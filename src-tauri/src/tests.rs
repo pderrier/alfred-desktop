@@ -4197,3 +4197,250 @@ use crate::storage::read_json_file;
         // env (parallelism + isolation hygiene).
         std::env::remove_var("ALFRED_STATE_DIR");
     }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // v0.3.2 P0-1 + P0-4 + P0-5 — Canonical-key cluster (Worktree A)
+    //
+    // Three same-class regressions in v0.3.0 (persist whitelist, scorecard
+    // canonical, technicals 10/28) share a single architectural root: a
+    // sibling consumer code path didn't follow the canonical convention.
+    // The tests below pin the readers / parsers so the class cannot recur
+    // without a red test naming the broken contract.
+    //
+    // - P0-1: pure parser for `/api/market/technicals` response — null
+    //   indicators / empty indicators / envelope-or-flat shapes.
+    // - P0-4: `run_get_signal_scorecard` resolves canonical-key entries and
+    //   falls back to raw ticker.
+    // - P0-5: `resolve_line_memory_key` contract test — every public
+    //   reader must surface a canonical-keyed entry.
+    // ═════════════════════════════════════════════════════════════════════
+
+
+    /// Helper — write a line-memory store fixture to disk and reset the cache
+    /// so the next `command_handlers` read picks up the fresh fixture. Mirrors
+    /// the pattern in `scored_count_uses_distinct_dates`.
+    fn seed_line_memory_fixture(state_dir: &std::path::Path, store: serde_json::Value) {
+        std::fs::create_dir_all(state_dir).expect("mkdir state_dir");
+        let path = state_dir.join("line-memory.json");
+        std::fs::write(&path, serde_json::to_string(&store).unwrap()).unwrap();
+        crate::native_mcp_analysis::line_memory_reset_for_tests();
+    }
+
+
+    // ── P0-5: `resolve_line_memory_key` contract test ─────────────────
+
+    /// **CONTRACT TEST** — every public Tauri-command reader of `by_ticker`
+    /// that takes a single raw ticker MUST go through `resolve_line_memory_key`
+    /// (or its `read_line_memory_entry` cousin when a `resolved_symbol` is in
+    /// hand). This test seeds a store with a canonical-keyed entry only
+    /// (`STMPA.PA` → `ticker: "STMPA"`) and exercises every relevant reader
+    /// with the raw broker ticker `STMPA`. Each reader must surface the
+    /// entry's signal history.
+    ///
+    /// Why this test exists: v0.3.0 shipped three same-class regressions
+    /// (persist whitelist, scorecard, technicals 10/28). The shared root is
+    /// "a reader didn't follow the canonical-key convention". Without this
+    /// guard, the next public reader added to `command_handlers.rs` is a
+    /// latent P0 — agents can't be relied on to remember a convention that
+    /// lives in a different file. See `feedback_contract_tests_regression_audit`.
+    #[test]
+    fn no_raw_ticker_lookup_without_canonical_fallback() {
+        let _guard = env_lock();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempdir.path().join("runtime-state");
+        std::env::set_var("ALFRED_STATE_DIR", state_dir.as_os_str());
+
+        // Canonical-only fixture: the entry exists ONLY under the canonical
+        // Yahoo symbol. Any reader doing a raw `by_ticker[&raw_ticker]` lookup
+        // misses it. Any reader going through `resolve_line_memory_key` hits it.
+        seed_line_memory_fixture(&state_dir, json!({
+            "by_ticker": {
+                "STMPA.PA": {
+                    "schema_version": 2,
+                    "ticker": "STMPA",
+                    "signal": "ACHAT",
+                    "conviction": "forte",
+                    "signal_history": [
+                        { "date": "2026-05-14", "signal": "ACHAT", "price_at_signal": 50.0 },
+                        { "date": "2026-05-10", "signal": "ACHAT", "price_at_signal": 48.0 }
+                    ],
+                    "price_tracking": { "current_price": 52.0 },
+                    "memory_narrative": "STM Q1 beat, momentum solid."
+                }
+            }
+        }));
+
+        // 1) Scorecard reader — P0-4 fix.
+        let card = crate::command_handlers::run_get_signal_scorecard("STMPA".to_string())
+            .expect("scorecard ok");
+        assert!(
+            card.get("signals").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false),
+            "CONTRACT VIOLATION: run_get_signal_scorecard returned empty signals for STMPA — \
+             canonical-keyed entry (STMPA.PA) not surfaced. Fix: route the read through \
+             native_mcp_analysis::resolve_line_memory_key. Got: {card}"
+        );
+
+        // 2) `run_line_show` reader.
+        let show = crate::command_handlers::run_line_show("STMPA").expect("line_show ok");
+        let mem = show.get("line_memory").cloned().unwrap_or(serde_json::Value::Null);
+        assert!(
+            !mem.is_null() && mem.get("signal_history").is_some(),
+            "CONTRACT VIOLATION: run_line_show returned null line_memory for STMPA — \
+             canonical-keyed entry (STMPA.PA) not surfaced. Fix: route the read through \
+             native_mcp_analysis::resolve_line_memory_key. Got: {show}"
+        );
+
+        // 3) `run_line_memory_show` reader (per-ticker branch).
+        let mem_show = crate::command_handlers::run_line_memory_show(Some("STMPA"))
+            .expect("line_memory_show ok");
+        assert!(
+            mem_show.get("memory")
+                .and_then(|m| m.get("signal_history"))
+                .and_then(|v| v.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false),
+            "CONTRACT VIOLATION: run_line_memory_show returned empty/null memory for STMPA — \
+             canonical-keyed entry (STMPA.PA) not surfaced. Fix: route the read through \
+             native_mcp_analysis::resolve_line_memory_key. Got: {mem_show}"
+        );
+
+        // 4) Pure helper sanity — exercises both step 1 (direct hit) and
+        //    step 2 (body-ticker match) so the contract is pinned at the
+        //    helper layer, not only through callers.
+        let store = crate::native_mcp_analysis::line_memory_read();
+        let resolved = crate::native_mcp_analysis::resolve_line_memory_key(&store, "STMPA");
+        assert!(
+            resolved.is_some(),
+            "resolve_line_memory_key must surface the canonical-keyed entry via body-ticker match"
+        );
+        // Case-insensitive: lowercase input must resolve identically.
+        let resolved_lc = crate::native_mcp_analysis::resolve_line_memory_key(&store, "stmpa");
+        assert!(resolved_lc.is_some(), "resolver must be case-insensitive on raw input");
+        // Empty / whitespace ticker → None (no implicit first-entry leak).
+        assert!(
+            crate::native_mcp_analysis::resolve_line_memory_key(&store, "  ").is_none(),
+            "empty/whitespace raw ticker must return None"
+        );
+        // Unknown ticker → None.
+        assert!(
+            crate::native_mcp_analysis::resolve_line_memory_key(&store, "UNKNOWN").is_none(),
+            "unknown raw ticker must return None"
+        );
+
+        std::env::remove_var("ALFRED_STATE_DIR");
+        crate::native_mcp_analysis::line_memory_reset_for_tests();
+    }
+
+    /// Lint-as-test — fail loudly if a future PR re-introduces a raw
+    /// `by_ticker.get(&<single_ticker_var>)` lookup outside the sanctioned
+    /// helpers. Greps the production source tree (excluding `tests.rs`) for
+    /// the pattern. Allow-listed sites are the helpers themselves
+    /// (`resolve_line_memory_key`, `read_line_memory_entry`) and the few
+    /// places where the call is provably canonical-keyed already (quality
+    /// sub-map, not line-memory).
+    ///
+    /// This is the **discipline gate** mandated by the PO plan's P0-5 audit
+    /// + `feedback_contract_tests_regression_audit`. Without it, a single
+    /// reviewer slip re-opens the regression class.
+    #[test]
+    fn lint_no_raw_by_ticker_lookup_outside_helpers() {
+        use std::path::PathBuf;
+
+        // Walk the src tree (excluding tests.rs) and collect every line that
+        // matches the forbidden pattern. Pattern: a `by_ticker` reference
+        // followed by `.get(&<ident>)` where the ident is a runtime variable
+        // (not a literal string and not a canonical helper call).
+        //
+        // We use a simple text search rather than syn so the test stays cheap
+        // and self-contained — false positives are caught by the allow-list.
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR must be set by cargo");
+        let src_root = PathBuf::from(manifest_dir).join("src");
+
+        let mut offenders: Vec<String> = Vec::new();
+
+        fn walk(dir: &std::path::Path, offenders: &mut Vec<String>) {
+            let entries = match std::fs::read_dir(dir) {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, offenders);
+                    continue;
+                }
+                let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                // Skip the test file itself — fixture lookups are intentional.
+                if fname == "tests.rs" { continue; }
+                if !fname.ends_with(".rs") { continue; }
+                let content = match std::fs::read_to_string(&path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                for (i, line) in content.lines().enumerate() {
+                    // Explicit allow: a `// LINT-ALLOW: …` trailing comment
+                    // marks a site as intentionally exempt. Either the line
+                    // IS the helper definition itself (`resolve_line_memory_key`
+                    // / `read_line_memory_entry`) or the lookup target is a
+                    // sub-map that happens to be named `by_ticker` but is
+                    // unrelated to line-memory (e.g. `run_state.quality.by_ticker`).
+                    if line.contains("LINT-ALLOW") {
+                        continue;
+                    }
+                    // Pattern: `by_ticker.get(&<ident>)` — i.e. a runtime
+                    // variable bound earlier in the function. We use a coarse
+                    // heuristic: the substring `by_ticker.get(&` followed
+                    // by an alphabetic char (not `"`). This catches the
+                    // forbidden pattern without parsing.
+                    //
+                    // Also: `bt.get(&<ident>)` where `bt` is the canonical
+                    // shorthand for the by_ticker map (used in the file).
+                    if line.contains("//") {
+                        // Strip comments before pattern match — `// by_ticker.get(&...)`
+                        // documentation must not flag.
+                        let code = line.split("//").next().unwrap_or("");
+                        if !contains_forbidden(code) { continue; }
+                    } else if !contains_forbidden(line) {
+                        continue;
+                    }
+                    let rel = path
+                        .strip_prefix(dir.ancestors().last().unwrap_or(dir))
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| path.display().to_string());
+                    offenders.push(format!("{}:{}: {}", rel, i + 1, line.trim()));
+                }
+            }
+        }
+
+        fn contains_forbidden(s: &str) -> bool {
+            // Direct `by_ticker.get(&<ident>)` — variable lookup.
+            for pat in &["by_ticker.get(&", "bt.get(&"] {
+                if let Some(idx) = s.find(pat) {
+                    let after = &s[idx + pat.len()..];
+                    let next = after.chars().next();
+                    // Skip literal strings (`"AAPL"` — no `&`) — already not
+                    // captured because the pattern includes `&`. Reject if
+                    // the next char is alphabetic (variable name).
+                    if matches!(next, Some(c) if c.is_ascii_alphabetic() || c == '_') {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+
+        walk(&src_root, &mut offenders);
+
+        assert!(
+            offenders.is_empty(),
+            "CONTRACT VIOLATION (P0-5): the following sites read `by_ticker` with a raw \
+             variable key without going through `resolve_line_memory_key` / \
+             `read_line_memory_entry`. Any such lookup is a latent canonical-key \
+             regression (see feedback_contract_tests_regression_audit, 3 incidents in \
+             v0.3.0). Fix: route through native_mcp_analysis::resolve_line_memory_key \
+             (raw-only callers) or read_line_memory_entry (callers with resolved_symbol).\n\
+             Offenders:\n{}",
+            offenders.join("\n")
+        );
+    }

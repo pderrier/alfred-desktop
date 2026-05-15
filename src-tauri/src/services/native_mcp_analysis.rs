@@ -553,17 +553,63 @@ pub(crate) fn read_line_memory_entry(store: &Value, ticker: &str, resolved_symbo
         Some(bt) => bt,
         None => return Value::Null,
     };
-    if let Some(entry) = by_ticker.get(&canonical_key) {
+    if let Some(entry) = by_ticker.get(&canonical_key) { // LINT-ALLOW: canonical-key helper itself
         return entry.clone();
     }
     // Legacy fallback: pre-v0.3 entries written under the raw ticker key.
     let raw_key = ticker.trim().to_uppercase();
     if raw_key != canonical_key {
-        if let Some(entry) = by_ticker.get(&raw_key) {
+        if let Some(entry) = by_ticker.get(&raw_key) { // LINT-ALLOW: canonical-key helper itself
             return entry.clone();
         }
     }
     Value::Null
+}
+
+/// Canonical-aware reader for line-memory entries when the caller does not
+/// have a `resolved_symbol` in hand (Tauri command handlers receive the raw
+/// broker ticker only). Implements the v0.3 (#22) canonical-key dedup
+/// **read** contract that mirrors the **write** contract pinned by
+/// `canonical_line_memory_key` + `sync_line_memory`:
+///
+/// 1. Try `by_ticker[raw_ticker.to_uppercase()]` — hits pre-v0.3 entries and
+///    any post-v0.3 entry whose canonical key equals the broker ticker
+///    (e.g. tickers without ISIN resolution).
+/// 2. Scan `by_ticker` values for an entry whose `entry["ticker"]` field
+///    matches the raw ticker. `sync_line_memory` always writes the broker
+///    ticker into the entry body even when the map key is canonical
+///    (`STMPA.PA` key, `"ticker": "STMPA"` body), so this catches every
+///    canonical-keyed entry without forcing readers to know the resolved
+///    Yahoo symbol up-front.
+/// 3. Return `None` when neither path matches.
+///
+/// This is the **single sanctioned entry point** for `by_ticker` reads in
+/// command-handler / CLI / scorecard code paths. Any direct
+/// `by_ticker.get(&raw_ticker)` lookup is a latent regression in the
+/// canonical-key class (see `feedback_contract_tests_regression_audit` —
+/// the third occurrence in this class shipped as v0.3.0).
+///
+/// Returns `Option<&Value>` (borrow) to avoid forcing a clone on the hot
+/// path — callers that need ownership can `.cloned()`.
+pub(crate) fn resolve_line_memory_key<'a>(store: &'a Value, raw_ticker: &str) -> Option<&'a Value> {
+    let by_ticker = store.get("by_ticker").and_then(|v| v.as_object())?;
+    let raw_key = raw_ticker.trim().to_uppercase();
+    if raw_key.is_empty() {
+        return None;
+    }
+    // Step 1: direct hit (canonical == raw, or pre-v0.3 legacy entry).
+    if let Some(entry) = by_ticker.get(&raw_key) { // LINT-ALLOW: canonical-key helper itself
+        return Some(entry);
+    }
+    // Step 2: canonical-keyed entry whose body carries the raw ticker.
+    // O(N) over by_ticker size (capped to portfolio size, ~50 in practice).
+    by_ticker.values().find(|entry| {
+        entry
+            .get("ticker")
+            .and_then(|v| v.as_str())
+            .map(|t| t.trim().eq_ignore_ascii_case(raw_key.as_str()))
+            .unwrap_or(false)
+    })
 }
 
 /// Sync a validated recommendation into the persistent line-memory.json store.

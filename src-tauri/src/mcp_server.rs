@@ -739,11 +739,13 @@ fn tool_get_line_data(data_dir: &Path, params: &Value) -> Result<Value> {
         }
     };
 
-    // Quality indicators
+    // Quality indicators — per-run `run_state.quality.by_ticker` map, NOT
+    // line-memory. Ticker key is the raw broker ticker (no canonical dedup
+    // applies — quality is scoped to the active run only).
     let quality = run_state
         .get("quality")
         .and_then(|q| q.get("by_ticker"))
-        .and_then(|bt| bt.get(&ticker))
+        .and_then(|bt| bt.get(&ticker)) // LINT-ALLOW: run_state.quality map, not line-memory
         .cloned()
         .unwrap_or(Value::Null);
 

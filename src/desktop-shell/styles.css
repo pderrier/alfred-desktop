@@ -1087,6 +1087,29 @@ main {
   align-self: center;
 }
 
+/* Run narration health badge — surfaces when run_narrator enters degraded
+   mode after too many consecutive LLM failures (P0-2, v0.3.2). Stays hidden
+   in normal operation; appears just below the pipeline bar with an amber
+   tone so the user knows toasts are paused without the run itself being
+   in trouble. */
+.run-narration-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.72rem;
+  color: #f4c75e;
+  background: rgba(244, 199, 94, 0.08);
+  border: 1px solid rgba(244, 199, 94, 0.25);
+  border-radius: 0.35rem;
+  padding: 0.15rem 0.5rem;
+  margin-bottom: 0.5rem;
+}
+.run-narration-status::before {
+  content: "\26A0"; /* warning sign */
+  font-size: 0.85rem;
+  line-height: 1;
+}
+
 /* Synthesis card pending state */
 .report-synthesis-card.synthesis-pending {
   border-color: rgba(142, 202, 230, 0.3);

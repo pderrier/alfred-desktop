@@ -4531,3 +4531,113 @@ use crate::storage::read_json_file;
         std::env::remove_var("ALFRED_STATE_DIR");
         crate::native_mcp_analysis::line_memory_reset_for_tests();
     }
+
+    // ── P0-1: pure parser for `/api/market/technicals` ─────────────────
+
+    #[test]
+    fn parse_technical_snapshot_drops_null_indicators() {
+        // Server populates the technicals cache with an `{"indicators": null}`
+        // shell when upstream OHLC fails — pre-v0.3.2 the snapshot was stored
+        // because `.get("indicators").is_some()` accepts `Some(&Value::Null)`,
+        // so `technicals[ticker]` got an unusable shell. Parser must drop.
+        let resp = json!({
+            "technical_snapshot": {
+                "as_of": "2026-05-15",
+                "source": "yahoo:chart",
+                "samples": 0,
+                "indicators": null
+            }
+        });
+        let parsed = crate::enrichment::parse_technical_snapshot_response(&resp);
+        assert!(
+            parsed.is_none(),
+            "indicators=null must be dropped — pre-v0.3.2 the .is_some() check accepted it, persisting useless shells. Got: {:?}",
+            parsed
+        );
+    }
+
+    #[test]
+    fn parse_technical_snapshot_drops_empty_indicators() {
+        // Server returns an empty indicators object on edge cases (no samples
+        // yet, cache miss returning placeholder). Parser must reject — prompt
+        // renderer would treat the snapshot as "non disponible" anyway, so
+        // persisting it just inflates run state.
+        let resp = json!({
+            "technical_snapshot": {
+                "as_of": "2026-05-15",
+                "source": "yahoo:chart",
+                "samples": 0,
+                "indicators": {}
+            }
+        });
+        let parsed = crate::enrichment::parse_technical_snapshot_response(&resp);
+        assert!(
+            parsed.is_none(),
+            "indicators={{}} must be dropped — empty object is no different from absent for prompt purposes. Got: {:?}",
+            parsed
+        );
+    }
+
+    #[test]
+    fn parse_technical_snapshot_drops_missing_indicators() {
+        // Server returns a minimal envelope without indicators at all
+        // (negative-cache scenario or rate-limited body).
+        let resp = json!({
+            "technical_snapshot": {
+                "as_of": "2026-05-15",
+                "source": "yahoo:chart",
+                "samples": 0
+            }
+        });
+        let parsed = crate::enrichment::parse_technical_snapshot_response(&resp);
+        assert!(parsed.is_none(), "missing indicators must be dropped");
+    }
+
+    #[test]
+    fn parse_technical_snapshot_accepts_envelope_shape() {
+        // Happy path with envelope: { "technical_snapshot": { indicators: {...} } }.
+        let resp = json!({
+            "technical_snapshot": {
+                "as_of": "2026-05-15",
+                "source": "yahoo:chart:resolved:STMPA.PA",
+                "samples": 250,
+                "indicators": {
+                    "sma_200": 26.51,
+                    "rsi_14": 64.68,
+                    "trend_signal": "up"
+                }
+            }
+        });
+        let parsed = crate::enrichment::parse_technical_snapshot_response(&resp)
+            .expect("valid envelope must parse");
+        assert_eq!(parsed.get("samples").and_then(|v| v.as_i64()), Some(250));
+        assert!(parsed.get("indicators").and_then(|v| v.as_object()).is_some());
+    }
+
+    #[test]
+    fn parse_technical_snapshot_accepts_flat_shape() {
+        // Happy path without envelope: { indicators: {...}, ... }. Server-side
+        // emitters drifted between envelope and flat shapes during v0.3
+        // rollout; parser must accept both. (Test pins the contract — any
+        // future server change that drops the flat shape is loud.)
+        let resp = json!({
+            "as_of": "2026-05-15",
+            "source": "alphavantage:daily",
+            "samples": 250,
+            "indicators": { "sma_200": 130.1, "rsi_14": 58.2 }
+        });
+        let parsed = crate::enrichment::parse_technical_snapshot_response(&resp)
+            .expect("flat shape must parse");
+        assert_eq!(parsed.get("samples").and_then(|v| v.as_i64()), Some(250));
+    }
+
+    #[test]
+    fn parse_technical_snapshot_drops_indicators_string_or_array() {
+        // Defensive: contract drift could surface as `indicators: "computing"`
+        // or `indicators: []`. Parser rejects anything that isn't a non-empty
+        // object — prompt renderer expects `as_object()` downstream.
+        let string_resp = json!({ "indicators": "computing" });
+        assert!(crate::enrichment::parse_technical_snapshot_response(&string_resp).is_none());
+        let array_resp = json!({ "indicators": [] });
+        assert!(crate::enrichment::parse_technical_snapshot_response(&array_resp).is_none());
+    }

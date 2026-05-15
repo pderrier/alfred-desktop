@@ -98,30 +98,82 @@ pub fn fetch_resolved_symbol(isin: &str) -> Option<String> {
 /// shape as the `TechnicalSnapshot` struct in `models::`. We pass it as
 /// `Value` here to avoid eagerly typing it in the hot path (deserialization
 /// happens only when the prompt builder needs it).
+///
+/// v0.3.2 (P0-1): instrumentation expanded — every failure path now logs
+/// the *reason* with the ticker so partial-coverage runs (10/28 in
+/// `019e2c9de5ee`) can be diagnosed from `data/debug.log` instead of
+/// guessing between 4 hypotheses (timeout / 429 / parse / null indicators).
+/// The response parsing is also factored into the pure
+/// `parse_technical_snapshot_response` helper so the null-indicators and
+/// envelope-shape contracts can be unit-tested without HTTP.
 pub fn fetch_technical_snapshot(ticker: &str, isin: Option<&str>, canonical: Option<&str>) -> Option<Value> {
     match crate::alfred_api_client::remote_fetch_technicals(ticker, isin, canonical) {
-        Ok(resp) => {
-            // Envelope may wrap as { "technical_snapshot": {...} } or be the
-            // snapshot directly — accept both.
-            let snapshot = resp
-                .get("technical_snapshot")
-                .cloned()
-                .unwrap_or_else(|| resp.clone());
-            // Require at least an `indicators` sub-object to consider it valid.
-            if snapshot.get("indicators").is_some() {
-                Some(snapshot)
-            } else {
+        Ok(resp) => match parse_technical_snapshot_response(&resp) {
+            Some(snapshot) => {
                 crate::debug_log(&format!(
-                    "enrichment technical_snapshot empty for {ticker} — server response had no `indicators`"
+                    "enrichment technical_snapshot ok for {ticker} (samples={})",
+                    snapshot
+                        .get("samples")
+                        .and_then(|v| v.as_i64())
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "?".to_string()),
+                ));
+                Some(snapshot)
+            }
+            None => {
+                crate::debug_log(&format!(
+                    "enrichment technical_snapshot dropped for {ticker} — server response had no usable `indicators` object (body keys: {:?})",
+                    resp.as_object()
+                        .map(|m| m.keys().cloned().collect::<Vec<_>>())
+                        .unwrap_or_default(),
                 ));
                 None
             }
-        }
+        },
         Err(e) => {
-            crate::debug_log(&format!("enrichment technical_snapshot unavailable for {ticker}: {e}"));
+            crate::debug_log(&format!(
+                "enrichment technical_snapshot transport error for {ticker} (isin={:?}, canonical={:?}): {e}",
+                isin, canonical
+            ));
             None
         }
     }
+}
+
+/// Pure response parser for the `/api/market/technicals` envelope. Extracted
+/// from `fetch_technical_snapshot` so the contract (null indicators dropped,
+/// envelope-or-flat shape accepted, empty object dropped) can be unit-tested
+/// without an HTTP round trip.
+///
+/// Accepts either:
+///   - `{ "technical_snapshot": { "indicators": {...}, ... } }` (envelope)
+///   - `{ "indicators": {...}, ... }` (flat)
+///
+/// Rejects (returns `None`) when:
+///   - `indicators` field is absent
+///   - `indicators` is `null` (server populated cache with no-data marker)
+///   - `indicators` is an empty object `{}` (server returned shell)
+///   - `indicators` is not an object (defensive — server contract drift)
+///
+/// v0.3.2 (P0-1): the previous check used `snapshot.get("indicators").is_some()`
+/// which **accepts** `indicators: null` (Some(&Value::Null)) and stores a
+/// useless snapshot. Tightened so the persisted `technicals` map never
+/// contains snapshots that the prompt renderer would treat as "non disponible"
+/// anyway — partial coverage is now visible at the persist layer, not buried
+/// in the prompt.
+pub(crate) fn parse_technical_snapshot_response(resp: &Value) -> Option<Value> {
+    // Envelope may wrap as { "technical_snapshot": {...} } or be the snapshot
+    // directly — accept both. Cloning is cheap: ~1KB JSON per ticker.
+    let snapshot = resp
+        .get("technical_snapshot")
+        .cloned()
+        .unwrap_or_else(|| resp.clone());
+    let indicators = snapshot.get("indicators")?;
+    let indicators_obj = indicators.as_object()?;
+    if indicators_obj.is_empty() {
+        return None;
+    }
+    Some(snapshot)
 }
 
 pub fn fetch_news(ticker: &str, name: &str, isin: &str, canonical: Option<&str>) -> Result<Value> {

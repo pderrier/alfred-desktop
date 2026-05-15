@@ -35,8 +35,8 @@ pub fn fetch_shared_insights(ticker: &str, isin: &str) -> Result<Value> {
     }
 }
 
-pub fn fetch_sector(ticker: &str, name: &str, isin: &str) -> Result<Value> {
-    match crate::alfred_api_client::remote_fetch_sector(ticker, name, isin) {
+pub fn fetch_sector(ticker: &str, name: &str, isin: &str, canonical: Option<&str>) -> Result<Value> {
+    match crate::alfred_api_client::remote_fetch_sector(ticker, name, isin, canonical) {
         Ok(resp) => Ok(resp),
         Err(e) => {
             crate::debug_log(&format!("enrichment sector unavailable for {ticker}: {e}"));
@@ -45,12 +45,37 @@ pub fn fetch_sector(ticker: &str, name: &str, isin: &str) -> Result<Value> {
     }
 }
 
-pub fn fetch_cot(ticker: &str, isin: &str) -> Result<Value> {
-    match crate::alfred_api_client::remote_fetch_cot(ticker, isin) {
+pub fn fetch_cot(ticker: &str, isin: &str, canonical: Option<&str>) -> Result<Value> {
+    match crate::alfred_api_client::remote_fetch_cot(ticker, isin, canonical) {
         Ok(resp) => Ok(resp),
         Err(e) => {
             crate::debug_log(&format!("enrichment COT unavailable for {ticker}: {e}"));
             Ok(json!({ "ok": true, "cot": null }))
+        }
+    }
+}
+
+/// Resolve the canonical Yahoo symbol for an ISIN via `GET /api/resolve`.
+///
+/// Silent on errors — mirrors `fetch_sector`/`fetch_cot` style. Returns `None`
+/// when:
+///   - `isin` is empty/whitespace (no point hitting the resolver)
+///   - the server returns `source = "none"` or a null symbol
+///   - `/api/resolve` is unreachable (older server, transport error, 5xx)
+///
+/// Callers must treat `None` as "no canonical resolution available" — they
+/// fall back to using the raw ticker as before. Additive contract per
+/// `feedback_snapshot_ui_contract`.
+pub fn fetch_resolved_symbol(isin: &str) -> Option<String> {
+    let code = isin.trim();
+    if code.is_empty() {
+        return None;
+    }
+    match crate::alfred_api_client::remote_fetch_resolve(code) {
+        Ok(symbol) => symbol,
+        Err(e) => {
+            crate::debug_log(&format!("enrichment resolve unavailable for {code}: {e}"));
+            None
         }
     }
 }
@@ -73,8 +98,8 @@ pub fn fetch_cot(ticker: &str, isin: &str) -> Result<Value> {
 /// shape as the `TechnicalSnapshot` struct in `models::`. We pass it as
 /// `Value` here to avoid eagerly typing it in the hot path (deserialization
 /// happens only when the prompt builder needs it).
-pub fn fetch_technical_snapshot(ticker: &str, isin: Option<&str>) -> Option<Value> {
-    match crate::alfred_api_client::remote_fetch_technicals(ticker, isin) {
+pub fn fetch_technical_snapshot(ticker: &str, isin: Option<&str>, canonical: Option<&str>) -> Option<Value> {
+    match crate::alfred_api_client::remote_fetch_technicals(ticker, isin, canonical) {
         Ok(resp) => {
             // Envelope may wrap as { "technical_snapshot": {...} } or be the
             // snapshot directly — accept both.
@@ -99,8 +124,8 @@ pub fn fetch_technical_snapshot(ticker: &str, isin: Option<&str>) -> Option<Valu
     }
 }
 
-pub fn fetch_news(ticker: &str, name: &str, isin: &str) -> Result<Value> {
-    match crate::alfred_api_client::remote_fetch_news(ticker, name, isin) {
+pub fn fetch_news(ticker: &str, name: &str, isin: &str, canonical: Option<&str>) -> Result<Value> {
+    match crate::alfred_api_client::remote_fetch_news(ticker, name, isin, canonical) {
         Ok(resp) => {
             if let Some(news) = resp.get("news") {
                 Ok(json!({ "ok": true, "news": news, "cache_hit": false }))

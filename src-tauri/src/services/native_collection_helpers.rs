@@ -553,6 +553,7 @@ pub(crate) fn fetch_ticker_enrichment(
     ticker: &str,
     name: Option<&str>,
     isin: Option<&str>,
+    canonical: Option<&str>,
     request_fn: HttpRequestFn,
 ) -> (Value, Value, Vec<Value>) {
     let base_url = resolve_enrichment_base_url();
@@ -564,6 +565,14 @@ pub(crate) fn fetch_ticker_enrichment(
     if let Some(value) = isin.filter(|value| !value.trim().is_empty()) {
         query.push_str("&isin=");
         query.push_str(&percent_encode_component(value.trim().to_uppercase().as_str()));
+    }
+    // Canonical Yahoo symbol — additive, propagates the v0.3 parity contract
+    // through the in-process HTTP shim to /news (only news consumes it here;
+    // /market/spot routes through fetch_market_spot which keys on ticker+isin
+    // and benefits transparently from the server-side Yahoo fallback).
+    if let Some(value) = canonical.filter(|value| !value.trim().is_empty()) {
+        query.push_str("&canonical=");
+        query.push_str(&percent_encode_component(value.trim()));
     }
     let market_result =
         request_json_from_url("GET", &format!("{base_url}/market/spot?{query}"), None, Some(8000), request_fn);

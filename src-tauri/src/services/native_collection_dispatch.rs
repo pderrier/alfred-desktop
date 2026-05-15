@@ -121,6 +121,16 @@ fn process_collection_task(config: &CollectionWorkerConfig, task: CollectionTask
     let ticker = normalize_ticker(task.row.get("ticker"));
     let name = as_text(task.row.get("nom"));
     let isin = as_text(task.row.get("isin"));
+    // Canonical Yahoo symbol resolved upstream (in the collection loop, before
+    // dispatch). Read directly from the row so worker threads stay pure — no
+    // /api/resolve hop per worker. Empty means "no resolution available";
+    // server falls back to ticker. See v0.3 task #21.
+    let resolved_symbol = as_text(task.row.get("resolved_symbol"));
+    let canonical_opt = if resolved_symbol.is_empty() {
+        None
+    } else {
+        Some(resolved_symbol.as_str())
+    };
     let (mut market_row, news_row, issues) = if ticker.is_empty() {
         (Value::Object(Default::default()), json!({ "articles": [], "sources": [] }), Vec::new())
     } else {
@@ -128,6 +138,7 @@ fn process_collection_task(config: &CollectionWorkerConfig, task: CollectionTask
             &ticker,
             if name.is_empty() { None } else { Some(name.as_str()) },
             if isin.is_empty() { None } else { Some(isin.as_str()) },
+            canonical_opt,
             config.request_fn,
         )
     };
@@ -152,11 +163,14 @@ fn process_collection_task(config: &CollectionWorkerConfig, task: CollectionTask
     // exchange suffix for bare EU tickers (`EXA` → `EXA.PA` via FR ISIN
     // prefix). Without it, the source_router classifies these as US and
     // every Yahoo OHLC fetch returns `yahoo_no_timestamps`.
+    //
+    // `canonical_opt` is forwarded so the v0.3 server routes the upstream
+    // Yahoo OHLC call on the resolved symbol when present (parity contract).
     let technical_snapshot = if ticker.is_empty() {
         None
     } else {
         let isin_opt = if isin.is_empty() { None } else { Some(isin.as_str()) };
-        crate::enrichment::fetch_technical_snapshot(&ticker, isin_opt)
+        crate::enrichment::fetch_technical_snapshot(&ticker, isin_opt, canonical_opt)
     };
     CollectionResult {
         index: task.index,

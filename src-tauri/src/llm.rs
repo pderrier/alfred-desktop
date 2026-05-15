@@ -99,12 +99,20 @@ fn enrich_line_context_with_sector(line_context: &Value) -> Value {
         .or_else(|| line_context.get("isin").and_then(|v| v.as_str()))
         .unwrap_or(ticker);
     let name = line_context.get("nom").and_then(|v| v.as_str()).unwrap_or("");
+    // Canonical Yahoo symbol — resolved during collection and stashed on the
+    // position row (`Position::resolved_symbol`). Forwarded to news/sector/cot
+    // so the server can route on the resolved symbol instead of the broker
+    // ticker. Optional — server falls back to ticker when absent.
+    let canonical_opt = line_context
+        .get("row").and_then(|r| r.get("resolved_symbol")).and_then(|v| v.as_str())
+        .or_else(|| line_context.get("resolved_symbol").and_then(|v| v.as_str()))
+        .filter(|s| !s.trim().is_empty());
 
     if ticker.is_empty() && isin.is_empty() {
         return line_context.clone();
     }
 
-    let sector_resp = crate::enrichment::fetch_sector(ticker, name, isin).ok();
+    let sector_resp = crate::enrichment::fetch_sector(ticker, name, isin, canonical_opt).ok();
     let sector_slug = sector_resp.as_ref()
         .and_then(|r| r.get("sector").and_then(|v| v.as_str()))
         .unwrap_or("");
@@ -112,7 +120,7 @@ fn enrich_line_context_with_sector(line_context: &Value) -> Value {
         .and_then(|r| r.get("sector_analysis").cloned())
         .unwrap_or(Value::Null);
     let cot_data = if !sector_slug.is_empty() {
-        crate::enrichment::fetch_cot(ticker, isin)
+        crate::enrichment::fetch_cot(ticker, isin, canonical_opt)
             .ok()
             .and_then(|r| r.get("cot").cloned())
             .unwrap_or(Value::Null)

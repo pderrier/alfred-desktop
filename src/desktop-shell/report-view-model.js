@@ -122,6 +122,13 @@ function normalizeAnalysisDetails(rec, latestRun) {
     newsArticles: newsRows,
     enrichmentFailures
   });
+  // v0.3 (#23): the canonical Yahoo symbol resolved from ISIN at collection
+  // time. Surfaced into `details.resolvedSymbol` so the line-modal can render
+  // a small "ticker · venue" hint when the canonical symbol carries a Yahoo
+  // exchange suffix the user wouldn't otherwise see. Falls through as null
+  // when no resolution happened (legacy rows, older server, watchlist
+  // without ISIN) — the modal then renders exactly as before.
+  const resolvedSymbol = asText(row?.resolved_symbol) || null;
   return {
     line_id: lineId,
     position: row
@@ -135,6 +142,8 @@ function normalizeAnalysisDetails(rec, latestRun) {
           valorisation: row?.valorisation ?? null
         }
       : null,
+    ticker,
+    resolvedSymbol,
     market:
       market && typeof market === "object"
         ? {

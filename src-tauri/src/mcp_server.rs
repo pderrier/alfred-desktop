@@ -722,13 +722,17 @@ fn tool_get_line_data(data_dir: &Path, params: &Value) -> Result<Value> {
         Value::Null
     };
 
-    // Line memory (cross-run) — schema: { "by_ticker": { "AAPL": {...} } }
+    // Line memory (cross-run) — schema: { "by_ticker": { "AAPL": {...} } }.
+    // v0.3 (#22): honour canonical_line_memory_key so a cross-account dup
+    // surfaces the same persistent history regardless of which broker ticker
+    // the LLM queried for. Legacy fallback to raw ticker key keeps pre-v0.3
+    // entries readable.
     let line_memory = {
         let mem_path = line_memory_path(data_dir);
         if mem_path.exists() {
             read_json(&mem_path)
                 .ok()
-                .and_then(|mem| mem.get("by_ticker").and_then(|bt| bt.get(&ticker)).cloned())
+                .map(|mem| crate::native_mcp_analysis::read_line_memory_entry(&mem, &ticker, canonical_opt))
                 .unwrap_or(Value::Null)
         } else {
             Value::Null

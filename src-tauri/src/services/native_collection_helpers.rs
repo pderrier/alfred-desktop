@@ -480,7 +480,13 @@ pub(crate) fn hydrate_row_with_line_memory(store: &Value, row: &Value, news_row:
             }),
         );
     }
-    let entry = store.get("by_ticker").and_then(|value| value.get(&ticker));
+    // v0.3 (#22): cross-account dedup — prefer the canonical Yahoo symbol
+    // stashed on `row.resolved_symbol` so two brokers carrying the same
+    // security share line-memory history. Falls back to the raw ticker key
+    // for rows without a resolution (pre-v0.3 entries, watchlist without ISIN).
+    let resolved = row.get("resolved_symbol").and_then(|v| v.as_str());
+    let entry_value = crate::native_mcp_analysis::read_line_memory_entry(store, &ticker, resolved);
+    let entry = if entry_value.is_null() { None } else { Some(&entry_value) };
     let memory = build_memory_for_prompt(entry, store.get("global_deep_news_banned_urls"));
     let global_banned = as_string_list(store.get("global_deep_news_banned_urls"), 2000, 700)
         .into_iter()

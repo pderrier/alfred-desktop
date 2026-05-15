@@ -43,6 +43,10 @@ struct NarratorState {
     last_drain_at: Instant,
     consecutive_failures: u32,
     degraded: bool,
+    /// Most recent narration produced for this run. Injected into the next
+    /// prompt so the LLM can build on it rather than starting from zero each
+    /// tick (narrative continuity).
+    last_narration: Option<String>,
     stop_flag: Arc<AtomicBool>,
 }
 
@@ -53,6 +57,7 @@ impl NarratorState {
             last_drain_at: Instant::now(),
             consecutive_failures: 0,
             degraded: false,
+            last_narration: None,
             stop_flag,
         }
     }
@@ -218,13 +223,19 @@ pub(crate) fn tick_once(run_id: &str, llm_call: &LlmCall) -> bool {
         return false;
     }
 
-    let prompt = build_narration_prompt(&events);
+    let last_narration: Option<String> = narrators()
+        .lock()
+        .ok()
+        .and_then(|g| g.get(run_id).and_then(|s| s.last_narration.clone()));
+
+    let prompt = build_narration_prompt(&events, last_narration.as_deref());
     match llm_call(&prompt) {
-        Ok(text) if !text.is_empty() => {
-            on_success(run_id);
+        Ok(text) if !text.trim().is_empty() => {
+            let cleaned = text.trim().to_string();
+            on_success(run_id, &cleaned);
             crate::emit_event(
                 "alfred://run-narration",
-                json!({ "run_id": run_id, "message": text }),
+                json!({ "run_id": run_id, "message": cleaned }),
             );
             true
         }
@@ -240,10 +251,11 @@ pub(crate) fn tick_once(run_id: &str, llm_call: &LlmCall) -> bool {
     }
 }
 
-fn on_success(run_id: &str) {
+fn on_success(run_id: &str, narration: &str) {
     if let Ok(mut guard) = narrators().lock() {
         if let Some(state) = guard.get_mut(run_id) {
             state.consecutive_failures = 0;
+            state.last_narration = Some(narration.to_string());
         }
     }
 }
@@ -268,10 +280,13 @@ fn on_failure(run_id: &str, reason: &str) {
     }
 }
 
-/// Build the compact narration prompt from a slice of recorded events.
-/// Keeps the most recent `MAX_EVENTS_IN_PROMPT` so the prompt stays bounded
-/// even on very busy runs.
-pub(crate) fn build_narration_prompt(events: &[RecordedEvent]) -> String {
+/// Build the compact narration prompt from a slice of recorded events plus
+/// the previous narration (for continuity). Keeps the most recent
+/// `MAX_EVENTS_IN_PROMPT` so the prompt stays bounded even on very busy runs.
+pub(crate) fn build_narration_prompt(
+    events: &[RecordedEvent],
+    last_narration: Option<&str>,
+) -> String {
     let total = events.len();
     let slice: &[RecordedEvent] = if total > MAX_EVENTS_IN_PROMPT {
         &events[total - MAX_EVENTS_IN_PROMPT..]
@@ -289,8 +304,30 @@ pub(crate) fn build_narration_prompt(events: &[RecordedEvent]) -> String {
         }
     }
 
+    let previous_block = match last_narration {
+        Some(s) if !s.trim().is_empty() => format!(
+            "Pr\u{00e9}c\u{00e9}dent r\u{00e9}sum\u{00e9} (continuer le fil, NE PAS r\u{00e9}p\u{00e9}ter) :\n\u{00ab} {} \u{00bb}\n\n",
+            s.trim()
+        ),
+        _ => String::new(),
+    };
+
     format!(
-        "Run d'analyse de portefeuille en cours. \u{00c9}v\u{00e8}nements des 10 derni\u{00e8}res secondes :\n{body}\nD\u{00e9}cris en UNE phrase (15-25 mots, fran\u{00e7}ais, ton calme, factuel) ce qui se passe maintenant.\nPas de pr\u{00e9}ambule. R\u{00e9}ponds uniquement avec la phrase."
+        "Tu narres en direct l'analyse de portefeuille men\u{00e9}e par Alfred. \
+         Alfred est l'agent IA qui analyse les positions. \
+         Les codes courts en MAJUSCULES (ex : AAPL, MSFT, NVDA, EXA, TSLA) sont des TICKERS \
+         d'ENTREPRISES analys\u{00e9}es par Alfred — jamais des agents qui font une action.\n\n\
+         {previous}\
+         \u{00c9}v\u{00e8}nements r\u{00e9}cents de l'analyse :\n{body}\n\
+         Produis 1 \u{00e0} 2 phrases courtes (25-45 mots au total, fran\u{00e7}ais, ton calme et pr\u{00e9}cis), \
+         qui m\u{00ea}lent :\n\
+         (1) la progression c\u{00f4}t\u{00e9} Alfred (ce qui vient de se passer pour la ou les entreprises mentionn\u{00e9}es),\n\
+         (2) quand c'est pertinent, une br\u{00e8}ve sur une de ces entreprises \
+         (secteur, contexte connu, fait notable) en t'appuyant sur ta connaissance g\u{00e9}n\u{00e9}rale.\n\
+         Ne fais pas r\u{00e9}p\u{00e9}ter une entreprise comme « agent ». Pas de pr\u{00e9}ambule. \
+         R\u{00e9}ponds uniquement avec la ou les phrases.",
+        previous = previous_block,
+        body = body
     )
 }
 
@@ -452,15 +489,40 @@ mod tests {
                 payload: json!({"stage": "line_analysis"}),
             },
         ];
-        let prompt = build_narration_prompt(&events);
-        assert!(prompt.len() < 500, "prompt should be < 500 chars, got {}", prompt.len());
+        let prompt = build_narration_prompt(&events, None);
+        // Prompt is richer than v1 (system framing + insight ask) but still bounded.
+        assert!(prompt.len() < 1500, "prompt should be < 1500 chars, got {}", prompt.len());
         for ticker in ["AAPL", "MSFT", "NVDA"] {
             assert!(prompt.contains(ticker), "prompt missing ticker {ticker}");
         }
         assert!(prompt.contains("synthesis"));
         assert!(prompt.contains("line_analysis"));
-        // Sanity: instruction trailer present.
-        assert!(prompt.contains("UNE phrase"));
+        // Sanity: the new framing must explicitly disambiguate tickers vs agents
+        // (regression guard for the "EXA est en train d'analyser" bug).
+        assert!(
+            prompt.contains("TICKERS") && prompt.contains("ENTREPRISES"),
+            "prompt must clarify that tickers are companies, not agents"
+        );
+        assert!(prompt.contains("Alfred"));
+        // First tick has no previous narration block.
+        assert!(!prompt.contains("Pr\u{00e9}c\u{00e9}dent r\u{00e9}sum\u{00e9}"));
+    }
+
+    #[test]
+    fn test_build_narration_prompt_with_previous_narration() {
+        let events = vec![RecordedEvent {
+            ts: SystemTime::now(),
+            kind: "line_done".to_string(),
+            payload: json!({"ticker": "NVDA", "recommendation": {"signal": "BUY", "conviction": "high"}}),
+        }];
+        let previous = "Alfred valide AAPL en BUY, attaque NVDA dans la foul\u{00e9}e.";
+        let prompt = build_narration_prompt(&events, Some(previous));
+        assert!(prompt.contains("Pr\u{00e9}c\u{00e9}dent r\u{00e9}sum\u{00e9}"));
+        assert!(prompt.contains(previous));
+        assert!(prompt.contains("NVDA"));
+        // Whitespace-only previous narration must be skipped — exercise that path too.
+        let prompt_blank = build_narration_prompt(&events, Some("   "));
+        assert!(!prompt_blank.contains("Pr\u{00e9}c\u{00e9}dent r\u{00e9}sum\u{00e9}"));
     }
 
     #[test]
@@ -543,13 +605,63 @@ mod tests {
         CALLS.store(0, Ordering::SeqCst);
         fn fake(_p: &str) -> Result<String> {
             CALLS.fetch_add(1, Ordering::SeqCst);
-            Ok("Alfred analyse AAPL.".to_string())
+            Ok("  Alfred vient de valider AAPL en BUY haute conviction.  ".to_string())
         }
         let fired = tick_once(run_id, &(fake as LlmCall));
         assert!(fired);
         assert_eq!(CALLS.load(Ordering::SeqCst), 1);
         let guard = narrators().lock().unwrap();
-        assert_eq!(guard.get(run_id).unwrap().consecutive_failures, 0);
+        let state = guard.get(run_id).unwrap();
+        assert_eq!(state.consecutive_failures, 0);
+        // The successful narration is stored (trimmed) for the next tick's continuity.
+        assert_eq!(
+            state.last_narration.as_deref(),
+            Some("Alfred vient de valider AAPL en BUY haute conviction.")
+        );
+        drop(guard);
+        remove_state(run_id);
+    }
+
+    #[test]
+    fn test_previous_narration_is_passed_to_next_tick() {
+        let run_id = "test_continuity";
+        install_state(run_id);
+
+        // First tick — record an event, fake an LLM that returns a narration.
+        record_event(
+            run_id,
+            &make_event("line_done", json!({"ticker": "AAPL", "recommendation": {"signal": "BUY"}})),
+        );
+        fn fake_first(_p: &str) -> Result<String> {
+            Ok("Premi\u{00e8}re narration sur AAPL.".to_string())
+        }
+        assert!(tick_once(run_id, &(fake_first as LlmCall)));
+
+        // Second tick — record a fresh event, the next LLM call must receive
+        // the first narration in its prompt.
+        record_event(
+            run_id,
+            &make_event("line_done", json!({"ticker": "NVDA", "recommendation": {"signal": "HOLD"}})),
+        );
+        static SEEN_PROMPT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+        fn fake_second(p: &str) -> Result<String> {
+            *SEEN_PROMPT.lock().unwrap() = p.to_string();
+            Ok("Deuxi\u{00e8}me narration.".to_string())
+        }
+        assert!(tick_once(run_id, &(fake_second as LlmCall)));
+
+        let captured = SEEN_PROMPT.lock().unwrap().clone();
+        assert!(
+            captured.contains("Premi\u{00e8}re narration sur AAPL."),
+            "second prompt should carry the first narration; got: {captured}"
+        );
+        assert!(captured.contains("Pr\u{00e9}c\u{00e9}dent r\u{00e9}sum\u{00e9}"));
+        // The second narration should now be the stored state.
+        let guard = narrators().lock().unwrap();
+        assert_eq!(
+            guard.get(run_id).unwrap().last_narration.as_deref(),
+            Some("Deuxi\u{00e8}me narration.")
+        );
         drop(guard);
         remove_state(run_id);
     }

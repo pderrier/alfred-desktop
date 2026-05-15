@@ -13,6 +13,10 @@ import {
   setNarrationDegradedBadge,
   updateMarketSynthesisEarlyStage
 } from "/desktop-shell/shell-layout.js";
+import {
+  updateTickerCollectionStatus,
+  resetTickerCollectionStatus
+} from "/desktop-shell/ticker-collection-status.js";
 
 export function initEvents(deps) {
   const {
@@ -51,31 +55,40 @@ export function initEvents(deps) {
       }
     });
 
-    // Run stage changes — instant pipeline bar update + early-run toast.
-    // P1-2: the granular `finary_fetching` / `snapshot_received` /
-    // `enriching_market` stages also drive the `alfred-run-stage-toast`
-    // overlay trigger so the user has feedback during the pre-LLM phase,
-    // and the Market Synthesis card shows progressive status text via the
-    // synthesis card writer below.
+    // Run stage changes — pipeline bar update + early-run UX + per-run
+    // ticker-status reset.
+    // P1-2: granular `finary_fetching` / `snapshot_received` /
+    // `enriching_market` stages drive the `alfred-run-stage-toast` overlay
+    // trigger and progressive Market Synthesis card status text.
+    // P0-7: a new run_id observed on a run-stage event clears the per-ticker
+    // retry/failure badge — covers the case where this run has zero retries
+    // (no ticker-collection-event fires) but a previous run left the badge
+    // visible.
+    let lastTickerStatusRunId = null;
     window.__TAURI__.event.listen("alfred://run-stage", (event) => {
       const payload = event.payload || {};
-      const { stage, line_progress, collection_progress } = payload;
+      const { stage, line_progress, collection_progress, run_id } = payload;
       if (!stage || !getActiveRunId()) return;
       renderPipelineBar(stage);
       renderTopBarProgress({ status: "running", line_progress });
-      // Surface early-run progress in the Market Synthesis card so the
-      // user sees "Récupération Finary…" / "Snapshot reçu (N)" /
-      // "Cours marché (C/T)…" instead of static "Waiting for…" text.
       updateMarketSynthesisEarlyStage(stage, payload);
-      // Fan out to the overlay trigger registry. The overlay picks up
-      // `run-stage` via the `alfred-run-stage-toast` trigger registered
-      // in app-alfred-triggers.js.
       window.__alfredOverlay?.notify?.("run-stage", {
         stage,
         collection_progress,
         line_progress,
         snapshot_summary: payload.snapshot_summary,
       });
+      if (run_id && run_id !== lastTickerStatusRunId) {
+        lastTickerStatusRunId = run_id;
+        resetTickerCollectionStatus();
+      }
+    });
+
+    // Per-ticker collection retry/failure (P0-7) — emitted by
+    // `fetch_technical_snapshot` in the Rust enrichment retry loop.
+    window.__TAURI__.event.listen("alfred://ticker-collection-event", (event) => {
+      if (!getActiveRunId()) return;
+      updateTickerCollectionStatus(event.payload || null);
     });
 
     // Run narration — LLM-generated 1-sentence summary of the last 10s of events.

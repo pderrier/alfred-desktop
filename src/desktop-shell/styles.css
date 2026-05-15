@@ -1110,6 +1110,32 @@ main {
   line-height: 1;
 }
 
+/* Per-ticker retry/failure aggregator badge (P0-7) — sits under the
+   pipeline bar during a run, additive to existing run-in-progress indicators. */
+.run-ticker-collection-status {
+  display: inline-flex;
+  gap: 0.55rem;
+  align-items: center;
+  padding: 0.2rem 0.55rem;
+  margin-bottom: 0.45rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  background: rgba(18, 29, 40, 0.72);
+  border: 1px solid rgba(73, 100, 126, 0.4);
+  border-radius: 10px;
+  line-height: 1.3;
+}
+.ticker-collection-retries {
+  color: #f1b56b; /* orange — transient retry, recoverable */
+}
+.ticker-collection-failures {
+  color: #f08a77; /* red — permanent failure */
+}
+.ticker-collection-sep {
+  color: var(--sea-muted);
+  opacity: 0.4;
+}
+
 /* Synthesis card pending state */
 .report-synthesis-card.synthesis-pending {
   border-color: rgba(142, 202, 230, 0.3);

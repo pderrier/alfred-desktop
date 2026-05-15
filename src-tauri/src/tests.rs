@@ -4567,6 +4567,8 @@ use crate::storage::read_json_file;
         );
 
         crate::run_narrator::test_remove_state(run_id);
+    }
+
     // ── P0-6 — Storage Tauri handlers must conform to bridge envelope ──
     //
     // The JS bridge (`bridge-client.js::normalizeTauriPayload`) requires every

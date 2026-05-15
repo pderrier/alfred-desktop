@@ -458,8 +458,14 @@ pub fn run_get_signal_scorecard(ticker: String) -> Result<serde_json::Value> {
             crate::storage::read_json_file(&path)?
         }
     };
-    let entry = store.get("by_ticker")
-        .and_then(|bt| bt.get(&ticker));
+    // v0.3.2 (P0-4 / P0-5): resolve the line-memory entry via the canonical-aware
+    // helper. Raw `by_ticker.get(&ticker)` would miss any entry written under
+    // the canonical Yahoo symbol by `sync_line_memory` (v0.3 #22 dedup), which
+    // is the root cause of the v0.3.0 scorecard regression — the entry exists
+    // but is keyed `STMPA.PA`, not `STMPA`. See
+    // `feedback_contract_tests_regression_audit` (3rd occurrence of the same
+    // class).
+    let entry = crate::native_mcp_analysis::resolve_line_memory_key(&store, &ticker);
     let entry = match entry {
         Some(e) => e,
         None => return Ok(json!({ "ticker": ticker, "signals": [], "overall_accuracy_pct": 0, "scored_count": 0, "correct_count": 0, "trend": "stable" })),
@@ -1056,10 +1062,10 @@ pub fn run_line_show(ticker: &str) -> Result<serde_json::Value> {
         .cloned();
 
     let store = load_line_memory_from_disk_or_cache();
-    let memory = store
-        .get("by_ticker")
-        .and_then(|bt| bt.get(&ticker))
-        .cloned();
+    // v0.3.2 (P0-5): canonical-aware lookup so a CLI `line:show STMPA` resolves
+    // an entry actually keyed `STMPA.PA`. Raw lookup would miss the v0.3 dedup
+    // write path.
+    let memory = crate::native_mcp_analysis::resolve_line_memory_key(&store, &ticker).cloned();
 
     if rec.is_none() && memory.is_none() {
         return Err(anyhow!("ticker_not_found:{ticker}"));
@@ -1083,8 +1089,10 @@ pub fn run_line_memory_show(ticker: Option<&str>) -> Result<serde_json::Value> {
         if t.is_empty() {
             return Err(anyhow!("ticker_required"));
         }
-        let entry = by_ticker
-            .and_then(|bt| bt.get(&t))
+        // v0.3.2 (P0-5): canonical-aware lookup so the CLI returns the v0.3-
+        // keyed entry when present (e.g. `line:memory STMPA` finds the entry
+        // stored under `STMPA.PA`).
+        let entry = crate::native_mcp_analysis::resolve_line_memory_key(&store, &t)
             .cloned()
             .unwrap_or(serde_json::Value::Null);
         if entry.is_null() {

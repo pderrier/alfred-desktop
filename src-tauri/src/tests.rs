@@ -4919,3 +4919,658 @@ use crate::storage::read_json_file;
         assert!(!model.is_empty(), "model must not be empty");
         let _ = std::fs::remove_dir_all(&tmp);
     }
+    // ═════════════════════════════════════════════════════════════════════
+    // v0.3.2 P0-1 + P0-4 + P0-5 — Canonical-key cluster (Worktree A)
+    //
+    // Three same-class regressions in v0.3.0 (persist whitelist, scorecard
+    // canonical, technicals 10/28) share a single architectural root: a
+    // sibling consumer code path didn't follow the canonical convention.
+    // The tests below pin the readers / parsers so the class cannot recur
+    // without a red test naming the broken contract.
+    //
+    // - P0-1: pure parser for `/api/market/technicals` response — null
+    //   indicators / empty indicators / envelope-or-flat shapes.
+    // - P0-4: `run_get_signal_scorecard` resolves canonical-key entries and
+    //   falls back to raw ticker.
+    // - P0-5: `resolve_line_memory_key` contract test — every public
+    //   reader must surface a canonical-keyed entry.
+    // ═════════════════════════════════════════════════════════════════════
+
+
+    /// Helper — write a line-memory store fixture to disk and reset the cache
+    /// so the next `command_handlers` read picks up the fresh fixture. Mirrors
+    /// the pattern in `scored_count_uses_distinct_dates`.
+    fn seed_line_memory_fixture(state_dir: &std::path::Path, store: serde_json::Value) {
+        std::fs::create_dir_all(state_dir).expect("mkdir state_dir");
+        let path = state_dir.join("line-memory.json");
+        std::fs::write(&path, serde_json::to_string(&store).unwrap()).unwrap();
+        crate::native_mcp_analysis::line_memory_reset_for_tests();
+    }
+
+
+    // ── P0-5: `resolve_line_memory_key` contract test ─────────────────
+
+    /// **CONTRACT TEST** — every public Tauri-command reader of `by_ticker`
+    /// that takes a single raw ticker MUST go through `resolve_line_memory_key`
+    /// (or its `read_line_memory_entry` cousin when a `resolved_symbol` is in
+    /// hand). This test seeds a store with a canonical-keyed entry only
+    /// (`STMPA.PA` → `ticker: "STMPA"`) and exercises every relevant reader
+    /// with the raw broker ticker `STMPA`. Each reader must surface the
+    /// entry's signal history.
+    ///
+    /// Why this test exists: v0.3.0 shipped three same-class regressions
+    /// (persist whitelist, scorecard, technicals 10/28). The shared root is
+    /// "a reader didn't follow the canonical-key convention". Without this
+    /// guard, the next public reader added to `command_handlers.rs` is a
+    /// latent P0 — agents can't be relied on to remember a convention that
+    /// lives in a different file. See `feedback_contract_tests_regression_audit`.
+    #[test]
+    fn no_raw_ticker_lookup_without_canonical_fallback() {
+        let _guard = env_lock();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempdir.path().join("runtime-state");
+        std::env::set_var("ALFRED_STATE_DIR", state_dir.as_os_str());
+
+        // Canonical-only fixture: the entry exists ONLY under the canonical
+        // Yahoo symbol. Any reader doing a raw `by_ticker[&raw_ticker]` lookup
+        // misses it. Any reader going through `resolve_line_memory_key` hits it.
+        seed_line_memory_fixture(&state_dir, json!({
+            "by_ticker": {
+                "STMPA.PA": {
+                    "schema_version": 2,
+                    "ticker": "STMPA",
+                    "signal": "ACHAT",
+                    "conviction": "forte",
+                    "signal_history": [
+                        { "date": "2026-05-14", "signal": "ACHAT", "price_at_signal": 50.0 },
+                        { "date": "2026-05-10", "signal": "ACHAT", "price_at_signal": 48.0 }
+                    ],
+                    "price_tracking": { "current_price": 52.0 },
+                    "memory_narrative": "STM Q1 beat, momentum solid."
+                }
+            }
+        }));
+
+        // 1) Scorecard reader — P0-4 fix.
+        let card = crate::command_handlers::run_get_signal_scorecard("STMPA".to_string())
+            .expect("scorecard ok");
+        assert!(
+            card.get("signals").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false),
+            "CONTRACT VIOLATION: run_get_signal_scorecard returned empty signals for STMPA — \
+             canonical-keyed entry (STMPA.PA) not surfaced. Fix: route the read through \
+             native_mcp_analysis::resolve_line_memory_key. Got: {card}"
+        );
+
+        // 2) `run_line_show` reader.
+        let show = crate::command_handlers::run_line_show("STMPA").expect("line_show ok");
+        let mem = show.get("line_memory").cloned().unwrap_or(serde_json::Value::Null);
+        assert!(
+            !mem.is_null() && mem.get("signal_history").is_some(),
+            "CONTRACT VIOLATION: run_line_show returned null line_memory for STMPA — \
+             canonical-keyed entry (STMPA.PA) not surfaced. Fix: route the read through \
+             native_mcp_analysis::resolve_line_memory_key. Got: {show}"
+        );
+
+        // 3) `run_line_memory_show` reader (per-ticker branch).
+        let mem_show = crate::command_handlers::run_line_memory_show(Some("STMPA"))
+            .expect("line_memory_show ok");
+        assert!(
+            mem_show.get("memory")
+                .and_then(|m| m.get("signal_history"))
+                .and_then(|v| v.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false),
+            "CONTRACT VIOLATION: run_line_memory_show returned empty/null memory for STMPA — \
+             canonical-keyed entry (STMPA.PA) not surfaced. Fix: route the read through \
+             native_mcp_analysis::resolve_line_memory_key. Got: {mem_show}"
+        );
+
+        // 4) Pure helper sanity — exercises both step 1 (direct hit) and
+        //    step 2 (body-ticker match) so the contract is pinned at the
+        //    helper layer, not only through callers.
+        let store = crate::native_mcp_analysis::line_memory_read();
+        let resolved = crate::native_mcp_analysis::resolve_line_memory_key(&store, "STMPA");
+        assert!(
+            resolved.is_some(),
+            "resolve_line_memory_key must surface the canonical-keyed entry via body-ticker match"
+        );
+        // Case-insensitive: lowercase input must resolve identically.
+        let resolved_lc = crate::native_mcp_analysis::resolve_line_memory_key(&store, "stmpa");
+        assert!(resolved_lc.is_some(), "resolver must be case-insensitive on raw input");
+        // Empty / whitespace ticker → None (no implicit first-entry leak).
+        assert!(
+            crate::native_mcp_analysis::resolve_line_memory_key(&store, "  ").is_none(),
+            "empty/whitespace raw ticker must return None"
+        );
+        // Unknown ticker → None.
+        assert!(
+            crate::native_mcp_analysis::resolve_line_memory_key(&store, "UNKNOWN").is_none(),
+            "unknown raw ticker must return None"
+        );
+
+        std::env::remove_var("ALFRED_STATE_DIR");
+        crate::native_mcp_analysis::line_memory_reset_for_tests();
+    }
+
+    /// Lint-as-test — fail loudly if a future PR re-introduces a raw
+    /// `by_ticker.get(&<single_ticker_var>)` lookup outside the sanctioned
+    /// helpers. Greps the production source tree (excluding `tests.rs`) for
+    /// the pattern. Allow-listed sites are the helpers themselves
+    /// (`resolve_line_memory_key`, `read_line_memory_entry`) and the few
+    /// places where the call is provably canonical-keyed already (quality
+    /// sub-map, not line-memory).
+    ///
+    /// This is the **discipline gate** mandated by the PO plan's P0-5 audit
+    /// + `feedback_contract_tests_regression_audit`. Without it, a single
+    /// reviewer slip re-opens the regression class.
+    #[test]
+    fn lint_no_raw_by_ticker_lookup_outside_helpers() {
+        use std::path::PathBuf;
+
+        // Walk the src tree (excluding tests.rs) and collect every line that
+        // matches the forbidden pattern. Pattern: a `by_ticker` reference
+        // followed by `.get(&<ident>)` where the ident is a runtime variable
+        // (not a literal string and not a canonical helper call).
+        //
+        // We use a simple text search rather than syn so the test stays cheap
+        // and self-contained — false positives are caught by the allow-list.
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR must be set by cargo");
+        let src_root = PathBuf::from(manifest_dir).join("src");
+
+        let mut offenders: Vec<String> = Vec::new();
+
+        fn walk(dir: &std::path::Path, offenders: &mut Vec<String>) {
+            let entries = match std::fs::read_dir(dir) {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, offenders);
+                    continue;
+                }
+                let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                // Skip the test file itself — fixture lookups are intentional.
+                if fname == "tests.rs" { continue; }
+                if !fname.ends_with(".rs") { continue; }
+                let content = match std::fs::read_to_string(&path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                for (i, line) in content.lines().enumerate() {
+                    // Explicit allow: a `// LINT-ALLOW: …` trailing comment
+                    // marks a site as intentionally exempt. Either the line
+                    // IS the helper definition itself (`resolve_line_memory_key`
+                    // / `read_line_memory_entry`) or the lookup target is a
+                    // sub-map that happens to be named `by_ticker` but is
+                    // unrelated to line-memory (e.g. `run_state.quality.by_ticker`).
+                    if line.contains("LINT-ALLOW") {
+                        continue;
+                    }
+                    // Pattern: `by_ticker.get(&<ident>)` — i.e. a runtime
+                    // variable bound earlier in the function. We use a coarse
+                    // heuristic: the substring `by_ticker.get(&` followed
+                    // by an alphabetic char (not `"`). This catches the
+                    // forbidden pattern without parsing.
+                    //
+                    // Also: `bt.get(&<ident>)` where `bt` is the canonical
+                    // shorthand for the by_ticker map (used in the file).
+                    if line.contains("//") {
+                        // Strip comments before pattern match — `// by_ticker.get(&...)`
+                        // documentation must not flag.
+                        let code = line.split("//").next().unwrap_or("");
+                        if !contains_forbidden(code) { continue; }
+                    } else if !contains_forbidden(line) {
+                        continue;
+                    }
+                    let rel = path
+                        .strip_prefix(dir.ancestors().last().unwrap_or(dir))
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| path.display().to_string());
+                    offenders.push(format!("{}:{}: {}", rel, i + 1, line.trim()));
+                }
+            }
+        }
+
+        fn contains_forbidden(s: &str) -> bool {
+            // Direct `by_ticker.get(&<ident>)` — variable lookup.
+            for pat in &["by_ticker.get(&", "bt.get(&"] {
+                if let Some(idx) = s.find(pat) {
+                    let after = &s[idx + pat.len()..];
+                    let next = after.chars().next();
+                    // Skip literal strings (`"AAPL"` — no `&`) — already not
+                    // captured because the pattern includes `&`. Reject if
+                    // the next char is alphabetic (variable name).
+                    if matches!(next, Some(c) if c.is_ascii_alphabetic() || c == '_') {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+
+        walk(&src_root, &mut offenders);
+
+        assert!(
+            offenders.is_empty(),
+            "CONTRACT VIOLATION (P0-5): the following sites read `by_ticker` with a raw \
+             variable key without going through `resolve_line_memory_key` / \
+             `read_line_memory_entry`. Any such lookup is a latent canonical-key \
+             regression (see feedback_contract_tests_regression_audit, 3 incidents in \
+             v0.3.0). Fix: route through native_mcp_analysis::resolve_line_memory_key \
+             (raw-only callers) or read_line_memory_entry (callers with resolved_symbol).\n\
+             Offenders:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    // ── P0-4: scorecard resolves canonical-key entry ───────────────────
+
+    #[test]
+    fn scorecard_resolves_canonical_key_when_present() {
+        // v0.3 #22 cross-account dedup writes the entry under canonical Yahoo
+        // symbol (`STMPA.PA`), not raw broker ticker (`STMPA`). Pre-v0.3.2
+        // `run_get_signal_scorecard("STMPA")` did a raw `by_ticker.get(&ticker)`
+        // → miss → empty signals → UI hides the scorecard section. With the
+        // canonical-aware resolver, the entry surfaces.
+        let _guard = env_lock();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempdir.path().join("runtime-state");
+        std::env::set_var("ALFRED_STATE_DIR", state_dir.as_os_str());
+        seed_line_memory_fixture(&state_dir, json!({
+            "by_ticker": {
+                // Entry keyed under canonical Yahoo symbol (v0.3 #22 write path).
+                "STMPA.PA": {
+                    "schema_version": 2,
+                    // Body still carries the raw broker ticker — this is what
+                    // `resolve_line_memory_key` matches on for step-2 fallback.
+                    "ticker": "STMPA",
+                    "signal_history": [
+                        { "date": "2026-05-14", "signal": "ACHAT", "price_at_signal": 50.0 },
+                        { "date": "2026-05-10", "signal": "ACHAT", "price_at_signal": 48.0 },
+                        { "date": "2026-05-05", "signal": "CONSERVER", "price_at_signal": 47.0 }
+                    ],
+                    "price_tracking": { "current_price": 52.0 }
+                }
+            }
+        }));
+
+        let card = crate::command_handlers::run_get_signal_scorecard("STMPA".to_string())
+            .expect("scorecard must return ok");
+
+        let signals = card.get("signals").and_then(|v| v.as_array())
+            .expect("signals array must be present");
+        assert_eq!(
+            signals.len(), 3,
+            "signal_history(len=3) under canonical key STMPA.PA must surface for raw ticker STMPA — got: {card}"
+        );
+        assert_eq!(
+            card.get("ticker").and_then(|v| v.as_str()),
+            Some("STMPA"),
+            "echoed ticker must be the raw input — canonical resolution is internal"
+        );
+
+        std::env::remove_var("ALFRED_STATE_DIR");
+        crate::native_mcp_analysis::line_memory_reset_for_tests();
+    }
+
+    #[test]
+    fn scorecard_falls_back_to_raw_ticker_when_no_canonical() {
+        // Backward compat: pre-v0.3 entries keyed by raw broker ticker must
+        // still surface. The resolver's step-1 (direct hit on raw_ticker.upper)
+        // catches these without needing the step-2 body scan.
+        let _guard = env_lock();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempdir.path().join("runtime-state");
+        std::env::set_var("ALFRED_STATE_DIR", state_dir.as_os_str());
+        seed_line_memory_fixture(&state_dir, json!({
+            "by_ticker": {
+                "AAPL": {
+                    "schema_version": 2,
+                    "ticker": "AAPL",
+                    "signal_history": [
+                        { "date": "2026-05-14", "signal": "ACHAT", "price_at_signal": 195.0 },
+                        { "date": "2026-05-10", "signal": "CONSERVER", "price_at_signal": 192.0 }
+                    ],
+                    "price_tracking": { "current_price": 198.0 }
+                }
+            }
+        }));
+
+        let card = crate::command_handlers::run_get_signal_scorecard("AAPL".to_string())
+            .expect("scorecard must return ok");
+
+        let signals = card.get("signals").and_then(|v| v.as_array())
+            .expect("signals array must be present");
+        assert_eq!(
+            signals.len(), 2,
+            "raw-keyed entry (pre-v0.3 shape) must still surface — backward compat. Got: {card}"
+        );
+
+        std::env::remove_var("ALFRED_STATE_DIR");
+        crate::native_mcp_analysis::line_memory_reset_for_tests();
+    }
+
+    // ── P0-1: pure parser for `/api/market/technicals` ─────────────────
+
+    #[test]
+    fn parse_technical_snapshot_drops_null_indicators() {
+        // Server populates the technicals cache with an `{"indicators": null}`
+        // shell when upstream OHLC fails — pre-v0.3.2 the snapshot was stored
+        // because `.get("indicators").is_some()` accepts `Some(&Value::Null)`,
+        // so `technicals[ticker]` got an unusable shell. Parser must drop.
+        let resp = json!({
+            "technical_snapshot": {
+                "as_of": "2026-05-15",
+                "source": "yahoo:chart",
+                "samples": 0,
+                "indicators": null
+            }
+        });
+        let parsed = crate::enrichment::parse_technical_snapshot_response(&resp);
+        assert!(
+            parsed.is_none(),
+            "indicators=null must be dropped — pre-v0.3.2 the .is_some() check accepted it, persisting useless shells. Got: {:?}",
+            parsed
+        );
+    }
+
+    #[test]
+    fn parse_technical_snapshot_drops_empty_indicators() {
+        // Server returns an empty indicators object on edge cases (no samples
+        // yet, cache miss returning placeholder). Parser must reject — prompt
+        // renderer would treat the snapshot as "non disponible" anyway, so
+        // persisting it just inflates run state.
+        let resp = json!({
+            "technical_snapshot": {
+                "as_of": "2026-05-15",
+                "source": "yahoo:chart",
+                "samples": 0,
+                "indicators": {}
+            }
+        });
+        let parsed = crate::enrichment::parse_technical_snapshot_response(&resp);
+        assert!(
+            parsed.is_none(),
+            "indicators={{}} must be dropped — empty object is no different from absent for prompt purposes. Got: {:?}",
+            parsed
+        );
+    }
+
+    #[test]
+    fn parse_technical_snapshot_drops_missing_indicators() {
+        // Server returns a minimal envelope without indicators at all
+        // (negative-cache scenario or rate-limited body).
+        let resp = json!({
+            "technical_snapshot": {
+                "as_of": "2026-05-15",
+                "source": "yahoo:chart",
+                "samples": 0
+            }
+        });
+        let parsed = crate::enrichment::parse_technical_snapshot_response(&resp);
+        assert!(parsed.is_none(), "missing indicators must be dropped");
+    }
+
+    #[test]
+    fn parse_technical_snapshot_accepts_envelope_shape() {
+        // Happy path with envelope: { "technical_snapshot": { indicators: {...} } }.
+        let resp = json!({
+            "technical_snapshot": {
+                "as_of": "2026-05-15",
+                "source": "yahoo:chart:resolved:STMPA.PA",
+                "samples": 250,
+                "indicators": {
+                    "sma_200": 26.51,
+                    "rsi_14": 64.68,
+                    "trend_signal": "up"
+                }
+            }
+        });
+        let parsed = crate::enrichment::parse_technical_snapshot_response(&resp)
+            .expect("valid envelope must parse");
+        assert_eq!(parsed.get("samples").and_then(|v| v.as_i64()), Some(250));
+        assert!(parsed.get("indicators").and_then(|v| v.as_object()).is_some());
+    }
+
+    #[test]
+    fn parse_technical_snapshot_accepts_flat_shape() {
+        // Happy path without envelope: { indicators: {...}, ... }. Server-side
+        // emitters drifted between envelope and flat shapes during v0.3
+        // rollout; parser must accept both. (Test pins the contract — any
+        // future server change that drops the flat shape is loud.)
+        let resp = json!({
+            "as_of": "2026-05-15",
+            "source": "alphavantage:daily",
+            "samples": 250,
+            "indicators": { "sma_200": 130.1, "rsi_14": 58.2 }
+        });
+        let parsed = crate::enrichment::parse_technical_snapshot_response(&resp)
+            .expect("flat shape must parse");
+        assert_eq!(parsed.get("samples").and_then(|v| v.as_i64()), Some(250));
+    }
+
+    #[test]
+    fn parse_technical_snapshot_drops_indicators_string_or_array() {
+        // Defensive: contract drift could surface as `indicators: "computing"`
+        // or `indicators: []`. Parser rejects anything that isn't a non-empty
+        // object — prompt renderer expects `as_object()` downstream.
+        let string_resp = json!({ "indicators": "computing" });
+        assert!(crate::enrichment::parse_technical_snapshot_response(&string_resp).is_none());
+        let array_resp = json!({ "indicators": [] });
+        assert!(crate::enrichment::parse_technical_snapshot_response(&array_resp).is_none());
+    }
+
+    // ── P0-1 + P0-7: retry-with-backoff + ticker-collection-event ─────────
+    //
+    // Pre-fix diagnostic: 18/18 serial probes against the missing tickers of
+    // run `019e2c9de5ee` returned HTTP 200 + indicators=true + 250 samples
+    // (`quality=fresh`). Conclusion: the 10/28 partial coverage is transient
+    // failure under parallel load (Yahoo rate-limit / network blip / 5xx),
+    // NOT a contract issue. Strategy: 3 attempts (1 initial + 2 retries),
+    // backoff 500ms then 1500ms, retry ONLY on transport `Err` — a 200
+    // response with invalid indicators is a server verdict ("unavailable")
+    // and must NOT trigger retry.
+    //
+    // Per-ticker visibility (P0-7) ships in the same commit: every retry
+    // and every final failure emit `alfred://ticker-collection-event` so
+    // worktree D's UI aggregator (v032-D) renders a live counter. A
+    // successful retry (i.e. attempt > 1) also emits a `success` event so
+    // the UI can decrement the "retrying" badge — first-try success emits
+    // nothing (zero noise on the happy path).
+    //
+    // Tests inject the fetcher and a no-op sleeper into
+    // `fetch_technical_snapshot_with_retry`, the pure helper extracted from
+    // the production wrapper (see `feedback_pure_helper_for_async_testability`).
+    // Event assertions scope by ticker since the capture buffer is shared
+    // across parallel tests (see `feedback_emit_event_test_capture`).
+
+    fn drain_ticker_collection_events(ticker: &str) -> Vec<serde_json::Value> {
+        // Scoped drain — only remove events targeting `ticker`. Leaves other
+        // parallel tests' events in the shared buffer intact. Critical: the
+        // global `test_event_capture_drain()` would race-delete sibling
+        // tests' events. See `feedback_emit_event_test_capture`.
+        let owned_ticker = ticker.to_string();
+        crate::test_event_capture_drain_where(move |name, payload| {
+            name == "alfred://ticker-collection-event"
+                && payload.get("ticker").and_then(|v| v.as_str()) == Some(owned_ticker.as_str())
+        })
+        .into_iter()
+        .map(|(_, payload)| payload)
+        .collect()
+    }
+
+    fn no_sleep(_: std::time::Duration) {}
+
+    #[test]
+    fn fetch_technical_snapshot_retries_once_on_transient_error_then_succeeds() {
+        // Mock: call 1 returns Err (simulated 5xx / connection reset), call 2
+        // returns Ok with a valid indicators payload. Expect Some(snapshot).
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let fetcher = |_ticker: &str, _isin: Option<&str>, _canonical: Option<&str>| {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                Err(anyhow::anyhow!("alfred_api_http_error:503"))
+            } else {
+                Ok(json!({
+                    "technical_snapshot": {
+                        "as_of": "2026-05-15",
+                        "source": "yahoo:chart",
+                        "samples": 250,
+                        "indicators": { "rsi_14": 55.0, "sma_200": 100.0 }
+                    }
+                }))
+            }
+        };
+        let snap = crate::enrichment::fetch_technical_snapshot_with_retry(
+            "RETRY1", None, None, &fetcher, &no_sleep,
+        );
+        assert!(snap.is_some(), "second attempt must produce a snapshot");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn fetch_technical_snapshot_retries_twice_max_then_returns_none() {
+        // Mock: Err on all 3 calls. Loop must stop after the 3rd attempt and
+        // return None — never a 4th call.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let fetcher = |_t: &str, _i: Option<&str>, _c: Option<&str>| -> anyhow::Result<serde_json::Value> {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(anyhow::anyhow!("alfred_api_unreachable:io_error"))
+        };
+        let snap = crate::enrichment::fetch_technical_snapshot_with_retry(
+            "RETRY2", None, None, &fetcher, &no_sleep,
+        );
+        assert!(snap.is_none(), "3 consecutive transport errors must yield None");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "retry budget: 1 initial + 2 retries = 3 total calls, never 4"
+        );
+    }
+
+    #[test]
+    fn fetch_technical_snapshot_does_not_retry_on_unavailable_response() {
+        // Mock: Ok on call 1 but the body has `indicators: null` (server
+        // verdict "unavailable" — upstream OHLC fetch failed but the cache
+        // populated with a no-data marker). This is NOT a transient failure
+        // — retrying just wastes the rate budget. Expect 1 call, None.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let fetcher = |_t: &str, _i: Option<&str>, _c: Option<&str>| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(json!({
+                "technical_snapshot": {
+                    "as_of": "2026-05-15",
+                    "source": "yahoo:chart",
+                    "samples": 0,
+                    "indicators": null
+                }
+            }))
+        };
+        let snap = crate::enrichment::fetch_technical_snapshot_with_retry(
+            "RETRY3", None, None, &fetcher, &no_sleep,
+        );
+        assert!(snap.is_none(), "indicators=null returns None — server has spoken");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "200-with-unusable-body must NOT trigger retry (waste of rate budget)"
+        );
+    }
+
+    #[test]
+    fn fetch_technical_snapshot_emits_retry_event_with_attempt_number() {
+        // Mock: Err on call 1, Ok on call 2. Assert a `retry` event was
+        // emitted before the second attempt, carrying attempt=1 and a reason.
+        // A `success` event is also emitted because the final outcome
+        // recovered from a retry — worktree D uses it to decrement the
+        // "retrying" badge for that ticker.
+        let _ = drain_ticker_collection_events("RETRY_EVT1");
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let fetcher = |_t: &str, _i: Option<&str>, _c: Option<&str>| {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                Err(anyhow::anyhow!("alfred_api_http_error:502 bad gateway"))
+            } else {
+                Ok(json!({
+                    "indicators": { "rsi_14": 60.0 },
+                    "samples": 250
+                }))
+            }
+        };
+        let snap = crate::enrichment::fetch_technical_snapshot_with_retry(
+            "RETRY_EVT1", None, None, &fetcher, &no_sleep,
+        );
+        assert!(snap.is_some(), "retry recovers to a snapshot");
+
+        let events = drain_ticker_collection_events("RETRY_EVT1");
+        let retry_evt = events.iter().find(|e| {
+            e.get("kind").and_then(|v| v.as_str()) == Some("retry")
+        }).expect("a `retry` event must be emitted before the second attempt");
+        assert_eq!(retry_evt.get("attempt").and_then(|v| v.as_i64()), Some(1));
+        let reason = retry_evt.get("reason").and_then(|v| v.as_str()).unwrap_or_default();
+        assert!(
+            reason.contains("502") || reason.contains("bad gateway"),
+            "retry event reason must surface the underlying error — got {reason:?}"
+        );
+    }
+
+    #[test]
+    fn fetch_technical_snapshot_emits_failure_event_after_exhausted_retries() {
+        // Mock: Err x 3. Assert two `retry` events (attempt 1 then 2) and one
+        // final `failure` event with attempts=3. No `success` event.
+        let _ = drain_ticker_collection_events("RETRY_EVT2");
+        let fetcher = |_t: &str, _i: Option<&str>, _c: Option<&str>| -> anyhow::Result<serde_json::Value> {
+            Err(anyhow::anyhow!("alfred_api_unreachable:timeout"))
+        };
+        let snap = crate::enrichment::fetch_technical_snapshot_with_retry(
+            "RETRY_EVT2", None, None, &fetcher, &no_sleep,
+        );
+        assert!(snap.is_none());
+
+        let events = drain_ticker_collection_events("RETRY_EVT2");
+        let retries: Vec<_> = events
+            .iter()
+            .filter(|e| e.get("kind").and_then(|v| v.as_str()) == Some("retry"))
+            .collect();
+        assert_eq!(retries.len(), 2, "two retries fired (attempts 1 and 2)");
+        let failure = events.iter().find(|e| {
+            e.get("kind").and_then(|v| v.as_str()) == Some("failure")
+        }).expect("a `failure` event must be emitted once retries are exhausted");
+        assert_eq!(
+            failure.get("attempts").and_then(|v| v.as_i64()),
+            Some(3),
+            "failure event must report total attempts (1 initial + 2 retries)"
+        );
+        let no_success = events.iter().all(|e| {
+            e.get("kind").and_then(|v| v.as_str()) != Some("success")
+        });
+        assert!(no_success, "no success event when all attempts fail");
+    }
+
+    #[test]
+    fn fetch_technical_snapshot_emits_no_event_on_first_try_success() {
+        // Mock: Ok on call 1. Happy path must be silent — emitting `success`
+        // on every ticker on every run would be 28+ events of pure noise per
+        // run for worktree D's aggregator. Success events are reserved for
+        // post-retry recovery (decrements the "retrying" badge).
+        let _ = drain_ticker_collection_events("RETRY_EVT3");
+        let fetcher = |_t: &str, _i: Option<&str>, _c: Option<&str>| {
+            Ok(json!({
+                "indicators": { "rsi_14": 50.0 },
+                "samples": 250
+            }))
+        };
+        let snap = crate::enrichment::fetch_technical_snapshot_with_retry(
+            "RETRY_EVT3", None, None, &fetcher, &no_sleep,
+        );
+        assert!(snap.is_some());
+
+        let events = drain_ticker_collection_events("RETRY_EVT3");
+        assert!(
+            events.is_empty(),
+            "first-try success must emit zero events — got {events:?}"
+        );
+    }

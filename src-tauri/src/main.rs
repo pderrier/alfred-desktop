@@ -71,7 +71,12 @@ static APP_HANDLE: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::
 pub fn emit_event(event: &str, payload: serde_json::Value) {
     #[cfg(test)]
     {
-        if let Ok(mut buf) = TEST_EVENT_CAPTURE.lock() {
+        // Mirror every emitted event into a test-only buffer so unit tests
+        // can assert on the wire shape without a Tauri runtime. The buffer
+        // is shared across parallel tests — callers must scope assertions
+        // by a per-test field (run_id, ticker, …) when filtering. See
+        // `feedback_emit_event_test_capture`.
+        if let Ok(mut buf) = test_event_capture_buffer().lock() {
             buf.push((event.to_string(), payload.clone()));
         }
     }
@@ -85,26 +90,65 @@ pub fn emit_event(event: &str, payload: serde_json::Value) {
 //
 // In unit tests there is no Tauri AppHandle, so `emit_event` would normally
 // be a silent no-op. To let tests assert on events the production code
-// emits (e.g. P0-2 narration-status), we mirror every emit into this
-// buffer when compiled with `cfg(test)`. Tests reset it with
-// `test_event_capture_reset()` and read it with `test_event_capture_drain()`.
+// emits (e.g. P0-2 narration-status, P0-7 ticker-collection-event), we
+// mirror every emit into this buffer when compiled with `cfg(test)`. Tests
+// reset it with `test_event_capture_reset()` and read it with
+// `test_event_capture_drain()` (or the scoped `test_event_capture_drain_where`
+// when running alongside parallel tests on the same buffer).
 #[cfg(test)]
-static TEST_EVENT_CAPTURE: std::sync::Mutex<Vec<(String, serde_json::Value)>> =
-    std::sync::Mutex::new(Vec::new());
+fn test_event_capture_buffer() -> &'static std::sync::Mutex<Vec<(String, serde_json::Value)>> {
+    static BUFFER: std::sync::OnceLock<std::sync::Mutex<Vec<(String, serde_json::Value)>>> =
+        std::sync::OnceLock::new();
+    BUFFER.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
 
 #[cfg(test)]
 pub fn test_event_capture_reset() {
-    if let Ok(mut buf) = TEST_EVENT_CAPTURE.lock() {
+    if let Ok(mut buf) = test_event_capture_buffer().lock() {
         buf.clear();
     }
 }
 
+/// Drain every captured event since the last drain. Tests should call this
+/// at the start of a scenario to clear residual events from prior tests,
+/// then assert on the returned vec. Filtering by a scoping field (ticker,
+/// run_id) is REQUIRED — the buffer is global.
+///
+/// Prefer `test_event_capture_drain_where` in tests that run alongside other
+/// tests touching the same buffer — an unscoped drain destroys events that
+/// belong to parallel tests.
 #[cfg(test)]
 pub fn test_event_capture_drain() -> Vec<(String, serde_json::Value)> {
-    TEST_EVENT_CAPTURE
+    test_event_capture_buffer()
         .lock()
-        .map(|mut buf| std::mem::take(&mut *buf))
+        .map(|mut g| std::mem::take(&mut *g))
         .unwrap_or_default()
+}
+
+/// Drain ONLY the events matching `predicate`, leaving the others in the
+/// buffer for other parallel tests. This is the safe primitive for any
+/// test that runs alongside other emit_event-aware tests: an unscoped
+/// `test_event_capture_drain` race-deletes events between tests on the
+/// same shared buffer.
+#[cfg(test)]
+pub fn test_event_capture_drain_where<P>(predicate: P) -> Vec<(String, serde_json::Value)>
+where
+    P: Fn(&str, &serde_json::Value) -> bool,
+{
+    let Ok(mut guard) = test_event_capture_buffer().lock() else {
+        return Vec::new();
+    };
+    let mut matched = Vec::new();
+    let mut retained = Vec::with_capacity(guard.len());
+    for (name, payload) in guard.drain(..) {
+        if predicate(&name, &payload) {
+            matched.push((name, payload));
+        } else {
+            retained.push((name, payload));
+        }
+    }
+    *guard = retained;
+    matched
 }
 
 // ── Re-exports for service modules that still use `crate::function_name` ─────

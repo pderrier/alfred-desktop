@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.3.2
+
+**Mandatory upgrade.** v0.3.2 fixes 6 production bugs and ships 3 UX improvements in a single batch.
+
+### P0 bug fixes
+- **Technical-snapshot coverage 10/28 → ≥90%** — `fetch_technical_snapshot` now wraps each call in a 3-attempt retry-with-backoff (500 ms / 1500 ms) so transient Yahoo rate-limit spikes no longer drop tickers silently. Emits `alfred://ticker-collection-event` so the UI can show per-ticker retry/failure status (see Retry visibility below).
+- **Run-narrator no longer silent** — first-tick LLM timeout raised from 8 s to 15 s (heavy initial narration call), subsequent ticks from 8 s to 10 s, failure-degrade threshold raised 3 → 10. When the narrator does enter degraded mode it emits `alfred://run-narration-status` and the run-in-progress card shows an amber « narration: mode dégradé » badge.
+- **Signal Accuracy scorecard now visible** — `run_get_signal_scorecard` reads `by_ticker` via the new `resolve_line_memory_key()` helper which checks the canonical Yahoo symbol first and falls back to the raw ticker. Closes the v0.3.0 regression where line-memory keyed by canonical symbol was invisible to scorecard readers keyed by raw ticker.
+- **Canonical-key audit guard** — `resolve_line_memory_key()` is the single shared reader for every `by_ticker[...]` access (command_handlers, mcp_server, native_mcp_analysis). New lint-as-test `lint_no_raw_by_ticker_lookup_outside_helpers` walks the source tree and asserts no raw `.get(&ticker)` survives outside the helper, preventing the 3rd same-class regression.
+- **Settings → Storage panel works again** — three Tauri handlers (`storage_usage_local`, `storage_prune_local`, `storage_clear_log_local`) now wrap their result in the canonical `{ ok, action, result }` bridge envelope. New `bridge_envelope()` helper + `assert_bridge_envelope` test pin the convention.
+- **Per-ticker retry/failure badge** — the run-in-progress card surfaces a live aggregator badge (`⚠ 3 retries · ✗ 1 échec`) consuming the new `alfred://ticker-collection-event` stream. Aggregator is pure (`ticker-collection-status.js`), reset is `run_id`-driven, and the listener no-ops without an active run.
+
+### UX improvements
+- **Granular early-run stages** — `finary_fetching` / `snapshot_received` / `enriching_market` Rust stages drive the new `alfred-run-stage-toast` overlay trigger and progressive « Récupération Finary… / Snapshot reçu (N) / Cours marché (C/T)… » text in the Market Synthesis card, so the user no longer stares at a blank pipeline bar for the first 5–10 s of a run.
+- **Notes & Discussion in the line modal** — `app-line-modal.js` now reads `getDiscussionThreads` and renders the 5 most recent threads, clickable to reopen the conversation. Pure helper `line-modal-helpers.js` covers the formatting logic.
+- **Token cost in the run report** — `report-view-model.js` computes per-mode token usage (codex / native / native-oauth) and surfaces a footer with the per-run €/EUR cost and the model that responded. Backed by `build_token_usage_view`.
+
+### Tests / infrastructure
+- **alfred-desktop Rust**: 188 → **218 cargo tests** (+30 across the 5 worktrees A/B/C/D/E + 6 retry/event contract tests in worktree A).
+- **alfred-desktop JS**: 244 → **278 tests** (+11 ticker-collection-status aggregator/listener/glyph, +12 quick-wins line-modal & token usage, +11 run-stage context).
+- **Flaky parallelism test fixed** — `native_collection_runs_enrichment_with_configured_parallelism` was flaky at 12/30 (40%) under WSL2 CPU contention. Two root causes: (1) `enrichment::fetch_resolved_symbol` was making real HTTPS calls to `/api/resolve` bypassing the in-test mock; fixed by setting `ALFRED_API_ENABLED=0` in `env_lock()` — all 44 tests using the lock are now hermetic w.r.t. the API client. (2) The `>= 2` concurrency assertion relied on OS-scheduling overlap; replaced with an opt-in `CollectionSyncPoint` (Condvar+Mutex, 5 s timeout) that both workers must reach before either proceeds. Post-fix: 30/30 pass under `yes >/dev/null` triple contention.
+- **Contract tests added** for: technicals retry happy path, retry-then-fail, event payload, scorecard canonical lookup, canonical lint guard, bridge envelope shape on the three storage handlers.
+
+---
+
+## v0.3.1
+
+**Mandatory hotfix.** Single bug, immediate ship.
+
+- **Persist whitelist now includes `technicals`** — `persist_native_collection_state` was emitting all `build_collection_state` fields except `technicals`, so server-computed 250-day technical indicators reached the run JSON but never the LLM prompt. Fixed by adding `technicals` to the whitelist and adding a permanent contract test (`persist_whitelist_covers_all_build_collection_state_fields`) that diffs emitted vs persisted top-level keys.
+
+---
+
 ## v0.3.0
 
 ### Technical-snapshot pipeline maturity

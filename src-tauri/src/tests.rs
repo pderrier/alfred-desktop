@@ -4641,3 +4641,215 @@ use crate::storage::read_json_file;
         let array_resp = json!({ "indicators": [] });
         assert!(crate::enrichment::parse_technical_snapshot_response(&array_resp).is_none());
     }
+
+    // ── P0-1 + P0-7: retry-with-backoff + ticker-collection-event ─────────
+    //
+    // Pre-fix diagnostic: 18/18 serial probes against the missing tickers of
+    // run `019e2c9de5ee` returned HTTP 200 + indicators=true + 250 samples
+    // (`quality=fresh`). Conclusion: the 10/28 partial coverage is transient
+    // failure under parallel load (Yahoo rate-limit / network blip / 5xx),
+    // NOT a contract issue. Strategy: 3 attempts (1 initial + 2 retries),
+    // backoff 500ms then 1500ms, retry ONLY on transport `Err` — a 200
+    // response with invalid indicators is a server verdict ("unavailable")
+    // and must NOT trigger retry.
+    //
+    // Per-ticker visibility (P0-7) ships in the same commit: every retry
+    // and every final failure emit `alfred://ticker-collection-event` so
+    // worktree D's UI aggregator (v032-D) renders a live counter. A
+    // successful retry (i.e. attempt > 1) also emits a `success` event so
+    // the UI can decrement the "retrying" badge — first-try success emits
+    // nothing (zero noise on the happy path).
+    //
+    // Tests inject the fetcher and a no-op sleeper into
+    // `fetch_technical_snapshot_with_retry`, the pure helper extracted from
+    // the production wrapper (see `feedback_pure_helper_for_async_testability`).
+    // Event assertions scope by ticker since the capture buffer is shared
+    // across parallel tests (see `feedback_emit_event_test_capture`).
+
+    fn drain_ticker_collection_events(ticker: &str) -> Vec<serde_json::Value> {
+        // Scoped drain — only remove events targeting `ticker`. Leaves other
+        // parallel tests' events in the shared buffer intact. Critical: the
+        // global `test_event_capture_drain()` would race-delete sibling
+        // tests' events. See `feedback_emit_event_test_capture`.
+        let owned_ticker = ticker.to_string();
+        crate::test_event_capture_drain_where(move |name, payload| {
+            name == "alfred://ticker-collection-event"
+                && payload.get("ticker").and_then(|v| v.as_str()) == Some(owned_ticker.as_str())
+        })
+        .into_iter()
+        .map(|(_, payload)| payload)
+        .collect()
+    }
+
+    fn no_sleep(_: std::time::Duration) {}
+
+    #[test]
+    fn fetch_technical_snapshot_retries_once_on_transient_error_then_succeeds() {
+        // Mock: call 1 returns Err (simulated 5xx / connection reset), call 2
+        // returns Ok with a valid indicators payload. Expect Some(snapshot).
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let fetcher = |_ticker: &str, _isin: Option<&str>, _canonical: Option<&str>| {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                Err(anyhow::anyhow!("alfred_api_http_error:503"))
+            } else {
+                Ok(json!({
+                    "technical_snapshot": {
+                        "as_of": "2026-05-15",
+                        "source": "yahoo:chart",
+                        "samples": 250,
+                        "indicators": { "rsi_14": 55.0, "sma_200": 100.0 }
+                    }
+                }))
+            }
+        };
+        let snap = crate::enrichment::fetch_technical_snapshot_with_retry(
+            "RETRY1", None, None, &fetcher, &no_sleep,
+        );
+        assert!(snap.is_some(), "second attempt must produce a snapshot");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn fetch_technical_snapshot_retries_twice_max_then_returns_none() {
+        // Mock: Err on all 3 calls. Loop must stop after the 3rd attempt and
+        // return None — never a 4th call.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let fetcher = |_t: &str, _i: Option<&str>, _c: Option<&str>| -> anyhow::Result<serde_json::Value> {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(anyhow::anyhow!("alfred_api_unreachable:io_error"))
+        };
+        let snap = crate::enrichment::fetch_technical_snapshot_with_retry(
+            "RETRY2", None, None, &fetcher, &no_sleep,
+        );
+        assert!(snap.is_none(), "3 consecutive transport errors must yield None");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "retry budget: 1 initial + 2 retries = 3 total calls, never 4"
+        );
+    }
+
+    #[test]
+    fn fetch_technical_snapshot_does_not_retry_on_unavailable_response() {
+        // Mock: Ok on call 1 but the body has `indicators: null` (server
+        // verdict "unavailable" — upstream OHLC fetch failed but the cache
+        // populated with a no-data marker). This is NOT a transient failure
+        // — retrying just wastes the rate budget. Expect 1 call, None.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let fetcher = |_t: &str, _i: Option<&str>, _c: Option<&str>| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(json!({
+                "technical_snapshot": {
+                    "as_of": "2026-05-15",
+                    "source": "yahoo:chart",
+                    "samples": 0,
+                    "indicators": null
+                }
+            }))
+        };
+        let snap = crate::enrichment::fetch_technical_snapshot_with_retry(
+            "RETRY3", None, None, &fetcher, &no_sleep,
+        );
+        assert!(snap.is_none(), "indicators=null returns None — server has spoken");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "200-with-unusable-body must NOT trigger retry (waste of rate budget)"
+        );
+    }
+
+    #[test]
+    fn fetch_technical_snapshot_emits_retry_event_with_attempt_number() {
+        // Mock: Err on call 1, Ok on call 2. Assert a `retry` event was
+        // emitted before the second attempt, carrying attempt=1 and a reason.
+        // A `success` event is also emitted because the final outcome
+        // recovered from a retry — worktree D uses it to decrement the
+        // "retrying" badge for that ticker.
+        let _ = drain_ticker_collection_events("RETRY_EVT1");
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let fetcher = |_t: &str, _i: Option<&str>, _c: Option<&str>| {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                Err(anyhow::anyhow!("alfred_api_http_error:502 bad gateway"))
+            } else {
+                Ok(json!({
+                    "indicators": { "rsi_14": 60.0 },
+                    "samples": 250
+                }))
+            }
+        };
+        let snap = crate::enrichment::fetch_technical_snapshot_with_retry(
+            "RETRY_EVT1", None, None, &fetcher, &no_sleep,
+        );
+        assert!(snap.is_some(), "retry recovers to a snapshot");
+
+        let events = drain_ticker_collection_events("RETRY_EVT1");
+        let retry_evt = events.iter().find(|e| {
+            e.get("kind").and_then(|v| v.as_str()) == Some("retry")
+        }).expect("a `retry` event must be emitted before the second attempt");
+        assert_eq!(retry_evt.get("attempt").and_then(|v| v.as_i64()), Some(1));
+        let reason = retry_evt.get("reason").and_then(|v| v.as_str()).unwrap_or_default();
+        assert!(
+            reason.contains("502") || reason.contains("bad gateway"),
+            "retry event reason must surface the underlying error — got {reason:?}"
+        );
+    }
+
+    #[test]
+    fn fetch_technical_snapshot_emits_failure_event_after_exhausted_retries() {
+        // Mock: Err x 3. Assert two `retry` events (attempt 1 then 2) and one
+        // final `failure` event with attempts=3. No `success` event.
+        let _ = drain_ticker_collection_events("RETRY_EVT2");
+        let fetcher = |_t: &str, _i: Option<&str>, _c: Option<&str>| -> anyhow::Result<serde_json::Value> {
+            Err(anyhow::anyhow!("alfred_api_unreachable:timeout"))
+        };
+        let snap = crate::enrichment::fetch_technical_snapshot_with_retry(
+            "RETRY_EVT2", None, None, &fetcher, &no_sleep,
+        );
+        assert!(snap.is_none());
+
+        let events = drain_ticker_collection_events("RETRY_EVT2");
+        let retries: Vec<_> = events
+            .iter()
+            .filter(|e| e.get("kind").and_then(|v| v.as_str()) == Some("retry"))
+            .collect();
+        assert_eq!(retries.len(), 2, "two retries fired (attempts 1 and 2)");
+        let failure = events.iter().find(|e| {
+            e.get("kind").and_then(|v| v.as_str()) == Some("failure")
+        }).expect("a `failure` event must be emitted once retries are exhausted");
+        assert_eq!(
+            failure.get("attempts").and_then(|v| v.as_i64()),
+            Some(3),
+            "failure event must report total attempts (1 initial + 2 retries)"
+        );
+        let no_success = events.iter().all(|e| {
+            e.get("kind").and_then(|v| v.as_str()) != Some("success")
+        });
+        assert!(no_success, "no success event when all attempts fail");
+    }
+
+    #[test]
+    fn fetch_technical_snapshot_emits_no_event_on_first_try_success() {
+        // Mock: Ok on call 1. Happy path must be silent — emitting `success`
+        // on every ticker on every run would be 28+ events of pure noise per
+        // run for worktree D's aggregator. Success events are reserved for
+        // post-retry recovery (decrements the "retrying" badge).
+        let _ = drain_ticker_collection_events("RETRY_EVT3");
+        let fetcher = |_t: &str, _i: Option<&str>, _c: Option<&str>| {
+            Ok(json!({
+                "indicators": { "rsi_14": 50.0 },
+                "samples": 250
+            }))
+        };
+        let snap = crate::enrichment::fetch_technical_snapshot_with_retry(
+            "RETRY_EVT3", None, None, &fetcher, &no_sleep,
+        );
+        assert!(snap.is_some());
+
+        let events = drain_ticker_collection_events("RETRY_EVT3");
+        assert!(
+            events.is_empty(),
+            "first-try success must emit zero events — got {events:?}"
+        );
+    }

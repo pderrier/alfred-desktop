@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.3.0 — unreleased (in progress)
+## v0.3.0
 
 ### Technical-snapshot pipeline maturity
 - **ISIN→canonical Yahoo symbol resolver** — 180d positive / 15s negative Redis cache. Covers all geographies tested live (US/UK/DE/IT/JP/HK/AU/IN/BR/IE/multi-listed NL/crypto). See `docs/technical-snapshot.md`.
@@ -18,7 +18,12 @@
 - **Mandatory upgrade** — clients ≤ v0.2.18 will fail HMAC authentication after the secret rotation included in this release. See `docs/update-manifest-and-mandatory-upgrade.md`.
 
 ### Tests / infrastructure
-- _Will be filled at release time with final counts and any infrastructure highlights._
+- **alfred-api**: 90 → **113 cargo tests** (+23: 6 for `/api/resolve` shape, 9 for Yahoo spot fallback, 14 for canonical query helpers). Zero new warnings.
+- **alfred-desktop Rust**: 170 → **185 cargo tests** (+15: resolved_symbol plumbing, canonical-key line-memory dedup, venue mapping).
+- **alfred-desktop JS**: 229 → **244 tests** (+15: 21 venue-suffix mappings, byte-identical legacy layout pin, watchlist canonical resolution).
+- **Negative caching capped at 15 seconds** across `yahoo_symbol-neg`, `ohlc-neg`, `technicals-neg` (was 24h / 1h / 1h). Pinned by `*_ttl_is_15_seconds` tests. Flood protection only — production incident on 2026-05-15 showed a 1h negative cache blocked a freshly-deployed fix from surfacing.
+- **`deploy/deploy-alfred-api.sh`** merges `~/.alfred-secrets.env` (mode 600, gitignored, HOME-resident) into the VPS env file before SCP — closes the loop where each deploy was silently wiping `ALFRED_API_SECRET`.
+- **CHANGELOG backfilled** for v0.2.8–v0.2.18 (10 versions) from git history; README features list updated.
 
 ---
 

@@ -4444,3 +4444,90 @@ use crate::storage::read_json_file;
             offenders.join("\n")
         );
     }
+
+    // ── P0-4: scorecard resolves canonical-key entry ───────────────────
+
+    #[test]
+    fn scorecard_resolves_canonical_key_when_present() {
+        // v0.3 #22 cross-account dedup writes the entry under canonical Yahoo
+        // symbol (`STMPA.PA`), not raw broker ticker (`STMPA`). Pre-v0.3.2
+        // `run_get_signal_scorecard("STMPA")` did a raw `by_ticker.get(&ticker)`
+        // → miss → empty signals → UI hides the scorecard section. With the
+        // canonical-aware resolver, the entry surfaces.
+        let _guard = env_lock();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempdir.path().join("runtime-state");
+        std::env::set_var("ALFRED_STATE_DIR", state_dir.as_os_str());
+        seed_line_memory_fixture(&state_dir, json!({
+            "by_ticker": {
+                // Entry keyed under canonical Yahoo symbol (v0.3 #22 write path).
+                "STMPA.PA": {
+                    "schema_version": 2,
+                    // Body still carries the raw broker ticker — this is what
+                    // `resolve_line_memory_key` matches on for step-2 fallback.
+                    "ticker": "STMPA",
+                    "signal_history": [
+                        { "date": "2026-05-14", "signal": "ACHAT", "price_at_signal": 50.0 },
+                        { "date": "2026-05-10", "signal": "ACHAT", "price_at_signal": 48.0 },
+                        { "date": "2026-05-05", "signal": "CONSERVER", "price_at_signal": 47.0 }
+                    ],
+                    "price_tracking": { "current_price": 52.0 }
+                }
+            }
+        }));
+
+        let card = crate::command_handlers::run_get_signal_scorecard("STMPA".to_string())
+            .expect("scorecard must return ok");
+
+        let signals = card.get("signals").and_then(|v| v.as_array())
+            .expect("signals array must be present");
+        assert_eq!(
+            signals.len(), 3,
+            "signal_history(len=3) under canonical key STMPA.PA must surface for raw ticker STMPA — got: {card}"
+        );
+        assert_eq!(
+            card.get("ticker").and_then(|v| v.as_str()),
+            Some("STMPA"),
+            "echoed ticker must be the raw input — canonical resolution is internal"
+        );
+
+        std::env::remove_var("ALFRED_STATE_DIR");
+        crate::native_mcp_analysis::line_memory_reset_for_tests();
+    }
+
+    #[test]
+    fn scorecard_falls_back_to_raw_ticker_when_no_canonical() {
+        // Backward compat: pre-v0.3 entries keyed by raw broker ticker must
+        // still surface. The resolver's step-1 (direct hit on raw_ticker.upper)
+        // catches these without needing the step-2 body scan.
+        let _guard = env_lock();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempdir.path().join("runtime-state");
+        std::env::set_var("ALFRED_STATE_DIR", state_dir.as_os_str());
+        seed_line_memory_fixture(&state_dir, json!({
+            "by_ticker": {
+                "AAPL": {
+                    "schema_version": 2,
+                    "ticker": "AAPL",
+                    "signal_history": [
+                        { "date": "2026-05-14", "signal": "ACHAT", "price_at_signal": 195.0 },
+                        { "date": "2026-05-10", "signal": "CONSERVER", "price_at_signal": 192.0 }
+                    ],
+                    "price_tracking": { "current_price": 198.0 }
+                }
+            }
+        }));
+
+        let card = crate::command_handlers::run_get_signal_scorecard("AAPL".to_string())
+            .expect("scorecard must return ok");
+
+        let signals = card.get("signals").and_then(|v| v.as_array())
+            .expect("signals array must be present");
+        assert_eq!(
+            signals.len(), 2,
+            "raw-keyed entry (pre-v0.3 shape) must still surface — backward compat. Got: {card}"
+        );
+
+        std::env::remove_var("ALFRED_STATE_DIR");
+        crate::native_mcp_analysis::line_memory_reset_for_tests();
+    }

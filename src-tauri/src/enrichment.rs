@@ -57,6 +57,13 @@ pub fn fetch_cot(ticker: &str, isin: &str) -> Result<Value> {
 
 /// Fetch the 250-day technical snapshot for a ticker.
 ///
+/// `isin` is forwarded to the server so the source_router can classify EU
+/// equities whose ticker is a bare alpha string (e.g. `EXA`, `LBIRD`,
+/// `VETO`) — these match the `^[A-Z]{1,5}$` US regex and would otherwise
+/// route to Yahoo without an exchange suffix and fail. With the ISIN, the
+/// server infers `.PA` (or `.AS`, `.DE`, …) and the Yahoo OHLC fetch
+/// succeeds. Callers should pass the row ISIN whenever available.
+///
 /// Returns `None` silently on any non-200 (404 = ticker unsupported / endpoint
 /// not yet deployed, 429 = rate-limited, transport errors, parse failures).
 /// The caller stores the result alongside other enrichments; downstream
@@ -66,8 +73,8 @@ pub fn fetch_cot(ticker: &str, isin: &str) -> Result<Value> {
 /// shape as the `TechnicalSnapshot` struct in `models::`. We pass it as
 /// `Value` here to avoid eagerly typing it in the hot path (deserialization
 /// happens only when the prompt builder needs it).
-pub fn fetch_technical_snapshot(ticker: &str) -> Option<Value> {
-    match crate::alfred_api_client::remote_fetch_technicals(ticker) {
+pub fn fetch_technical_snapshot(ticker: &str, isin: Option<&str>) -> Option<Value> {
+    match crate::alfred_api_client::remote_fetch_technicals(ticker, isin) {
         Ok(resp) => {
             // Envelope may wrap as { "technical_snapshot": {...} } or be the
             // snapshot directly — accept both.

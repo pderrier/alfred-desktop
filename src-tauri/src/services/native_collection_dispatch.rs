@@ -147,10 +147,16 @@ fn process_collection_task(config: &CollectionWorkerConfig, task: CollectionTask
     // VPS endpoint is being rolled out, so this adds negligible latency.
     // Shared insights / sector / COT remain fetched on-demand by the MCP
     // server's get_line_data tool (direct API calls), not stored in run_state.
+    //
+    // ISIN is passed through so the server can resolve the correct Yahoo
+    // exchange suffix for bare EU tickers (`EXA` → `EXA.PA` via FR ISIN
+    // prefix). Without it, the source_router classifies these as US and
+    // every Yahoo OHLC fetch returns `yahoo_no_timestamps`.
     let technical_snapshot = if ticker.is_empty() {
         None
     } else {
-        crate::enrichment::fetch_technical_snapshot(&ticker)
+        let isin_opt = if isin.is_empty() { None } else { Some(isin.as_str()) };
+        crate::enrichment::fetch_technical_snapshot(&ticker, isin_opt)
     };
     CollectionResult {
         index: task.index,

@@ -159,10 +159,35 @@ pub fn remote_fetch_sector(ticker: &str, name: &str, isin: &str) -> Result<Value
 /// ~250 trading days of OHLC. Returns the parsed JSON envelope verbatim — the
 /// caller is responsible for unwrapping `technical_snapshot`.
 ///
+/// `isin` is forwarded so the server-side source_router can classify a bare
+/// French/EU ticker (e.g. `EXA`, `LBIRD`) as European and derive the correct
+/// Yahoo exchange suffix (`.PA`). Without it, the regex `^[A-Z]{1,5}$`
+/// classifies these as US and the Yahoo OHLC fetch returns
+/// `yahoo:yahoo_no_timestamps` — see `docs/technical-snapshot.md` and the
+/// server `source_router::infer_exchange_suffix` helper.
+///
 /// Server endpoint may not be deployed yet — callers must handle errors
 /// gracefully (typically map to `None`).
-pub fn remote_fetch_technicals(ticker: &str) -> Result<Value> {
-    api_get(&format!("/api/market/technicals?ticker={}", urlenc(ticker)), TIMEOUT_SECS)
+pub fn remote_fetch_technicals(ticker: &str, isin: Option<&str>) -> Result<Value> {
+    api_get(&build_technicals_path(ticker, isin), TIMEOUT_SECS)
+}
+
+/// Build the `/api/market/technicals` query string for `(ticker, isin)`.
+/// Extracted so the URL contract is unit-testable without an HTTP round trip.
+///
+/// The `isin` argument is included only when present and non-empty after
+/// trimming — empty strings degrade gracefully to a ticker-only query so
+/// existing callers without ISIN keep their previous wire shape.
+fn build_technicals_path(ticker: &str, isin: Option<&str>) -> String {
+    let trimmed_isin = isin.map(str::trim).filter(|s| !s.is_empty());
+    match trimmed_isin {
+        Some(code) => format!(
+            "/api/market/technicals?ticker={}&isin={}",
+            urlenc(ticker),
+            urlenc(code),
+        ),
+        None => format!("/api/market/technicals?ticker={}", urlenc(ticker)),
+    }
 }
 
 /// Fetch COT data for a ticker from the API.
@@ -228,5 +253,47 @@ fn map_api_error(e: ureq::Error) -> anyhow::Error {
         ureq::Error::Status(429, _) => anyhow!("alfred_api_rate_limited"),
         ureq::Error::Status(code, _) => anyhow!("alfred_api_http_error:{code}"),
         _ => anyhow!("alfred_api_request_failed:{e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn technicals_path_without_isin_keeps_ticker_only_shape() {
+        // Existing callers (US tickers, watchlist entries without ISIN) must
+        // continue to produce the original wire path so cached server-side
+        // responses keyed by URL don't fragment.
+        let p = build_technicals_path("AAPL", None);
+        assert_eq!(p, "/api/market/technicals?ticker=AAPL");
+    }
+
+    #[test]
+    fn technicals_path_with_isin_appends_isin_param() {
+        // The whole point of v0.2.18: French small/mid caps need ISIN so the
+        // server can route to the EU OHLC chain (Yahoo with `.PA` suffix).
+        let p = build_technicals_path("EXA", Some("FR0010163345"));
+        assert_eq!(p, "/api/market/technicals?ticker=EXA&isin=FR0010163345");
+    }
+
+    #[test]
+    fn technicals_path_empty_isin_treated_as_absent() {
+        // Position::isin is Option<String>; an `Some("")` slips through
+        // serde for legacy rows. Strip it so we don't ship `isin=` (which
+        // some axum query parsers reject) — match the trim-and-empty rule
+        // used by the server handlers (handlers.rs:OhlcParams).
+        let p = build_technicals_path("AAPL", Some(""));
+        assert_eq!(p, "/api/market/technicals?ticker=AAPL");
+        let p2 = build_technicals_path("AAPL", Some("   "));
+        assert_eq!(p2, "/api/market/technicals?ticker=AAPL");
+    }
+
+    #[test]
+    fn technicals_path_url_encodes_both_params() {
+        // Defensive: ISIN is always alphanumeric, but ticker fields from CSVs
+        // can carry surprising characters. Confirm urlenc is applied to both.
+        let p = build_technicals_path("A B", Some("FR 1234"));
+        assert_eq!(p, "/api/market/technicals?ticker=A+B&isin=FR+1234");
     }
 }

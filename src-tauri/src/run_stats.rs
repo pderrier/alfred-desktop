@@ -34,9 +34,19 @@ pub fn aggregate_from_progress_file(data_dir: &str, run_id: &str) -> Value {
     let mut signals: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     let mut first_event_ts = String::new();
     let mut last_event_ts = String::new();
-    let mut max_total_tokens = 0u64;
-    let mut max_input_tokens = 0u64;
-    let mut max_output_tokens = 0u64;
+    // Native mode emits ONE token_usage event per LLM call (at
+    // response.completed in openai_client.rs), so totals across parallel
+    // line workers must be SUMMED. Codex mode emits cumulative
+    // per-thread updates within a single stream — keep MAX semantics so
+    // a single call isn't multi-counted. Events tagged `mode: "native"`
+    // route to the sum bucket; everything else (codex + legacy untagged
+    // pre-mode-tag JSONL files) keeps the max behaviour.
+    let mut native_sum_total = 0u64;
+    let mut native_sum_input = 0u64;
+    let mut native_sum_output = 0u64;
+    let mut other_max_total = 0u64;
+    let mut other_max_input = 0u64;
+    let mut other_max_output = 0u64;
     let mut token_updates = 0u32;
     let mut last_rate_limit_pct = 0u64;
 
@@ -91,10 +101,18 @@ pub fn aggregate_from_progress_file(data_dir: &str, run_id: &str) -> Value {
                 let total = event.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
                 let input = event.get("input").and_then(|v| v.as_u64()).unwrap_or(0);
                 let output = event.get("output").and_then(|v| v.as_u64()).unwrap_or(0);
-                // Token usage is cumulative per thread — take the max seen
-                if total > max_total_tokens { max_total_tokens = total; }
-                if input > max_input_tokens { max_input_tokens = input; }
-                if output > max_output_tokens { max_output_tokens = output; }
+                let mode = event.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+                if mode == "native" {
+                    // Native: one event = one whole LLM call. Sum.
+                    native_sum_total += total;
+                    native_sum_input += input;
+                    native_sum_output += output;
+                } else {
+                    // Codex / legacy untagged: cumulative per stream. Max.
+                    if total > other_max_total { other_max_total = total; }
+                    if input > other_max_input { other_max_input = input; }
+                    if output > other_max_output { other_max_output = output; }
+                }
                 token_updates += 1;
             }
             "rate_limit" => {
@@ -127,18 +145,80 @@ pub fn aggregate_from_progress_file(data_dir: &str, run_id: &str) -> Value {
             "reasoning_steps": reasoning_steps,
             "total_progress_events": total_progress_events,
         },
-        "token_usage": {
-            "total_tokens": max_total_tokens,
-            "input_tokens": max_input_tokens,
-            "output_tokens": max_output_tokens,
-            "token_updates": token_updates,
-            "rate_limit_pct": last_rate_limit_pct,
-        },
+        "token_usage": build_token_usage_summary(
+            native_sum_total, native_sum_input, native_sum_output,
+            other_max_total, other_max_input, other_max_output,
+            token_updates, last_rate_limit_pct,
+        ),
         "signals": signals,
         "timing": {
             "first_event": first_event_ts,
             "last_event": last_event_ts,
         },
+    })
+}
+
+// ── Cost / model exposure for the report footer ──
+//
+// GPT-5 published pricing (2025): $1.25 per 1M input tokens, $10 per 1M
+// output tokens. Conversion rate USD→EUR defaults to 0.92 (broad mid-2025
+// average) and is overridable via `ALFRED_USD_TO_EUR` for users on
+// different rate desks.
+const GPT5_USD_PER_INPUT_M: f64 = 1.25;
+const GPT5_USD_PER_OUTPUT_M: f64 = 10.0;
+const DEFAULT_USD_TO_EUR: f64 = 0.92;
+
+/// Resolve the model name reported alongside cost. Native runs read
+/// `ALFRED_MODEL` (set by the openai client config); falls back to
+/// `gpt-5`.
+fn resolve_reported_model() -> String {
+    std::env::var("ALFRED_MODEL").unwrap_or_else(|_| "gpt-5".to_string())
+}
+
+/// Compute the EUR cost for a given pair of token counts using GPT-5
+/// pricing and the resolved USD→EUR rate. Returns `0.0` when no tokens
+/// were used (typical for codex OAuth runs, which have no per-call cost).
+pub fn compute_cost_eur(input_tokens: u64, output_tokens: u64) -> f64 {
+    if input_tokens == 0 && output_tokens == 0 {
+        return 0.0;
+    }
+    let usd_to_eur = std::env::var("ALFRED_USD_TO_EUR")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|r| r.is_finite() && *r > 0.0)
+        .unwrap_or(DEFAULT_USD_TO_EUR);
+    let input_usd = (input_tokens as f64) * GPT5_USD_PER_INPUT_M / 1_000_000.0;
+    let output_usd = (output_tokens as f64) * GPT5_USD_PER_OUTPUT_M / 1_000_000.0;
+    (input_usd + output_usd) * usd_to_eur
+}
+
+/// Combine the two aggregation buckets into the `token_usage` summary
+/// emitted on `run_statistics`. Native counts are summed across parallel
+/// LLM calls; codex/legacy counts use max-of-cumulative. The two are
+/// summed at the end so a hybrid run (rare, but possible if user swaps
+/// backend mid-flight) still reports a meaningful upper bound.
+fn build_token_usage_summary(
+    native_total: u64, native_input: u64, native_output: u64,
+    other_total: u64, other_input: u64, other_output: u64,
+    token_updates: u32, last_rate_limit_pct: u64,
+) -> Value {
+    let total_tokens = native_total + other_total;
+    let input_tokens = native_input + other_input;
+    let output_tokens = native_output + other_output;
+    let cost_eur = compute_cost_eur(input_tokens, output_tokens);
+    json!({
+        "total_tokens": total_tokens,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "token_updates": token_updates,
+        "rate_limit_pct": last_rate_limit_pct,
+        "model": resolve_reported_model(),
+        "cost_eur": cost_eur,
+        // Sub-totals so the UI can show "Native: 12.5k tokens / Codex: 0"
+        // if it ever wants to disambiguate (the current footer just
+        // displays the aggregate).
+        "native_total_tokens": native_total,
+        "codex_total_tokens": other_total,
     })
 }
 

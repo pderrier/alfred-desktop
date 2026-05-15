@@ -856,6 +856,19 @@ function renderReport(payload) {
       : "";
     reportProvenanceNode.textContent = provenanceText;
   }
+  // v0.3.2 (P1-3): per-run estimated cost + token usage footer.
+  // Source: model.tokenUsage (null when run had no measurable cost / no
+  // run_statistics field — pre-v0.3.2 runs and free-tier codex OAuth).
+  const reportCostNode = document.getElementById("report-cost");
+  if (reportCostNode) {
+    if (model.tokenUsage) {
+      reportCostNode.textContent = `${model.tokenUsage.costLabel} — ${model.tokenUsage.tokensLabel} (${model.tokenUsage.model})`;
+      reportCostNode.classList.remove("hidden");
+    } else {
+      reportCostNode.textContent = "";
+      reportCostNode.classList.add("hidden");
+    }
+  }
   // Surface synthesis validation warnings as a non-blocking notice — we always
   // show the run; the badge just signals that the validator caught quality
   // issues (priority_invalid, too_many_actions, etc.) so the user knows the

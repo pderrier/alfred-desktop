@@ -4,7 +4,8 @@
  */
 import { escapeHtml } from "/desktop-shell/ui-display-utils.js";
 import { openChatWizard } from "/desktop-shell/app-chat-wizard.js";
-import { openDiscussionHistoryModal, saveDiscussionThread } from "/desktop-shell/discussion-memory.js";
+import { openDiscussionHistoryModal, saveDiscussionThread, getDiscussionThreads } from "/desktop-shell/discussion-memory.js";
+import { renderDiscussionThreadsList } from "/desktop-shell/line-modal-helpers.js";
 
 // ── DOM nodes ────────────────────────────────────────────────────
 
@@ -909,15 +910,28 @@ export function initLineModal() {
     const narrative = memory.memory_narrative || "";
     if (lineMemoryNarrativeNode) lineMemoryNarrativeNode.textContent = narrative || "No memory.";
     // Notes & Discussions — user-saved insights from chat drill-downs
+    // plus the top-5 most recent discussion threads scoped to this ticker.
+    // Behaviour pinned by renderDiscussionThreadsList tests (line-modal-helpers.js).
     const notesSection = document.getElementById("line-memory-notes-section");
     const userNoteNode = document.getElementById("line-memory-user-note");
     const userNote = memory.user_note || "";
-    const hasNotes = narrative || userNote;
-    if (notesSection) notesSection.classList.toggle("hidden", !hasNotes);
     if (userNoteNode) {
       userNoteNode.textContent = userNote || "No personal note.";
       document.getElementById("line-memory-user-note-block")?.classList.toggle("hidden", !userNote);
     }
+    // Render top-5 discussion threads for this ticker.
+    const discussionsBlock = document.getElementById("line-memory-discussions-block");
+    const discussionsList = document.getElementById("line-memory-discussions-list");
+    const discussionCount = renderDiscussionThreadsList(ticker, discussionsBlock, discussionsList, {
+      getThreads: getDiscussionThreads,
+      openHistoryModal: openDiscussionHistoryModal,
+      limit: 5,
+    });
+    // Show the outer section if the narrative, the personal note, OR any
+    // discussion thread is present. Previously the section was hidden when
+    // both narrative and user_note were empty even though discussions existed.
+    const hasNotes = Boolean(narrative) || Boolean(userNote) || discussionCount > 0;
+    if (notesSection) notesSection.classList.toggle("hidden", !hasNotes);
     // "News Analysis" = LLM's deep_news_summary from this run
     const freshSummary = String(details.analysis?.deep_news_summary || "");
     const memorySummary = String(memory.deep_news_memory_summary || "");

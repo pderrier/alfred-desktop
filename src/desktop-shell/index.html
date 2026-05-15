@@ -249,6 +249,7 @@
             <h2>Market Synthesis</h2>
             <p id="report-provenance" class="settings-note">No provenance available yet.</p>
             <p id="report-synthesis" class="report-synthesis">No synthesis yet.</p>
+            <p id="report-cost" class="settings-note hidden" data-testid="report-cost"></p>
           </section>
 
           <!-- Recommended actions -->
@@ -455,6 +456,10 @@
             <div id="line-memory-user-note-block">
               <label style="font-size:0.7rem;color:var(--sea-muted,#8a9bb0)">Personal Note</label>
               <p id="line-memory-user-note" class="lm-memory-text" style="white-space:pre-wrap;margin:0.2rem 0 0"></p>
+            </div>
+            <div id="line-memory-discussions-block" class="hidden">
+              <label style="font-size:0.7rem;color:var(--sea-muted,#8a9bb0)">Previous Discussions</label>
+              <ul id="line-memory-discussions-list" class="lm-discussions-list" style="list-style:none;padding:0;margin:0.2rem 0 0;display:flex;flex-direction:column;gap:0.3rem"></ul>
             </div>
           </div>
         </details>

@@ -10,7 +10,8 @@ use crate::storage::read_json_file;
     use serde_json::json;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::{Condvar, Mutex};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         let guard = crate::helpers::test_env_lock();
@@ -19,6 +20,15 @@ use crate::storage::read_json_file;
         crate::run_state_cache::reset_cache();
         // Always use mock_cache mode in tests — never call real LLM APIs.
         std::env::set_var("LITELLM_GENERATION_MODE", "mock_cache");
+        // Disable the alfred-api HTTP client. Otherwise the ISIN resolver
+        // (`enrichment::fetch_resolved_symbol`) hits the production
+        // `/api/resolve` endpoint over real DNS/HTTPS, and intermittent
+        // success/failure of that call changes downstream enrichment URLs
+        // (`&canonical=` is appended or not), bypassing the in-test
+        // `request_fn` mock and producing wall-clock-dependent flakes.
+        // Every test using `env_lock()` is already hermetic w.r.t. LLM and
+        // Codex; the API client must be hermetic too.
+        std::env::set_var("ALFRED_API_ENABLED", "0");
         // Install Codex mock so MCP batch/synthesis turns don't hit real Codex.
         crate::codex::set_codex_mock(Some(codex_test_mock));
         guard
@@ -134,6 +144,7 @@ use crate::storage::read_json_file;
         "ALFRED_RUNTIME_SETTINGS_PATH",
         "LITELLM_GENERATION_MODE",
         "ALFRED_LLM_TOKEN",
+        "ALFRED_API_ENABLED",
     ];
 
     static TEST_ACTIVE_LINE_ANALYZE_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -149,10 +160,121 @@ use crate::storage::read_json_file;
     }
 
     fn record_collection_parallelism() {
+        // Deterministic concurrency rendezvous (opt-in via CollectionSyncPoint).
+        // When enabled by a test that needs to prove the dispatcher fans out
+        // N workers concurrently, every worker waits here until all parties
+        // arrive — guaranteeing the max-concurrent counter reaches `parties`
+        // regardless of OS scheduling. When disabled (default), this is a
+        // cheap atomic read and other tests using the same mock harness
+        // are unaffected. See `CollectionSyncPoint` below for the protocol.
+        CollectionSyncPoint::arrive_if_enabled();
         let active = TEST_ACTIVE_COLLECTION_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
         TEST_MAX_CONCURRENT_COLLECTION_CALLS.fetch_max(active, Ordering::SeqCst);
         std::thread::sleep(std::time::Duration::from_millis(60));
         TEST_ACTIVE_COLLECTION_CALLS.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Deterministic concurrency rendezvous used by the collection-parallelism
+    /// test. The semantic intent of that test is "the dispatcher actually runs
+    /// N collection workers concurrently when configured for N-way parallelism".
+    /// The previous design relied on OS scheduling to overlap two 60ms sleeps
+    /// inside `record_collection_parallelism`; under CPU contention (WSL2,
+    /// busy CI) workers serialised and the max-concurrent counter never
+    /// reached 2 — a ~40% flake rate.
+    ///
+    /// Protocol:
+    /// - Test calls `CollectionSyncPoint::enable(parties)` before launching the
+    ///   workflow, and `disable()` (or drops the guard) after.
+    /// - Each worker hitting `record_collection_parallelism()` calls
+    ///   `arrive_if_enabled()`. The first `parties - 1` arrivers block on the
+    ///   condvar; the `parties`-th arriver releases everyone. All workers
+    ///   then proceed into the existing counter-increment block.
+    /// - `arrive_if_enabled()` carries a 5s timeout. A serial-dispatch
+    ///   regression manifests as: only one worker reaches the rendezvous,
+    ///   times out after 5s, proceeds, counter stays at 1, the test assertion
+    ///   `>= parties` fails fast and loudly. The barrier never deadlocks the
+    ///   whole suite.
+    /// - When disabled, `arrive_if_enabled()` is a single atomic load and
+    ///   returns immediately — other tests sharing the mock harness are
+    ///   unaffected.
+    struct CollectionSyncPoint;
+
+    static SYNC_PARTIES: AtomicUsize = AtomicUsize::new(0);
+    static SYNC_STATE: Mutex<SyncState> = Mutex::new(SyncState {
+        arrived: 0,
+        released: false,
+    });
+    static SYNC_COND: Condvar = Condvar::new();
+
+    struct SyncState {
+        arrived: usize,
+        released: bool,
+    }
+
+    /// RAII guard returned by `CollectionSyncPoint::enable`. Disables the
+    /// rendezvous on drop so a panicking test still leaves the sync point
+    /// clean for subsequent tests.
+    struct SyncPointGuard;
+
+    impl Drop for SyncPointGuard {
+        fn drop(&mut self) {
+            CollectionSyncPoint::disable();
+        }
+    }
+
+    impl CollectionSyncPoint {
+        const TIMEOUT: Duration = Duration::from_secs(5);
+
+        fn enable(parties: usize) -> SyncPointGuard {
+            assert!(parties >= 2, "sync point needs >= 2 parties to be meaningful");
+            {
+                let mut state = SYNC_STATE.lock().expect("sync state lock");
+                state.arrived = 0;
+                state.released = false;
+            }
+            SYNC_PARTIES.store(parties, Ordering::SeqCst);
+            SyncPointGuard
+        }
+
+        fn disable() {
+            SYNC_PARTIES.store(0, Ordering::SeqCst);
+            let mut state = SYNC_STATE.lock().expect("sync state lock");
+            state.arrived = 0;
+            state.released = true;
+            SYNC_COND.notify_all();
+        }
+
+        fn arrive_if_enabled() {
+            let parties = SYNC_PARTIES.load(Ordering::SeqCst);
+            if parties == 0 {
+                return;
+            }
+            let mut state = SYNC_STATE.lock().expect("sync state lock");
+            state.arrived += 1;
+            if state.arrived >= parties {
+                state.released = true;
+                SYNC_COND.notify_all();
+                return;
+            }
+            // Wait until released or timeout — timeout means the dispatcher
+            // failed to fan out enough workers concurrently. We proceed
+            // anyway so the test's assertion can fail with a meaningful
+            // counter value instead of the whole suite deadlocking.
+            let deadline = std::time::Instant::now() + Self::TIMEOUT;
+            while !state.released {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let (next_state, result) = SYNC_COND
+                    .wait_timeout(state, remaining)
+                    .expect("sync condvar wait");
+                state = next_state;
+                if result.timed_out() {
+                    break;
+                }
+            }
+        }
     }
 
     fn native_parallelism_test_request(
@@ -224,6 +346,13 @@ use crate::storage::read_json_file;
             let ticker = parsed["line_context"]["ticker"]
                 .as_str()
                 .expect("ticker should exist");
+            // NOTE: increments the max-concurrent counter but no test currently
+            // asserts on it — `native_analysis_workflow_runs_line_analysis_with_configured_parallelism`
+            // checks reco_count / orchestration_status / report file, never the
+            // line-analyze max-concurrent counter. So this site is NOT prone to
+            // the same OS-scheduling flake as `record_collection_parallelism`.
+            // If a future test does assert on it, route it through
+            // `CollectionSyncPoint`-style rendezvous to stay deterministic.
             let active = TEST_ACTIVE_LINE_ANALYZE_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
             TEST_MAX_CONCURRENT_LINE_ANALYZE_CALLS.fetch_max(active, Ordering::SeqCst);
             std::thread::sleep(std::time::Duration::from_millis(80));
@@ -614,6 +743,11 @@ use crate::storage::read_json_file;
     fn native_collection_runs_enrichment_with_configured_parallelism() {
         let _guard = env_lock();
         reset_parallelism_counters();
+        // Force the two dispatcher workers to rendezvous inside the mock
+        // before either proceeds, so the max-concurrent counter is
+        // guaranteed to reach 2 regardless of OS scheduling. See
+        // `CollectionSyncPoint` doc-comment for the rationale.
+        let _sync_guard = CollectionSyncPoint::enable(2);
 
         let base_dir = std::env::temp_dir().join(format!(
             "alfred-native-collection-parallel-{}-{}",

@@ -699,7 +699,14 @@ fn tool_get_line_data(data_dir: &Path, params: &Value) -> Result<Value> {
 
     // Sector classification + COT positioning
     let name = position_row.get("nom").and_then(|v| v.as_str()).unwrap_or("");
-    let sector_resp = crate::enrichment::fetch_sector(&ticker, name, isin).ok();
+    // Canonical Yahoo symbol — resolved during collection and stashed on the
+    // position row. Forwarded so the server can route on it for sector/cot
+    // lookups (cross-account dedup: PEA STMPA + CTO STM share canonical).
+    let canonical_opt = position_row
+        .get("resolved_symbol")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
+    let sector_resp = crate::enrichment::fetch_sector(&ticker, name, isin, canonical_opt).ok();
     let sector_slug = sector_resp.as_ref()
         .and_then(|r| r.get("sector").and_then(|v| v.as_str()))
         .unwrap_or("");
@@ -707,7 +714,7 @@ fn tool_get_line_data(data_dir: &Path, params: &Value) -> Result<Value> {
         .and_then(|r| r.get("sector_analysis").cloned())
         .unwrap_or(Value::Null);
     let cot_data = if !sector_slug.is_empty() {
-        crate::enrichment::fetch_cot(&ticker, isin)
+        crate::enrichment::fetch_cot(&ticker, isin, canonical_opt)
             .ok()
             .and_then(|r| r.get("cot").cloned())
             .unwrap_or(Value::Null)
@@ -715,13 +722,17 @@ fn tool_get_line_data(data_dir: &Path, params: &Value) -> Result<Value> {
         Value::Null
     };
 
-    // Line memory (cross-run) — schema: { "by_ticker": { "AAPL": {...} } }
+    // Line memory (cross-run) — schema: { "by_ticker": { "AAPL": {...} } }.
+    // v0.3 (#22): honour canonical_line_memory_key so a cross-account dup
+    // surfaces the same persistent history regardless of which broker ticker
+    // the LLM queried for. Legacy fallback to raw ticker key keeps pre-v0.3
+    // entries readable.
     let line_memory = {
         let mem_path = line_memory_path(data_dir);
         if mem_path.exists() {
             read_json(&mem_path)
                 .ok()
-                .and_then(|mem| mem.get("by_ticker").and_then(|bt| bt.get(&ticker)).cloned())
+                .map(|mem| crate::native_mcp_analysis::read_line_memory_entry(&mem, &ticker, canonical_opt))
                 .unwrap_or(Value::Null)
         } else {
             Value::Null

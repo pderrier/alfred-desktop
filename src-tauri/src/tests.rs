@@ -3884,3 +3884,205 @@ use crate::storage::read_json_file;
         assert_eq!(outcome2.flagged, 0);
         assert_eq!(outcome2.cleared, 0, "second pass must not re-clear");
     }
+
+    // ── v0.3 #22: cross-account ISIN dedup via canonical key ─────────
+
+    #[test]
+    fn canonical_line_memory_key_prefers_resolved_symbol() {
+        // Two brokers carrying the same security must collapse onto a
+        // single line-memory bucket keyed by the resolved Yahoo symbol.
+        let key_pea = crate::native_mcp_analysis::canonical_line_memory_key(
+            "STMPA", Some("STMPA.PA"),
+        );
+        let key_cto = crate::native_mcp_analysis::canonical_line_memory_key(
+            "STM", Some("STMPA.PA"),
+        );
+        assert_eq!(key_pea, "STMPA.PA");
+        assert_eq!(key_cto, "STMPA.PA");
+        assert_eq!(key_pea, key_cto, "PEA + CTO must share canonical key");
+    }
+
+    #[test]
+    fn canonical_line_memory_key_falls_back_to_ticker_when_unresolved() {
+        // Watchlist entries without ISIN never hit /api/resolve — they must
+        // still produce a stable key (uppercased ticker) so we don't lose
+        // pre-v0.3 history nor confuse repeated writes.
+        let key_none = crate::native_mcp_analysis::canonical_line_memory_key("aapl", None);
+        let key_empty = crate::native_mcp_analysis::canonical_line_memory_key("aapl", Some(""));
+        let key_blank = crate::native_mcp_analysis::canonical_line_memory_key("aapl", Some("   "));
+        assert_eq!(key_none, "AAPL");
+        assert_eq!(key_empty, "AAPL");
+        assert_eq!(key_blank, "AAPL");
+    }
+
+    #[test]
+    fn read_line_memory_entry_canonical_first_then_legacy_ticker() {
+        // Hybrid store: one entry under raw ticker (pre-v0.3), one under
+        // canonical key (v0.3+). The canonical key must win when both
+        // exist, and the raw key serves as fallback when only it is
+        // present.
+        let store = json!({
+            "by_ticker": {
+                "AAPL":     { "schema_version": 2, "signal": "legacy" },
+                "STMPA.PA": { "schema_version": 2, "signal": "canonical" }
+            }
+        });
+
+        let canonical_hit = crate::native_mcp_analysis::read_line_memory_entry(
+            &store, "STMPA", Some("STMPA.PA"),
+        );
+        assert_eq!(
+            canonical_hit.get("signal").and_then(|v| v.as_str()),
+            Some("canonical"),
+            "canonical-key match must take precedence",
+        );
+
+        let legacy_hit = crate::native_mcp_analysis::read_line_memory_entry(
+            &store, "AAPL", None,
+        );
+        assert_eq!(
+            legacy_hit.get("signal").and_then(|v| v.as_str()),
+            Some("legacy"),
+            "raw-ticker key must still be readable for back-compat",
+        );
+
+        // Missing entry returns Value::Null.
+        let miss = crate::native_mcp_analysis::read_line_memory_entry(
+            &store, "TSLA", Some("TSLA"),
+        );
+        assert!(miss.is_null());
+    }
+
+    #[test]
+    fn read_line_memory_entry_falls_back_when_canonical_missing() {
+        // v0.3 first-run-after-upgrade: history was written under the raw
+        // ticker by an older binary; the new resolver returns a canonical
+        // symbol but no entry exists under that key yet. The reader must
+        // still surface the legacy entry so memory continuity is preserved.
+        let store = json!({
+            "by_ticker": {
+                "STMPA": { "schema_version": 2, "signal": "achat" }
+            }
+        });
+        let hit = crate::native_mcp_analysis::read_line_memory_entry(
+            &store, "STMPA", Some("STMPA.PA"),
+        );
+        assert_eq!(
+            hit.get("signal").and_then(|v| v.as_str()),
+            Some("achat"),
+            "legacy raw-ticker entry must surface when canonical key has no data",
+        );
+    }
+
+    #[test]
+    fn lookup_resolved_symbol_from_state_returns_canonical_when_set() {
+        // The codex batch path has only `ticker` at merge time and must
+        // pull `resolved_symbol` from run_state.portfolio.positions[] so
+        // sync_line_memory can route the write under the canonical key.
+        let state = json!({
+            "portfolio": {
+                "positions": [
+                    { "ticker": "STMPA", "resolved_symbol": "STMPA.PA" },
+                    { "ticker": "RBT" },  // no resolved_symbol
+                ]
+            }
+        });
+
+        let stmpa = crate::native_mcp_analysis::lookup_resolved_symbol_from_state_value(
+            &state, "stmpa",  // ticker matching is case-insensitive
+        );
+        assert_eq!(stmpa.as_deref(), Some("STMPA.PA"));
+
+        let rbt = crate::native_mcp_analysis::lookup_resolved_symbol_from_state_value(
+            &state, "RBT",
+        );
+        assert_eq!(rbt, None, "row without resolved_symbol must yield None");
+
+        let unknown = crate::native_mcp_analysis::lookup_resolved_symbol_from_state_value(
+            &state, "TSLA",
+        );
+        assert_eq!(unknown, None, "ticker not in portfolio yields None");
+    }
+
+    #[test]
+    fn lookup_resolved_symbol_filters_blank_strings() {
+        // Defensive: a stale snapshot might carry an empty string under
+        // `resolved_symbol`. Treat it as absent so we don't route writes
+        // under an empty canonical_key (which collides with falsy keys).
+        let state = json!({
+            "portfolio": {
+                "positions": [
+                    { "ticker": "X", "resolved_symbol": "" },
+                    { "ticker": "Y", "resolved_symbol": "   " },
+                ]
+            }
+        });
+        assert_eq!(
+            crate::native_mcp_analysis::lookup_resolved_symbol_from_state_value(&state, "X"),
+            None,
+        );
+        assert_eq!(
+            crate::native_mcp_analysis::lookup_resolved_symbol_from_state_value(&state, "Y"),
+            None,
+        );
+    }
+
+    #[test]
+    fn sync_line_memory_writes_single_entry_for_cross_account_dup() {
+        // The whole point of v0.3 #22: same ISIN held in two accounts under
+        // different broker tickers (PEA STMPA / CTO STM) must collapse into
+        // ONE entry on disk, keyed by the canonical Yahoo symbol resolved
+        // upstream.
+        let _guard = env_lock();
+        crate::native_mcp_analysis::line_memory_reset_for_tests();
+
+        let pea_rec = json!({
+            "ticker": "STMPA", "signal": "ACHAT", "conviction": "haute",
+            "synthese": "from PEA", "memory_narrative": "PEA narrative",
+        });
+        crate::native_mcp_analysis::sync_line_memory_for_test(
+            "run-pea", "STMPA", Some("STMPA.PA"), &pea_rec, 42.0,
+        );
+
+        let cto_rec = json!({
+            "ticker": "STM", "signal": "ACHAT", "conviction": "haute",
+            "synthese": "from CTO", "memory_narrative": "CTO narrative",
+        });
+        crate::native_mcp_analysis::sync_line_memory_for_test(
+            "run-cto", "STM", Some("STMPA.PA"), &cto_rec, 41.5,
+        );
+
+        let store = crate::native_mcp_analysis::line_memory_read_for_test();
+        let by_ticker = store
+            .get("by_ticker")
+            .and_then(|v| v.as_object())
+            .expect("by_ticker map must exist after sync");
+
+        // Both writes must land under STMPA.PA — never under STMPA or STM.
+        assert!(
+            by_ticker.contains_key("STMPA.PA"),
+            "canonical key STMPA.PA missing from line memory:\n{by_ticker:#?}",
+        );
+        assert!(
+            !by_ticker.contains_key("STMPA"),
+            "broker key STMPA must NOT exist (cross-account dedup):\n{by_ticker:#?}",
+        );
+        assert!(
+            !by_ticker.contains_key("STM"),
+            "broker key STM must NOT exist (cross-account dedup):\n{by_ticker:#?}",
+        );
+
+        // And the canonical entry must reflect the LAST write (CTO came
+        // second). The merge preserves signal_history across runs — both
+        // entries should appear there.
+        let canonical_entry = by_ticker.get("STMPA.PA").expect("canonical entry");
+        let history = canonical_entry
+            .get("signal_history")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            history.len() >= 1,
+            "signal_history must record at least the latest run on the canonical entry",
+        );
+    }

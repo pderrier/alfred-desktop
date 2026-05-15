@@ -9,6 +9,14 @@ pub struct Position {
     pub nom: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub isin: Option<String>,
+    /// Canonical Yahoo symbol resolved from `isin` via `GET /api/resolve`.
+    /// `None` when ISIN is missing, the resolver returned no match, or the
+    /// `/api/resolve` endpoint was unreachable. Additive — never replaces
+    /// `ticker` (which remains the broker/CSV symbol the user sees).
+    /// Downstream enrichment passes this as `&canonical=` so the server uses
+    /// it for Yahoo/News/Sector/COT/Technicals upstream queries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_symbol: Option<String>,
     pub quantite: f64,
     pub prix_actuel: f64,
     pub prix_revient: f64,

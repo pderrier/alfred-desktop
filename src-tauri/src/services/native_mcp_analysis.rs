@@ -114,6 +114,27 @@ pub fn line_memory_reset_for_tests() {
     guard.dirty = false;
 }
 
+/// Test-only wrapper around the private `sync_line_memory` so unit tests can
+/// exercise the v0.3 #22 canonical-key dedup contract without going through
+/// the full codex/native batch dispatch.
+#[cfg(test)]
+pub fn sync_line_memory_for_test(
+    run_id: &str,
+    ticker: &str,
+    resolved_symbol: Option<&str>,
+    rec: &Value,
+    current_price: f64,
+) {
+    sync_line_memory(run_id, ticker, resolved_symbol, rec, current_price);
+}
+
+/// Test-only alias for `line_memory_read` to keep test naming consistent
+/// with the other `_for_test` wrappers in this module.
+#[cfg(test)]
+pub fn line_memory_read_for_test() -> Value {
+    line_memory_read()
+}
+
 /// Test-only: thin wrapper around the private `compute_trend` so unit tests
 /// can exercise the bucket-by-distinct-date contract directly.
 #[cfg(test)]
@@ -206,9 +227,12 @@ fn merge_mcp_results(run_id: &str, data_dir: &str) {
                     let ticker = line_id.split(':').last().unwrap_or("");
                     if !ticker.is_empty() {
                         crate::run_state_cache::cache_line_status(run_id, ticker, json!({"status": "done"}));
-                        // Sync line memory for codex mode (V2 schema)
+                        // Sync line memory for codex mode (V2 schema).
+                        // v0.3 (#22): look up resolved_symbol from the position
+                        // row so cross-account dups collapse under canonical_key.
                         let price = extract_market_price_from_run_state(data_path, run_id, ticker);
-                        sync_line_memory(run_id, ticker, &rec, price);
+                        let resolved_owned = lookup_resolved_symbol_from_state(data_path, run_id, ticker);
+                        sync_line_memory(run_id, ticker, resolved_owned.as_deref(), &rec, price);
                     }
                     merged_count += 1;
                 }
@@ -503,25 +527,70 @@ fn extract_recommendation_json(result: &Value) -> Option<Value> {
 
 // ── Line memory sync (V2 schema) ────────────────────────────────
 
+/// Compute the line-memory `by_ticker` key for a (ticker, resolved_symbol)
+/// pair. Prefers the resolved canonical Yahoo symbol when present so two
+/// brokers carrying the same security (e.g. PEA `STMPA` + CTO `STM.MI`)
+/// share a single line-memory entry under `STMPA.PA`. Falls back to the
+/// uppercased broker ticker when no resolution is available.
+///
+/// v0.3 (#22) cross-account dedup primitive. Pure function, exposed for unit
+/// tests so the dedup contract stays pinned.
+pub(crate) fn canonical_line_memory_key(ticker: &str, resolved_symbol: Option<&str>) -> String {
+    if let Some(symbol) = resolved_symbol.map(str::trim).filter(|s| !s.is_empty()) {
+        return symbol.to_uppercase();
+    }
+    ticker.trim().to_uppercase()
+}
+
+/// Read a `by_ticker` entry honouring v0.3 canonical-key dedup with legacy
+/// fallback. Tries `canonical_key` first (where new v0.3 writes land), then
+/// falls back to the raw ticker (so pre-v0.3 entries keyed by broker ticker
+/// remain readable without an eager migration). Returns `Value::Null` when
+/// neither key exists.
+pub(crate) fn read_line_memory_entry(store: &Value, ticker: &str, resolved_symbol: Option<&str>) -> Value {
+    let canonical_key = canonical_line_memory_key(ticker, resolved_symbol);
+    let by_ticker = match store.get("by_ticker") {
+        Some(bt) => bt,
+        None => return Value::Null,
+    };
+    if let Some(entry) = by_ticker.get(&canonical_key) {
+        return entry.clone();
+    }
+    // Legacy fallback: pre-v0.3 entries written under the raw ticker key.
+    let raw_key = ticker.trim().to_uppercase();
+    if raw_key != canonical_key {
+        if let Some(entry) = by_ticker.get(&raw_key) {
+            return entry.clone();
+        }
+    }
+    Value::Null
+}
+
 /// Sync a validated recommendation into the persistent line-memory.json store.
 /// V2 schema — clean break from V1. Writes `schema_version: 2`,
 /// `signal_history`, `memory_narrative`, `news_themes`, `trend`, `price_tracking`.
 /// V1 fields (`llm_memory_summary`, `llm_strong_signals`, `llm_key_history`) are NOT written.
 /// NOTE: `memory_narrative` replaces the former `key_reasoning` field name.
-fn sync_line_memory(run_id: &str, ticker: &str, rec: &Value, current_price: f64) {
+///
+/// v0.3 (#22): writes under `canonical_line_memory_key(ticker, resolved_symbol)`
+/// so cross-account duplicates of the same security share a single entry.
+/// `resolved_symbol` may be empty for tickers without ISIN resolution; in that
+/// case the key falls back to the uppercased ticker (legacy shape).
+fn sync_line_memory(run_id: &str, ticker: &str, resolved_symbol: Option<&str>, rec: &Value, current_price: f64) {
     let ticker = ticker.trim().to_uppercase();
     if ticker.is_empty() { return; }
+    let canonical_key = canonical_line_memory_key(&ticker, resolved_symbol);
 
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let today = now[..10].to_string(); // "YYYY-MM-DD" — safe, ASCII only
 
-    // Read current ticker entry from cache (for merge)
+    // Read current entry from cache (for merge). Honours canonical key with
+    // legacy-ticker fallback so a v0.3 run picks up history written under the
+    // pre-v0.3 raw-ticker key without an eager migration.
     let current = {
         let store = line_memory_read();
-        store.get("by_ticker")
-            .and_then(|bt| bt.get(&ticker))
-            .cloned()
-            .unwrap_or(json!({}))
+        let entry = read_line_memory_entry(&store, &ticker, resolved_symbol);
+        if entry.is_null() { json!({}) } else { entry }
     };
 
     // Extract fields from recommendation
@@ -658,7 +727,8 @@ fn sync_line_memory(run_id: &str, ticker: &str, rec: &Value, current_price: f64)
     });
 
     // C-1: Write to in-memory cache (no direct file I/O, flushed at end of run)
-    let ticker_key = ticker.clone();
+    let write_key = canonical_key.clone();
+    let legacy_key = if ticker != canonical_key { Some(ticker.clone()) } else { None };
     let run_id_log = run_id.to_string();
     line_memory_patch(move |store| {
         // Ensure by_ticker exists
@@ -666,7 +736,15 @@ fn sync_line_memory(run_id: &str, ticker: &str, rec: &Value, current_price: f64)
             store["by_ticker"] = json!({});
         }
         if let Some(bt) = store.get_mut("by_ticker").and_then(|v| v.as_object_mut()) {
-            bt.insert(ticker_key.clone(), entry);
+            // v0.3 (#22): write under canonical key so cross-account dups
+            // collapse into a single entry. Remove any pre-v0.3 raw-ticker
+            // entry so reads don't bifurcate after the first canonical write
+            // — the merged content is already carried forward by the
+            // `current` snapshot read above.
+            if let Some(raw_key) = legacy_key.as_ref() {
+                bt.remove(raw_key);
+            }
+            bt.insert(write_key.clone(), entry);
         }
 
         // Merge deep news banned URLs into global list
@@ -684,7 +762,7 @@ fn sync_line_memory(run_id: &str, ticker: &str, rec: &Value, current_price: f64)
             }
         }
     });
-    crate::debug_log(&format!("sync_line_memory: updated V2 for {ticker} run {run_id_log} (cached)"));
+    crate::debug_log(&format!("sync_line_memory: updated V2 for {ticker} (key={canonical_key}) run {run_id_log} (cached)"));
 }
 
 // ── Theme concentration aggregation (Phase 2b) ─────────────────
@@ -1163,6 +1241,42 @@ pub(crate) fn extract_market_price_from_run_state(
     extract_market_price_from_state_value(&state, &ticker_upper)
 }
 
+/// Look up `resolved_symbol` for `ticker` from the cached run state's
+/// `portfolio.positions`. Returns `None` when the run state can't be loaded,
+/// the ticker isn't found, or the row has no resolution.
+///
+/// v0.3 (#22): used by the codex batch dispatch (which has only ticker + rec
+/// at merge time) so it can route line-memory writes under the canonical key.
+pub(crate) fn lookup_resolved_symbol_from_state(
+    data_dir: &std::path::Path,
+    run_id: &str,
+    ticker: &str,
+) -> Option<String> {
+    let state = crate::run_state_cache::load(data_dir, run_id).ok()?;
+    lookup_resolved_symbol_from_state_value(&state, ticker)
+}
+
+/// Pure-function core of `lookup_resolved_symbol_from_state`, exposed for
+/// unit tests so we don't round-trip through the run-state cache.
+pub(crate) fn lookup_resolved_symbol_from_state_value(state: &Value, ticker: &str) -> Option<String> {
+    let upper = ticker.trim().to_uppercase();
+    state
+        .get("portfolio")
+        .and_then(|p| p.get("positions"))
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .find(|row| {
+            row.get("ticker")
+                .and_then(|v| v.as_str())
+                .map(|t| t.trim().to_uppercase() == upper)
+                .unwrap_or(false)
+        })
+        .and_then(|row| row.get("resolved_symbol").and_then(|v| v.as_str()))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Pure-function core of `extract_market_price_from_run_state`, exposed for
 /// unit tests so we don't have to round-trip through the run-state cache.
 pub(crate) fn extract_market_price_from_state_value(state: &Value, ticker_upper: &str) -> f64 {
@@ -1277,8 +1391,17 @@ fn persist_line_extras(data_dir: &std::path::Path, run_id: &str, ticker: &str, l
             .or_else(|| m.get("cours"))
             .or_else(|| m.get("prix_actuel"))))
         .unwrap_or(0.0);
-    // Sync line memory (cross-run persistent state, V2 schema)
-    sync_line_memory(run_id, ticker, rec, current_price);
+    // Sync line memory (cross-run persistent state, V2 schema).
+    // v0.3 (#22): resolved_symbol drives canonical key — when present, cross-
+    // account dups (PEA STMPA + CTO STM.MI) collapse into a single by_ticker
+    // entry keyed by the resolved Yahoo symbol.
+    let resolved_symbol = line_data
+        .get("position")
+        .and_then(|p| p.get("resolved_symbol"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    sync_line_memory(run_id, ticker, resolved_symbol, rec, current_price);
     let isin = line_data.get("position")
         .and_then(|p| p.get("isin"))
         .and_then(|v| v.as_str())

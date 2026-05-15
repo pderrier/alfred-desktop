@@ -319,6 +319,7 @@ fn execute_spec(spec: &CsvParsingSpec, rows: &[Vec<String>], _headers: &[String]
                         ticker: ticker.clone(),
                         nom: if name_raw.is_empty() { ticker.clone() } else { name_raw },
                         isin: if isin_raw.is_empty() { None } else { Some(isin_raw) },
+                        resolved_symbol: None,
                         quantite: quantity,
                         prix_actuel,
                         valeur_actuelle,
@@ -550,6 +551,7 @@ fn parse_positions_text(text: &str, account_name: &str) -> Result<Value> {
                 ticker,
                 nom,
                 isin: if isin.trim().is_empty() { None } else { Some(isin) },
+                resolved_symbol: None,
                 quantite: parse_fr_number(&cols[2]),
                 prix_actuel: parse_fr_number(&cols[3]),
                 valeur_actuelle: parse_fr_number(&cols[4]),
@@ -1013,6 +1015,7 @@ fn reconcile_transactions(transactions: &[CsvTransaction], account: &str) -> Val
                 ticker: acc.ticker.clone(),
                 nom: if acc.name.is_empty() { acc.ticker.clone() } else { acc.name.clone() },
                 isin: if acc.isin.is_empty() { None } else { Some(acc.isin.clone()) },
+                resolved_symbol: None,
                 quantite: acc.quantity,
                 prix_actuel: 0.0,      // Filled by enrichment pipeline
                 prix_revient,
@@ -2030,6 +2033,7 @@ fn map_security_to_position(row: &Value) -> Value {
         ticker,
         nom: nom.to_string(),
         isin: if isin.is_empty() { None } else { Some(isin.to_string()) },
+        resolved_symbol: None,
         quantite: quantity,
         prix_actuel: current_price,
         prix_revient: buying_price,
@@ -2057,6 +2061,81 @@ fn patch_source_ingestion_failed(run_id: &str, portfolio_source: &str, error: &a
         }
     })?;
     Ok(())
+}
+
+/// Resolve canonical Yahoo symbols for every unique non-empty ISIN in
+/// `positions`, then return a new `Vec<Value>` with `resolved_symbol` stashed
+/// on each row.
+///
+/// Calls `GET /api/resolve` at most once per unique ISIN per run (cached in a
+/// `HashMap<String, Option<String>>` so repeats across accounts don't re-hit
+/// the endpoint). Resolution is best-effort: when the server returns None or
+/// the endpoint is unreachable, the row stays untouched (`resolved_symbol`
+/// remains null) and downstream enrichment falls back to ticker routing.
+///
+/// Pure function — no run_state writes, no side effects beyond the
+/// `/api/resolve` calls. Logged via `debug_log` so a missing v0.3 server is
+/// visible in the debug log without surfacing user-facing errors.
+fn resolve_canonical_symbols(positions: Vec<Value>) -> Vec<Value> {
+    use std::collections::HashMap;
+    let mut cache: HashMap<String, Option<String>> = HashMap::new();
+    positions
+        .into_iter()
+        .map(|mut row| {
+            let isin = as_text(row.get("isin"));
+            let trimmed = isin.trim();
+            if trimmed.is_empty() {
+                return row;
+            }
+            let key = trimmed.to_uppercase();
+            let resolved = cache
+                .entry(key.clone())
+                .or_insert_with(|| crate::enrichment::fetch_resolved_symbol(&key))
+                .clone();
+            if let Some(symbol) = resolved {
+                if let Some(obj) = row.as_object_mut() {
+                    obj.insert("resolved_symbol".to_string(), json!(symbol));
+                }
+            }
+            row
+        })
+        .collect()
+}
+
+/// Resolve canonical Yahoo symbols on LLM-suggested watchlist items (#23).
+///
+/// Same dedup behaviour as `resolve_canonical_symbols`: at most one
+/// `/api/resolve` call per unique non-empty ISIN. Items without ISIN, or whose
+/// ISIN doesn't resolve, are returned unchanged — the field is additive.
+///
+/// Watchlist items already carry `ticker`, so the resolved symbol is only
+/// useful when it differs (e.g. Yahoo `.PA` suffix on a French entry the
+/// LLM listed as `STMPA`). When equal, we still store it so downstream
+/// enrichment can pass `&canonical=` consistently.
+fn resolve_watchlist_items(items: Vec<Value>) -> Vec<Value> {
+    use std::collections::HashMap;
+    let mut cache: HashMap<String, Option<String>> = HashMap::new();
+    items
+        .into_iter()
+        .map(|mut item| {
+            let isin = as_text(item.get("isin"));
+            let trimmed = isin.trim();
+            if trimmed.is_empty() {
+                return item;
+            }
+            let key = trimmed.to_uppercase();
+            let resolved = cache
+                .entry(key.clone())
+                .or_insert_with(|| crate::enrichment::fetch_resolved_symbol(&key))
+                .clone();
+            if let Some(symbol) = resolved {
+                if let Some(obj) = item.as_object_mut() {
+                    obj.insert("resolved_symbol".to_string(), json!(symbol));
+                }
+            }
+            item
+        })
+        .collect()
 }
 
 fn resolve_native_snapshot(
@@ -2495,6 +2574,20 @@ pub(crate) fn execute_native_local_analysis_workflow_with(
         json!([]),
     );
 
+    // ── v0.3 (#21): canonical-symbol resolution ────────────────────
+    //
+    // For every unique non-empty ISIN, call `GET /api/resolve` once and stash
+    // the returned canonical Yahoo symbol on every Position row that shares
+    // the ISIN. Downstream enrichment fetches (technical_snapshot, news,
+    // sector, COT) forward this as `&canonical=` so the server routes on the
+    // resolved symbol instead of the broker ticker — fixes cross-account
+    // duplicates (PEA STMPA vs CTO STM both resolve to STMPA.PA).
+    //
+    // Resolution is best-effort and additive: when the resolver returns None
+    // or the endpoint is unreachable, the row keeps `resolved_symbol: null`
+    // and downstream calls fall back to ticker-based routing as before.
+    let positions = resolve_canonical_symbols(positions);
+
     let mut snapshot = snapshot;
     if let Some(obj) = snapshot.as_object_mut() {
         obj.insert("liquidites".to_string(), json!(account_cash));
@@ -2653,6 +2746,14 @@ pub(crate) fn execute_native_local_analysis_workflow_with(
         });
         match crate::llm::generate_watchlist_suggestions(&wl_positions, &portfolio_summary, &wl_guidelines, &wl_account) {
             Ok(items) if !items.is_empty() => {
+                // v0.3 (#23): when an LLM-suggested watchlist item carries an
+                // ISIN, resolve it once via /api/resolve so the saved entry
+                // and the run_state watchlist both carry resolved_symbol.
+                // Downstream enrichment + the line-modal venue hint reuse this
+                // field — keeps the watchlist on the same v0.3 parity contract
+                // as portfolio positions. Fire-and-forget: missing v0.3 server
+                // → items stay unchanged and behave as pre-v0.3.
+                let items = resolve_watchlist_items(items);
                 eprintln!("[watchlist] LLM suggested {} items (background)", items.len());
                 // Save to user preferences
                 let mut prefs = crate::runtime_settings::get_user_preferences();
@@ -2759,13 +2860,23 @@ pub(crate) fn execute_native_local_analysis_workflow_with(
             if crate::analysis_ops::is_any_operation_cancelled_for_run(&run_id) { break; }
             let ticker = as_text(item.get("ticker"));
             if ticker.is_empty() { continue; }
-            let wl_row = json!({
+            // v0.3 (#23): forward resolved_symbol so the dispatch worker
+            // routes upstream queries via &canonical= (parity with portfolio
+            // positions). When the item has no resolution the field is just
+            // absent — server falls back to ticker.
+            let mut wl_row = json!({
                 "ticker": ticker.to_uppercase(), "nom": as_text(item.get("nom")),
                 "isin": as_text(item.get("isin")), "type": "watchlist",
                 "quantite": 0, "prix_actuel": 0, "valeur_actuelle": 0,
                 "prix_revient": 0, "plus_moins_value": 0, "plus_moins_value_pct": 0,
                 "compte": account,
             });
+            let resolved = as_text(item.get("resolved_symbol"));
+            if !resolved.is_empty() {
+                if let Some(obj) = wl_row.as_object_mut() {
+                    obj.insert("resolved_symbol".to_string(), json!(resolved));
+                }
+            }
             let _ = crate::update_line_status(&run_id, &ticker.to_uppercase(), "collecting");
             collection_dispatch.push(positions.len() + collection_completed - positions.len(), wl_row)?;
             for result in collection_dispatch.drain_ready() {
@@ -2898,7 +3009,11 @@ fn native_request_fn(
         let ticker = params.get("ticker").map(|s| s.as_str()).unwrap_or_default();
         let name = params.get("name").map(|s| s.as_str()).unwrap_or_default();
         let isin = params.get("isin").map(|s| s.as_str()).unwrap_or_default();
-        return crate::enrichment::fetch_news(ticker, name, isin);
+        let canonical = params
+            .get("canonical")
+            .map(|s| s.as_str())
+            .filter(|s| !s.trim().is_empty());
+        return crate::enrichment::fetch_news(ticker, name, isin, canonical);
     }
     if method == "GET" && path.starts_with("/insights?") {
         let params = parse_query_params(path);

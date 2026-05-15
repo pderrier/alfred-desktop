@@ -141,8 +141,14 @@ pub fn remote_fetch_market(ticker: &str, name: &str, isin: &str) -> Result<Value
 }
 
 /// Fetch news from the remote API (SearXNG-backed).
-pub fn remote_fetch_news(ticker: &str, name: &str, isin: &str) -> Result<Value> {
-    api_get(&format!("/api/news?ticker={}&name={}&isin={}", urlenc(ticker), urlenc(name), urlenc(isin)), TIMEOUT_SECS)
+///
+/// When `canonical` is `Some(symbol)`, the server uses it for upstream news
+/// queries (Yahoo finance, news aggregators) instead of the broker `ticker` —
+/// this is how a French PEA `STMPA` gets routed to the same news bucket as a
+/// CTO `STM.MI`. Server falls back to `ticker` when absent (backward compat).
+pub fn remote_fetch_news(ticker: &str, name: &str, isin: &str, canonical: Option<&str>) -> Result<Value> {
+    let path = format!("/api/news?ticker={}&name={}&isin={}", urlenc(ticker), urlenc(name), urlenc(isin));
+    api_get(&append_canonical(path, canonical), TIMEOUT_SECS)
 }
 
 /// Fetch shared insights for a ticker from the API cache.
@@ -151,8 +157,13 @@ pub fn remote_fetch_insights(ticker: &str, isin: &str) -> Result<Value> {
 }
 
 /// Fetch sector classification for a ticker from the API.
-pub fn remote_fetch_sector(ticker: &str, name: &str, isin: &str) -> Result<Value> {
-    api_get(&format!("/api/sector?ticker={}&name={}&isin={}", urlenc(ticker), urlenc(name), urlenc(isin)), TIMEOUT_SECS)
+///
+/// `canonical` lets the server route on the resolved Yahoo symbol so PEA
+/// vs CTO duplicates of the same security share a single sector lookup. See
+/// `remote_fetch_news` for the full rationale.
+pub fn remote_fetch_sector(ticker: &str, name: &str, isin: &str, canonical: Option<&str>) -> Result<Value> {
+    let path = format!("/api/sector?ticker={}&name={}&isin={}", urlenc(ticker), urlenc(name), urlenc(isin));
+    api_get(&append_canonical(path, canonical), TIMEOUT_SECS)
 }
 
 /// Fetch technical snapshot (SMA/RSI/MACD/ATR/52w) computed server-side from
@@ -168,31 +179,85 @@ pub fn remote_fetch_sector(ticker: &str, name: &str, isin: &str) -> Result<Value
 ///
 /// Server endpoint may not be deployed yet — callers must handle errors
 /// gracefully (typically map to `None`).
-pub fn remote_fetch_technicals(ticker: &str, isin: Option<&str>) -> Result<Value> {
-    api_get(&build_technicals_path(ticker, isin), TIMEOUT_SECS)
+pub fn remote_fetch_technicals(ticker: &str, isin: Option<&str>, canonical: Option<&str>) -> Result<Value> {
+    api_get(&build_technicals_path(ticker, isin, canonical), TIMEOUT_SECS)
 }
 
-/// Build the `/api/market/technicals` query string for `(ticker, isin)`.
+/// Build the `/api/market/technicals` query string for `(ticker, isin, canonical)`.
 /// Extracted so the URL contract is unit-testable without an HTTP round trip.
 ///
 /// The `isin` argument is included only when present and non-empty after
 /// trimming — empty strings degrade gracefully to a ticker-only query so
-/// existing callers without ISIN keep their previous wire shape.
-fn build_technicals_path(ticker: &str, isin: Option<&str>) -> String {
+/// existing callers without ISIN keep their previous wire shape. `canonical`
+/// follows the same trim-and-empty rule and is appended last.
+fn build_technicals_path(ticker: &str, isin: Option<&str>, canonical: Option<&str>) -> String {
     let trimmed_isin = isin.map(str::trim).filter(|s| !s.is_empty());
-    match trimmed_isin {
+    let base = match trimmed_isin {
         Some(code) => format!(
             "/api/market/technicals?ticker={}&isin={}",
             urlenc(ticker),
             urlenc(code),
         ),
         None => format!("/api/market/technicals?ticker={}", urlenc(ticker)),
-    }
+    };
+    append_canonical(base, canonical)
 }
 
 /// Fetch COT data for a ticker from the API.
-pub fn remote_fetch_cot(ticker: &str, isin: &str) -> Result<Value> {
-    api_get(&format!("/api/cot?ticker={}&isin={}", urlenc(ticker), urlenc(isin)), TIMEOUT_SECS)
+///
+/// `canonical` lets the server use the resolved Yahoo symbol for upstream
+/// COT lookups — see `remote_fetch_news` for the full rationale.
+pub fn remote_fetch_cot(ticker: &str, isin: &str, canonical: Option<&str>) -> Result<Value> {
+    let path = format!("/api/cot?ticker={}&isin={}", urlenc(ticker), urlenc(isin));
+    api_get(&append_canonical(path, canonical), TIMEOUT_SECS)
+}
+
+/// Append `&canonical=<symbol>` to a query path when a non-empty resolved
+/// Yahoo symbol is present. Centralised so the trim/empty-rejection rule is
+/// applied identically across every endpoint that accepts canonical routing
+/// — keeps the v0.3 parity contract honest: all 3 LLM modes see the same
+/// canonical enrichment data (`product_llm_mode_parity_2026_04`).
+fn append_canonical(path: String, canonical: Option<&str>) -> String {
+    match canonical.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(symbol) => format!("{path}&canonical={}", urlenc(symbol)),
+        None => path,
+    }
+}
+
+/// Resolve a canonical Yahoo symbol for the given ISIN via
+/// `GET /api/resolve?isin=X` (deployed in server-side v0.3 — feat/v0.3-server-bundle).
+///
+/// Returns `Ok(Some(symbol))` when the server returns a non-null symbol
+/// (`source = "yahoo_search"`), `Ok(None)` when the resolver returned no match
+/// (`source = "none"` or `symbol = null`), and `Err` on transport/auth errors
+/// so the caller can decide whether to log or swallow.
+///
+/// Server-side cache: 180 days positive, 15s negative — desktop callers do not
+/// need their own caching. Endpoint may not be deployed on older servers, so
+/// callers must degrade gracefully (treat error as "no resolution available").
+pub fn remote_fetch_resolve(isin: &str) -> Result<Option<String>> {
+    let resp = api_get(&build_resolve_path(isin), TIMEOUT_SECS)?;
+    // Source = "none" means the resolver searched but found nothing — treat
+    // identically to a null symbol so callers don't store the sentinel.
+    let source = resp.get("source").and_then(|v| v.as_str()).unwrap_or("");
+    if source == "none" {
+        return Ok(None);
+    }
+    let symbol = resp
+        .get("symbol")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    Ok(symbol)
+}
+
+/// Build the `/api/resolve` query string for a given ISIN. Extracted so the
+/// URL contract is unit-testable without a live HTTP round trip and so the
+/// trim/empty-rejection rule is colocated with the other path builders.
+fn build_resolve_path(isin: &str) -> String {
+    let code = isin.trim();
+    format!("/api/resolve?isin={}", urlenc(code))
 }
 
 /// Persist shared insights (generic analysis) back to the API for other users.
@@ -265,7 +330,7 @@ mod tests {
         // Existing callers (US tickers, watchlist entries without ISIN) must
         // continue to produce the original wire path so cached server-side
         // responses keyed by URL don't fragment.
-        let p = build_technicals_path("AAPL", None);
+        let p = build_technicals_path("AAPL", None, None);
         assert_eq!(p, "/api/market/technicals?ticker=AAPL");
     }
 
@@ -273,7 +338,7 @@ mod tests {
     fn technicals_path_with_isin_appends_isin_param() {
         // The whole point of v0.2.18: French small/mid caps need ISIN so the
         // server can route to the EU OHLC chain (Yahoo with `.PA` suffix).
-        let p = build_technicals_path("EXA", Some("FR0010163345"));
+        let p = build_technicals_path("EXA", Some("FR0010163345"), None);
         assert_eq!(p, "/api/market/technicals?ticker=EXA&isin=FR0010163345");
     }
 
@@ -283,9 +348,9 @@ mod tests {
         // serde for legacy rows. Strip it so we don't ship `isin=` (which
         // some axum query parsers reject) — match the trim-and-empty rule
         // used by the server handlers (handlers.rs:OhlcParams).
-        let p = build_technicals_path("AAPL", Some(""));
+        let p = build_technicals_path("AAPL", Some(""), None);
         assert_eq!(p, "/api/market/technicals?ticker=AAPL");
-        let p2 = build_technicals_path("AAPL", Some("   "));
+        let p2 = build_technicals_path("AAPL", Some("   "), None);
         assert_eq!(p2, "/api/market/technicals?ticker=AAPL");
     }
 
@@ -293,7 +358,89 @@ mod tests {
     fn technicals_path_url_encodes_both_params() {
         // Defensive: ISIN is always alphanumeric, but ticker fields from CSVs
         // can carry surprising characters. Confirm urlenc is applied to both.
-        let p = build_technicals_path("A B", Some("FR 1234"));
+        let p = build_technicals_path("A B", Some("FR 1234"), None);
         assert_eq!(p, "/api/market/technicals?ticker=A+B&isin=FR+1234");
+    }
+
+    // ── &canonical= passthrough (v0.3) ──────────────────────────────
+
+    #[test]
+    fn technicals_path_with_canonical_appends_after_isin() {
+        // v0.3 parity: when the desktop has resolved the canonical Yahoo
+        // symbol, the server must route on `canonical=` instead of the raw
+        // ticker. The query order is deterministic (ticker, isin, canonical)
+        // so URL-keyed caches stay stable across runs.
+        let p = build_technicals_path("STMPA", Some("NL0000226223"), Some("STMPA.PA"));
+        assert_eq!(
+            p,
+            "/api/market/technicals?ticker=STMPA&isin=NL0000226223&canonical=STMPA.PA"
+        );
+    }
+
+    #[test]
+    fn technicals_path_canonical_without_isin_still_appended() {
+        // Watchlist entries can have a resolved symbol from earlier resolve
+        // calls but no ISIN at all. The canonical param must still pass
+        // through so the server routes on it.
+        let p = build_technicals_path("STMPA", None, Some("STMPA.PA"));
+        assert_eq!(p, "/api/market/technicals?ticker=STMPA&canonical=STMPA.PA");
+    }
+
+    #[test]
+    fn technicals_path_canonical_empty_treated_as_absent() {
+        // `Position::resolved_symbol` is Option<String>; an empty/whitespace
+        // string slipped in by serde must NOT emit `canonical=` (server
+        // would treat it as a query for the empty symbol).
+        let p = build_technicals_path("AAPL", None, Some(""));
+        assert_eq!(p, "/api/market/technicals?ticker=AAPL");
+        let p2 = build_technicals_path("AAPL", None, Some("   "));
+        assert_eq!(p2, "/api/market/technicals?ticker=AAPL");
+    }
+
+    #[test]
+    fn append_canonical_idempotent_when_absent() {
+        // append_canonical is the single helper applied by every endpoint
+        // (news/sector/cot/technicals/market). Verify the no-op branch never
+        // mutates the path so legacy server caches keyed by URL don't
+        // fragment when resolver is disabled.
+        let base = "/api/news?ticker=AAPL&name=Apple&isin=US0378331005".to_string();
+        let out = append_canonical(base.clone(), None);
+        assert_eq!(out, base);
+    }
+
+    #[test]
+    fn append_canonical_url_encodes_symbol() {
+        // Yahoo suffixes are dotted (`.PA`, `.HK`) and dots are urlenc-safe,
+        // but exotic suffixes or whitespace must still round-trip cleanly.
+        let p = append_canonical("/api/sector?ticker=X".to_string(), Some("X Y"));
+        assert_eq!(p, "/api/sector?ticker=X&canonical=X+Y");
+    }
+
+    // ── /api/resolve path builder (v0.3) ────────────────────────────
+
+    #[test]
+    fn resolve_path_emits_canonical_isin_query() {
+        // Canonical shape the server-side resolver expects — must mirror
+        // `feat/v0.3-server-bundle` commit 877f18f.
+        let p = build_resolve_path("NL0000226223");
+        assert_eq!(p, "/api/resolve?isin=NL0000226223");
+    }
+
+    #[test]
+    fn resolve_path_trims_whitespace_before_encoding() {
+        // ISIN slips through with leading/trailing whitespace from CSV imports.
+        // Trim BEFORE urlenc so we emit the canonical shape — otherwise we'd
+        // ship `%20FR0010163345%20` and split the server-side 180d positive
+        // cache key across whitespace variants of the same instrument.
+        let p = build_resolve_path("  FR0010163345  ");
+        assert_eq!(p, "/api/resolve?isin=FR0010163345");
+    }
+
+    #[test]
+    fn resolve_path_url_encodes_unexpected_chars() {
+        // Defensive: malformed ISINs from broker CSVs must round-trip safely
+        // — never crash, never emit a raw `+` or space into the query string.
+        let p = build_resolve_path("FR 12+34");
+        assert_eq!(p, "/api/resolve?isin=FR+12%2B34");
     }
 }

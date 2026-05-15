@@ -322,6 +322,87 @@ export function renderTechnicalIndicatorRows(snapshot) {
   return `<div class="collection-tech-header">Technique</div>${rows.join("")}`;
 }
 
+/**
+ * Mapping from Yahoo exchange suffix to human-readable venue label.
+ * Module-level constant so it can be reused by both the renderer and the
+ * test fixtures without duplication. Add new suffixes as we encounter them
+ * in production — unknown suffixes degrade gracefully to "as-is" rendering.
+ */
+const YAHOO_VENUE_BY_SUFFIX = {
+  ".PA": "Paris",
+  ".AS": "Amsterdam",
+  ".DE": "Frankfurt",
+  ".L":  "London",
+  ".MI": "Milan",
+  ".MC": "Madrid",
+  ".BR": "Brussels",
+  ".LS": "Lisbon",
+  ".SW": "Swiss",
+  ".HE": "Helsinki",
+  ".ST": "Stockholm",
+  ".CO": "Copenhagen",
+  ".OL": "Oslo",
+  ".VI": "Vienna",
+  ".T":  "Tokyo",
+  ".HK": "Hong Kong",
+  ".SA": "São Paulo",
+  ".AX": "Sydney",
+  ".NS": "Mumbai",
+  ".SS": "Shanghai",
+  ".SZ": "Shenzhen"
+};
+
+/**
+ * Resolve the human-readable venue name for a Yahoo-suffixed symbol.
+ *
+ * - "STMPA.PA"  → "Paris"
+ * - "7203.T"    → "Tokyo"
+ * - "AAPL"      → ""   (no suffix, bare US ticker)
+ * - "FOO.XX"    → ""   (unknown suffix — caller falls back to "symbol as-is")
+ *
+ * Pure function, exported for unit tests.
+ *
+ * @param {string|null|undefined} symbol
+ * @returns {string} venue name or empty string when unknown/absent
+ */
+export function venueLabelFromSymbol(symbol) {
+  const s = String(symbol || "").trim();
+  if (!s) return "";
+  const dot = s.lastIndexOf(".");
+  if (dot < 0 || dot === s.length - 1) return "";
+  const suffix = s.slice(dot); // includes the dot, e.g. ".PA"
+  return YAHOO_VENUE_BY_SUFFIX[suffix] || "";
+}
+
+/**
+ * Render the "symbol · venue" hint shown next to the line title when the
+ * resolved canonical Yahoo symbol differs from the bare ticker. Returns "":
+ *   - when `resolvedSymbol` is null/empty/whitespace
+ *   - when `resolvedSymbol` equals the bare `ticker` (no useful extra info)
+ *
+ * Backward compat: when this returns "", `renderCollectionDetail` skips the
+ * hint entirely and the modal layout is byte-identical to the pre-v0.3
+ * rendering — preserves the snapshot UI contract.
+ *
+ * Pure function, exported for unit tests.
+ *
+ * @param {string|null|undefined} resolvedSymbol canonical symbol from /api/resolve
+ * @param {string|null|undefined} ticker raw broker ticker
+ * @returns {string} HTML snippet or empty string
+ */
+export function renderVenueHint(resolvedSymbol, ticker) {
+  const resolved = String(resolvedSymbol || "").trim();
+  const bare = String(ticker || "").trim();
+  if (!resolved) return "";
+  if (resolved.toUpperCase() === bare.toUpperCase()) return "";
+  const venue = venueLabelFromSymbol(resolved);
+  // When the suffix is unknown, still show "resolved" but no venue tail —
+  // the canonical symbol itself is the useful signal (it differs from the
+  // broker ticker), so silence here would hide that information.
+  const tail = venue ? ` · ${escapeHtml(venue)}` : "";
+  return `<span class="collection-venue-hint" title="Canonical Yahoo symbol resolved from ISIN">${escapeHtml(resolved)}${tail}</span>`;
+}
+
 export function renderCollectionDetail(details) {
   const panel = document.getElementById("line-memory-collection-detail");
   const grid = document.getElementById("line-memory-indicators-grid");
@@ -333,6 +414,7 @@ export function renderCollectionDetail(details) {
   const issues = details?.enrichmentIssues || [];
   const collectionQuality = details?.collectionQuality || null;
   const technicalSnapshot = details?.technicalSnapshot || null;
+  const venueHint = renderVenueHint(details?.resolvedSymbol, details?.ticker);
 
   const indicators = [
     { key: "prix_actuel", label: "Spot Price", value: market.prix_actuel, unit: "\u20ac" },
@@ -375,7 +457,10 @@ export function renderCollectionDetail(details) {
 
   const technicalBlock = renderTechnicalIndicatorRows(technicalSnapshot);
 
-  grid.innerHTML = header + fundamentalsBlock + newsQualityRow + technicalBlock;
+  // v0.3 (#23): venue hint goes ABOVE the header so the user sees "STMPA · Paris"
+  // before scanning the quality grid. Empty string when there's nothing useful
+  // to surface — preserves the legacy layout byte-for-byte.
+  grid.innerHTML = venueHint + header + fundamentalsBlock + newsQualityRow + technicalBlock;
 
   if (issuesNode) {
     issuesNode.innerHTML = issues.length > 0

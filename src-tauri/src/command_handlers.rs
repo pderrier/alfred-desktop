@@ -9,6 +9,24 @@ use crate::finary;
 use crate::report;
 use crate::run_state;
 use crate::runtime_settings;
+use crate::storage_cleanup;
+
+// ── Bridge envelope helper ──
+//
+// The JS bridge (`bridge-client.js::normalizeTauriPayload`) requires every
+// Tauri command response to follow the shape
+// `{ ok: true, action: "<command>", result: <value> }`. Returning a flat
+// payload triggers `bridge_payload_invalid` in the UI. Use this helper for
+// any handler whose result is the only data being forwarded — it pins the
+// envelope shape once instead of repeating the json! literal at every
+// call site (which is exactly how the v0.3.0 storage handlers drifted).
+pub fn bridge_envelope(action: &str, result: serde_json::Value) -> serde_json::Value {
+    json!({
+        "ok": true,
+        "action": action,
+        "result": result,
+    })
+}
 
 // ── Synchronous implementations (shared between Tauri + CLI) ──
 
@@ -271,6 +289,28 @@ pub fn open_external_url(url: &str) -> Result<serde_json::Value> {
     }))
 }
 
+// ── Storage cleanup handlers ──
+//
+// Wrap the `storage_cleanup::*` helpers in the bridge envelope expected by
+// `bridge-client.js::normalizeTauriPayload`. Without the envelope the UI
+// surfaces `bridge_payload_invalid` and the Settings → Storage panel shows
+// "Could not read storage usage" / "Prune failed". See P0-6 in
+// `docs/plans/po-plan-2026-05.md`.
+
+pub fn run_storage_usage() -> Result<serde_json::Value> {
+    Ok(bridge_envelope("storage_usage_local", storage_cleanup::get_storage_usage()))
+}
+
+pub fn run_storage_prune(keep: usize) -> Result<serde_json::Value> {
+    let result = storage_cleanup::prune_old_runs(keep)?;
+    Ok(bridge_envelope("storage_prune_local", result))
+}
+
+pub fn run_storage_clear_log() -> Result<serde_json::Value> {
+    let result = storage_cleanup::clear_debug_log()?;
+    Ok(bridge_envelope("storage_clear_log_local", result))
+}
+
 // ── Invoke dispatch (used by CLI and tests) ──
 
 pub fn invoke_command(command: &str) -> Result<serde_json::Value> {
@@ -305,6 +345,9 @@ pub fn invoke_command(command: &str) -> Result<serde_json::Value> {
         "codex:session-logout-local" | "codex_session_logout_local" => run_codex_session_logout(),
         "codex:probe-quota-local" | "probe_codex_quota_local" => run_probe_codex_quota(),
         "codex:auth-mode-local" | "codex_auth_mode_local" => run_codex_auth_mode(),
+        "storage_usage_local" => run_storage_usage(),
+        "storage_prune_local" => run_storage_prune(10),
+        "storage_clear_log_local" => run_storage_clear_log(),
         other => Err(anyhow!("unknown_invoke_command:{other}")),
     }
 }

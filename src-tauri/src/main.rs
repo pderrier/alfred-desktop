@@ -292,13 +292,13 @@ async fn account_positions_local(account: String) -> Result<serde_json::Value, S
 
 #[tauri::command]
 async fn storage_usage_local() -> Result<serde_json::Value, String> {
-    Ok(storage_cleanup::get_storage_usage())
+    command_handlers::run_storage_usage().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn storage_prune_local(keep: Option<usize>) -> Result<serde_json::Value, String> {
     let keep = keep.unwrap_or(10);
-    tauri::async_runtime::spawn_blocking(move || storage_cleanup::prune_old_runs(keep))
+    tauri::async_runtime::spawn_blocking(move || command_handlers::run_storage_prune(keep))
         .await
         .map_err(|e| format!("storage_prune_failed:join:{e}"))?
         .map_err(|e| e.to_string())
@@ -306,7 +306,7 @@ async fn storage_prune_local(keep: Option<usize>) -> Result<serde_json::Value, S
 
 #[tauri::command]
 async fn storage_clear_log_local() -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(storage_cleanup::clear_debug_log)
+    tauri::async_runtime::spawn_blocking(command_handlers::run_storage_clear_log)
         .await
         .map_err(|e| format!("storage_clear_log_failed:join:{e}"))?
         .map_err(|e| e.to_string())

@@ -4197,3 +4197,103 @@ use crate::storage::read_json_file;
         // env (parallelism + isolation hygiene).
         std::env::remove_var("ALFRED_STATE_DIR");
     }
+
+    // ── P0-6 — Storage Tauri handlers must conform to bridge envelope ──
+    //
+    // The JS bridge (`bridge-client.js::normalizeTauriPayload`) requires every
+    // Tauri command response to wrap its result in
+    // `{ ok: true, action: "<command>", result: {...} }`. The pre-fix
+    // `storage_*_local` handlers returned a flat `{run_files, run_mb, ...}`
+    // payload, so the Settings panel showed "bridge_payload_invalid" and the
+    // Storage section was unusable. These three tests pin the envelope shape
+    // so the convention can't drift again silently.
+
+    fn assert_bridge_envelope(response: &serde_json::Value, expected_action: &str) {
+        assert_eq!(
+            response.get("ok").and_then(|v| v.as_bool()),
+            Some(true),
+            "bridge envelope contract: `ok` must be exactly `true` for {expected_action}, got {response:#}"
+        );
+        assert_eq!(
+            response.get("action").and_then(|v| v.as_str()),
+            Some(expected_action),
+            "bridge envelope contract: `action` must equal the Tauri command name for {expected_action}, got {response:#}"
+        );
+        let result = response.get("result").unwrap_or_else(|| {
+            panic!("bridge envelope contract: `result` field missing for {expected_action}, got {response:#}")
+        });
+        assert!(
+            result.is_object(),
+            "bridge envelope contract: `result` must be a JSON object for {expected_action}, got {result:#}"
+        );
+    }
+
+    #[test]
+    fn storage_usage_local_returns_bridge_envelope() {
+        let _guard = env_lock();
+        let response = crate::command_handlers::run_storage_usage()
+            .expect("run_storage_usage must succeed");
+        assert_bridge_envelope(&response, "storage_usage_local");
+        // The wrapped result must still expose the storage usage fields the
+        // Settings UI consumes (run_files, run_mb, log_mb, total_mb).
+        let result = response.get("result").unwrap();
+        assert!(result.get("run_files").is_some(), "result missing run_files: {result:#}");
+        assert!(result.get("run_mb").is_some(), "result missing run_mb: {result:#}");
+        assert!(result.get("log_mb").is_some(), "result missing log_mb: {result:#}");
+        assert!(result.get("total_mb").is_some(), "result missing total_mb: {result:#}");
+    }
+
+    #[test]
+    fn storage_prune_local_returns_bridge_envelope() {
+        let _guard = env_lock();
+        // Isolate to a tempdir so prune doesn't touch real run files.
+        let tmp = std::env::temp_dir().join(format!("alfred_test_prune_{}", now_epoch_ms()));
+        let state_dir = tmp.join("runtime-state");
+        std::fs::create_dir_all(&state_dir).expect("create state_dir");
+        std::env::set_var("ALFRED_STATE_DIR", &tmp);
+
+        let response = crate::command_handlers::run_storage_prune(10)
+            .expect("run_storage_prune must succeed");
+        assert_bridge_envelope(&response, "storage_prune_local");
+        let result = response.get("result").unwrap();
+        assert!(result.get("removed").is_some(), "result missing removed: {result:#}");
+        assert!(result.get("freed_mb").is_some(), "result missing freed_mb: {result:#}");
+
+        std::env::remove_var("ALFRED_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn storage_clear_log_local_returns_bridge_envelope() {
+        let _guard = env_lock();
+        // Isolate to a tempdir so we don't truncate the real debug.log.
+        let tmp = std::env::temp_dir().join(format!("alfred_test_clearlog_{}", now_epoch_ms()));
+        let state_dir = tmp.join("runtime-state");
+        std::fs::create_dir_all(&state_dir).expect("create state_dir");
+        std::fs::write(tmp.join("debug.log"), b"old content").expect("seed debug.log");
+        std::env::set_var("ALFRED_STATE_DIR", &tmp);
+
+        let response = crate::command_handlers::run_storage_clear_log()
+            .expect("run_storage_clear_log must succeed");
+        assert_bridge_envelope(&response, "storage_clear_log_local");
+        let result = response.get("result").unwrap();
+        assert!(result.get("freed_mb").is_some(), "result missing freed_mb: {result:#}");
+
+        std::env::remove_var("ALFRED_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── Reusable envelope helper: pin its own contract ──
+    //
+    // `bridge_envelope(action, result)` is the canonical wrapper. Test it
+    // independently so any future caller can rely on its shape.
+    #[test]
+    fn bridge_envelope_helper_produces_canonical_shape() {
+        let response = crate::command_handlers::bridge_envelope(
+            "some_command_local",
+            json!({"foo": "bar"}),
+        );
+        assert_eq!(response["ok"], json!(true));
+        assert_eq!(response["action"], json!("some_command_local"));
+        assert_eq!(response["result"], json!({"foo": "bar"}));
+    }

@@ -37,6 +37,17 @@ pub struct RecordedEvent {
     pub payload: Value,
 }
 
+/// Aggregate progress carried across ticks so the prompt can surface
+/// "X/Y positions analysées, dernière: TTE" — the same data points the
+/// alfred-analysis-progress template trigger uses. Updated on every
+/// `line_done` event.
+#[derive(Clone, Debug)]
+pub(crate) struct ProgressSnapshot {
+    pub completed: usize,
+    pub total: usize,
+    pub latest_ticker: String,
+}
+
 /// Per-run narrator state.
 struct NarratorState {
     buffer: VecDeque<RecordedEvent>,
@@ -47,6 +58,11 @@ struct NarratorState {
     /// prompt so the LLM can build on it rather than starting from zero each
     /// tick (narrative continuity).
     last_narration: Option<String>,
+    /// Latest aggregated progress (completed/total + last ticker done).
+    /// Updated from each `line_done` event and surfaced in the prompt even
+    /// when the current tick's drained events don't include a fresh
+    /// line_done. Mirrors the data the JS template trigger uses.
+    latest_progress: Option<ProgressSnapshot>,
     stop_flag: Arc<AtomicBool>,
 }
 
@@ -58,6 +74,7 @@ impl NarratorState {
             consecutive_failures: 0,
             degraded: false,
             last_narration: None,
+            latest_progress: None,
             stop_flag,
         }
     }
@@ -90,6 +107,34 @@ pub fn record_event(run_id: &str, event: &Value) {
 
     let Ok(mut guard) = narrators().lock() else { return };
     let Some(state) = guard.get_mut(run_id) else { return };
+
+    // On line_done, refresh the aggregate progress snapshot so the prompt
+    // can mention "X/Y analysées, dernière: TTE" even when the current
+    // tick drains only line_progress events.
+    if kind == "line_done" {
+        let ticker = event
+            .get("ticker")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let completed = event
+            .get("completed")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize);
+        let total = event
+            .get("total")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize);
+        if let (Some(completed), Some(total)) = (completed, total) {
+            if total > 0 && !ticker.is_empty() {
+                state.latest_progress = Some(ProgressSnapshot {
+                    completed,
+                    total,
+                    latest_ticker: ticker,
+                });
+            }
+        }
+    }
 
     let recorded = RecordedEvent {
         ts: SystemTime::now(),
@@ -223,12 +268,15 @@ pub(crate) fn tick_once(run_id: &str, llm_call: &LlmCall) -> bool {
         return false;
     }
 
-    let last_narration: Option<String> = narrators()
+    let (last_narration, progress): (Option<String>, Option<ProgressSnapshot>) = narrators()
         .lock()
         .ok()
-        .and_then(|g| g.get(run_id).and_then(|s| s.last_narration.clone()));
+        .and_then(|g| {
+            g.get(run_id).map(|s| (s.last_narration.clone(), s.latest_progress.clone()))
+        })
+        .unwrap_or((None, None));
 
-    let prompt = build_narration_prompt(&events, last_narration.as_deref());
+    let prompt = build_narration_prompt(&events, last_narration.as_deref(), progress.as_ref());
     match llm_call(&prompt) {
         Ok(text) if !text.trim().is_empty() => {
             let cleaned = text.trim().to_string();
@@ -281,11 +329,14 @@ fn on_failure(run_id: &str, reason: &str) {
 }
 
 /// Build the compact narration prompt from a slice of recorded events plus
-/// the previous narration (for continuity). Keeps the most recent
-/// `MAX_EVENTS_IN_PROMPT` so the prompt stays bounded even on very busy runs.
+/// the previous narration (for continuity) plus the latest aggregate
+/// progress snapshot (so the LLM has the same X/Y counter the template
+/// trigger uses). Keeps the most recent `MAX_EVENTS_IN_PROMPT` so the
+/// prompt stays bounded even on very busy runs.
 pub(crate) fn build_narration_prompt(
     events: &[RecordedEvent],
     last_narration: Option<&str>,
+    progress: Option<&ProgressSnapshot>,
 ) -> String {
     let total = events.len();
     let slice: &[RecordedEvent] = if total > MAX_EVENTS_IN_PROMPT {
@@ -312,21 +363,32 @@ pub(crate) fn build_narration_prompt(
         _ => String::new(),
     };
 
+    let progress_block = match progress {
+        Some(p) if p.total > 0 => format!(
+            "Progression globale : {}/{} positions analys\u{00e9}es \
+             (derni\u{00e8}re finalis\u{00e9}e : {}).\n\n",
+            p.completed, p.total, p.latest_ticker
+        ),
+        _ => String::new(),
+    };
+
     format!(
         "Tu narres en direct l'analyse de portefeuille men\u{00e9}e par Alfred. \
          Alfred est l'agent IA qui analyse les positions. \
          Les codes courts en MAJUSCULES (ex : AAPL, MSFT, NVDA, EXA, TSLA) sont des TICKERS \
          d'ENTREPRISES analys\u{00e9}es par Alfred — jamais des agents qui font une action.\n\n\
          {previous}\
+         {progress}\
          \u{00c9}v\u{00e8}nements r\u{00e9}cents de l'analyse :\n{body}\n\
          Produis 1 \u{00e0} 2 phrases courtes (25-45 mots au total, fran\u{00e7}ais, ton calme et pr\u{00e9}cis), \
          qui m\u{00ea}lent :\n\
-         (1) la progression c\u{00f4}t\u{00e9} Alfred (ce qui vient de se passer pour la ou les entreprises mentionn\u{00e9}es),\n\
+         (1) la progression c\u{00f4}t\u{00e9} Alfred (ce qui vient de se passer, et si pertinent le compteur X/Y),\n\
          (2) quand c'est pertinent, une br\u{00e8}ve sur une de ces entreprises \
          (secteur, contexte connu, fait notable) en t'appuyant sur ta connaissance g\u{00e9}n\u{00e9}rale.\n\
          Ne fais pas r\u{00e9}p\u{00e9}ter une entreprise comme « agent ». Pas de pr\u{00e9}ambule. \
          R\u{00e9}ponds uniquement avec la ou les phrases.",
         previous = previous_block,
+        progress = progress_block,
         body = body
     )
 }
@@ -489,7 +551,7 @@ mod tests {
                 payload: json!({"stage": "line_analysis"}),
             },
         ];
-        let prompt = build_narration_prompt(&events, None);
+        let prompt = build_narration_prompt(&events, None, None);
         // Prompt is richer than v1 (system framing + insight ask) but still bounded.
         assert!(prompt.len() < 1500, "prompt should be < 1500 chars, got {}", prompt.len());
         for ticker in ["AAPL", "MSFT", "NVDA"] {
@@ -516,13 +578,104 @@ mod tests {
             payload: json!({"ticker": "NVDA", "recommendation": {"signal": "BUY", "conviction": "high"}}),
         }];
         let previous = "Alfred valide AAPL en BUY, attaque NVDA dans la foul\u{00e9}e.";
-        let prompt = build_narration_prompt(&events, Some(previous));
+        let prompt = build_narration_prompt(&events, Some(previous), None);
         assert!(prompt.contains("Pr\u{00e9}c\u{00e9}dent r\u{00e9}sum\u{00e9}"));
         assert!(prompt.contains(previous));
         assert!(prompt.contains("NVDA"));
         // Whitespace-only previous narration must be skipped — exercise that path too.
-        let prompt_blank = build_narration_prompt(&events, Some("   "));
+        let prompt_blank = build_narration_prompt(&events, Some("   "), None);
         assert!(!prompt_blank.contains("Pr\u{00e9}c\u{00e9}dent r\u{00e9}sum\u{00e9}"));
+    }
+
+    #[test]
+    fn test_build_narration_prompt_includes_progress_snapshot() {
+        let events = vec![RecordedEvent {
+            ts: SystemTime::now(),
+            kind: "line_progress".to_string(),
+            payload: json!({"ticker": "MSFT", "status": "analyzing"}),
+        }];
+        let progress = ProgressSnapshot {
+            completed: 21,
+            total: 33,
+            latest_ticker: "TTE".to_string(),
+        };
+        let prompt = build_narration_prompt(&events, None, Some(&progress));
+        assert!(prompt.contains("21/33"));
+        assert!(prompt.contains("TTE"));
+        assert!(prompt.contains("Progression globale"));
+
+        // Zero-total is treated as no-progress (avoid bogus "0/0 positions analysées").
+        let progress_zero = ProgressSnapshot {
+            completed: 0,
+            total: 0,
+            latest_ticker: "X".to_string(),
+        };
+        let prompt_zero = build_narration_prompt(&events, None, Some(&progress_zero));
+        assert!(!prompt_zero.contains("Progression globale"));
+    }
+
+    #[test]
+    fn test_record_event_updates_progress_snapshot() {
+        let run_id = "test_progress_snapshot";
+        install_state(run_id);
+
+        // line_progress alone must NOT touch the progress snapshot.
+        record_event(
+            run_id,
+            &make_event("line_progress", json!({"ticker": "AAPL", "status": "analyzing"})),
+        );
+        {
+            let guard = narrators().lock().unwrap();
+            assert!(guard.get(run_id).unwrap().latest_progress.is_none());
+        }
+
+        // line_done with completed/total/ticker updates the snapshot.
+        record_event(
+            run_id,
+            &make_event(
+                "line_done",
+                json!({"ticker": "TTE", "completed": 21, "total": 33, "recommendation": {"signal": "HOLD"}}),
+            ),
+        );
+        {
+            let guard = narrators().lock().unwrap();
+            let p = guard.get(run_id).unwrap().latest_progress.as_ref().unwrap();
+            assert_eq!(p.completed, 21);
+            assert_eq!(p.total, 33);
+            assert_eq!(p.latest_ticker, "TTE");
+        }
+
+        // A later line_done overwrites the snapshot.
+        record_event(
+            run_id,
+            &make_event(
+                "line_done",
+                json!({"ticker": "MSFT", "completed": 22, "total": 33, "recommendation": {"signal": "BUY"}}),
+            ),
+        );
+        {
+            let guard = narrators().lock().unwrap();
+            let p = guard.get(run_id).unwrap().latest_progress.as_ref().unwrap();
+            assert_eq!(p.completed, 22);
+            assert_eq!(p.latest_ticker, "MSFT");
+        }
+
+        // line_done missing completed/total leaves the existing snapshot intact.
+        record_event(
+            run_id,
+            &make_event(
+                "line_done",
+                json!({"ticker": "NVDA", "recommendation": {"signal": "HOLD"}}),
+            ),
+        );
+        {
+            let guard = narrators().lock().unwrap();
+            let p = guard.get(run_id).unwrap().latest_progress.as_ref().unwrap();
+            assert_eq!(p.completed, 22);
+            assert_eq!(p.latest_ticker, "MSFT");
+        }
+
+        remove_state(run_id);
     }
 
     #[test]

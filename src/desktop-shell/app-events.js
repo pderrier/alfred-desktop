@@ -11,6 +11,10 @@ import {
   renderPipelineBar,
   updateSingleLineProgress
 } from "/desktop-shell/shell-layout.js";
+import {
+  updateTickerCollectionStatus,
+  resetTickerCollectionStatus
+} from "/desktop-shell/ticker-collection-status.js";
 
 export function initEvents(deps) {
   const {
@@ -50,11 +54,30 @@ export function initEvents(deps) {
     });
 
     // Run stage changes — instant pipeline bar update
+    let lastTickerStatusRunId = null;
     window.__TAURI__.event.listen("alfred://run-stage", (event) => {
-      const { stage, line_progress } = event.payload || {};
+      const { stage, line_progress, run_id } = event.payload || {};
       if (!stage || !getActiveRunId()) return;
       renderPipelineBar(stage);
       renderTopBarProgress({ status: "running", line_progress });
+      // P0-7: any new run_id observed on a run-stage event clears the
+      // per-ticker retry/failure badge — covers the case where this run has
+      // zero retries (no ticker-collection-event fires) but a previous run
+      // left the badge visible.
+      if (run_id && run_id !== lastTickerStatusRunId) {
+        lastTickerStatusRunId = run_id;
+        resetTickerCollectionStatus();
+      }
+    });
+
+    // Per-ticker collection retry/failure (P0-7) — emitted by
+    // `fetch_technical_snapshot` in the Rust enrichment retry loop. Each
+    // payload increments the aggregator and re-renders the badge under the
+    // pipeline bar. Reset is run_id-driven inside the aggregator + via the
+    // run-stage listener above.
+    window.__TAURI__.event.listen("alfred://ticker-collection-event", (event) => {
+      if (!getActiveRunId()) return;
+      updateTickerCollectionStatus(event.payload || null);
     });
 
     // Run narration — LLM-generated 1-sentence summary of the last 10s of events.

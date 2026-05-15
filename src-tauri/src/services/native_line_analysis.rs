@@ -13,12 +13,23 @@ pub(crate) fn persist_native_collection_state(run_id: &str, collection_state: &V
         .unwrap_or_else(crate::paths::default_data_dir);
     crate::run_state_cache::patch(&data_dir, run_id, |run_state| {
         if let Some(object) = run_state.as_object_mut() {
+            // Whitelist of top-level keys propagated from collection_state into
+            // the persisted run_state. **MUST match what build_collection_state
+            // emits** — see the contract test
+            // `persist_whitelist_covers_all_build_collection_state_fields`.
+            //
+            // Forgetting an entry here silently drops the field at persist
+            // time even though build_collection_state writes it (production
+            // bug 2026-05-15: `technicals` was emitted but missing from the
+            // run JSON until this whitelist was completed).
             for key in [
                 "portfolio",
                 "transactions",
                 "orders",
                 "market",
                 "news",
+                // v0.2.17: server-computed 250d technical indicators per ticker
+                "technicals",
                 "quality",
                 "collection_issues",
                 "enrichment",

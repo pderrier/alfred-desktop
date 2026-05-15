@@ -4086,3 +4086,114 @@ use crate::storage::read_json_file;
             "signal_history must record at least the latest run on the canonical entry",
         );
     }
+
+    // ── Contract test: persist must propagate every field build emits ─────
+    //
+    // Production bug surfaced 2026-05-15: a v0.3.0 run had `technicals: {}`
+    // ABSENT from the run JSON despite `build_collection_state` writing it.
+    // Root cause: `persist_native_collection_state` uses a hardcoded whitelist
+    // of keys from `collection_state` to copy into `run_state`. When new
+    // top-level fields were added to `build_collection_state` (`technicals`
+    // in v0.2.17, `collection_quality` later), the whitelist was never
+    // updated and the data was silently dropped.
+    //
+    // This is a CONTRACT test: it computes the diff of top-level keys
+    // between what `build_collection_state` emits and what survives the
+    // persist round-trip. The set must be empty (modulo control fields the
+    // persist adds, like `updated_at`). Any future field added to
+    // `build_collection_state` will fail this test if the whitelist isn't
+    // updated — agents can't silently drop data anymore.
+    #[test]
+    fn persist_whitelist_covers_all_build_collection_state_fields() {
+        use std::collections::HashSet;
+        let _guard = env_lock();
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        // ALFRED_STATE_DIR is the runtime-state directory itself (per
+        // paths::resolve_runtime_state_dir). persist_native_collection_state
+        // takes its parent as data_dir, so the actual file lives at
+        // ALFRED_STATE_DIR/{run_id}.json (= data_dir/runtime-state/{run_id}.json).
+        let runtime_dir = tmpdir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_dir).expect("mkdir runtime-state");
+        std::env::set_var("ALFRED_STATE_DIR", runtime_dir.as_os_str());
+        crate::run_state_cache::reset_cache();
+
+        // Seed a minimal run state file so `persist_native_collection_state`
+        // can patch it (otherwise it errors run_not_found).
+        let run_id = "test_persist_contract_run";
+        std::fs::write(
+            runtime_dir.join(format!("{run_id}.json")),
+            "{}",
+        ).expect("seed empty run state");
+        let state_dir = tmpdir.path();
+
+        // Build a fully-populated collection_state. Every top-level field
+        // produced by build_collection_state must come through persist.
+        let mut market = serde_json::Map::new();
+        market.insert("STMPA".into(), json!({ "prix_actuel": 51.91, "source": "boursorama:spot" }));
+        let news = serde_json::Map::new();
+        let mut technicals = serde_json::Map::new();
+        technicals.insert("STMPA".into(), json!({
+            "as_of": "2026-05-15",
+            "source": "yahoo:chart:resolved:STMPA.PA",
+            "samples": 250,
+            "indicators": { "sma_200": 26.51, "rsi_14": 64.68, "trend_signal": "up" }
+        }));
+        let snapshot = json!({ "valeur_totale": 1000.0, "plus_value_totale": 0.0, "liquidites": 0.0 });
+        let positions = vec![json!({
+            "ticker": "STMPA", "nom": "STMicroelectronics",
+            "isin": "NL0000226223", "resolved_symbol": "STMPA.PA",
+            "quantite": 18.0, "prix_actuel": 51.91, "prix_revient": 26.95,
+            "valeur_actuelle": 934.38, "plus_moins_value": 449.28,
+            "plus_moins_value_pct": 92.51, "compte": "PEA"
+        })];
+
+        let collection_state = crate::native_collection_helpers::build_collection_state(
+            &snapshot, &positions, &market, &news, &technicals,
+            &serde_json::Value::Null, &[], &[],
+            "finary", "ok",
+            &serde_json::Value::Null, &serde_json::Value::Null, None,
+        );
+
+        // Persist through the actual production pipeline.
+        crate::native_line_analysis::persist_native_collection_state(run_id, &collection_state)
+            .expect("persist must succeed");
+        crate::run_state_cache::flush_to_disk();
+
+        let persisted = crate::run_state_cache::load(state_dir, run_id)
+            .expect("must read back the persisted state");
+
+        // Diff: every top-level key emitted by build_collection_state should
+        // appear in the persisted run state.
+        let emitted_keys: HashSet<String> = collection_state.as_object().unwrap()
+            .keys().cloned().collect();
+        let persisted_keys: HashSet<String> = persisted.as_object().unwrap()
+            .keys().cloned().collect();
+        let missing: Vec<&String> = emitted_keys.difference(&persisted_keys).collect();
+        assert!(
+            missing.is_empty(),
+            "CONTRACT VIOLATION: persist_native_collection_state's hardcoded whitelist \
+             dropped these fields emitted by build_collection_state: {:?}.\n\
+             Fix: add them to the `for key in [...]` array in \
+             native_line_analysis.rs::persist_native_collection_state.\n\
+             Emitted (build): {:?}\n\
+             Persisted: {:?}",
+            missing, emitted_keys, persisted_keys
+        );
+
+        // Spot check: the technicals payload must round-trip intact when
+        // the whitelist propagates it.
+        let stmpa_after = persisted.get("technicals").and_then(|t| t.get("STMPA"));
+        assert!(stmpa_after.is_some(),
+            "STMPA technical must survive persist round-trip");
+        assert_eq!(
+            stmpa_after.unwrap().get("source").and_then(|s| s.as_str()),
+            Some("yahoo:chart:resolved:STMPA.PA"),
+            "source audit tag must be preserved verbatim"
+        );
+
+        // Clean up env vars — env_lock serializes but doesn't reset on drop.
+        // Leaving ALFRED_STATE_DIR pointing at the just-deleted tempdir would
+        // break any subsequent test that resolves the runtime state dir from
+        // env (parallelism + isolation hygiene).
+        std::env::remove_var("ALFRED_STATE_DIR");
+    }

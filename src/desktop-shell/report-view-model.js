@@ -780,6 +780,41 @@ export function buildReportViewModel(dashboardPayload, extras = {}) {
     // Decided at splash bootstrap (codex-fallback-policy.decideOauthProposal),
     // rendered by app.js renderOauthProposalBanner.
     oauthProposal: extras?.oauthProposal || null,
+    // v0.3.2 (P1-3): token usage + estimated cost in EUR. Null when the run
+    // has no run_statistics yet (pre-v0.3.2 runs, or runs that recorded
+    // 0 tokens — e.g. codex OAuth runs where cost is irrelevant). The
+    // renderer hides the footer when this is null.
+    tokenUsage: buildTokenUsageView(latestRun),
+  };
+}
+
+// Build the token-usage summary the report footer renders ("Coût estimé…").
+// Source: `latestRun.run_statistics.token_usage`, written by Rust
+// `run_stats::aggregate_from_progress_file`. We surface it as a structured
+// object so the UI can decide to hide it (e.g. when all tokens are 0 and
+// the run is codex-only with no observable cost).
+//
+// Exported for unit testing.
+export function buildTokenUsageView(latestRun) {
+  const usage = latestRun?.run_statistics?.token_usage || null;
+  if (!usage || typeof usage !== "object") return null;
+  const totalTokens = asNumber(usage.total_tokens, 0);
+  const inputTokens = asNumber(usage.input_tokens, 0);
+  const outputTokens = asNumber(usage.output_tokens, 0);
+  const costEur = asNumber(usage.cost_eur, 0);
+  const model = asText(usage.model, "");
+  // Suppress the section entirely when nothing was measured — keeps the
+  // footer clean for pre-v0.3.2 runs that don't have run_statistics yet.
+  if (totalTokens === 0 && costEur === 0) return null;
+  return {
+    totalTokens,
+    inputTokens,
+    outputTokens,
+    costEur,
+    model: model || "gpt-5",
+    // Pre-formatted display strings so the renderer stays trivial.
+    tokensLabel: `${totalTokens.toLocaleString("fr-FR")} tokens (in ${inputTokens.toLocaleString("fr-FR")} / out ${outputTokens.toLocaleString("fr-FR")})`,
+    costLabel: `Coût estimé : ${costEur.toFixed(2)} €`,
   };
 }
 

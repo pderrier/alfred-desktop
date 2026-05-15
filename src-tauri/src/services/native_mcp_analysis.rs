@@ -269,7 +269,17 @@ pub(crate) fn build_native_line_prompt(_run_id: &str, ticker: &str, nom: &str, l
     let market = serde_json::to_string_pretty(&line_data["market_data"]).unwrap_or_default();
     let news = serde_json::to_string_pretty(&line_data["news"]).unwrap_or_default();
     let insights = serde_json::to_string_pretty(&line_data["shared_insights"]).unwrap_or_default();
-    let memory = serde_json::to_string_pretty(&line_data["line_memory"]).unwrap_or_default();
+    // Reuse the shared MEMOIRE LIGNE renderer (codex/MCP path uses the same
+    // helper). Two reasons: (1) parity contract — the 3 LLM modes must see
+    // the same memory rendering, see `docs/llm-mode-parity-contract.md`;
+    // (2) token budget — the bounded human renderer is materially shorter
+    // than `serde_json::to_string_pretty(line_memory)` on V2 memory (10
+    // signals + 15 themes), see P1-3 in po-plan-2026-05. Pinned by tests
+    // `native_line_prompt_renders_memory_via_shared_renderer` and
+    // `native_line_prompt_token_budget_drops_substantially_vs_raw_dump`.
+    let memory_block = crate::llm_prompts::build_memory_section(
+        line_data.get("line_memory"),
+    );
     let quality = serde_json::to_string_pretty(&line_data["quality"]).unwrap_or_default();
     // Reuse the shared TECHNIQUE renderer to guarantee parity across the 3
     // LLM modes (codex / native / native-oauth) — see llm_prompts.rs.
@@ -346,8 +356,7 @@ Insights partages:
 {sector_section}
 {activity_section}
 
-Memoire precedente:
-{memory}
+{memory_block}
 
 {section_technical}
 
@@ -386,7 +395,7 @@ Les articles "RESUME APPROFONDI (cache)" sont deja resumes — utilise-les direc
         market = market,
         news = news,
         insights = insights,
-        memory = memory,
+        memory_block = memory_block,
         section_technical = section_technical,
         quality = quality,
     )
@@ -1866,8 +1875,17 @@ impl McpBatchDispatchQueue {
                                     use std::io::Write;
                                     let event = if label.starts_with("tokens:") {
                                         let parts: Vec<&str> = label.split(':').collect();
+                                        // Tag with `mode: "native"` so the run_stats
+                                        // aggregator sums per-call totals across
+                                        // parallel lines (each native call emits one
+                                        // event at response.completed — see
+                                        // openai_client.rs:594-617). Codex events
+                                        // are cumulative-per-thread and must keep
+                                        // max-semantics, which run_stats does when
+                                        // `mode != "native"`.
                                         serde_json::json!({
                                             "type": "token_usage",
+                                            "mode": "native",
                                             "total": parts.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
                                             "input": parts.get(2).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
                                             "output": parts.get(3).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
@@ -1942,8 +1960,12 @@ impl McpBatchDispatchQueue {
                             use std::io::Write;
                             let event = if label.starts_with("tokens:") {
                                 let parts: Vec<&str> = label.split(':').collect();
+                                // Codex batch dispatch — emits cumulative
+                                // per-thread updates. `mode: "codex"` keeps
+                                // max-semantics in the aggregator.
                                 serde_json::json!({
                                     "type": "token_usage",
+                                    "mode": "codex",
                                     "total": parts.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
                                     "input": parts.get(2).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
                                     "output": parts.get(3).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),

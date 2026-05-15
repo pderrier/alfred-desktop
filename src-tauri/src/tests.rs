@@ -4297,3 +4297,256 @@ use crate::storage::read_json_file;
         assert_eq!(response["action"], json!("some_command_local"));
         assert_eq!(response["result"], json!({"foo": "bar"}));
     }
+
+    // ── P1-3 — Native context windowing + token tracking + cost ──
+    //
+    // The native LLM path used `serde_json::to_string_pretty(&line_data["line_memory"])`
+    // for the MEMOIRE LIGNE section while the codex/MCP path used
+    // `build_memory_section` (a bounded human-formatted renderer). Two
+    // consequences:
+    //   1. Token bloat — raw JSON is 3-5× longer than the codex rendering.
+    //   2. Parity violation — see `docs/llm-mode-parity-contract.md`: the
+    //      output may differ when the model parses raw JSON differently
+    //      from the human-bullet format.
+    //
+    // The fix routes native through `build_memory_section`. These tests pin
+    // the new behaviour AND the regression-guard contract that the native
+    // prompt's memory rendering matches the shared renderer byte-for-byte.
+
+    fn fixture_v2_line_memory() -> serde_json::Value {
+        json!({
+            "schema_version": 2,
+            "ticker": "STMPA",
+            "trend": "improving",
+            "price_tracking": {
+                "last_signal": "ACHAT",
+                "last_signal_date": "2026-05-01",
+                "price_at_signal": 42.5,
+                "return_since_signal_pct": 8.2,
+                "signal_accuracy": "correct"
+            },
+            "conviction": "forte",
+            "memory_narrative": "Cycle haut sur le segment automotive avec recent design win Tesla. Concurrence Infineon stable. Risque cyclique mais valuation raisonnable.",
+            "news_themes": ["design_win", "auto_cycle", "tesla", "infineon"],
+            "signal_history": [
+                {"date": "2026-05-01", "signal": "ACHAT", "price": 42.5},
+                {"date": "2026-04-15", "signal": "CONSERVER", "price": 41.0},
+                {"date": "2026-04-01", "signal": "ACHAT", "price": 40.0}
+            ],
+            "user_action": null
+        })
+    }
+
+    #[test]
+    fn native_line_prompt_renders_memory_via_shared_renderer() {
+        let line_data = json!({
+            "position": {"nom": "STMicroelectronics", "ticker": "STMPA"},
+            "market_data": {"prix_actuel": 45.0},
+            "news": [],
+            "shared_insights": {},
+            "line_memory": fixture_v2_line_memory(),
+            "quality": {"news_score": 80},
+            "technical_snapshot": null,
+        });
+        let prompt = crate::native_mcp_analysis::build_native_line_prompt(
+            "run_test", "STMPA", "STMicroelectronics", "position", &line_data,
+        );
+        // Must use the shared human-formatted renderer (codex parity).
+        let expected_section = crate::llm_prompts::build_memory_section(Some(line_data.get("line_memory").unwrap()));
+        assert!(
+            prompt.contains(&expected_section),
+            "native prompt must include the exact `build_memory_section` rendering for parity. \n--- expected section ---\n{expected_section}\n--- prompt ---\n{prompt}"
+        );
+        // Must NOT inline the raw JSON dump of line_memory (that was the bug).
+        let raw_json = serde_json::to_string_pretty(&line_data["line_memory"]).unwrap_or_default();
+        assert!(
+            !prompt.contains(&raw_json),
+            "native prompt must NOT include raw JSON dump of line_memory (token bloat + parity break)"
+        );
+    }
+
+    #[test]
+    fn native_line_prompt_token_budget_drops_substantially_vs_raw_dump() {
+        // Realistic V2 memory fixture: 10 signals (V2 cap), 15 themes (V2
+        // cap), full price tracking, full narrative — mirrors what
+        // `sync_line_memory` writes after ~10 runs on a tracked ticker.
+        let mut signal_history = Vec::new();
+        for i in 0..10 {
+            signal_history.push(json!({
+                "date": format!("2026-{:02}-15", 1 + i),
+                "signal": "ACHAT",
+                "price": 40.0 + (i as f64) * 0.5,
+            }));
+        }
+        let news_themes: Vec<&str> = (0..15).map(|i| match i {
+            0 => "design_win", 1 => "auto_cycle", 2 => "tesla", 3 => "infineon",
+            4 => "soc", 5 => "ai_inference", 6 => "european_industrials",
+            7 => "valuation", 8 => "guidance_cut", 9 => "buyback",
+            10 => "dividend", 11 => "ceo_change", 12 => "fab_capacity",
+            13 => "geopolitics", _ => "supply_chain",
+        }).collect();
+        let memory = json!({
+            "schema_version": 2,
+            "ticker": "STMPA",
+            "trend": "improving",
+            "price_tracking": {
+                "last_signal": "ACHAT",
+                "last_signal_date": "2026-05-01",
+                "price_at_signal": 42.5,
+                "return_since_signal_pct": 8.2,
+                "signal_accuracy": "correct"
+            },
+            "conviction": "forte",
+            "memory_narrative": "Cycle haut sur le segment automotive avec recent design win Tesla. Concurrence Infineon stable. Risque cyclique mais valuation raisonnable. Run precedent: signal ACHAT a 42.50EUR a tenu, rendement +8.2%. Catalyseur prochain: T2 earnings + guidance margins.",
+            "news_themes": news_themes,
+            "signal_history": signal_history,
+            "user_action": null
+        });
+        let line_data = json!({
+            "position": {"nom": "STMicroelectronics", "ticker": "STMPA"},
+            "market_data": {"prix_actuel": 45.0},
+            "news": [],
+            "shared_insights": {},
+            "line_memory": memory.clone(),
+            "quality": {"news_score": 80},
+            "technical_snapshot": null,
+        });
+        let prompt_after = crate::native_mcp_analysis::build_native_line_prompt(
+            "run_test", "STMPA", "STMicroelectronics", "position", &line_data,
+        );
+        let raw_memory = serde_json::to_string_pretty(&memory).unwrap_or_default();
+        let rendered_memory = crate::llm_prompts::build_memory_section(Some(&memory));
+        // On realistic V2 memory (10 signals + 15 themes + full narrative)
+        // the bounded renderer must compress to ≤50% of the raw JSON byte
+        // length — this is the regression guard for the token budget
+        // acceptance criterion in po-plan-2026-05 P1-3.
+        assert!(
+            rendered_memory.len() * 2 <= raw_memory.len(),
+            "memory section must be ≤50% of raw JSON dump (raw={} bytes, rendered={} bytes)",
+            raw_memory.len(),
+            rendered_memory.len()
+        );
+        // Full prompt sanity guard — must not regrow.
+        assert!(
+            prompt_after.len() < 6000,
+            "native line prompt should remain under 6 KB for typical V2 memory (got {} bytes)",
+            prompt_after.len()
+        );
+    }
+
+    // ── P1-3 — Token aggregation correctness (native sum vs codex max) ──
+    //
+    // Each native LLM call emits ONE `token_usage` event at
+    // `response.completed` carrying that call's per-call totals — so
+    // running 10 lines in parallel produces 10 separate events. The
+    // pre-fix aggregator took the max across all events, which underreports
+    // 10× the real total. Codex still emits cumulative per-thread updates,
+    // so its `max` behaviour stays correct.
+
+    fn write_progress_jsonl(dir: &std::path::Path, run_id: &str, events: &[serde_json::Value]) {
+        let runtime = dir.join("runtime-state");
+        std::fs::create_dir_all(&runtime).expect("create runtime-state");
+        let path = runtime.join(format!("{run_id}_mcp_progress.jsonl"));
+        let body: String = events.iter()
+            .map(|e| serde_json::to_string(e).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, body).expect("write progress jsonl");
+    }
+
+    #[test]
+    fn token_usage_native_events_sum_across_parallel_lines() {
+        let _guard = env_lock();
+        let tmp = std::env::temp_dir().join(format!("alfred_test_tokens_native_{}", now_epoch_ms()));
+        let run_id = "run_native_tokens";
+        // 3 native lines, each emits one event with per-call totals.
+        let events = vec![
+            json!({"type":"token_usage","mode":"native","total":1200,"input":1000,"output":200}),
+            json!({"type":"token_usage","mode":"native","total":1500,"input":1300,"output":200}),
+            json!({"type":"token_usage","mode":"native","total":900,"input":800,"output":100}),
+        ];
+        write_progress_jsonl(&tmp, run_id, &events);
+        let stats = crate::run_stats::aggregate_from_progress_file(
+            tmp.to_string_lossy().as_ref(),
+            run_id,
+        );
+        let usage = stats.get("token_usage").expect("token_usage field present");
+        // Native mode must SUM across calls — each event is one whole call.
+        assert_eq!(usage.get("total_tokens").and_then(|v| v.as_u64()), Some(3600));
+        assert_eq!(usage.get("input_tokens").and_then(|v| v.as_u64()), Some(3100));
+        assert_eq!(usage.get("output_tokens").and_then(|v| v.as_u64()), Some(500));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn token_usage_codex_events_take_max_per_cumulative_stream() {
+        let _guard = env_lock();
+        let tmp = std::env::temp_dir().join(format!("alfred_test_tokens_codex_{}", now_epoch_ms()));
+        let run_id = "run_codex_tokens";
+        // Codex emits cumulative updates within one stream — take the max.
+        let events = vec![
+            json!({"type":"token_usage","mode":"codex","total":500,"input":400,"output":100}),
+            json!({"type":"token_usage","mode":"codex","total":1200,"input":1000,"output":200}),
+            json!({"type":"token_usage","mode":"codex","total":2000,"input":1700,"output":300}),
+        ];
+        write_progress_jsonl(&tmp, run_id, &events);
+        let stats = crate::run_stats::aggregate_from_progress_file(
+            tmp.to_string_lossy().as_ref(),
+            run_id,
+        );
+        let usage = stats.get("token_usage").expect("token_usage field present");
+        assert_eq!(usage.get("total_tokens").and_then(|v| v.as_u64()), Some(2000));
+        assert_eq!(usage.get("input_tokens").and_then(|v| v.as_u64()), Some(1700));
+        assert_eq!(usage.get("output_tokens").and_then(|v| v.as_u64()), Some(300));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn token_usage_legacy_events_without_mode_take_max_for_backward_compat() {
+        let _guard = env_lock();
+        let tmp = std::env::temp_dir().join(format!("alfred_test_tokens_legacy_{}", now_epoch_ms()));
+        let run_id = "run_legacy_tokens";
+        // Old JSONL files (pre-mode-tag) — must remain readable with the
+        // pre-fix max behaviour so historical runs don't suddenly show
+        // wildly different totals.
+        let events = vec![
+            json!({"type":"token_usage","total":500,"input":400,"output":100}),
+            json!({"type":"token_usage","total":2000,"input":1700,"output":300}),
+        ];
+        write_progress_jsonl(&tmp, run_id, &events);
+        let stats = crate::run_stats::aggregate_from_progress_file(
+            tmp.to_string_lossy().as_ref(),
+            run_id,
+        );
+        let usage = stats.get("token_usage").expect("token_usage field present");
+        assert_eq!(usage.get("total_tokens").and_then(|v| v.as_u64()), Some(2000));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn token_usage_includes_cost_eur_and_model() {
+        let _guard = env_lock();
+        let tmp = std::env::temp_dir().join(format!("alfred_test_tokens_cost_{}", now_epoch_ms()));
+        let run_id = "run_cost";
+        // 1 native call: 1M input + 1M output → $1.25 + $10 = $11.25 →
+        // around 10.46 EUR at 0.93 conversion (we just assert ratio bounds).
+        let events = vec![
+            json!({"type":"token_usage","mode":"native","total":2_000_000,"input":1_000_000,"output":1_000_000}),
+        ];
+        write_progress_jsonl(&tmp, run_id, &events);
+        let stats = crate::run_stats::aggregate_from_progress_file(
+            tmp.to_string_lossy().as_ref(),
+            run_id,
+        );
+        let usage = stats.get("token_usage").expect("token_usage field present");
+        let cost_eur = usage.get("cost_eur").and_then(|v| v.as_f64())
+            .expect("cost_eur must be present and numeric");
+        // GPT-5 pricing 2025: $1.25/M input, $10/M output → $11.25 raw.
+        // At any conversion in [0.85, 1.05] EUR/USD that lands within
+        // [9.56, 11.81] EUR — bracket the published live rate.
+        assert!(cost_eur > 9.5 && cost_eur < 12.0, "expected cost in [9.5, 12.0] EUR, got {cost_eur}");
+        let model = usage.get("model").and_then(|v| v.as_str())
+            .expect("model must be present and stringly typed");
+        assert!(!model.is_empty(), "model must not be empty");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }

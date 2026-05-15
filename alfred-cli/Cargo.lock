@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "alfred-cli"
-version = "0.2.18"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",

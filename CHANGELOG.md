@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.3.3
+
+Six items shipped in one bundle across four worktrees: scorecard correctness, rate-limit hardening, LLM post-processing, line-memory sync fixes. No mandatory upgrade flag — real-provider QA gate (P3-15/P3-16) must pass before flipping `mandatory: true`.
+
+### P0 fixes
+- **Scorecard truly accurate** — `run_get_signal_scorecard` now scores CONSERVER correctly (price-vs-anchor band → correct/incorrect/neutral), treats SURVEILLANCE as a watch signal (icon 👁️, raises `flag: watch_missed_drop` if return falls below -5%), and marks recent signals (<5d, |return|<2%) as `pending` instead of incorrect. New helper `resolve_current_price` extracted as a pure 4-tier price chain (`prix_actuel` → `market.spot` → derived from `technicals.high_52w × (1 + current_vs_high_52w_pct/100)` → last-known-good with `stale: true`) and never writes `0` to `price_tracking.current_price`. Contract tests pin `scorecard.current_price == line_modal.header_price == portfolio.positions[i].prix_actuel`. JS column "Return" renamed to "Price drift" with tooltip. **Tests**: 13 new (4 scorecard + 5 sync + 2 contract + 2 bonus).
+- **alfred-api rate-limit sized for real portfolios** — `RATE_LIMIT_RPM` default raised 60 → 600 (`DEFAULT_RATE_LIMIT_RPM` const in `apps/alfred-api/src/config.rs`); pure decision helper `evaluate_rate_limit` extracted from `check_rate_limit` so the "50 tickers × 4 endpoints does not trip default" contract is testable without Redis. Desktop side adds `ApiGetOutcome` enum + `api_get_with_retry(fetcher, sleeper)` pure helper in `alfred_api_client.rs`: max 3 retries (500ms / 1500ms / 4500ms backoff), `Retry-After` header honoured and clamped at 30s. `deploy/alfred-api.env.example` documents the value with incident history. New pre-release real-provider QA checklist in `docs/update-manifest-and-mandatory-upgrade.md` blocks `mandatory: true` until a 28-ticker portfolio reaches ≥90% technicals coverage with 0 rate-limit errors. **Tests**: 11 new (6 server + 5 desktop).
+
+### LLM post-processing (P2-6 + P2-7)
+- **Acquisition signal without fundamentals → conviction degraded + UI badge** — `mcp_server::tool_validate_recommendation` now runs `enforce_data_quality_guards`: if `signal ∈ {ACHAT, ACHAT_FORT, RENFORCEMENT}` and `analyse_fondamentale` is empty or contains `"indispon"`, the payload gets `data_quality: "fundamentals_missing"` and `conviction` is downgraded to `"degradee"`. CONSERVER and SURVEILLANCE are exempt (no new capital committed). The signal itself is never modified — the thesis can remain valid from memory. UI surfaces `⚠ données partielles` badge in the line modal via the new `updateDataQualityBadge` helper (`line-modal-helpers.js`). Single MCP hook covers all 3 LLM modes (codex / native / native-oauth) per the parity contract.
+- **Action prices backfilled from rationale** — new `services/llm_post_processing.rs` module exposes `backfill_action_immediate(action)`: when `limit_price` is null but the `rationale` contains an EUR-denominated number (French comma + decimal point + €), the price is extracted via a regex that requires an `EUR` / `€` suffix (so bare quantities like "1000 titres" are not misread). When `limit_price × quantity` is computable but `estimated_amount_eur` is null, the product is filled. Hooked into both `mcp_server::tool_validate_synthesis` (MCP path) and `report::persist_retry_global_synthesis` (codex retry + native fallback) — idempotent on both call sites. System prompts (`llm_prompts.rs`, `services/native_mcp_analysis.rs`) reinforced with "TU DOIS peupler limit_price + estimated_amount_eur". **Tests**: 15 Rust + 8 JS new.
+
+### Line memory sync (P1-4 + P1-5)
+- **`key_reasoning` persisted for every ticker including .PA suffixed** — fix for the 132/150 tickers that had `key_reasoning = null` post-rename. `sync_line_memory` now writes via a 3-tier fallback: `rec.key_reasoning` → `extract_first_sentences(synthese, 3)` → prior value (a degraded run with empty synthese never wipes a captured thesis). Synthetic keys like `_PORTFOLIO` and unsuffixed tickers like `AAPL` continue to work (non-regression tests). **Tests**: 4 new.
+- **`price_at_signal` guard + lazy migration of legacy zero anchors** — addresses the 341/723 historical signals contaminated by the prior v0.3 `current_price=0` outage. Two mechanisms in `sync_line_memory`: (a) write guard skips the `signal_history` prepend entirely when no usable price is available — non-scorable rows would pollute the history; (b) `migrate_zero_price_at_signal_entries` walks the prior history and backfills any entry with `price_at_signal <= 0` using the run's current price as a best-effort proxy, tagged `"price_at_signal_source": "migration_proxy"` for audit. Idempotent (only touches `<=0` entries) and runs per-ticker per-sync (no separate startup task). A contaminated ticker repairs itself the next time it's analysed. **Tests**: 5 + 1 contract.
+
+### Tests / infrastructure
+- **alfred-desktop Rust**: 218 → **260 cargo tests** (+42 across the 4 worktrees A/B/C/D).
+- **alfred-api Rust**: 113 → **119 cargo tests** (+6 rate-limit + config contract).
+- **alfred-desktop JS**: 278 → **286 tests** (+8 data-quality badge, wired into `npm test`).
+- **Zero new clippy warnings** on touched files across both crates (pre-existing baseline of 76 desktop + 20 alfred-api unchanged — tracked in P3-28).
+
+### Known caveats (tracked as P3)
+- P3-24..30 cover follow-up tests (UI scorecard render, regex bare-quantity, `_PORTFOLIO` prod-writer path, `migration_proxy` UX surface), one cleanup (`persist_deep_news_summary` 8-arg refactor), and one process gate (real-provider QA pass before `mandatory: true`).
+
+---
+
 ## v0.3.2
 
 **Mandatory upgrade.** v0.3.2 fixes 6 production bugs and ships 3 UX improvements in a single batch.

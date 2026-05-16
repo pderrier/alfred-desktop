@@ -1810,6 +1810,17 @@ WORKFLOW STRICT — suis ces etapes dans l'ordre :
    LIMIT => limit_price > 0, MARKET => limit_price = null.
    Si liquidites = 0: uniquement VENTE/ALLEGEMENT (ou 0 action).
 
+   OBLIGATIONS de remplissage (P2-7):
+   - TU DOIS peupler `limit_price` pour TOUTE action VENTE / ALLEGEMENT /
+     ACHAT / RENFORCEMENT (order_type=LIMIT). Si la rationale mentionne un
+     prix (ex: "Vendre 10 titres OVH a 12,09 EUR"), reprends ce prix dans
+     `limit_price` — JAMAIS null si le prix existe dans la rationale.
+   - TU DOIS peupler `estimated_amount_eur` = quantity x limit_price (ou x
+     prix mentionne dans la rationale si MARKET). JAMAIS null si quantity
+     et un prix sont connus.
+   - Un post-processing detecte un prix oublie via regex sur la rationale,
+     mais comptes-y JAMAIS — peuple les champs explicitement.
+
    prochaine_analyse: date + catalyseurs justifiant cette date
    (ex: "Relancez apres le 15 avril — resultats T1 Schneider et LVMH")
 

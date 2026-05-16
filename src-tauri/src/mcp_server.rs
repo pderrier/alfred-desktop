@@ -944,7 +944,7 @@ fn build_collection_quality(
 fn tool_validate_recommendation(data_dir: &Path, params: &Value) -> Result<Value> {
     let run_id = as_text(params.get("run_id"));
     let rec_str = as_text(params.get("recommendation"));
-    let rec: Value =
+    let mut rec: Value =
         serde_json::from_str(&rec_str).map_err(|e| anyhow!("invalid_recommendation_json:{e}"))?;
 
     // Progress: validating
@@ -1051,6 +1051,22 @@ fn tool_validate_recommendation(data_dir: &Path, params: &Value) -> Result<Value
         }
     }
 
+    // P2-6 — apply data-quality post-processing AFTER validation so the
+    // validator sees the LLM's actual conviction value, but BEFORE persist
+    // so the downgrade is visible in every downstream consumer (sidecar
+    // JSONL → run_state → line_memory → synthesis cross-check → UI). The
+    // guard runs at this single funnel point shared by all 3 LLM modes
+    // (codex / native / native-oauth) per the parity contract — see
+    // `docs/llm-mode-parity-contract.md`.
+    if crate::llm_post_processing::enforce_data_quality_guards(&mut rec) {
+        let ticker_for_log = as_text(rec.get("ticker"));
+        let signal_for_log = as_text(rec.get("signal"));
+        crate::debug_log(&format!(
+            "[p2-6] data_quality=fundamentals_missing — downgraded conviction to degradee \
+             for {signal_for_log} {ticker_for_log} (run {run_id})"
+        ));
+    }
+
     // Valid — write to sidecar file (main process merges after each batch)
     append_mcp_result(data_dir, &run_id, &json!({
         "type": "recommendation",
@@ -1077,6 +1093,11 @@ fn tool_validate_recommendation(data_dir: &Path, params: &Value) -> Result<Value
     let ticker_part = line_id.split(':').last().unwrap_or_default();
     let conviction_text = as_text(rec.get("conviction"));
     let synthese_short: String = synthese.chars().take(120).collect();
+    // P2-6 — propagate the data_quality flag into live events so the UI can
+    // render the warning badge during the run (not only on report re-open).
+    // Null when absent so the JS side can treat it as a tri-state without
+    // sniffing for missing keys.
+    let data_quality_flag = rec.get("data_quality").cloned().unwrap_or(Value::Null);
 
     append_progress(
         data_dir,
@@ -1084,7 +1105,12 @@ fn tool_validate_recommendation(data_dir: &Path, params: &Value) -> Result<Value
         &json!({
             "type": "line_done",
             "ticker": ticker_part,
-            "recommendation": { "signal": signal, "conviction": conviction_text, "synthese": synthese_short },
+            "recommendation": {
+                "signal": signal,
+                "conviction": conviction_text,
+                "synthese": synthese_short,
+                "data_quality": data_quality_flag,
+            },
             "completed": completed,
             "total": total,
             "at": now_iso(),
@@ -1100,7 +1126,12 @@ fn tool_validate_recommendation(data_dir: &Path, params: &Value) -> Result<Value
     crate::emit_event("alfred://line-done", json!({
         "run_id": run_id,
         "ticker": ticker_part,
-        "recommendation": { "signal": signal, "conviction": conviction_text, "synthese": synthese_short },
+        "recommendation": {
+            "signal": signal,
+            "conviction": conviction_text,
+            "synthese": synthese_short,
+            "data_quality": data_quality_flag,
+        },
         "line_progress": { "completed": completed, "total": total },
     }));
 
@@ -1124,8 +1155,29 @@ fn tool_validate_synthesis(data_dir: &Path, params: &Value) -> Result<Value> {
     let prochaine_analyse = as_text(params.get("prochaine_analyse"));
     let opportunites_watchlist = as_text(params.get("opportunites_watchlist"));
 
-    let actions: Vec<Value> = serde_json::from_str(&actions_str)
+    let mut actions: Vec<Value> = serde_json::from_str(&actions_str)
         .map_err(|e| anyhow!("invalid_actions_immediates_json:{e}"))?;
+
+    // P2-7 — backfill `limit_price` and `estimated_amount_eur` from the
+    // rationale string when the LLM left them null. Runs at this single
+    // funnel point shared by all 3 LLM modes (codex / native / native-oauth)
+    // per the parity contract. Pure post-processing: never overwrites a
+    // populated value; never invents data when the rationale has no EUR
+    // price token.
+    {
+        let mut actions_value = Value::Array(actions);
+        let mutated_count =
+            crate::llm_post_processing::backfill_actions_immediates(&mut actions_value);
+        if mutated_count > 0 {
+            crate::debug_log(&format!(
+                "[p2-7] backfilled {mutated_count} action_immediate(s) for run {run_id}"
+            ));
+        }
+        actions = actions_value
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+    }
 
     let mut issues: Vec<String> = Vec::new();
 

@@ -5576,3 +5576,204 @@ use crate::storage::read_json_file;
             "first-try success must emit zero events — got {events:?}"
         );
     }
+
+    // ── P0-9: alfred-api 429 retry-with-backoff (Retry-After honoured) ────
+    //
+    // Production incident `019e2da21154` (2026-05-15): a 28-ticker portfolio
+    // sync fired 34 `alfred_api_rate_limited` errors at run start, dropping
+    // technicals coverage to 8/28 = 29%. The P0-1 retry-with-backoff helper
+    // only covers Yahoo `/technicals` (it sees ureq `Err` and retries) — it
+    // never observed the 429 because the request layer mapped 429 to an
+    // `anyhow::Error` that didn't trigger the same retry path.
+    //
+    // P0-9 (v0.3.3) closes the gap: `alfred_api_client::api_get_with_retry`
+    // is a pure helper that consumes a fetcher returning `ApiGetOutcome`
+    // (Ok / RateLimited / Err) and a sleeper closure. The production wrapper
+    // (`api_get`) binds the real ureq fetcher + `std::thread::sleep`; tests
+    // inject deterministic fakes so the policy (Retry-After honoured,
+    // exponential backoff fallback, max 3 retries) is fully covered without
+    // an HTTP runtime.
+    //
+    // Pattern: same dependency-injection split used by
+    // `fetch_technical_snapshot_with_retry` — see
+    // `feedback_pure_helper_for_async_testability`.
+
+    /// Capture sleeper-passed durations so tests can assert the backoff
+    /// schedule was respected without needing a wall clock.
+    fn record_sleeps(
+    ) -> (impl Fn(std::time::Duration), std::sync::Arc<std::sync::Mutex<Vec<std::time::Duration>>>)
+    {
+        let log: std::sync::Arc<std::sync::Mutex<Vec<std::time::Duration>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log_clone = log.clone();
+        let sleeper = move |d: std::time::Duration| {
+            if let Ok(mut guard) = log_clone.lock() {
+                guard.push(d);
+            }
+        };
+        (sleeper, log)
+    }
+
+    #[test]
+    fn alfred_api_client_retries_on_429_with_retry_after_header() {
+        // Mock: call 1 returns 429 with Retry-After: 1, call 2 returns Ok.
+        // Assert: api_get_with_retry succeeds AND the sleeper was called
+        // exactly once with 1 second (the Retry-After value, NOT the local
+        // backoff schedule). Honouring the header is the whole point of
+        // P0-9 — if the server says "wait 1s" and we slept 500ms, we'd
+        // double the rate-limit penalty.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let fetcher = || {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                crate::alfred_api_client::ApiGetOutcome::RateLimited {
+                    retry_after_secs: Some(1),
+                }
+            } else {
+                crate::alfred_api_client::ApiGetOutcome::Ok(json!({"ok": true}))
+            }
+        };
+        let (sleeper, log) = record_sleeps();
+        let result = crate::alfred_api_client::api_get_with_retry(&fetcher, &sleeper);
+        assert!(result.is_ok(), "second attempt must succeed — got {result:?}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let sleeps = log.lock().unwrap().clone();
+        assert_eq!(sleeps.len(), 1, "exactly one backoff between the two attempts");
+        assert_eq!(
+            sleeps[0],
+            std::time::Duration::from_secs(1),
+            "Retry-After header value must be honoured verbatim (was {:?})",
+            sleeps[0],
+        );
+    }
+
+    #[test]
+    fn alfred_api_client_uses_exponential_backoff_when_no_retry_after() {
+        // Mock: 429 (no Retry-After) on calls 1+2, Ok on call 3.
+        // Assert: api_get_with_retry succeeds AND the sleeper was called
+        // with the local backoff schedule (500ms then 1500ms). This is the
+        // production fall-through when the server-side `apply_rate_limit`
+        // forgets to set Retry-After or the header gets stripped by a proxy.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let fetcher = || {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < 2 {
+                crate::alfred_api_client::ApiGetOutcome::RateLimited {
+                    retry_after_secs: None,
+                }
+            } else {
+                crate::alfred_api_client::ApiGetOutcome::Ok(json!({"ok": true}))
+            }
+        };
+        let (sleeper, log) = record_sleeps();
+        let result = crate::alfred_api_client::api_get_with_retry(&fetcher, &sleeper);
+        assert!(result.is_ok(), "third attempt must succeed — got {result:?}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let sleeps = log.lock().unwrap().clone();
+        assert_eq!(
+            sleeps,
+            vec![
+                std::time::Duration::from_millis(500),
+                std::time::Duration::from_millis(1500),
+            ],
+            "exponential backoff schedule (500ms, 1500ms) when Retry-After absent",
+        );
+    }
+
+    #[test]
+    fn alfred_api_client_surfaces_error_after_exhausted_retries() {
+        // Mock: 429 on every call. Budget = 1 initial + 3 retries = 4 calls.
+        // Assert: api_get_with_retry returns Err(alfred_api_rate_limited)
+        // — the error wire-shape the existing `enrichment::classify_api_error`
+        // dispatcher already maps to `alfred_api_rate_limited:scope:ticker`,
+        // so callers downstream don't need to change.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let fetcher = || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            crate::alfred_api_client::ApiGetOutcome::RateLimited {
+                retry_after_secs: None,
+            }
+        };
+        let (sleeper, log) = record_sleeps();
+        let result = crate::alfred_api_client::api_get_with_retry(&fetcher, &sleeper);
+        let err = result.expect_err("4 consecutive 429s must surface as Err");
+        assert!(
+            err.to_string().contains("alfred_api_rate_limited"),
+            "error must carry the rate_limited classification — got {err}",
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            (crate::alfred_api_client::ALFRED_API_MAX_RETRIES_ON_429 + 1) as usize,
+            "retry budget: 1 initial + 3 retries = 4 total calls, never 5",
+        );
+        // Three backoffs (between attempts 1→2, 2→3, 3→4) — never a 4th
+        // because we surface the error instead of looping again.
+        let sleeps = log.lock().unwrap().clone();
+        assert_eq!(
+            sleeps.len(),
+            crate::alfred_api_client::ALFRED_API_MAX_RETRIES_ON_429 as usize,
+            "exactly N backoffs for N retries — never a wasted sleep after the last attempt",
+        );
+    }
+
+    #[test]
+    fn alfred_api_client_does_not_retry_on_non_429_errors() {
+        // Mock: 500-server-error on call 1. Assert no retry — the helper
+        // surfaces it immediately because non-429 errors are not transient
+        // by the v0.3.3 policy (auth / parse / 5xx may indicate a real
+        // server issue or a contract drift; retrying just wastes time and
+        // the rate-limit budget). The existing P0-1 retry-with-backoff in
+        // `enrichment::fetch_technical_snapshot_with_retry` already covers
+        // transport errors for the technical_snapshot path; this helper
+        // only owns the 429 case.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let fetcher = || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            crate::alfred_api_client::ApiGetOutcome::Err(anyhow::anyhow!(
+                "alfred_api_http_error:500"
+            ))
+        };
+        let (sleeper, log) = record_sleeps();
+        let result = crate::alfred_api_client::api_get_with_retry(&fetcher, &sleeper);
+        assert!(result.is_err());
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "non-429 errors must NOT trigger a retry",
+        );
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "sleeper must not be called when no retry happens",
+        );
+    }
+
+    #[test]
+    fn alfred_api_client_clamps_retry_after_to_30_seconds() {
+        // Defensive: a hostile or misconfigured server (or a clock-skewed
+        // proxy) could set Retry-After to a huge value, stalling the
+        // desktop client for minutes. The helper clamps Retry-After to
+        // 30s so the worst-case wait stays bounded; beyond that, the user
+        // sees the error instead of a frozen UI.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let fetcher = || {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                crate::alfred_api_client::ApiGetOutcome::RateLimited {
+                    retry_after_secs: Some(3600), // 1 hour — abuse case
+                }
+            } else {
+                crate::alfred_api_client::ApiGetOutcome::Ok(json!({"ok": true}))
+            }
+        };
+        let (sleeper, log) = record_sleeps();
+        let result = crate::alfred_api_client::api_get_with_retry(&fetcher, &sleeper);
+        assert!(result.is_ok());
+        let sleeps = log.lock().unwrap().clone();
+        assert_eq!(sleeps.len(), 1);
+        assert_eq!(
+            sleeps[0],
+            std::time::Duration::from_secs(30),
+            "Retry-After must be clamped to the 30s ceiling — got {:?}",
+            sleeps[0],
+        );
+    }

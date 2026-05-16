@@ -115,14 +115,127 @@ fn get_local_jwt() -> Option<String> {
     None
 }
 
-/// Authenticated GET request to the API.
-fn api_get(path: &str, timeout: u64) -> Result<Value> {
-    let base = api_url().ok_or_else(|| anyhow!("alfred_api_not_configured"))?;
+/// Outcome of a single HTTP attempt. Separates 429 from other failures so
+/// the retry loop can read `Retry-After` and back off intelligently.
+///
+/// v0.3.3 (P0-9): introduced to handle alfred-api 429 responses (the P0-1
+/// retry-with-backoff only covers Yahoo `/technicals` and treats every
+/// transport error identically). Production incident `019e2da21154`
+/// (2026-05-15) showed a 28-ticker run firing 34 `alfred_api_rate_limited`
+/// errors at run start; the desktop client must respect the server's
+/// `Retry-After` instead of surfacing the error to the user.
+pub(crate) enum ApiGetOutcome {
+    Ok(Value),
+    /// HTTP 429 — caller should sleep then retry. `retry_after_secs` is
+    /// the parsed `Retry-After` header value (when present + valid).
+    RateLimited { retry_after_secs: Option<u64> },
+    /// Any other error (4xx, 5xx, parse failure, transport failure) —
+    /// not retried, surfaced immediately.
+    Err(anyhow::Error),
+}
+
+/// Retry-on-429 policy. 1 initial attempt + up to 3 retries = 4 calls max.
+///
+/// Backoff schedule (used when the server does NOT send `Retry-After`):
+/// 500ms → 1500ms → 4500ms (×3 multiplier). Total wait worst case ~6.5s
+/// before surfacing the error. The server-side `apply_rate_limit` ticks
+/// in 1-minute buckets, so a 60s `Retry-After` is the natural ceiling
+/// when the header is honoured.
+pub(crate) const ALFRED_API_MAX_RETRIES_ON_429: u32 = 3;
+const ALFRED_API_429_BACKOFFS: [Duration; 3] = [
+    Duration::from_millis(500),
+    Duration::from_millis(1500),
+    Duration::from_millis(4500),
+];
+
+fn default_sleep(d: Duration) {
+    std::thread::sleep(d);
+}
+
+/// One-shot HTTP attempt — surfaces 429 with parsed `Retry-After` header
+/// so the retry layer can choose its sleep budget. All other outcomes
+/// collapse into the existing `map_api_error` classification.
+fn api_get_once(path: &str, timeout: u64) -> ApiGetOutcome {
+    let base = match api_url() {
+        Some(u) => u,
+        None => return ApiGetOutcome::Err(anyhow!("alfred_api_not_configured")),
+    };
     let url = format!("{base}{path}");
-    let req = apply_auth(ureq::get(&url), path)
-        .timeout(Duration::from_secs(timeout));
-    let resp = req.call().map_err(|e| map_api_error(e))?;
-    resp.into_json().map_err(|e| anyhow!("alfred_api_parse_failed:{e}"))
+    let req = apply_auth(ureq::get(&url), path).timeout(Duration::from_secs(timeout));
+    match req.call() {
+        Ok(resp) => match resp.into_json() {
+            Ok(value) => ApiGetOutcome::Ok(value),
+            Err(e) => ApiGetOutcome::Err(anyhow!("alfred_api_parse_failed:{e}")),
+        },
+        Err(ureq::Error::Status(429, resp)) => {
+            let retry_after_secs = resp
+                .header("Retry-After")
+                .and_then(|v| v.trim().parse::<u64>().ok());
+            ApiGetOutcome::RateLimited { retry_after_secs }
+        }
+        Err(e) => ApiGetOutcome::Err(map_api_error(e)),
+    }
+}
+
+/// Pure retry loop — fetcher + sleeper injected so the policy
+/// (max retries, backoff schedule, `Retry-After` honouring) is fully
+/// unit-testable without an HTTP runtime. See `tests::alfred_api_client_*`
+/// in `tests.rs`.
+///
+/// Decision tree:
+/// - `Ok(value)` → return immediately
+/// - `RateLimited { retry_after_secs }` → if budget remains, sleep
+///   `retry_after_secs` (clamped to a sane cap) or the next backoff
+///   slot, then retry. If exhausted, surface `alfred_api_rate_limited`.
+/// - `Err(e)` → surface immediately (don't retry on auth / server /
+///   parse errors — those are not transient).
+///
+/// The `Retry-After` clamp caps at 30s so a hostile server (or a clock
+/// skew) can't stall the desktop client indefinitely; beyond that we
+/// fall back to the local backoff schedule.
+pub(crate) fn api_get_with_retry<F, S>(fetcher: &F, sleeper: &S) -> Result<Value>
+where
+    F: Fn() -> ApiGetOutcome,
+    S: Fn(Duration),
+{
+    const RETRY_AFTER_CLAMP: Duration = Duration::from_secs(30);
+    let mut attempt: u32 = 0;
+    loop {
+        match fetcher() {
+            ApiGetOutcome::Ok(value) => return Ok(value),
+            ApiGetOutcome::Err(e) => return Err(e),
+            ApiGetOutcome::RateLimited { retry_after_secs } => {
+                if attempt >= ALFRED_API_MAX_RETRIES_ON_429 {
+                    // Exhausted retry budget — surface the classified error
+                    // so existing callers (`enrichment::classify_api_error`
+                    // and friends) keep their wire shape.
+                    return Err(anyhow!("alfred_api_rate_limited"));
+                }
+                let backoff = retry_after_secs
+                    .map(|s| Duration::from_secs(s).min(RETRY_AFTER_CLAMP))
+                    .unwrap_or(ALFRED_API_429_BACKOFFS[attempt as usize]);
+                crate::debug_log(&format!(
+                    "alfred-api: 429 received (attempt {}/{}), sleeping {}ms before retry (retry_after_header={:?})",
+                    attempt + 1,
+                    ALFRED_API_MAX_RETRIES_ON_429 + 1,
+                    backoff.as_millis(),
+                    retry_after_secs,
+                ));
+                sleeper(backoff);
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// Authenticated GET request to the API.
+///
+/// v0.3.3 (P0-9): now retries on HTTP 429 with `Retry-After` honoured.
+/// All other errors (auth, 5xx, transport) surface on the first attempt
+/// — only rate-limit errors are transient by design.
+fn api_get(path: &str, timeout: u64) -> Result<Value> {
+    let fetcher = || api_get_once(path, timeout);
+    api_get_with_retry(&fetcher, &default_sleep)
 }
 
 /// Authenticated POST request to the API (fire-and-forget).

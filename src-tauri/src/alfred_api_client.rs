@@ -939,7 +939,7 @@ mod tests {
     #[test]
     fn classify_run_start_ok_rejects_missing_session_id() {
         let body = serde_json::json!({"expires_at": 1_700_000_600u64});
-        let err = classify_run_start_ok(body).err().expect("missing session_id must error");
+        let err = classify_run_start_ok(body).expect_err("missing session_id must error");
         assert!(err.to_string().contains("missing run_session_id"));
     }
 
@@ -972,7 +972,7 @@ mod tests {
         // event. The classification helper distinguishes the two so
         // the UI doesn't show the upgrade modal for a transient limit.
         let body = serde_json::json!({"error": "rate_limited", "retry_after": 30u64});
-        let err = classify_run_start_429(body).err().expect("rate_limited must Err");
+        let err = classify_run_start_429(body).expect_err("rate_limited must Err");
         assert_eq!(err.to_string(), "alfred_api_rate_limited");
     }
 
@@ -982,7 +982,7 @@ mod tests {
         // truncation) maps to alfred_api_rate_limited, not a phantom
         // quota event.
         let body = serde_json::Value::Null;
-        let err = classify_run_start_429(body).err().expect("empty body must Err");
+        let err = classify_run_start_429(body).expect_err("empty body must Err");
         assert_eq!(err.to_string(), "alfred_api_rate_limited");
     }
 }

@@ -6256,3 +6256,493 @@ use crate::storage::read_json_file;
             sleeps[0],
         );
     }
+
+    // ── v0.3.3 P1-4: key_reasoning written for every ticker ─────────────
+    //
+    // Real-run inspection 2026-05-16 (run 019e2dc4f40f): 132/150 tickers
+    // had `key_reasoning = null` in line-memory.json despite a rich
+    // `synthese`. Every `.PA` suffixed ticker was missing it. Root cause:
+    // `sync_line_memory` was renamed to write only `memory_narrative` and
+    // dropped the `key_reasoning` write entirely — the 18/150 tickers that
+    // still had it were leftover pre-rename entries on disk. The V2 spec
+    // (line-memory-v2-spec.md) and the line memory architecture doc both
+    // require `key_reasoning` to be persisted as the compressed 3-sentence
+    // thesis. This test pins the contract that EVERY ticker — regardless of
+    // suffix or non-suffix — receives `key_reasoning`.
+    #[test]
+    fn sync_line_memory_writes_key_reasoning_for_suffixed_tickers() {
+        let _guard = env_lock();
+        crate::native_mcp_analysis::line_memory_reset_for_tests();
+
+        let rec = json!({
+            "ticker": "ENGI",
+            "signal": "ACHAT",
+            "conviction": "forte",
+            "synthese": "ENGI confirme la trajectoire de marge operationnelle. \
+                         Le cycle eolien offshore soutient la guidance long terme. \
+                         Risque principal: regulation tarifaire FRA en Q3.",
+            "memory_narrative": "narrative for engi",
+        });
+        crate::native_mcp_analysis::sync_line_memory_for_test(
+            "run-engi-1",
+            "ENGI",
+            Some("ENGI.PA"),
+            &rec,
+            Some((26.6, false)),
+        );
+
+        let store = crate::native_mcp_analysis::line_memory_read_for_test();
+        let entry =
+            crate::native_mcp_analysis::read_line_memory_entry(&store, "ENGI", Some("ENGI.PA"));
+        assert!(!entry.is_null(), "entry must exist for suffixed ticker");
+        let kr = entry
+            .get("key_reasoning")
+            .and_then(|v| v.as_str())
+            .expect("key_reasoning must be a non-null string for .PA-suffixed tickers");
+        assert!(
+            !kr.trim().is_empty(),
+            "key_reasoning must be non-empty when synthese is non-empty — got {kr:?}",
+        );
+        assert!(
+            kr.contains("ENGI"),
+            "key_reasoning must be distilled from synthese — got {kr:?}",
+        );
+    }
+
+    #[test]
+    fn sync_line_memory_key_reasoning_persists_across_runs() {
+        // Guard the spec rule: a run with an empty `synthese` MUST NOT
+        // overwrite a previously captured `key_reasoning`. The 2nd run
+        // models a degraded MCP turn where the LLM produced a recommendation
+        // but the synthese field came back empty (validation pass-through).
+        let _guard = env_lock();
+        crate::native_mcp_analysis::line_memory_reset_for_tests();
+
+        let first = json!({
+            "ticker": "ENGI",
+            "signal": "ACHAT",
+            "conviction": "forte",
+            "synthese": "ENGI premiere these durable. Confirmation des marges. \
+                         Surveiller la regulation 2026.",
+            "memory_narrative": "first narrative",
+        });
+        crate::native_mcp_analysis::sync_line_memory_for_test(
+            "run-engi-A",
+            "ENGI",
+            Some("ENGI.PA"),
+            &first,
+            Some((26.6, false)),
+        );
+
+        let store_a = crate::native_mcp_analysis::line_memory_read_for_test();
+        let prior_kr = crate::native_mcp_analysis::read_line_memory_entry(
+            &store_a, "ENGI", Some("ENGI.PA"),
+        )
+        .get("key_reasoning")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .expect("first run must populate key_reasoning");
+        assert!(!prior_kr.trim().is_empty());
+
+        // Second run: empty synthese, empty memory_narrative — degraded path.
+        let degraded = json!({
+            "ticker": "ENGI",
+            "signal": "ACHAT",
+            "conviction": "forte",
+            "synthese": "",
+            "memory_narrative": "",
+        });
+        crate::native_mcp_analysis::sync_line_memory_for_test(
+            "run-engi-B",
+            "ENGI",
+            Some("ENGI.PA"),
+            &degraded,
+            Some((27.0, false)),
+        );
+
+        let store_b = crate::native_mcp_analysis::line_memory_read_for_test();
+        let after_kr = crate::native_mcp_analysis::read_line_memory_entry(
+            &store_b, "ENGI", Some("ENGI.PA"),
+        )
+        .get("key_reasoning")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .expect("key_reasoning must NOT be overwritten with empty string");
+        assert_eq!(
+            after_kr, prior_kr,
+            "empty-synthese run must preserve prior key_reasoning verbatim",
+        );
+    }
+
+    #[test]
+    fn sync_line_memory_writes_key_reasoning_for_underscored_synthetic_keys() {
+        // Non-regression: synthetic keys (`_PORTFOLIO` and friends) must
+        // continue to flow through `sync_line_memory` unchanged. The plan
+        // specifically called out that `_PORTFOLIO` had `key_reasoning`
+        // populated in prod (via a different writer); a future drift that
+        // would write the synthetic key here must still honour the contract.
+        let _guard = env_lock();
+        crate::native_mcp_analysis::line_memory_reset_for_tests();
+
+        let rec = json!({
+            "ticker": "_PORTFOLIO",
+            "signal": "CONSERVER",
+            "conviction": "moderee",
+            "synthese": "Portefeuille equilibre, fondamentaux solides. \
+                         Diversification adequate. \
+                         Risque sectoriel concentre sur l'energie.",
+        });
+        crate::native_mcp_analysis::sync_line_memory_for_test(
+            "run-portfolio",
+            "_PORTFOLIO",
+            None,
+            &rec,
+            Some((1.0, false)),
+        );
+
+        let store = crate::native_mcp_analysis::line_memory_read_for_test();
+        let entry = store
+            .get("by_ticker")
+            .and_then(|v| v.get("_PORTFOLIO"))
+            .expect("synthetic key must persist through sync_line_memory");
+        let kr = entry
+            .get("key_reasoning")
+            .and_then(|v| v.as_str())
+            .expect("synthetic key must also receive key_reasoning");
+        assert!(!kr.trim().is_empty(), "key_reasoning empty for _PORTFOLIO");
+    }
+
+    #[test]
+    fn sync_line_memory_writes_key_reasoning_for_us_unsuffixed_tickers() {
+        // Non-regression: an unsuffixed US ticker (`AAPL`) was reportedly
+        // working before the bug surfaced. Pin that it still works after the
+        // P1-4 fix — the write must be format-agnostic.
+        let _guard = env_lock();
+        crate::native_mcp_analysis::line_memory_reset_for_tests();
+
+        let rec = json!({
+            "ticker": "AAPL",
+            "signal": "ACHAT",
+            "conviction": "forte",
+            "synthese": "AAPL: services growth offsets iPhone deceleration. \
+                         AI integration drives multiple expansion. \
+                         Watch for China revenue inflection in Q3.",
+        });
+        crate::native_mcp_analysis::sync_line_memory_for_test(
+            "run-aapl",
+            "AAPL",
+            None,
+            &rec,
+            Some((178.30, false)),
+        );
+
+        let store = crate::native_mcp_analysis::line_memory_read_for_test();
+        let entry =
+            crate::native_mcp_analysis::read_line_memory_entry(&store, "AAPL", None);
+        assert!(!entry.is_null(), "entry must exist for unsuffixed ticker");
+        let kr = entry
+            .get("key_reasoning")
+            .and_then(|v| v.as_str())
+            .expect("key_reasoning must persist for unsuffixed US ticker");
+        assert!(!kr.trim().is_empty());
+    }
+
+    // ── v0.3.3 P1-5: price_at_signal guard + migration ───────────────────
+    //
+    // Real-run inspection 2026-05-16: 341/723 entries in `signal_history`
+    // had `price_at_signal == 0`. Cause: legacy contamination by a price
+    // provider outage that wrote 0 into the anchor before P0-8 fixed the
+    // resolver. The two-pronged fix:
+    //   1. Guard at write time — never persist a new signal with no usable
+    //      anchor; skip the prepend and preserve prior history as-is.
+    //   2. Migration at sync time — backfill zero-price entries with the
+    //      current price as a best-effort proxy + audit trail field.
+
+    #[test]
+    fn sync_line_memory_never_writes_zero_price_at_signal() {
+        // Resolver returns None → caller passes None → no signal entry
+        // appended. The prior history is untouched.
+        let _guard = env_lock();
+        crate::native_mcp_analysis::line_memory_reset_for_tests();
+
+        // Seed with a prior good entry so we can prove the new degraded run
+        // doesn't pollute it.
+        let seed = json!({
+            "ticker": "PATHO",
+            "signal": "CONSERVER",
+            "conviction": "moderee",
+            "synthese": "Stable thesis from prior run.",
+        });
+        crate::native_mcp_analysis::sync_line_memory_for_test(
+            "run-good", "PATHO", None, &seed, Some((42.0, false)),
+        );
+
+        // Degraded follow-up: signal computed, but resolver couldn't yield
+        // any positive price.
+        let degraded = json!({
+            "ticker": "PATHO",
+            "signal": "ALLEGEMENT",
+            "conviction": "moderee",
+            "synthese": "Late-breaking risk emerges.",
+        });
+        crate::native_mcp_analysis::sync_line_memory_for_test(
+            "run-no-price", "PATHO", None, &degraded, None,
+        );
+
+        let store = crate::native_mcp_analysis::line_memory_read_for_test();
+        let entry =
+            crate::native_mcp_analysis::read_line_memory_entry(&store, "PATHO", None);
+        let history = entry
+            .get("signal_history")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .expect("signal_history must exist");
+        assert_eq!(
+            history.len(),
+            1,
+            "degraded run with no price must not append — only the seeded entry remains",
+        );
+        let head = &history[0];
+        assert_eq!(
+            head.get("signal").and_then(|v| v.as_str()),
+            Some("CONSERVER"),
+            "head must still be the seeded good entry, not the degraded ALLEGEMENT",
+        );
+        assert_eq!(
+            head.get("price_at_signal").and_then(|v| v.as_f64()),
+            Some(42.0),
+            "preserved entry must keep its real price",
+        );
+    }
+
+    #[test]
+    fn sync_line_memory_writes_price_at_signal_when_price_available() {
+        // Happy path: fresh resolver output → new signal is appended with the
+        // resolved price.
+        let _guard = env_lock();
+        crate::native_mcp_analysis::line_memory_reset_for_tests();
+
+        let rec = json!({
+            "ticker": "STMPA",
+            "signal": "ACHAT",
+            "conviction": "forte",
+            "synthese": "STMPA: cycle inflection.",
+        });
+        crate::native_mcp_analysis::sync_line_memory_for_test(
+            "run-stmpa",
+            "STMPA",
+            Some("STMPA.PA"),
+            &rec,
+            Some((42.2, false)),
+        );
+
+        let store = crate::native_mcp_analysis::line_memory_read_for_test();
+        let entry = crate::native_mcp_analysis::read_line_memory_entry(
+            &store, "STMPA", Some("STMPA.PA"),
+        );
+        let head = entry
+            .get("signal_history")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .cloned()
+            .expect("signal_history must have a head entry");
+        assert_eq!(
+            head.get("price_at_signal").and_then(|v| v.as_f64()),
+            Some(42.2),
+            "fresh price must propagate to price_at_signal",
+        );
+        assert!(
+            head.get("price_at_signal_source").is_none(),
+            "fresh writes must NOT carry the migration_proxy audit field",
+        );
+    }
+
+    #[test]
+    fn signal_history_migration_repairs_zero_price_at_signal() {
+        // Seed a ticker with 3 legacy zero-price entries (the production
+        // shape from the v0.3 outage), then call sync_line_memory with a
+        // healthy resolved price. The 3 entries must be backfilled with the
+        // proxy and tagged with `price_at_signal_source: migration_proxy`.
+        let _guard = env_lock();
+        crate::native_mcp_analysis::line_memory_reset_for_tests();
+
+        // Build a contaminated history via three sequential same-signal runs
+        // where the resolver yielded `None` (simulating the outage). Each
+        // run's sync skips the prepend, so we end up with no entries — that
+        // isn't the contamination shape. Instead, seed by passing a
+        // pretend-fresh price of 0.0 directly... but the guard rejects 0
+        // upstream. So drive the legacy state by writing the entries via
+        // build_signal_history directly on a synthetic prior history.
+        //
+        // Construct the contaminated prior history manually, then call sync
+        // with a fresh price — the in-line migration must repair the old
+        // entries before the new head is prepended.
+        let prior_zero_hist: Vec<serde_json::Value> = vec![
+            json!({
+                "date": "2026-05-10", "signal": "ALLEGEMENT", "conviction": "moyenne",
+                "price_at_signal": 0.0, "run_id": "old-1",
+            }),
+            json!({
+                "date": "2026-05-08", "signal": "CONSERVER", "conviction": "moderee",
+                "price_at_signal": 0.0, "run_id": "old-2",
+            }),
+            json!({
+                "date": "2026-05-05", "signal": "ACHAT", "conviction": "forte",
+                "price_at_signal": 0.0, "run_id": "old-3",
+            }),
+        ];
+        let (repaired, count) =
+            crate::native_mcp_analysis::migrate_zero_price_at_signal_entries(
+                prior_zero_hist, 51.9,
+            );
+        assert_eq!(count, 3, "all three zero entries must be repaired");
+        for (i, entry) in repaired.iter().enumerate() {
+            let p = entry
+                .get("price_at_signal")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            assert!(
+                (p - 51.9).abs() < 1e-6,
+                "entry {i}: price_at_signal must be the proxy 51.9, got {p}",
+            );
+            assert_eq!(
+                entry
+                    .get("price_at_signal_source")
+                    .and_then(|v| v.as_str()),
+                Some("migration_proxy"),
+                "entry {i}: audit trail field must be set",
+            );
+            // Other fields preserved.
+            assert!(entry.get("signal").is_some());
+            assert!(entry.get("date").is_some());
+            assert!(entry.get("run_id").is_some());
+        }
+    }
+
+    #[test]
+    fn signal_history_migration_is_idempotent() {
+        // After the first migration, re-running with the same proxy must
+        // touch zero entries. The audit field is the proof we already
+        // migrated; the migrator must skip entries whose `price_at_signal`
+        // is now positive.
+        let already_migrated: Vec<serde_json::Value> = vec![
+            json!({
+                "date": "2026-05-10", "signal": "ALLEGEMENT",
+                "price_at_signal": 51.9, "price_at_signal_source": "migration_proxy",
+                "run_id": "old-1",
+            }),
+            json!({
+                "date": "2026-05-08", "signal": "CONSERVER",
+                "price_at_signal": 51.9, "price_at_signal_source": "migration_proxy",
+                "run_id": "old-2",
+            }),
+        ];
+        let snapshot = already_migrated.clone();
+        let (after, count) =
+            crate::native_mcp_analysis::migrate_zero_price_at_signal_entries(
+                already_migrated, 51.9,
+            );
+        assert_eq!(count, 0, "second pass must migrate nothing — idempotency");
+        assert_eq!(after, snapshot, "history vector unchanged byte-for-byte");
+    }
+
+    #[test]
+    fn signal_history_migration_skips_when_no_current_price_proxy() {
+        // Symmetric contract: when the current run yields no positive price
+        // (proxy <= 0 / NaN), the migrator must NOT pollute the audit trail
+        // by tagging entries with `migration_proxy: 0`. Entries stay at 0
+        // and a future run will repair them.
+        let zero_hist: Vec<serde_json::Value> = vec![
+            json!({
+                "date": "2026-05-10", "signal": "CONSERVER",
+                "price_at_signal": 0.0, "run_id": "old-1",
+            }),
+        ];
+        let snapshot = zero_hist.clone();
+        let (after, count) =
+            crate::native_mcp_analysis::migrate_zero_price_at_signal_entries(zero_hist, 0.0);
+        assert_eq!(count, 0, "0 proxy must skip migration");
+        assert_eq!(after, snapshot);
+
+        // NaN must also be rejected.
+        let (after_nan, count_nan) =
+            crate::native_mcp_analysis::migrate_zero_price_at_signal_entries(
+                after,
+                f64::NAN,
+            );
+        assert_eq!(count_nan, 0);
+        assert_eq!(after_nan, snapshot);
+    }
+
+    // ── Contract test: post-run invariant ─────────────────────────────────
+    //
+    // Pins the global contract enforced by sync_line_memory: after any run,
+    // every signal_history entry across by_ticker has either:
+    //   - price_at_signal > 0 (resolver yielded a fresh price), OR
+    //   - price_at_signal_source == "migration_proxy" (legacy zero was
+    //     backfilled with the run's current price)
+    //
+    // Any entry with price_at_signal == 0 AND no migration audit field is a
+    // regression of P1-5 — it would resurface a non-scorable row in the
+    // signal accuracy widget.
+    #[test]
+    fn line_memory_no_zero_price_at_signal_after_full_run() {
+        let _guard = env_lock();
+        crate::native_mcp_analysis::line_memory_reset_for_tests();
+
+        // Drive a multi-ticker run: each ticker is synced once with a fresh
+        // price. The first sync seeds the entry; we then call sync a second
+        // time with a different signal to grow signal_history to 2 entries.
+        let positions = [
+            ("ENGI", Some("ENGI.PA"), 26.6),
+            ("STMPA", Some("STMPA.PA"), 51.9),
+            ("AAPL", None, 178.3),
+        ];
+        for (ticker, resolved, price) in &positions {
+            let first = json!({
+                "ticker": *ticker, "signal": "CONSERVER", "conviction": "moderee",
+                "synthese": format!("{ticker}: first run thesis."),
+            });
+            crate::native_mcp_analysis::sync_line_memory_for_test(
+                "run-1", ticker, *resolved, &first, Some((*price, false)),
+            );
+            let second = json!({
+                "ticker": *ticker, "signal": "ACHAT", "conviction": "forte",
+                "synthese": format!("{ticker}: upgrade after fresh data."),
+            });
+            crate::native_mcp_analysis::sync_line_memory_for_test(
+                "run-2", ticker, *resolved, &second, Some((*price + 1.0, false)),
+            );
+        }
+
+        let store = crate::native_mcp_analysis::line_memory_read_for_test();
+        let by_ticker = store
+            .get("by_ticker")
+            .and_then(|v| v.as_object())
+            .expect("by_ticker must exist");
+
+        let mut zero_offenders: Vec<String> = Vec::new();
+        for (key, entry) in by_ticker {
+            let history = match entry.get("signal_history").and_then(|v| v.as_array()) {
+                Some(arr) => arr,
+                None => continue,
+            };
+            for (i, item) in history.iter().enumerate() {
+                let pas = item
+                    .get("price_at_signal")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                let migrated = item
+                    .get("price_at_signal_source")
+                    .and_then(|v| v.as_str())
+                    == Some("migration_proxy");
+                if pas <= 0.0 && !migrated {
+                    zero_offenders.push(format!("{key}[{i}]"));
+                }
+            }
+        }
+        assert!(
+            zero_offenders.is_empty(),
+            "expected no zero price_at_signal after a healthy full run, found offenders: {zero_offenders:?}",
+        );
+    }

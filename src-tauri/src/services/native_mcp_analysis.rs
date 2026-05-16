@@ -833,25 +833,66 @@ fn sync_line_memory(
     // (so an analysis dated today is anchored to today's market), but never 0.
     // When even the stale fallback is empty, omit the anchor by writing null —
     // downstream scorecard already gates on `price_at_signal > 0`.
+    //
+    // v0.3.3 P0-8 contract: `resolve_current_price` never returns `Some(0.0)`,
+    // but we re-assert here to defend against test fixtures or any future
+    // caller that bypasses the resolver. A non-positive price is treated as
+    // "no usable price" — same as `None`.
     let (price_value, price_is_stale) = match current_price {
-        Some((p, s)) => (Some(p), s),
-        None => (None, false),
+        Some((p, s)) if p.is_finite() && p > 0.0 => (Some(p), s),
+        _ => (None, false),
     };
     let signal_anchor_price: Value = price_value
         .map(|p| json!(p))
         .unwrap_or(Value::Null);
 
-    // ── V2: signal_history (dedup same-day same-signal, else prepend, cap at 10) ──
-    let new_signal_entry = json!({
-        "date": today,
-        "signal": signal,
-        "conviction": conviction,
-        "price_at_signal": signal_anchor_price,
-        "run_id": run_id,
-    });
-
+    // ── V2 P1-5: signal_history guard ─────────────────────────────────
+    // Skip writing the new signal entry when we don't have a usable
+    // `price_at_signal`. A signal without a price anchor cannot be scored
+    // (the scorecard gates on `price_at_signal > 0`), so persisting it
+    // pollutes `signal_history` with non-scorable rows that look real to the
+    // LLM and the UI. Prior history is preserved as-is — the next run with a
+    // healthy price will be the first to advance the history forward.
     let prior = current.get("signal_history").and_then(|v| v.as_array());
-    let signal_history = build_signal_history(&new_signal_entry, prior);
+    let signal_history: Vec<Value> = if price_value.is_some() {
+        let new_signal_entry = json!({
+            "date": today,
+            "signal": signal,
+            "conviction": conviction,
+            "price_at_signal": signal_anchor_price,
+            "run_id": run_id,
+        });
+        build_signal_history(&new_signal_entry, prior)
+    } else {
+        crate::debug_log(&format!(
+            "sync_line_memory: skipping signal_history append for {ticker} run {run_id} — no usable price_at_signal"
+        ));
+        prior.cloned().unwrap_or_default()
+    };
+
+    // ── V2 P1-5: in-line migration of legacy zero-price entries ────────
+    // Best-effort backfill: when we have a fresh price for this ticker but the
+    // existing `signal_history` carries entries written before P0-8 (or by an
+    // older run during a provider outage) with `price_at_signal == 0`,
+    // substitute the current price as a proxy and tag the entry with
+    // `price_at_signal_source: "migration_proxy"` for an audit trail. Pure
+    // best-effort — the proxy is the freshest known price, not the actual
+    // historical price; we trade fidelity for scorability.
+    //
+    // Idempotent: only touches entries with `price_at_signal == 0`. After the
+    // first migration write, the entries carry the proxy price and are no
+    // longer matched.
+    let (signal_history, migrated_count) = if let Some(proxy) = price_value {
+        migrate_zero_price_at_signal_entries(signal_history, proxy)
+    } else {
+        (signal_history, 0)
+    };
+    if migrated_count > 0 {
+        crate::debug_log(&format!(
+            "sync_line_memory: migrated {migrated_count} zero price_at_signal entries for {ticker} run {run_id} (proxy={:.4})",
+            price_value.unwrap_or(0.0)
+        ));
+    }
 
     // ── V2: memory_narrative (LLM-authored during analysis; fallback if missing) ─────
     let trend = compute_trend(&signal_history);
@@ -867,6 +908,30 @@ fn sync_line_memory(
                 trend,
             )
         });
+
+    // ── V2 P1-4: key_reasoning (compressed 3-sentence thesis distilled from
+    // `synthese`, overwritten each run per the V2 spec). The Rust code's
+    // earlier rename to `memory_narrative` left `key_reasoning` as an absent
+    // field for all tickers persisted through `sync_line_memory` —
+    // re-introducing it satisfies the V2 schema contract and unblocks the
+    // 88% of tickers (notably `.PA` suffixed) where it was null in prod.
+    //
+    // Guard: a run with an empty `synthese` must NOT overwrite a previously
+    // captured `key_reasoning`. The non-empty guard mirrors the
+    // `memory_narrative` fallback chain and prevents distilled context from
+    // being wiped by a degraded run.
+    let key_reasoning: Value = non_empty_str(rec.get("key_reasoning"))
+        .or_else(|| {
+            let distilled = extract_first_sentences(&synthese, 3);
+            if distilled.is_empty() {
+                None
+            } else {
+                Some(distilled)
+            }
+        })
+        .or_else(|| non_empty_str(current.get("key_reasoning")))
+        .map(Value::String)
+        .unwrap_or(Value::Null);
 
     // ── V2: news_themes (merge from badges_keywords, cap at 15) ────
     let news_themes = merge_string_list(
@@ -932,6 +997,7 @@ fn sync_line_memory(
         "conviction": conviction,
         "signal_history": signal_history,
         "memory_narrative": memory_narrative,
+        "key_reasoning": key_reasoning,
         "price_tracking": price_tracking,
         "price_data_unavailable": price_data_unavailable,
         "news_themes": news_themes,
@@ -1267,6 +1333,60 @@ fn build_memory_narrative(
     }
 
     truncate(&parts.join(" "), 1400)
+}
+
+/// v0.3.3 P1-5: walk a `signal_history` slice and backfill any entry with
+/// `price_at_signal == 0` (or null/missing) using `proxy_price` as a
+/// best-effort historical anchor. The replacement carries an audit trail
+/// field `"price_at_signal_source": "migration_proxy"` so consumers can
+/// distinguish a real captured price from a backfill.
+///
+/// Returns the (possibly mutated) history vector and the number of entries
+/// that were repaired. The function is pure and idempotent — calling it
+/// twice with the same `proxy_price` and an already-migrated history yields
+/// the same vector with zero new migrations.
+///
+/// `proxy_price` must be `> 0`; callers that have no positive price should
+/// skip the call rather than passing 0, otherwise the migration would write
+/// another zero and the audit trail would lie.
+pub(crate) fn migrate_zero_price_at_signal_entries(
+    history: Vec<Value>,
+    proxy_price: f64,
+) -> (Vec<Value>, usize) {
+    if !proxy_price.is_finite() || proxy_price <= 0.0 {
+        return (history, 0);
+    }
+    let mut migrated = 0usize;
+    let history = history
+        .into_iter()
+        .map(|entry| {
+            let needs_repair = entry
+                .get("price_at_signal")
+                .map(|v| match v {
+                    Value::Number(n) => n.as_f64().map(|x| x <= 0.0).unwrap_or(true),
+                    Value::Null => true,
+                    _ => true,
+                })
+                .unwrap_or(true);
+            if !needs_repair {
+                return entry;
+            }
+            let mut obj = match entry {
+                Value::Object(o) => o,
+                // Non-object entries are malformed; leave them alone so we
+                // don't silently swallow corrupt data.
+                other => return other,
+            };
+            obj.insert("price_at_signal".to_string(), json!(proxy_price));
+            obj.insert(
+                "price_at_signal_source".to_string(),
+                Value::String("migration_proxy".to_string()),
+            );
+            migrated += 1;
+            Value::Object(obj)
+        })
+        .collect();
+    (history, migrated)
 }
 
 /// Build the next-run `signal_history` array. If the prior head entry has

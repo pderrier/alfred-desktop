@@ -190,8 +190,8 @@ fn process_collection_task(config: &CollectionWorkerConfig, task: CollectionTask
 /// tag but a null `prix_actuel` — we fall back to the row's PRU (or
 /// `valeur_actuelle / quantite`) so the prompt has *some* price. Crucially we
 /// also overwrite `source` with the `"none"` sentinel so downstream guards
-/// (`is_real_market_source`, `sync_position_from_market`,
-/// `extract_market_price_from_run_state`) recognise this as a fallback rather
+/// (`is_real_market_source`, `sync_position_from_market`, and
+/// `resolve_current_price`'s P2 step) recognise this as a fallback rather
 /// than authentic provider data. Without that rewrite, the source field lies
 /// about its provenance and the PRU bleeds into position P&L, signal history,
 /// and the zero-price repair flag.

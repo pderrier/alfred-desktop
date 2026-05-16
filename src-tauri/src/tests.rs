@@ -3602,12 +3602,21 @@ use crate::storage::read_json_file;
         // history: three same-day ALLEGEMENT duplicates plus older varied
         // signals. After dedup-by-date, scored_count must count distinct
         // dates only.
+        //
+        // v0.3.3 P0-8 — dates are anchored relative to today so the test
+        // stays valid as the calendar advances. All three distinct dates must
+        // be older than SCOREABLE_AGE_DAYS (5) so the pending-window guard
+        // doesn't suppress the dedup signal we're actually testing here.
         let _guard = env_lock();
         let tempdir = tempfile::tempdir().expect("tempdir");
         let state_dir = tempdir.path().join("runtime-state");
         std::fs::create_dir_all(&state_dir).expect("mkdir state_dir");
         std::env::set_var("ALFRED_STATE_DIR", state_dir.as_os_str());
         crate::native_mcp_analysis::line_memory_reset_for_tests();
+
+        let d_recent = date_minus_days(7); // ~7d ago, well outside pending window
+        let d_mid = date_minus_days(10);
+        let d_old = date_minus_days(14);
 
         // Seed a store on disk so run_get_signal_scorecard can read it.
         let store = json!({
@@ -3617,12 +3626,12 @@ use crate::storage::read_json_file;
                     "ticker": "ERA",
                     "signal_history": [
                         // 3 same-day ALLEGEMENT duplicates (contamination)
-                        { "date": "2026-05-14", "signal": "ALLEGEMENT", "price_at_signal": 59.9 },
-                        { "date": "2026-05-14", "signal": "ALLEGEMENT", "price_at_signal": 59.9 },
-                        { "date": "2026-05-14", "signal": "ALLEGEMENT", "price_at_signal": 59.9 },
+                        { "date": d_recent, "signal": "ALLEGEMENT", "price_at_signal": 59.9 },
+                        { "date": d_recent, "signal": "ALLEGEMENT", "price_at_signal": 59.9 },
+                        { "date": d_recent, "signal": "ALLEGEMENT", "price_at_signal": 59.9 },
                         // Older distinct dates — one correct sell, one incorrect sell
-                        { "date": "2026-05-11", "signal": "ALLEGEMENT", "price_at_signal": 60.0 },
-                        { "date": "2026-05-07", "signal": "ALLEGEMENT", "price_at_signal": 58.3 },
+                        { "date": d_mid, "signal": "ALLEGEMENT", "price_at_signal": 60.0 },
+                        { "date": d_old, "signal": "ALLEGEMENT", "price_at_signal": 58.3 },
                     ],
                     "price_tracking": {
                         "current_price": 59.9,
@@ -3638,12 +3647,12 @@ use crate::storage::read_json_file;
             .expect("scorecard");
 
         // Three same-day duplicates collapse to ONE distinct-date bucket.
-        // 2026-05-14 ALLEGEMENT @59.9 (current=59.9) → 0% return, sell
-        //   expected <0 → incorrect.
-        // 2026-05-11 ALLEGEMENT @60.0 (current=59.9) → -0.17% return, sell
-        //   expected <0 → correct.
-        // 2026-05-07 ALLEGEMENT @58.3 (current=59.9) → +2.7% return, sell
-        //   expected <0 → incorrect.
+        //   d_recent ALLEGEMENT @59.9 (current=59.9) →  0%   drift, sell
+        //     expected drop → did NOT drop → incorrect.
+        //   d_mid    ALLEGEMENT @60.0 (current=59.9) → -0.17% drift, sell
+        //     expected drop → tiny drop → correct.
+        //   d_old    ALLEGEMENT @58.3 (current=59.9) → +2.7%  drift, sell
+        //     expected drop → rose → incorrect.
         // So 3 distinct dates scored, 1 correct.
         assert_eq!(
             card.get("scored_count").and_then(|v| v.as_u64()),
@@ -3728,16 +3737,19 @@ use crate::storage::read_json_file;
 
     // ── P1 source-bypass chain (sprint follow-up) ────────────────────────
     //
-    // The four tests below pin the contract that closes the cascade:
+    // The three tests below pin the contract that closes the cascade:
     //   1. Dispatch overwrites `source = "none"` whenever it falls back to PRU.
-    //   2. `extract_market_price_from_run_state` refuses to expose a price
-    //      from a `source == "none"` row, returning 0.0 so `sync_line_memory`
-    //      preserves `price_data_unavailable` instead of clearing it.
-    //   3. `build_signal_history` keeps the existing head's non-zero price
+    //   2. `build_signal_history` keeps the existing head's non-zero price
     //      on a same-day same-signal replace where the new entry's price is
     //      zero — protects accuracy/trend widgets from PRU-fallback contamination.
-    //   4. `apply_zero_price_repair` clears a stale `price_data_unavailable`
+    //   3. `apply_zero_price_repair` clears a stale `price_data_unavailable`
     //      flag once the ticker's history regains a real `price_at_signal`.
+    //
+    // The former contract test on `extract_market_price_from_run_state` was
+    // removed in v0.3.3 P0-8 when that helper was deleted — the same invariant
+    // (source=none must yield no price) is now covered by
+    // `sync_line_memory_falls_back_to_market_spot_when_prix_actuel_zero`'s
+    // negative-path assertion on `resolve_current_price`.
 
     #[test]
     fn dispatch_fallback_marks_source_as_none_when_pru_used() {
@@ -3795,69 +3807,6 @@ use crate::storage::read_json_file;
             Some(152.5),
             "real provider price must be preserved"
         );
-    }
-
-    #[test]
-    fn extract_market_price_returns_zero_when_source_none() {
-        // Direct contract test on the pure-function core. The codex path
-        // reads market[ticker].prix_actuel out of the cached run state to
-        // feed `sync_line_memory(current_price = ...)`. If the market row
-        // is a PRU fallback (`source == "none"`), the extractor MUST return
-        // 0.0 so `sync_line_memory` carries `price_data_unavailable: true`
-        // forward instead of clearing it on a phantom price recovery.
-        let state = json!({
-            "market": {
-                "TX": {
-                    "source": "none",
-                    "prix_actuel": 80.0,
-                }
-            }
-        });
-        let price = crate::native_mcp_analysis::extract_market_price_from_state_value(
-            &state, "TX",
-        );
-        assert_eq!(
-            price, 0.0,
-            "source=none must yield 0.0 — PRU fallback is not a real price"
-        );
-
-        // Sanity — a real provider row returns its price normally.
-        let state_real = json!({
-            "market": {
-                "TX": {
-                    "source": "boursorama:spot",
-                    "prix_actuel": 152.5,
-                }
-            }
-        });
-        let price_real = crate::native_mcp_analysis::extract_market_price_from_state_value(
-            &state_real, "TX",
-        );
-        assert_eq!(price_real, 152.5);
-
-        // Sanity — empty/missing source is also rejected.
-        let state_empty = json!({
-            "market": {
-                "TX": {
-                    "source": "",
-                    "prix_actuel": 152.5,
-                }
-            }
-        });
-        let price_empty = crate::native_mcp_analysis::extract_market_price_from_state_value(
-            &state_empty, "TX",
-        );
-        assert_eq!(
-            price_empty, 0.0,
-            "empty source must be rejected (treated as no real provider)"
-        );
-
-        // Sanity — ticker missing from market returns 0.0.
-        let state_missing = json!({ "market": {} });
-        let price_missing = crate::native_mcp_analysis::extract_market_price_from_state_value(
-            &state_missing, "TX",
-        );
-        assert_eq!(price_missing, 0.0);
     }
 
     #[test]
@@ -4175,7 +4124,7 @@ use crate::storage::read_json_file;
             "synthese": "from PEA", "memory_narrative": "PEA narrative",
         });
         crate::native_mcp_analysis::sync_line_memory_for_test(
-            "run-pea", "STMPA", Some("STMPA.PA"), &pea_rec, 42.0,
+            "run-pea", "STMPA", Some("STMPA.PA"), &pea_rec, Some((42.0, false)),
         );
 
         let cto_rec = json!({
@@ -4183,7 +4132,7 @@ use crate::storage::read_json_file;
             "synthese": "from CTO", "memory_narrative": "CTO narrative",
         });
         crate::native_mcp_analysis::sync_line_memory_for_test(
-            "run-cto", "STM", Some("STMPA.PA"), &cto_rec, 41.5,
+            "run-cto", "STM", Some("STMPA.PA"), &cto_rec, Some((41.5, false)),
         );
 
         let store = crate::native_mcp_analysis::line_memory_read_for_test();
@@ -5575,4 +5524,534 @@ use crate::storage::read_json_file;
             events.is_empty(),
             "first-try success must emit zero events — got {events:?}"
         );
+    }
+
+    // ── v0.3.3 P0-8 — Signal Accuracy scorecard correctness + current_price freshness ──
+    //
+    // Three coupled bugs in production line-memory + scorecard, fixed in v0.3.3:
+    //   A. ~50% tickers had `price_tracking.current_price = 0.0` — scorecard treated
+    //      every signal as "pending", masking accuracy.
+    //   B. CONSERVER never scored; SURVEILLANCE conflated with CONSERVER.
+    //   C. Signals < 5d old with near-zero drift were flagged ❌ before the thesis
+    //      had time to play out.
+    //
+    // The tests below pin the contract from the v0.3.3 plan
+    // (`docs/plans/po-plan-2026-05.md::P0-8`). Each test mirrors one bullet of the
+    // acceptance criteria.
+
+    fn seed_scorecard_store(state_dir: &std::path::Path, store: serde_json::Value) {
+        let lm_path = state_dir.join("line-memory.json");
+        std::fs::write(&lm_path, serde_json::to_string(&store).unwrap()).unwrap();
+        crate::native_mcp_analysis::line_memory_reset_for_tests();
+    }
+
+    fn today_yyyy_mm_dd() -> String {
+        chrono::Utc::now().format("%Y-%m-%d").to_string()
+    }
+
+    fn date_minus_days(days: i64) -> String {
+        (chrono::Utc::now() - chrono::Duration::days(days))
+            .format("%Y-%m-%d")
+            .to_string()
+    }
+
+    fn lookup_signal<'a>(
+        signals: &'a [serde_json::Value],
+        date: &str,
+    ) -> &'a serde_json::Value {
+        signals
+            .iter()
+            .find(|s| s.get("date").and_then(|v| v.as_str()) == Some(date))
+            .unwrap_or_else(|| panic!("no signal on date {date}: {signals:?}"))
+    }
+
+    #[test]
+    fn scorecard_skips_neutral_current_price_zero() {
+        let _guard = env_lock();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempdir.path().join("runtime-state");
+        std::fs::create_dir_all(&state_dir).expect("mkdir state_dir");
+        std::env::set_var("ALFRED_STATE_DIR", state_dir.as_os_str());
+
+        let store = json!({
+            "by_ticker": {
+                "ENGI": {
+                    "schema_version": 2,
+                    "ticker": "ENGI",
+                    "signal_history": [
+                        { "date": "2026-04-28", "signal": "ALLEGEMENT", "price_at_signal": 26.9 },
+                        { "date": "2026-04-22", "signal": "ALLEGEMENT", "price_at_signal": 28.5 },
+                    ],
+                    "price_tracking": { "current_price": 0.0 }
+                }
+            }
+        });
+        seed_scorecard_store(&state_dir, store);
+
+        let card = crate::command_handlers::run_get_signal_scorecard("ENGI".to_string())
+            .expect("scorecard");
+        let signals = card
+            .get("signals")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for s in &signals {
+            assert_eq!(
+                s.get("accuracy").and_then(|v| v.as_str()),
+                Some("pending"),
+                "current_price=0 must NOT score any signal — found: {s}"
+            );
+        }
+        assert_eq!(card.get("scored_count").and_then(|v| v.as_u64()), Some(0));
+
+        std::env::remove_var("ALFRED_STATE_DIR");
+        crate::native_mcp_analysis::line_memory_reset_for_tests();
+    }
+
+    #[test]
+    fn scorecard_scores_conserver_against_current_price() {
+        let _guard = env_lock();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempdir.path().join("runtime-state");
+        std::fs::create_dir_all(&state_dir).expect("mkdir state_dir");
+        std::env::set_var("ALFRED_STATE_DIR", state_dir.as_os_str());
+
+        let store = json!({
+            "by_ticker": {
+                "STMPA.PA": {
+                    "schema_version": 2,
+                    "ticker": "STMPA",
+                    "signal_history": [
+                        { "date": "2026-04-28", "signal": "CONSERVER", "price_at_signal": 42.2 },
+                        { "date": "2026-04-15", "signal": "CONSERVER", "price_at_signal": 55.0 },
+                        { "date": "2026-04-01", "signal": "CONSERVER", "price_at_signal": 51.9 },
+                    ],
+                    "price_tracking": { "current_price": 51.9 }
+                }
+            }
+        });
+        seed_scorecard_store(&state_dir, store);
+
+        let card = crate::command_handlers::run_get_signal_scorecard("STMPA".to_string())
+            .expect("scorecard");
+        let signals = card
+            .get("signals")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        assert_eq!(
+            lookup_signal(&signals, "2026-04-28").get("accuracy").and_then(|v| v.as_str()),
+            Some("correct"),
+            "CONSERVER @42.2 vs current 51.9 (+23%) → thesis validated. Got: {signals:?}"
+        );
+        assert_eq!(
+            lookup_signal(&signals, "2026-04-15").get("accuracy").and_then(|v| v.as_str()),
+            Some("incorrect"),
+            "CONSERVER @55.0 vs current 51.9 (-5.6%) → thesis failed. Got: {signals:?}"
+        );
+        assert_eq!(
+            lookup_signal(&signals, "2026-04-01").get("accuracy").and_then(|v| v.as_str()),
+            Some("neutral"),
+            "CONSERVER @51.9 vs current 51.9 (0%) → inside tolerance band. Got: {signals:?}"
+        );
+
+        std::env::remove_var("ALFRED_STATE_DIR");
+        crate::native_mcp_analysis::line_memory_reset_for_tests();
+    }
+
+    #[test]
+    fn scorecard_treats_surveillance_as_watch_not_hold() {
+        let _guard = env_lock();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempdir.path().join("runtime-state");
+        std::fs::create_dir_all(&state_dir).expect("mkdir state_dir");
+        std::env::set_var("ALFRED_STATE_DIR", state_dir.as_os_str());
+
+        let store = json!({
+            "by_ticker": {
+                "WATCHX": {
+                    "schema_version": 2,
+                    "ticker": "WATCHX",
+                    "signal_history": [
+                        { "date": "2026-04-28", "signal": "SURVEILLANCE", "price_at_signal": 42.2 },
+                        { "date": "2026-04-15", "signal": "SURVEILLANCE", "price_at_signal": 55.0 },
+                        { "date": "2026-04-01", "signal": "SURVEILLANCE", "price_at_signal": 51.9 },
+                    ],
+                    "price_tracking": { "current_price": 51.9 }
+                }
+            }
+        });
+        seed_scorecard_store(&state_dir, store);
+
+        let card = crate::command_handlers::run_get_signal_scorecard("WATCHX".to_string())
+            .expect("scorecard");
+        let signals = card
+            .get("signals")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let s_up = lookup_signal(&signals, "2026-04-28");
+        assert_eq!(
+            s_up.get("accuracy").and_then(|v| v.as_str()),
+            Some("neutral"),
+            "SURVEILLANCE on appreciation: analyst did NOT take a position → neutral, no credit. Got: {signals:?}"
+        );
+        assert_eq!(s_up.get("kind").and_then(|v| v.as_str()), Some("watch"));
+        assert!(
+            s_up.get("flag").and_then(|v| v.as_str()).is_none(),
+            "no flag when watch on appreciation"
+        );
+
+        let s_down = lookup_signal(&signals, "2026-04-15");
+        assert_eq!(
+            s_down.get("accuracy").and_then(|v| v.as_str()),
+            Some("neutral"),
+            "SURVEILLANCE on drop is NOT incorrect — no action was taken, only attention. Got: {signals:?}"
+        );
+        assert_eq!(
+            s_down.get("flag").and_then(|v| v.as_str()),
+            Some("watch_missed_drop"),
+            "drop > 5% on SURVEILLANCE → regret flag. Got: {signals:?}"
+        );
+
+        let s_flat = lookup_signal(&signals, "2026-04-01");
+        assert_eq!(s_flat.get("accuracy").and_then(|v| v.as_str()), Some("neutral"));
+        assert!(
+            s_flat.get("flag").and_then(|v| v.as_str()).is_none(),
+            "flat SURVEILLANCE → no flag"
+        );
+
+        // scored_count must be 0 — watch never counts toward accuracy.
+        assert_eq!(card.get("scored_count").and_then(|v| v.as_u64()), Some(0));
+
+        std::env::remove_var("ALFRED_STATE_DIR");
+        crate::native_mcp_analysis::line_memory_reset_for_tests();
+    }
+
+    #[test]
+    fn scorecard_marks_recent_signals_pending_not_incorrect() {
+        let _guard = env_lock();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempdir.path().join("runtime-state");
+        std::fs::create_dir_all(&state_dir).expect("mkdir state_dir");
+        std::env::set_var("ALFRED_STATE_DIR", state_dir.as_os_str());
+
+        let today = today_yyyy_mm_dd();
+        let store = json!({
+            "by_ticker": {
+                "RECENTX": {
+                    "schema_version": 2,
+                    "ticker": "RECENTX",
+                    "signal_history": [
+                        { "date": today, "signal": "ALLEGEMENT", "price_at_signal": 51.9 },
+                    ],
+                    "price_tracking": { "current_price": 51.9 }
+                }
+            }
+        });
+        seed_scorecard_store(&state_dir, store);
+
+        let card = crate::command_handlers::run_get_signal_scorecard("RECENTX".to_string())
+            .expect("scorecard");
+        let signals = card
+            .get("signals")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        assert_eq!(
+            lookup_signal(&signals, &today).get("accuracy").and_then(|v| v.as_str()),
+            Some("pending"),
+            "signal < 5d old + near-zero drift → pending, NOT incorrect. Got: {signals:?}"
+        );
+
+        std::env::remove_var("ALFRED_STATE_DIR");
+        crate::native_mcp_analysis::line_memory_reset_for_tests();
+    }
+
+    #[test]
+    fn sync_line_memory_uses_prix_actuel_for_finary_positions() {
+        // P1 of the resolve_current_price fallback chain — portfolio prix_actuel
+        // wins when > 0 (covers ~99% of cases: Finary positions, priced CSVs,
+        // backfilled CSVs).
+        let resolved = crate::native_mcp_analysis::resolve_current_price_for_test(
+            Some(&json!({ "prix_actuel": 55.7 })),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(resolved, Some((55.7, false)));
+    }
+
+    #[test]
+    fn sync_line_memory_falls_back_to_market_spot_when_prix_actuel_zero() {
+        // P2 — market.spot used when prix_actuel is 0 or missing AND market
+        // came from a real provider.
+        let resolved = crate::native_mcp_analysis::resolve_current_price_for_test(
+            Some(&json!({ "prix_actuel": 0.0 })),
+            Some(&json!({ "prix_actuel": 8.6, "source": "boursorama:spot" })),
+            None,
+            None,
+        );
+        assert_eq!(resolved, Some((8.6, false)));
+
+        // P2 guard — source="none" is a PRU fallback, NOT a real price. The
+        // resolver must skip it even though `prix_actuel` is numerically > 0,
+        // otherwise we'd write the cost basis into current_price and corrupt
+        // every downstream accuracy measurement.
+        let resolved_none = crate::native_mcp_analysis::resolve_current_price_for_test(
+            Some(&json!({ "prix_actuel": 0.0 })),
+            Some(&json!({ "prix_actuel": 80.0, "source": "none" })),
+            None,
+            None,
+        );
+        assert_eq!(
+            resolved_none, None,
+            "source=none must be rejected — PRU fallback is not a real price"
+        );
+    }
+
+    #[test]
+    fn sync_line_memory_derives_from_technicals_when_market_spot_missing() {
+        // P3 — derive from technicals: high_52w * (1 + current_vs_high_52w_pct / 100).
+        let resolved = crate::native_mcp_analysis::resolve_current_price_for_test(
+            Some(&json!({ "prix_actuel": 0.0 })),
+            Some(&json!({ "prix_actuel": 0.0, "source": "none" })),
+            Some(&json!({
+                "indicators": {
+                    "high_52w": 9.715,
+                    "current_vs_high_52w_pct": -8.18
+                }
+            })),
+            None,
+        );
+        let (price, stale) = resolved.expect("technicals fallback must yield a price");
+        assert!(
+            (price - 8.92).abs() < 0.02,
+            "derived price 9.715 * (1 - 0.0818) ≈ 8.92, got {price}"
+        );
+        assert!(!stale, "derived price is fresh, not stale");
+    }
+
+    #[test]
+    fn sync_line_memory_keeps_last_known_good_with_stale_flag() {
+        // P4 — fall back to previous current_price with stale=true.
+        let resolved = crate::native_mcp_analysis::resolve_current_price_for_test(
+            Some(&json!({ "prix_actuel": 0.0 })),
+            Some(&json!({ "prix_actuel": 0.0, "source": "none" })),
+            Some(&json!({ "indicators": {} })),
+            Some(10.5),
+        );
+        assert_eq!(resolved, Some((10.5, true)));
+    }
+
+    #[test]
+    fn sync_line_memory_never_writes_zero_current_price() {
+        // Pathological: all sources empty AND no prior value → None.
+        // Caller must NOT persist 0; field must be absent.
+        let resolved = crate::native_mcp_analysis::resolve_current_price_for_test(
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(resolved, None);
+
+        // End-to-end: sync with None must not write current_price=0.
+        let _guard = env_lock();
+        crate::native_mcp_analysis::line_memory_reset_for_tests();
+        let rec = json!({
+            "ticker": "PATHO", "signal": "CONSERVER", "conviction": "moderee",
+            "synthese": "no price data", "memory_narrative": "narr",
+        });
+        crate::native_mcp_analysis::sync_line_memory_for_test(
+            "run-no-price", "PATHO", None, &rec, None,
+        );
+        let store = crate::native_mcp_analysis::line_memory_read_for_test();
+        let entry = store
+            .get("by_ticker")
+            .and_then(|v| v.get("PATHO"))
+            .expect("entry must exist even without current_price");
+        let pt = entry.get("price_tracking").expect("price_tracking present");
+        let cp = pt.get("current_price");
+        assert!(
+            cp.is_none() || cp == Some(&serde_json::Value::Null),
+            "current_price must be absent or null when no source available — got {cp:?}"
+        );
+    }
+
+    #[test]
+    fn line_memory_current_price_matches_portfolio_prix_actuel() {
+        // Contract: for every portfolio position with prix_actuel > 0, the
+        // line_memory entry's price_tracking.current_price must equal
+        // prix_actuel (within float tolerance). The scorecard, the line modal
+        // header, and the portfolio must all read the same price.
+        let _guard = env_lock();
+        crate::native_mcp_analysis::line_memory_reset_for_tests();
+
+        let positions = [
+            ("STMPA", Some("STMPA.PA"), 51.91),
+            ("ENGI", None, 26.6),
+            ("AAPL", None, 178.30),
+        ];
+
+        for (ticker, resolved, prix_actuel) in &positions {
+            let pos = json!({ "ticker": *ticker, "prix_actuel": *prix_actuel });
+            let resolved_price = crate::native_mcp_analysis::resolve_current_price_for_test(
+                Some(&pos),
+                None,
+                None,
+                None,
+            );
+            let (price, stale) = resolved_price.expect("must resolve from prix_actuel");
+            assert!(!stale, "fresh from prix_actuel — not stale");
+            assert!(
+                (price - *prix_actuel).abs() < 1e-6,
+                "{ticker}: resolved {price} != prix_actuel {prix_actuel}"
+            );
+
+            let rec = json!({
+                "ticker": *ticker, "signal": "CONSERVER", "conviction": "moderee",
+                "synthese": "from finary", "memory_narrative": "narr",
+            });
+            crate::native_mcp_analysis::sync_line_memory_for_test(
+                "run-finary", ticker, *resolved, &rec, Some((price, stale)),
+            );
+        }
+
+        let store = crate::native_mcp_analysis::line_memory_read_for_test();
+        for (ticker, resolved, prix_actuel) in &positions {
+            let entry = crate::native_mcp_analysis::read_line_memory_entry(&store, ticker, *resolved);
+            assert!(!entry.is_null(), "{ticker}: entry must exist");
+            let cp = entry
+                .get("price_tracking")
+                .and_then(|pt| pt.get("current_price"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            assert!(
+                (cp - *prix_actuel).abs() < 1e-6,
+                "{ticker}: current_price {cp} != prix_actuel {prix_actuel}"
+            );
+        }
+    }
+
+    #[test]
+    fn scorecard_current_price_matches_line_modal_header_price() {
+        // The line modal header (app-line-modal.js:835) reads
+        //   `pos.prix_actuel ?? details.market?.prix_actuel`.
+        // The scorecard reads
+        //   `entry.price_tracking.current_price`.
+        // Both MUST yield the same value, otherwise the two widgets tell
+        // different stories. This contract test pins them through the resolver:
+        // the value we put in line-memory matches `position.prix_actuel`, which
+        // is exactly what the JS header uses.
+        let _guard = env_lock();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempdir.path().join("runtime-state");
+        std::fs::create_dir_all(&state_dir).expect("mkdir state_dir");
+        std::env::set_var("ALFRED_STATE_DIR", state_dir.as_os_str());
+        crate::native_mcp_analysis::line_memory_reset_for_tests();
+
+        // 1) simulate the resolver path that runs during analysis
+        let position = json!({ "ticker": "STMPA", "prix_actuel": 51.91 });
+        let resolved = crate::native_mcp_analysis::resolve_current_price_for_test(
+            Some(&position), None, None, None,
+        ).expect("must resolve");
+        let header_price = position
+            .get("prix_actuel")
+            .and_then(|v| v.as_f64())
+            .unwrap();
+
+        // 2) persist via sync_line_memory (same path as a real run)
+        let rec = json!({
+            "ticker": "STMPA", "signal": "CONSERVER", "conviction": "moderee",
+            "synthese": "header parity", "memory_narrative": "narr",
+        });
+        crate::native_mcp_analysis::sync_line_memory_for_test(
+            "run-parity", "STMPA", Some("STMPA.PA"), &rec, Some(resolved),
+        );
+        crate::native_mcp_analysis::line_memory_flush_now();
+
+        // 3) read back via the same code path the scorecard uses
+        let card = crate::command_handlers::run_get_signal_scorecard("STMPA".to_string())
+            .expect("scorecard");
+        let scorecard_price = card
+            .get("signals")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|s| s.get("current_price"))
+            .and_then(|v| v.as_f64())
+            .expect("scorecard must expose current_price");
+
+        assert!(
+            (scorecard_price - header_price).abs() < 1e-6,
+            "scorecard current_price {scorecard_price} must match line modal header price {header_price}"
+        );
+
+        std::env::remove_var("ALFRED_STATE_DIR");
+        crate::native_mcp_analysis::line_memory_reset_for_tests();
+    }
+
+    #[test]
+    fn classify_signal_returns_kind_for_conserver_and_surveillance() {
+        use crate::command_handlers::{classify_signal_for_test, SignalKind};
+        assert!(matches!(classify_signal_for_test("ACHAT"), SignalKind::Buy));
+        assert!(matches!(classify_signal_for_test("RENFORCEMENT"), SignalKind::Buy));
+        assert!(matches!(classify_signal_for_test("BUY"), SignalKind::Buy));
+        assert!(matches!(classify_signal_for_test("VENTE"), SignalKind::Sell));
+        assert!(matches!(classify_signal_for_test("ALLEGEMENT"), SignalKind::Sell));
+        assert!(matches!(classify_signal_for_test("SELL"), SignalKind::Sell));
+        assert!(matches!(classify_signal_for_test("CONSERVER"), SignalKind::Hold));
+        assert!(matches!(classify_signal_for_test("MAINTIEN"), SignalKind::Hold));
+        assert!(matches!(classify_signal_for_test("HOLD"), SignalKind::Hold));
+        assert!(matches!(classify_signal_for_test("SURVEILLANCE"), SignalKind::Watch));
+        assert!(matches!(classify_signal_for_test("MONITORING"), SignalKind::Watch));
+        assert!(matches!(classify_signal_for_test("WATCH"), SignalKind::Watch));
+        assert!(matches!(classify_signal_for_test(""), SignalKind::Other));
+        assert!(matches!(classify_signal_for_test("???"), SignalKind::Other));
+    }
+
+    #[test]
+    fn scorecard_old_recent_signals_can_still_be_marked_incorrect() {
+        // Guard against the pending logic over-triggering: a signal older than
+        // SCOREABLE_AGE_DAYS must score normally, even if the drift is small.
+        let _guard = env_lock();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempdir.path().join("runtime-state");
+        std::fs::create_dir_all(&state_dir).expect("mkdir state_dir");
+        std::env::set_var("ALFRED_STATE_DIR", state_dir.as_os_str());
+
+        let old_date = date_minus_days(30);
+        let store = json!({
+            "by_ticker": {
+                "OLDX": {
+                    "schema_version": 2,
+                    "ticker": "OLDX",
+                    "signal_history": [
+                        { "date": old_date, "signal": "ALLEGEMENT", "price_at_signal": 50.0 },
+                    ],
+                    "price_tracking": { "current_price": 51.0 }
+                }
+            }
+        });
+        seed_scorecard_store(&state_dir, store);
+
+        let card = crate::command_handlers::run_get_signal_scorecard("OLDX".to_string())
+            .expect("scorecard");
+        let signals = card
+            .get("signals")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        // ALLEGEMENT (sell) at 50 vs current 51 (+2%) → sell expected drop, got rise → incorrect
+        assert_eq!(
+            lookup_signal(&signals, &old_date).get("accuracy").and_then(|v| v.as_str()),
+            Some("incorrect"),
+            "old sell signal that drifted up must be incorrect — pending window expired. Got: {signals:?}"
+        );
+
+        std::env::remove_var("ALFRED_STATE_DIR");
+        crate::native_mcp_analysis::line_memory_reset_for_tests();
     }

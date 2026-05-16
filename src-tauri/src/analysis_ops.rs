@@ -62,6 +62,11 @@ pub fn request_cancellation(operation_id: &str) -> Result<serde_json::Value> {
     crate::debug_log(&format!("analysis: cancellation requested for {safe_id}"));
     // Kill any active codex child processes immediately
     crate::codex::kill_all_active();
+    // v0.4.0 P0-11: release the run-session slot so any in-flight
+    // worker thread does not keep stamping `X-Run-Session` on requests
+    // after the user asked to stop. The worker tear-down path also
+    // clears the slot — this is the cancellation-path counterpart.
+    crate::alfred_api_client::clear_active_run_session();
     // Mark the run state as aborted + all "analyzing" lines as aborted
     if let Ok(ops) = ops_store().lock() {
         if let Some(record) = ops.get(safe_id) {
@@ -149,6 +154,19 @@ pub fn ops_store() -> &'static Mutex<HashMap<String, AnalysisOperationRecord>> {
 pub fn start_analysis(options: Option<serde_json::Value>) -> Result<serde_json::Value> {
     crate::debug_log("analysis: start_analysis called");
     health::run_preflight(options.as_ref())?;
+
+    // v0.4.0 P0-11: acquire a server-issued run-session BEFORE we
+    // initialize on-disk run state. If the user has burned their free
+    // tier, `/run/start` returns 429 free_tier_exhausted and we abort
+    // here — no run_state directory, no worker thread, no partial state
+    // to clean up. Quota is the source of truth server-side.
+    //
+    // The session ID is stored in a process-global slot read by
+    // `alfred_api_client::apply_auth`. Every downstream `api_get` /
+    // `api_post` injects `X-Run-Session: <id>` automatically so the 14
+    // gated `/api/*` endpoints succeed for the duration of the run.
+    acquire_run_session_or_bail()?;
+
     let initialized = run_state::initialize_with_control_plane(options.as_ref())?;
     let run_id = initialized
         .get("run_id")
@@ -217,6 +235,12 @@ pub fn start_analysis(options: Option<serde_json::Value>) -> Result<serde_json::
         // Cleanup: flush cache, unregister cancel flag
         crate::run_state_cache::flush_to_disk();
         unregister_cancel_flag(&operation_id_for_thread);
+        // v0.4.0 P0-11: release the run-session slot. A subsequent api_get
+        // outside of a run must NOT carry a stale X-Run-Session header
+        // (the server would 401 with `run_session_invalid` and confuse
+        // diagnostics). Idempotent — safe to call twice if cancellation
+        // already cleared it.
+        crate::alfred_api_client::clear_active_run_session();
         if let Ok(ref payload) = outcome {
             if let Some(rid) = payload.get("result").and_then(|v| v.get("run_id")).and_then(|v| v.as_str()) {
                 crate::run_state_cache::clear_run(rid);
@@ -499,4 +523,128 @@ pub fn poll_analysis_status(operation_id: String) -> Result<serde_json::Value> {
             }
         }
     }))
+}
+
+// ── Run-session acquisition (v0.4.0 P0-11) ──────────────────────────
+
+/// Call `POST /run/start` and populate the desktop's active-session slot
+/// so downstream `api_get`/`api_post` calls carry `X-Run-Session`.
+///
+/// Returns:
+/// - `Ok(())` on success — slot populated, run may proceed.
+/// - `Err(_)` with a structured error code on quota exhaustion or
+///   transport failure. Error codes (consumed by JS via
+///   `inferCodedErrorFromText`):
+///   - `alfred_free_tier_exhausted:{retry_after}:{limit}:{period}` →
+///     UI surfaces the upgrade modal (P0-13, separate worktree).
+///   - any other `alfred_api_*` code → standard error toast.
+///
+/// Skips the whole flow (returns Ok) when `ALFRED_API_ENABLED=0` is set
+/// — the same env-var that disables the API client in tests, used so
+/// integration tests of `start_analysis` don't require a server.
+fn acquire_run_session_or_bail() -> Result<()> {
+    // Honor the same disable switch the API client uses, so tests that
+    // already set `ALFRED_API_ENABLED=0` (see `tests.rs::env_lock`) keep
+    // working without a fake `/run/start` server.
+    if std::env::var("ALFRED_API_ENABLED")
+        .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false)
+    {
+        crate::debug_log("analysis: skipping /run/start — ALFRED_API_ENABLED=0");
+        // Clear any stale session from a prior run that flipped state.
+        crate::alfred_api_client::clear_active_run_session();
+        return Ok(());
+    }
+
+    match crate::alfred_api_client::start_run_session() {
+        Ok(crate::alfred_api_client::RunStartOutcome::Ok(success)) => {
+            crate::debug_log(&format!(
+                "analysis: /run/start ok — session={} expires_at={} runs_this_week={} tier={}",
+                &success.run_session_id[..8],
+                success.expires_at,
+                success.runs_this_week,
+                success.tier,
+            ));
+            crate::alfred_api_client::set_active_run_session(success.run_session_id);
+            Ok(())
+        }
+        Ok(crate::alfred_api_client::RunStartOutcome::QuotaExhausted(info)) => {
+            crate::alfred_api_client::clear_active_run_session();
+            // Structured error code so the JS bridge can parse
+            // `retry_after`, `limit`, and `period` for the upgrade modal.
+            // Format pinned by `docs/desktop-api-integration.md` §
+            // "Error mapping".
+            crate::debug_log(&format!(
+                "analysis: /run/start returned free_tier_exhausted (retry_after={}, limit={}, period={})",
+                info.retry_after, info.limit, info.period,
+            ));
+            Err(anyhow!(
+                "alfred_free_tier_exhausted:{}:{}:{}",
+                info.retry_after,
+                info.limit,
+                info.period,
+            ))
+        }
+        Err(e) => {
+            crate::alfred_api_client::clear_active_run_session();
+            crate::debug_log(&format!("analysis: /run/start failed: {e}"));
+            Err(e)
+        }
+    }
+}
+
+#[cfg(test)]
+mod run_session_tests {
+    //! Tests for the v0.4.0 P0-11 wiring between `start_analysis` and
+    //! the alfred-api `POST /run/start` endpoint.
+    //!
+    //! We focus on the disable-switch path (`ALFRED_API_ENABLED=0`)
+    //! because every existing `start_analysis` test already sets it
+    //! (see `tests.rs::env_lock`). The real-server paths
+    //! (Ok / QuotaExhausted / Err) are covered server-side by the
+    //! `tests/quota_integration.rs` + `tests/run_session_integration.rs`
+    //! suites in alfred-api — re-asserting them here would duplicate
+    //! coverage without exercising new code, since the response
+    //! classification is unit-tested in `alfred_api_client::tests::
+    //! classify_run_start_*`.
+
+    /// Sequential lock for the active-session slot — shared state, same
+    /// pattern as `alfred_api_client::tests::run_session_test_lock`.
+    fn run_session_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn acquire_run_session_skips_when_api_disabled() {
+        let _guard = run_session_test_lock();
+        // Stamp a fake session into the slot to prove the disable path
+        // clears it (no stale header leaks once the API comes back).
+        crate::alfred_api_client::set_active_run_session("stale-session");
+        std::env::set_var("ALFRED_API_ENABLED", "0");
+
+        let result = super::acquire_run_session_or_bail();
+        assert!(result.is_ok(), "disable path must Ok, got {:?}", result.err());
+        assert!(
+            crate::alfred_api_client::active_run_session().is_none(),
+            "active session must be cleared on disable path so api_get can't inject stale header",
+        );
+
+        std::env::remove_var("ALFRED_API_ENABLED");
+    }
+
+    #[test]
+    fn acquire_run_session_skips_when_api_disabled_with_false_string() {
+        let _guard = run_session_test_lock();
+        crate::alfred_api_client::clear_active_run_session();
+        // Mirror the same case-insensitive match `api_url()` does.
+        std::env::set_var("ALFRED_API_ENABLED", "FALSE");
+
+        let result = super::acquire_run_session_or_bail();
+        assert!(result.is_ok());
+
+        std::env::remove_var("ALFRED_API_ENABLED");
+    }
 }

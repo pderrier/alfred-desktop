@@ -5,6 +5,7 @@
 //! (via CI), never exposed in source. The OpenAI JWT never leaves the device.
 
 use std::env;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -12,6 +13,10 @@ use serde_json::Value;
 
 const DEFAULT_API_URL: &str = "https://vps-c5793aab.vps.ovh.net/alfred/api";
 const TIMEOUT_SECS: u64 = 10;
+/// Timeout for `POST /run/start`. Short on purpose — if the session
+/// endpoint isn't responding in 8s, the desktop should fail loudly so
+/// the user knows the API is down before they're sunk into a 10-min run.
+const RUN_START_TIMEOUT_SECS: u64 = 8;
 
 /// API secret embedded at compile time by CI (ALFRED_API_SECRET env var).
 /// In dev builds without the secret, HMAC auth is skipped (API falls back to permissive mode).
@@ -67,14 +72,25 @@ fn get_client_hash() -> Option<String> {
 }
 
 /// Apply auth headers to a ureq request: HMAC signature + client hash + timestamp.
+///
+/// v0.4.0 (P0-11): also injects `X-Run-Session: <id>` when a run-session
+/// has been set via `set_active_run_session` (done by
+/// `analysis_ops::start_analysis` right after `/run/start` succeeds). The
+/// 14 gated analysis endpoints require this header server-side; without it
+/// they 401 with `run_session_invalid`. `/run/start` itself does NOT
+/// require the header (it's the source of sessions) — the active-session
+/// context is `None` when this function runs for that endpoint.
 fn apply_auth(req: ureq::Request, path: &str) -> ureq::Request {
     let ts = now_epoch_secs();
     let client_hash = get_client_hash().unwrap_or_default();
     // Sign only the path component (no query string) — must match server-side req.uri().path()
     let sign_path = path.split('?').next().unwrap_or(path);
-    let req = req
+    let mut req = req
         .set("X-Client-Hash", &client_hash)
         .set("X-Timestamp", &ts.to_string());
+    if let Some(session_id) = active_run_session() {
+        req = req.set("X-Run-Session", &session_id);
+    }
     let runtime_secret = env::var("ALFRED_API_SECRET").ok();
     let secret = API_SECRET.or(runtime_secret.as_deref());
     if let Some(s) = secret {
@@ -83,6 +99,58 @@ fn apply_auth(req: ureq::Request, path: &str) -> ureq::Request {
     } else {
         req
     }
+}
+
+// ── Run-session context (v0.4.0 P0-11) ──────────────────────────────
+//
+// The desktop holds a single, process-wide "active run-session" slot.
+// `analysis_ops::start_analysis` calls `set_active_run_session` after a
+// successful `POST /run/start`; the worker thread inherits this context
+// (all `api_get` / `api_post` calls on that thread will inject the header
+// via `apply_auth`). At run completion, `clear_active_run_session`
+// resets the slot.
+//
+// Why a global instead of explicit threading? The enrichment helpers
+// (`enrichment::fetch_market`, `remote_fetch_news`, etc.) are called from
+// 20+ call sites and pass `Position` / `Ticker` types — adding an
+// optional `session_id` everywhere would be a huge surface change for no
+// runtime benefit. The desktop runs ONE analysis at a time (verified by
+// the cancellation registry and ops_store invariants — see
+// `analysis_ops::ops_store`), so a single global slot is correct.
+
+static ACTIVE_RUN_SESSION: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+fn session_slot() -> &'static Mutex<Option<String>> {
+    ACTIVE_RUN_SESSION.get_or_init(|| Mutex::new(None))
+}
+
+/// Set the active run-session ID. Called by `analysis_ops::start_analysis`
+/// after the server has issued one via `POST /run/start`.
+///
+/// Mutex-protected to be safe under the (rare) case where the cancellation
+/// thread races the worker thread on completion. Replaces any prior value
+/// — the contract is "one run, one session", and a fresh `/run/start`
+/// always supersedes a stale slot.
+pub fn set_active_run_session(session_id: impl Into<String>) {
+    if let Ok(mut slot) = session_slot().lock() {
+        *slot = Some(session_id.into());
+    }
+}
+
+/// Clear the active run-session ID. Called on run completion / failure /
+/// cancellation so a subsequent `api_get` outside of a run does NOT
+/// silently use a stale session header (which would 401 with confusing
+/// `run_session_invalid` instead of the cleaner "no session" path).
+pub fn clear_active_run_session() {
+    if let Ok(mut slot) = session_slot().lock() {
+        *slot = None;
+    }
+}
+
+/// Read the active run-session ID (cloned to avoid holding the lock
+/// across the HTTP call). Returns `None` when no run is in flight.
+pub fn active_run_session() -> Option<String> {
+    session_slot().lock().ok().and_then(|s| s.clone())
 }
 
 /// Read the OpenAI JWT from local Codex session (never sent to the API).
@@ -415,6 +483,179 @@ pub fn ban_deep_news_url(ticker: &str, isin: &str, article_url: &str, reason: &s
     api_post("/api/deep-news/ban", &serde_json::json!({ "ticker": ticker, "isin": isin, "url": article_url, "reason": reason }));
 }
 
+// ── /run/start client (v0.4.0 P0-11) ─────────────────────────────────
+
+/// Result of calling `POST /run/start`. Two structured outcomes for the
+/// caller to render differently:
+/// - `Ok` → caller stores `session_id`, proceeds with the run.
+/// - `QuotaExhausted` → caller surfaces the upgrade modal (P0-13 in a
+///   separate worktree); the run NEVER starts.
+/// - `Err` → unrelated transport/auth failure; caller fails the run with
+///   the usual error path.
+///
+/// The 3-way shape matters because "quota exhausted" is a perfectly
+/// understandable user state (you've done 3 analyses this week), not a
+/// runtime error — collapsing it into `Err` would lose the structured
+/// fields the UI needs to render the upgrade CTA.
+#[derive(Debug)]
+pub enum RunStartOutcome {
+    /// `/run/start` succeeded — session is valid for `expires_at` seconds.
+    Ok(RunStartSuccess),
+    /// 429 `free_tier_exhausted` — surface upgrade CTA, do NOT start the run.
+    QuotaExhausted(QuotaExhaustedInfo),
+}
+
+#[derive(Debug, Clone)]
+pub struct RunStartSuccess {
+    pub run_session_id: String,
+    pub expires_at: u64,
+    pub runs_this_week: u32,
+    /// `None` for paid tier (the server returns the string "unlimited").
+    /// Allowed-dead: consumed by P0-13 modal (separate worktree W-B)
+    /// when it renders the "X of Y runs used" line. We log it from
+    /// `acquire_run_session_or_bail` for diagnostics but don't surface
+    /// it via the bridge yet — keeping the field on the struct pins the
+    /// wire contract so W-B doesn't have to re-parse the JSON.
+    #[allow(dead_code)]
+    pub limit: Option<u32>,
+    /// `"free"` or `"paid"`. The desktop renders different UI based on this.
+    pub tier: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct QuotaExhaustedInfo {
+    pub retry_after: u64,
+    /// Surfaced today via the structured `alfred_free_tier_exhausted:…`
+    /// error code (see `analysis_ops::acquire_run_session_or_bail`) — the
+    /// JS upgrade modal (P0-13, separate worktree W-B) reads it back from
+    /// the message body for display. Allowed-dead until W-B lands.
+    #[allow(dead_code)]
+    pub runs_this_week: u32,
+    pub limit: u32,
+    /// Always `"rolling_7d"` in v0.4.0; pinned so the UI can format the
+    /// reset hint correctly ("rolling 7 days").
+    pub period: String,
+}
+
+/// Issue a run-session via `POST /run/start`. Decrements the server-side
+/// rolling-7d quota. Caller is responsible for storing the returned
+/// `run_session_id` via `set_active_run_session` so downstream `api_get`
+/// calls inject the header automatically.
+///
+/// Errors:
+/// - `Ok(QuotaExhausted)` for HTTP 429 `free_tier_exhausted` (graceful UX path).
+/// - `Err(_)` for transport / auth / parse failures (treated as run-start failure).
+///
+/// Why not retry on 429? Unlike rate-limit 429s, a free-tier exhaustion
+/// won't resolve in seconds — the user has to wait for the rolling window
+/// or upgrade. Retrying would just consume the user's quota again the
+/// moment it frees up (a hostile pattern). Surface the structured info
+/// to the UI instead.
+pub fn start_run_session() -> Result<RunStartOutcome> {
+    let base = match api_url() {
+        Some(u) => u,
+        None => return Err(anyhow!("alfred_api_not_configured")),
+    };
+    let path = "/run/start";
+    let url = format!("{base}{path}");
+    let req = apply_auth(ureq::post(&url), path)
+        .set("Content-Type", "application/json")
+        .timeout(Duration::from_secs(RUN_START_TIMEOUT_SECS));
+
+    let response = req.send_string("{}");
+    parse_run_start_response(response)
+}
+
+/// Pure-ish helper: classify the `/run/start` response into a
+/// `RunStartOutcome`. Split from `start_run_session` so the classification
+/// logic is unit-testable (mocked `ureq::Response` shapes).
+fn parse_run_start_response(
+    result: std::result::Result<ureq::Response, ureq::Error>,
+) -> Result<RunStartOutcome> {
+    match result {
+        Ok(resp) => {
+            let body: Value = resp
+                .into_json()
+                .map_err(|e| anyhow!("alfred_api_parse_failed:{e}"))?;
+            classify_run_start_ok(body)
+        }
+        Err(ureq::Error::Status(429, resp)) => {
+            let body: Value = resp.into_json().unwrap_or(Value::Null);
+            classify_run_start_429(body)
+        }
+        Err(e) => Err(map_api_error(e)),
+    }
+}
+
+fn classify_run_start_ok(body: Value) -> Result<RunStartOutcome> {
+    let run_session_id = body
+        .get("run_session_id")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .ok_or_else(|| anyhow!("alfred_api_parse_failed:missing run_session_id"))?;
+    let expires_at = body
+        .get("expires_at")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow!("alfred_api_parse_failed:missing expires_at"))?;
+    let runs_this_week = body
+        .get("runs_this_week")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
+        .unwrap_or(0);
+    // `limit` is integer for Free, the string "unlimited" for Paid (the
+    // server caps at u32::MAX which we'd never want to display as-is).
+    let limit = body.get("limit").and_then(|v| v.as_u64()).map(|n| n as u32);
+    let tier = body
+        .get("tier")
+        .and_then(|v| v.as_str())
+        .unwrap_or("free")
+        .to_string();
+    Ok(RunStartOutcome::Ok(RunStartSuccess {
+        run_session_id,
+        expires_at,
+        runs_this_week,
+        limit,
+        tier,
+    }))
+}
+
+fn classify_run_start_429(body: Value) -> Result<RunStartOutcome> {
+    // The server always sends `error: "free_tier_exhausted"` for 429 on
+    // /run/start. If it ever returns the generic `rate_limited` here
+    // (e.g. global per-IP throttle), treat that as a transport-level
+    // 429 and surface to the caller via Err so the existing rate-limit
+    // retry path handles it.
+    let error_code = body.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    if error_code != "free_tier_exhausted" {
+        return Err(anyhow!("alfred_api_rate_limited"));
+    }
+    let retry_after = body
+        .get("retry_after")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let runs_this_week = body
+        .get("runs_this_week")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
+        .unwrap_or(0);
+    let limit = body
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
+        .unwrap_or(0);
+    let period = body
+        .get("period")
+        .and_then(|v| v.as_str())
+        .unwrap_or("rolling_7d")
+        .to_string();
+    Ok(RunStartOutcome::QuotaExhausted(QuotaExhaustedInfo {
+        retry_after,
+        runs_this_week,
+        limit,
+        period,
+    }))
+}
+
 fn urlenc(s: &str) -> String {
     s.chars()
         .map(|c| match c {
@@ -555,5 +796,193 @@ mod tests {
         // — never crash, never emit a raw `+` or space into the query string.
         let p = build_resolve_path("FR 12+34");
         assert_eq!(p, "/api/resolve?isin=FR+12%2B34");
+    }
+
+    // ── X-Run-Session propagation (v0.4.0 P0-11) ────────────────────
+
+    /// Sequential lock guard so the set/clear tests don't race each other
+    /// (they share a process-global slot — see ACTIVE_RUN_SESSION).
+    fn run_session_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn active_run_session_returns_none_when_unset() {
+        let _guard = run_session_test_lock();
+        clear_active_run_session();
+        assert!(active_run_session().is_none());
+    }
+
+    #[test]
+    fn set_active_run_session_round_trips_through_active_run_session() {
+        let _guard = run_session_test_lock();
+        clear_active_run_session();
+        set_active_run_session("abc123");
+        assert_eq!(active_run_session().as_deref(), Some("abc123"));
+        clear_active_run_session();
+    }
+
+    #[test]
+    fn clear_active_run_session_resets_slot() {
+        let _guard = run_session_test_lock();
+        set_active_run_session("xyz789");
+        assert!(active_run_session().is_some());
+        clear_active_run_session();
+        assert!(active_run_session().is_none());
+    }
+
+    #[test]
+    fn set_active_run_session_overwrites_previous_value() {
+        // Contract: one run, one session — if start_analysis fires a
+        // second /run/start (which would be a bug, but defend anyway),
+        // the new session must supersede the stale one rather than
+        // being silently ignored.
+        let _guard = run_session_test_lock();
+        clear_active_run_session();
+        set_active_run_session("first");
+        set_active_run_session("second");
+        assert_eq!(active_run_session().as_deref(), Some("second"));
+        clear_active_run_session();
+    }
+
+    #[test]
+    fn apply_auth_injects_run_session_header_when_set() {
+        // Smoke-test apply_auth's contract: when a session is set, the
+        // resulting ureq::Request carries X-Run-Session. Built using
+        // a dummy base URL since ureq::get accepts arbitrary strings
+        // and apply_auth doesn't fire the request.
+        let _guard = run_session_test_lock();
+        clear_active_run_session();
+        set_active_run_session("test-session-id");
+
+        let raw = ureq::get("https://example.test/api/news");
+        let signed = apply_auth(raw, "/api/news");
+        // ureq::Request doesn't expose headers via a public iterator,
+        // but the request can be converted back to a fmt::Debug shape
+        // that includes them. Cheap proxy: compare the Debug output.
+        let dbg = format!("{signed:?}");
+        assert!(
+            dbg.contains("X-Run-Session") || dbg.contains("x-run-session"),
+            "X-Run-Session header missing from signed request — apply_auth contract broken. Debug: {dbg}",
+        );
+
+        clear_active_run_session();
+    }
+
+    #[test]
+    fn apply_auth_omits_run_session_header_when_unset() {
+        // /run/start itself runs through apply_auth with no active
+        // session — must NOT inject a stale X-Run-Session.
+        let _guard = run_session_test_lock();
+        clear_active_run_session();
+
+        let raw = ureq::get("https://example.test/run/start");
+        let signed = apply_auth(raw, "/run/start");
+        let dbg = format!("{signed:?}");
+        assert!(
+            !dbg.to_lowercase().contains("x-run-session"),
+            "X-Run-Session must not be injected when no session is active — request would 401",
+        );
+    }
+
+    // ── /run/start response classification (v0.4.0 P0-11) ───────────
+
+    #[test]
+    fn classify_run_start_ok_parses_success_envelope() {
+        let body = serde_json::json!({
+            "ok": true,
+            "run_session_id": "abcd1234deadbeef00000000aabbccdd",
+            "expires_at": 1_700_000_600u64,
+            "runs_this_week": 1u64,
+            "limit": 3u64,
+            "period": "rolling_7d",
+            "tier": "free",
+        });
+        let outcome = classify_run_start_ok(body).unwrap();
+        match outcome {
+            RunStartOutcome::Ok(s) => {
+                assert_eq!(s.run_session_id, "abcd1234deadbeef00000000aabbccdd");
+                assert_eq!(s.expires_at, 1_700_000_600);
+                assert_eq!(s.runs_this_week, 1);
+                assert_eq!(s.limit, Some(3));
+                assert_eq!(s.tier, "free");
+            }
+            _ => panic!("expected Ok outcome"),
+        }
+    }
+
+    #[test]
+    fn classify_run_start_ok_handles_paid_unlimited_limit() {
+        // Paid users get `limit: "unlimited"` (string sentinel), not a
+        // numeric value. The Rust client maps that to Option::None so
+        // the UI doesn't render "u32::MAX runs/week".
+        let body = serde_json::json!({
+            "ok": true,
+            "run_session_id": "deadbeefdeadbeefdeadbeefdeadbeef",
+            "expires_at": 1_700_000_600u64,
+            "runs_this_week": 5u64,
+            "limit": "unlimited",
+            "period": "rolling_7d",
+            "tier": "paid",
+        });
+        let outcome = classify_run_start_ok(body).unwrap();
+        match outcome {
+            RunStartOutcome::Ok(s) => {
+                assert_eq!(s.tier, "paid");
+                assert!(s.limit.is_none());
+            }
+            _ => panic!("expected Ok outcome"),
+        }
+    }
+
+    #[test]
+    fn classify_run_start_ok_rejects_missing_session_id() {
+        let body = serde_json::json!({"expires_at": 1_700_000_600u64});
+        let err = classify_run_start_ok(body).expect_err("missing session_id must error");
+        assert!(err.to_string().contains("missing run_session_id"));
+    }
+
+    #[test]
+    fn classify_run_start_429_parses_free_tier_exhausted_envelope() {
+        let body = serde_json::json!({
+            "error": "free_tier_exhausted",
+            "retry_after": 86400u64,
+            "runs_this_week": 3u64,
+            "limit": 3u64,
+            "period": "rolling_7d",
+        });
+        let outcome = classify_run_start_429(body).unwrap();
+        match outcome {
+            RunStartOutcome::QuotaExhausted(info) => {
+                assert_eq!(info.retry_after, 86400);
+                assert_eq!(info.runs_this_week, 3);
+                assert_eq!(info.limit, 3);
+                assert_eq!(info.period, "rolling_7d");
+            }
+            _ => panic!("expected QuotaExhausted outcome"),
+        }
+    }
+
+    #[test]
+    fn classify_run_start_429_with_rate_limited_falls_back_to_err() {
+        // If the server ever returns a generic `rate_limited` on
+        // /run/start (e.g. global per-IP throttle), the desktop must
+        // surface it as a transport-level 429 — not a free-tier-quota
+        // event. The classification helper distinguishes the two so
+        // the UI doesn't show the upgrade modal for a transient limit.
+        let body = serde_json::json!({"error": "rate_limited", "retry_after": 30u64});
+        let err = classify_run_start_429(body).expect_err("rate_limited must Err");
+        assert_eq!(err.to_string(), "alfred_api_rate_limited");
+    }
+
+    #[test]
+    fn classify_run_start_429_empty_body_falls_back_to_rate_limited() {
+        // Defensive: a 429 with empty body (server bug or proxy
+        // truncation) maps to alfred_api_rate_limited, not a phantom
+        // quota event.
+        let body = serde_json::Value::Null;
+        let err = classify_run_start_429(body).expect_err("empty body must Err");
+        assert_eq!(err.to_string(), "alfred_api_rate_limited");
     }
 }

@@ -633,7 +633,30 @@ export function clearErrorToasts() {
   }
 }
 
-export function showErrorModal(title, message, hint) {
+/**
+ * Show the application-wide error modal. v0.4.0 P0-13 adds an optional
+ * `upgradeCta` parameter so the monetization flow can render a second
+ * button (e.g. "Upgrade — 9€/an") to the right of OK.
+ *
+ * @param {string} title
+ * @param {string} message
+ * @param {string} [hint]
+ * @param {{label: string, action?: function, detail?: object}} [upgradeCta]
+ *   - `label` : button text (rendered as-is).
+ *   - `action` : optional click handler. When absent (the default for
+ *     v0.4.0 P0-13), the button dispatches a `CustomEvent` named
+ *     `alfred://upgrade-requested` on `window` with `detail` carrying
+ *     the structured quota envelope (retry_after / limit / period).
+ *     This decouples the modal from the upgrade view that P0-15 will
+ *     wire later (an event listener on `app.js` consumes it and shows
+ *     a "coming soon" toast until P0-15 ships).
+ *   - `detail` : data forwarded to the CustomEvent. Only used when
+ *     `action` is omitted.
+ *
+ * The CTA button is recreated on every show so consecutive calls with
+ * different payloads don't accumulate stale event listeners.
+ */
+export function showErrorModal(title, message, hint, upgradeCta) {
   let modal = document.getElementById("error-modal");
   if (!modal) {
     modal = document.createElement("div");
@@ -644,7 +667,9 @@ export function showErrorModal(title, message, hint) {
         <h3 class="error-modal-title"></h3>
         <p class="error-modal-message"></p>
         <p class="error-modal-hint"></p>
-        <button class="error-modal-dismiss">OK</button>
+        <div class="error-modal-actions">
+          <button class="error-modal-dismiss">OK</button>
+        </div>
       </div>
     `;
     document.body.appendChild(modal);
@@ -654,6 +679,17 @@ export function showErrorModal(title, message, hint) {
     modal.addEventListener("click", (e) => {
       if (e.target === modal) modal.classList.add("hidden");
     });
+  } else if (!modal.querySelector(".error-modal-actions")) {
+    // Legacy DOM from a previous version that didn't have an actions
+    // container — wrap the existing OK button so the CTA can attach
+    // alongside without breaking flexbox layout. Idempotent on reload.
+    const okBtn = modal.querySelector(".error-modal-dismiss");
+    const actions = document.createElement("div");
+    actions.className = "error-modal-actions";
+    if (okBtn) {
+      okBtn.parentNode.insertBefore(actions, okBtn);
+      actions.appendChild(okBtn);
+    }
   }
   modal.querySelector(".error-modal-title").textContent = title || "Error";
   modal.querySelector(".error-modal-message").textContent = message || "";
@@ -664,6 +700,35 @@ export function showErrorModal(title, message, hint) {
   } else {
     hintNode.classList.add("hidden");
   }
+
+  // Tear down any prior CTA so repeated calls don't stack listeners
+  // (the modal element is a singleton attached to document.body).
+  const actionsRow = modal.querySelector(".error-modal-actions");
+  const priorCta = actionsRow?.querySelector(".error-modal-cta");
+  if (priorCta) priorCta.remove();
+
+  if (upgradeCta && upgradeCta.label && actionsRow) {
+    const ctaBtn = document.createElement("button");
+    ctaBtn.className = "error-modal-cta";
+    ctaBtn.textContent = String(upgradeCta.label);
+    ctaBtn.addEventListener("click", () => {
+      if (typeof upgradeCta.action === "function") {
+        upgradeCta.action();
+      } else if (typeof window !== "undefined" && typeof window.dispatchEvent === "function") {
+        // Default path: emit the upgrade-requested event so the
+        // (future) P0-15 LS overlay can consume it. Until then the
+        // listener in app.js shows a "coming soon" toast.
+        window.dispatchEvent(
+          new CustomEvent("alfred://upgrade-requested", {
+            detail: upgradeCta.detail || {}
+          })
+        );
+      }
+      modal.classList.add("hidden");
+    });
+    actionsRow.appendChild(ctaBtn);
+  }
+
   modal.classList.remove("hidden");
 }
 

@@ -1230,8 +1230,17 @@ main {
   padding: 0.4rem 0.6rem;
   margin: 0.6rem 0;
 }
-.error-modal-dismiss {
+/* v0.4.0 P0-13: actions row groups OK + optional CTA (e.g. Upgrade).
+ * `gap` keeps consistent spacing between buttons; `flex-wrap` lets
+ * narrow viewports stack vertically without overflow. */
+.error-modal-actions {
   margin-top: 0.8rem;
+  display: flex;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.error-modal-dismiss {
   padding: 0.4rem 1.4rem;
   background: rgba(240, 138, 119, 0.15);
   border: 1px solid rgba(240, 138, 119, 0.3);
@@ -1242,6 +1251,23 @@ main {
 }
 .error-modal-dismiss:hover {
   background: rgba(240, 138, 119, 0.25);
+}
+/* CTA (upgrade, etc.) uses an emphasis colour distinct from the neutral
+ * OK button — the monetization flow needs the call to action to read as
+ * the primary affordance. Greenish tone matches the existing buy/positive
+ * palette (see `.tone-buy` in the report view). */
+.error-modal-cta {
+  padding: 0.4rem 1.4rem;
+  background: rgba(47, 143, 93, 0.2);
+  border: 1px solid rgba(47, 143, 93, 0.45);
+  border-radius: 4px;
+  color: #4cbf85;
+  cursor: pointer;
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+.error-modal-cta:hover {
+  background: rgba(47, 143, 93, 0.32);
 }
 
 /* ── Cards (shared) ────────────────────────────────────────────── */

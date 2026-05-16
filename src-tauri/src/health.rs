@@ -99,7 +99,72 @@ fn normalize_service(
     })
 }
 
+/// Classify a 429 health probe based on the quota-tagged response
+/// headers the server-side P0-12 sets on free-tier exhaustion
+/// (`X-Quota-Limit`, `X-Quota-Reset-After`). Returns
+/// `(status_label, diagnostics_payload)` where the diagnostics carries
+/// the structured envelope the splash UI hands to `showErrorModal`.
+///
+/// Pure helper — no `ureq::Response` dependency so tests can drive it
+/// with synthetic header pairs without an HTTP runtime. See
+/// `feedback_pure_helper_for_async_testability`.
+///
+/// When neither header is present we fall back to the legacy P0-9
+/// global RPM rate-limit classification (`rate_limited`).
+pub(crate) fn classify_health_429(
+    retry_after_secs: Option<u64>,
+    limit: Option<u64>,
+) -> (&'static str, Option<serde_json::Value>) {
+    if limit.is_none() && retry_after_secs.is_none() {
+        return ("rate_limited", None);
+    }
+    let mut diag = serde_json::Map::new();
+    if let Some(v) = retry_after_secs {
+        diag.insert("retry_after".to_string(), json!(v));
+    }
+    if let Some(v) = limit {
+        diag.insert("limit".to_string(), json!(v));
+    }
+    diag.insert("period".to_string(), json!("rolling_7d"));
+    ("free_tier_exhausted", Some(serde_json::Value::Object(diag)))
+}
+
+/// Classify a transport-level health-probe error into the status code
+/// the splash UI consumes. Thin wrapper around `classify_health_429`
+/// that extracts the relevant headers from a live `ureq::Response`.
+fn classify_health_error(
+    e: &ureq::Error,
+) -> (&'static str, Option<serde_json::Value>) {
+    match e {
+        ureq::Error::Status(401, _) => ("unauthorized", None),
+        ureq::Error::Status(429, resp) => {
+            // Server-side P0-12 sets X-Quota-Limit / X-Quota-Reset-After
+            // on free-tier exhaustion; their absence means this is the
+            // global RPM rate-limit. ureq::Response is not Clone and
+            // into_string() consumes it, but header() takes &self so
+            // we can inspect both before dropping the borrow.
+            let limit = resp
+                .header("X-Quota-Limit")
+                .and_then(|v| v.trim().parse::<u64>().ok());
+            let retry_after = resp
+                .header("X-Quota-Reset-After")
+                .or_else(|| resp.header("Retry-After"))
+                .and_then(|v| v.trim().parse::<u64>().ok());
+            classify_health_429(retry_after, limit)
+        }
+        ureq::Error::Status(_code, _) => ("http_error", None),
+        _ => ("unreachable", None),
+    }
+}
+
 /// Check Alfred API remote health — calls /healthz endpoint.
+///
+/// v0.4.0 (P0-13): the 429 path now inspects the response body to
+/// distinguish global RPM rate-limit (`rate_limited`) from per-user
+/// quota exhaustion (`free_tier_exhausted`). The splash-screen consumer
+/// uses this distinction to decide whether to show a "back in a few
+/// seconds" toast or the upgrade modal. Body shape is documented in
+/// `docs/monetization-architecture.md`.
 fn check_alfred_api_health(timeout_ms: u64) -> serde_json::Value {
     let api_url = env::var("ALFRED_API_URL")
         .unwrap_or_else(|_| "https://vps-c5793aab.vps.ovh.net/alfred/api".to_string());
@@ -113,16 +178,9 @@ fn check_alfred_api_health(timeout_ms: u64) -> serde_json::Value {
     {
         Ok(resp) => resp.into_json::<serde_json::Value>().unwrap_or(json!({})),
         Err(e) => {
-            let status = match &e {
-                ureq::Error::Status(401, _) => "unauthorized",
-                ureq::Error::Status(429, _) => "rate_limited",
-                ureq::Error::Status(code, _) => {
-                    crate::debug_log(&format!("alfred-api health: HTTP {code}"));
-                    "http_error"
-                }
-                _ => "unreachable",
-            };
-            return json!({
+            let (status, diagnostics) = classify_health_error(&e);
+            crate::debug_log(&format!("alfred-api health: {status}"));
+            let mut payload = json!({
                 "name": "alfred-api",
                 "ok": false, "ready": false,
                 "live": status != "unreachable",
@@ -130,6 +188,15 @@ fn check_alfred_api_health(timeout_ms: u64) -> serde_json::Value {
                 "status": status,
                 "error": e.to_string()
             });
+            // Attach the parsed quota envelope (retry_after / limit / period)
+            // when the server sent one — the splash UI uses this to
+            // render the upgrade modal without a second round-trip.
+            if let Some(extras) = diagnostics {
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert("diagnostics".to_string(), extras);
+                }
+            }
+            return payload;
         }
     };
 
@@ -364,4 +431,53 @@ pub fn run_preflight(options: Option<&serde_json::Value>) -> Result<()> {
         wait_for_service(name, port, allow_degraded, timeout_ms)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_health_429_with_quota_headers_surfaces_free_tier_exhausted() {
+        // Server P0-12 sets X-Quota-Limit and X-Quota-Reset-After on
+        // quota exhaustion. The splash probe uses both to render the
+        // upgrade modal: limit shows "3 / 7 days", reset_after shows
+        // "next slot in Xj".
+        let (status, diag) = classify_health_429(Some(86400), Some(3));
+        assert_eq!(status, "free_tier_exhausted");
+        let diag = diag.expect("quota diagnostics must be attached");
+        assert_eq!(diag.get("retry_after").and_then(|v| v.as_u64()), Some(86400));
+        assert_eq!(diag.get("limit").and_then(|v| v.as_u64()), Some(3));
+        assert_eq!(
+            diag.get("period").and_then(|v| v.as_str()),
+            Some("rolling_7d"),
+            "period defaults to rolling_7d (only policy v0.4.0 ships)",
+        );
+    }
+
+    #[test]
+    fn classify_health_429_with_only_retry_after_still_quota() {
+        // Defensive: if the server forgets X-Quota-Limit but sets
+        // Retry-After, we still classify as quota exhaustion because
+        // the global RPM limit (P0-9) never sets X-Quota-Reset-After.
+        let (status, diag) = classify_health_429(Some(60), None);
+        assert_eq!(status, "free_tier_exhausted");
+        let diag = diag.expect("partial quota diagnostics still attached");
+        assert_eq!(diag.get("retry_after").and_then(|v| v.as_u64()), Some(60));
+        assert!(
+            diag.get("limit").is_none(),
+            "absent header must not synthesize a phantom limit",
+        );
+    }
+
+    #[test]
+    fn classify_health_429_without_any_quota_header_falls_back_to_rate_limited() {
+        // No quota tagging → this is the existing P0-9 global RPM
+        // rate-limit. Splash UI keeps its v0.3.x behaviour (status pill,
+        // no modal). Backward compatible with servers that haven't
+        // shipped P0-12 yet.
+        let (status, diag) = classify_health_429(None, None);
+        assert_eq!(status, "rate_limited");
+        assert!(diag.is_none());
+    }
 }

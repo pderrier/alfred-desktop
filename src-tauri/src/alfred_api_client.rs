@@ -223,6 +223,20 @@ fn default_sleep(d: Duration) {
 /// One-shot HTTP attempt — surfaces 429 with parsed `Retry-After` header
 /// so the retry layer can choose its sleep budget. All other outcomes
 /// collapse into the existing `map_api_error` classification.
+///
+/// v0.4.0 (P0-13): the 429 path now reads the response body so the
+/// `error` field can distinguish:
+/// - `rate_limited` → retryable transient → `RateLimited { retry_after_secs }`
+/// - `free_tier_exhausted` → permanent until quota slides → `Err(...)`
+///   surfaced immediately so the retry loop never wastes sleep budget
+///   on a condition the user must address (upgrade) rather than wait
+///   out a few seconds. See `docs/monetization-architecture.md` for the
+///   server-side semantics.
+///
+/// Same body-aware split for 401: a `run_session_invalid` is distinct
+/// from a hard auth failure (HMAC mismatch / missing client hash) — the
+/// caller can surface a "session expired, click Run again" hint instead
+/// of the generic "API unauthorized" message.
 fn api_get_once(path: &str, timeout: u64) -> ApiGetOutcome {
     let base = match api_url() {
         Some(u) => u,
@@ -236,12 +250,86 @@ fn api_get_once(path: &str, timeout: u64) -> ApiGetOutcome {
             Err(e) => ApiGetOutcome::Err(anyhow!("alfred_api_parse_failed:{e}")),
         },
         Err(ureq::Error::Status(429, resp)) => {
+            // Read header BEFORE consuming the body — `into_string()` takes
+            // self so the response is gone afterwards.
             let retry_after_secs = resp
                 .header("Retry-After")
                 .and_then(|v| v.trim().parse::<u64>().ok());
-            ApiGetOutcome::RateLimited { retry_after_secs }
+            let body = resp.into_string().unwrap_or_default();
+            let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            if let Some(structured) = classify_429_body(&parsed, retry_after_secs) {
+                // Quota exhaustion is NOT a transient error — surface it
+                // immediately so `api_get_with_retry` doesn't burn its
+                // budget waiting for a condition that won't resolve.
+                ApiGetOutcome::Err(anyhow!("{structured}"))
+            } else {
+                ApiGetOutcome::RateLimited { retry_after_secs }
+            }
+        }
+        Err(ureq::Error::Status(401, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            ApiGetOutcome::Err(anyhow!("{}", classify_401_body(&parsed)))
         }
         Err(e) => ApiGetOutcome::Err(map_api_error(e)),
+    }
+}
+
+/// Classify a 429 response body. Returns:
+/// - `Some(message)` when the body identifies a non-retryable quota
+///   exhaustion (`error == "free_tier_exhausted"`). The message follows
+///   the colon-delimited contract `alfred_free_tier_exhausted:{retry_after}:{limit}:{period}`
+///   so the JS layer's `inferCodedErrorFromText` regex (extended for
+///   structured codes in v0.4.0) can parse out the params for the
+///   upgrade modal.
+/// - `None` when the body says `rate_limited` or is empty/unparseable —
+///   the caller falls through to the existing retry path. We don't
+///   raise an error on missing fields because the server may be older
+///   than the desktop client; missing fields just mean "no extra hint".
+///
+/// `retry_after_header` is the parsed `Retry-After` header (caller
+/// already extracted it). When the body field `retry_after` is missing
+/// or invalid we fall back to the header, then to `0`. Either way the
+/// modal renders something — never a `NaN`/`null` placeholder.
+pub(crate) fn classify_429_body(body: &Value, retry_after_header: Option<u64>) -> Option<String> {
+    let code = body.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    if code != "free_tier_exhausted" {
+        return None;
+    }
+    let retry_after = body
+        .get("retry_after")
+        .and_then(|v| v.as_u64())
+        .or(retry_after_header)
+        .unwrap_or(0);
+    let limit = body
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let period = body
+        .get("period")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("rolling_7d");
+    Some(format!(
+        "alfred_free_tier_exhausted:{retry_after}:{limit}:{period}"
+    ))
+}
+
+/// Classify a 401 response body. Returns:
+/// - `"alfred_run_session_invalid"` when the body identifies an expired
+///   or absent run-session token (v0.4.0 P0-11). This is recoverable —
+///   the desktop just needs to call `/run/start` again to get a fresh
+///   session. The JS layer can show a soft hint rather than the global
+///   "API unauthorized" modal.
+/// - `"alfred_api_unauthorized"` otherwise (HMAC mismatch, missing
+///   `X-Client-Hash`, or an older server that doesn't set the body
+///   field). Same wire shape as v0.3.x so existing callers keep working.
+pub(crate) fn classify_401_body(body: &Value) -> &'static str {
+    let code = body.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    if code == "run_session_invalid" {
+        "alfred_run_session_invalid"
+    } else {
+        "alfred_api_unauthorized"
     }
 }
 
@@ -666,10 +754,15 @@ fn urlenc(s: &str) -> String {
         .collect()
 }
 
+/// Classify residual ureq errors after `api_get_once` has already peeled
+/// off 401 and 429 (which need body-aware handling for v0.4.0 quota /
+/// session codes). What lands here is the non-status transport tail
+/// (timeouts, DNS, TLS) plus any non-401/429 HTTP status (4xx other than
+/// auth, 5xx). Keep the colon-delimited shape (`alfred_api_http_error:<code>`)
+/// because downstream classifiers in `enrichment::classify_api_error`
+/// regex on that prefix.
 fn map_api_error(e: ureq::Error) -> anyhow::Error {
     match &e {
-        ureq::Error::Status(401, _) => anyhow!("alfred_api_unauthorized"),
-        ureq::Error::Status(429, _) => anyhow!("alfred_api_rate_limited"),
         ureq::Error::Status(code, _) => anyhow!("alfred_api_http_error:{code}"),
         _ => anyhow!("alfred_api_request_failed:{e}"),
     }
@@ -984,5 +1077,102 @@ mod tests {
         let body = serde_json::Value::Null;
         let err = classify_run_start_429(body).expect_err("empty body must Err");
         assert_eq!(err.to_string(), "alfred_api_rate_limited");
+    }
+
+    // ── 429 / 401 body classification (v0.4.0 P0-13) ────────────────
+
+    #[test]
+    fn classify_429_body_detects_free_tier_exhausted_with_full_payload() {
+        // Server-side P0-12 emits this exact envelope on quota exhaustion
+        // (see docs/monetization-architecture.md). The desktop must surface
+        // ALL three params (retry_after, limit, period) so the modal can
+        // render "limite 3 / 7 jours, reset dans Xj" without re-querying.
+        let body = serde_json::json!({
+            "error": "free_tier_exhausted",
+            "retry_after": 86400,
+            "runs_this_week": 3,
+            "limit": 3,
+            "period": "rolling_7d"
+        });
+        let classified = classify_429_body(&body, None);
+        assert_eq!(
+            classified.as_deref(),
+            Some("alfred_free_tier_exhausted:86400:3:rolling_7d"),
+            "structured code must encode retry_after:limit:period in order"
+        );
+    }
+
+    #[test]
+    fn classify_429_body_falls_back_to_header_when_body_retry_after_missing() {
+        // Defensive: if the server forgets `retry_after` in the body but
+        // sets the standard HTTP header, use the header — the modal still
+        // needs *something* to compute "reset in Xj".
+        let body = serde_json::json!({
+            "error": "free_tier_exhausted",
+            "limit": 3,
+            "period": "rolling_7d"
+        });
+        let classified = classify_429_body(&body, Some(43200));
+        assert_eq!(
+            classified.as_deref(),
+            Some("alfred_free_tier_exhausted:43200:3:rolling_7d"),
+        );
+    }
+
+    #[test]
+    fn classify_429_body_uses_default_period_when_missing() {
+        // Older servers might omit `period` — default to `rolling_7d`
+        // because that's the only quota policy v0.4.0 ships.
+        let body = serde_json::json!({
+            "error": "free_tier_exhausted",
+            "retry_after": 100,
+            "limit": 3
+        });
+        let classified = classify_429_body(&body, None);
+        assert_eq!(
+            classified.as_deref(),
+            Some("alfred_free_tier_exhausted:100:3:rolling_7d"),
+        );
+    }
+
+    #[test]
+    fn classify_429_body_returns_none_for_rate_limited() {
+        // The existing P0-9 global RPM rate-limit code (`rate_limited`) must
+        // NOT match — that one is retryable and stays on the transient path.
+        let body = serde_json::json!({"error": "rate_limited", "retry_after": 12});
+        assert_eq!(classify_429_body(&body, None), None);
+    }
+
+    #[test]
+    fn classify_429_body_returns_none_for_empty_or_unparseable() {
+        // An older server (or a proxy that strips bodies) might give us an
+        // empty 429. We must fall through to the retry path — assuming
+        // "rate_limited" — rather than ship a bogus modal.
+        assert_eq!(classify_429_body(&Value::Null, None), None);
+        assert_eq!(classify_429_body(&serde_json::json!({}), None), None);
+    }
+
+    #[test]
+    fn classify_401_body_detects_run_session_invalid() {
+        // P0-11 session token expired or revoked — the desktop should call
+        // /run/start to get a fresh one. Distinct from HMAC failure.
+        let body = serde_json::json!({"error": "run_session_invalid", "hint": "session expired"});
+        assert_eq!(classify_401_body(&body), "alfred_run_session_invalid");
+    }
+
+    #[test]
+    fn classify_401_body_defaults_to_unauthorized() {
+        // HMAC failure, missing X-Client-Hash, dev-mode rejection, or older
+        // server that doesn't set the body field — all map to the generic
+        // `alfred_api_unauthorized` (the v0.3.x wire shape).
+        assert_eq!(classify_401_body(&Value::Null), "alfred_api_unauthorized");
+        assert_eq!(
+            classify_401_body(&serde_json::json!({})),
+            "alfred_api_unauthorized",
+        );
+        assert_eq!(
+            classify_401_body(&serde_json::json!({"error": "unauthorized"})),
+            "alfred_api_unauthorized",
+        );
     }
 }

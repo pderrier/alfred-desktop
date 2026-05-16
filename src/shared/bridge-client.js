@@ -33,10 +33,73 @@ function isWrapperCode(code) {
   return normalized.endsWith("_local_failed") || normalized === "bridge_error";
 }
 
-function inferCodedErrorFromText(raw) {
+/**
+ * Match a v0.4.0 monetization error code carried as a colon-delimited
+ * suffix in the raw error text. Returns a structured payload the caller
+ * can hand to the upgrade modal without re-parsing.
+ *
+ * Contract (set by `alfred_api_client::api_get_once` Rust-side):
+ *   `alfred_free_tier_exhausted:{retry_after}:{limit}:{period}`
+ *   `alfred_run_session_invalid` (no payload) or `alfred_run_session_invalid:{hint}`
+ *
+ * The structured-code shape is documented in `docs/desktop-api-integration.md`
+ * and `docs/monetization-architecture.md`. Numeric fields are coerced to
+ * Number; non-numeric input degrades to `null` so the modal can still
+ * render without crashing.
+ *
+ * Exported so the splash-screen handler (app.js) can detect the code at
+ * probe time without going through `normalizeInvokeError` (the modal
+ * needs the structured fields, not just the bare code).
+ */
+export function parseStructuredErrorCode(raw) {
   const text = String(raw || "").trim();
   if (!text) {
     return null;
+  }
+  const freeTier = text.match(
+    /alfred_free_tier_exhausted(?::(-?\d+):(-?\d+):([a-z0-9_]+))?/i
+  );
+  if (freeTier) {
+    const retryAfter = Number(freeTier[1]);
+    const limit = Number(freeTier[2]);
+    return {
+      code: "alfred_free_tier_exhausted",
+      retryAfter: Number.isFinite(retryAfter) ? retryAfter : null,
+      limit: Number.isFinite(limit) ? limit : null,
+      period: freeTier[3] ? String(freeTier[3]).toLowerCase() : null
+    };
+  }
+  const sessionInvalid = text.match(/alfred_run_session_invalid(?::([^\s]+))?/i);
+  if (sessionInvalid) {
+    return {
+      code: "alfred_run_session_invalid",
+      hint: sessionInvalid[1] ? String(sessionInvalid[1]) : null
+    };
+  }
+  return null;
+}
+
+/**
+ * Extract the leading machine-readable code from raw error text.
+ *
+ * v0.4.0: structured codes (`alfred_free_tier_exhausted:...`,
+ * `alfred_run_session_invalid:...`) are recognised by `parseStructuredErrorCode`
+ * — when it matches we surface ONLY the bare code so the existing
+ * downstream wire shape stays stable. The structured params are
+ * available to callers via `parseStructuredErrorCode` directly.
+ *
+ * Exported so unit tests can pin the contract.
+ */
+export function inferCodedErrorFromText(raw) {
+  const text = String(raw || "").trim();
+  if (!text) {
+    return null;
+  }
+  // v0.4.0 P0-13: structured monetization codes — match before the
+  // generic fallback so we don't accidentally truncate the suffix.
+  const structured = parseStructuredErrorCode(text);
+  if (structured) {
+    return structured.code;
   }
   const loweredText = text.toLowerCase();
   const priorityCodes = [

@@ -1506,6 +1506,76 @@ function setThemeMode(theme) {
 
 // ── Splash + startup (delegated to app-bootstrap.js) ─────────────
 
+/**
+ * Scan a stack-health payload for the alfred-api service entry and
+ * return its quota-exhaustion envelope when status is
+ * `free_tier_exhausted` (set by health.rs::classify_health_429). Returns
+ * `null` when the service is absent, healthy, or in a different error
+ * state — the caller falls through to the normal status pill render.
+ *
+ * v0.4.0 P0-13: extracted as a pure helper so the splash-probe path
+ * can decide whether to render the upgrade modal without duplicating
+ * the payload-walking logic. Also keeps the splash from re-triggering
+ * the modal on subsequent polls — see `freeTierExhaustedModalShown`.
+ */
+function extractFreeTierExhaustion(payload) {
+  const services = Array.isArray(payload?.services) ? payload.services : [];
+  for (const service of services) {
+    if (service?.name === "alfred-api" && service?.status === "free_tier_exhausted") {
+      const diag = service.diagnostics || {};
+      return {
+        retryAfter: Number.isFinite(Number(diag.retry_after)) ? Number(diag.retry_after) : null,
+        limit: Number.isFinite(Number(diag.limit)) ? Number(diag.limit) : null,
+        period: typeof diag.period === "string" && diag.period ? diag.period : "rolling_7d"
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * Build the user-facing copy for the free-tier-exhausted upgrade modal.
+ * Returns `{title, message, hint, cta}` ready to pass to `showErrorModal`.
+ *
+ * The countdown ("reset in Xj") is computed from the `retry_after`
+ * seconds the server sent. When absent we fall back to a generic
+ * message — the modal still renders, never a `NaN`.
+ *
+ * Pure function — no DOM dependencies — so the test suite can pin the
+ * copy contract without a jsdom canvas.
+ */
+function buildFreeTierExhaustedModalCopy(envelope) {
+  const limit = envelope?.limit && envelope.limit > 0 ? envelope.limit : 3;
+  const retryAfter = envelope?.retryAfter && envelope.retryAfter > 0 ? envelope.retryAfter : null;
+  let resetClause = "Une nouvelle analyse sera disponible plus tard cette semaine.";
+  if (retryAfter !== null) {
+    const days = Math.ceil(retryAfter / 86400);
+    const hours = Math.ceil(retryAfter / 3600);
+    if (days >= 2) {
+      resetClause = `Prochaine analyse disponible dans ${days} jours.`;
+    } else if (hours >= 2) {
+      resetClause = `Prochaine analyse disponible dans ${hours} heures.`;
+    } else {
+      resetClause = "Prochaine analyse disponible sous peu.";
+    }
+  }
+  return {
+    title: "Quota atteint",
+    message: `Vous avez utilisé vos ${limit} analyses gratuites pour les 7 derniers jours. ${resetClause}`,
+    hint: "Passez en Premium (9 €/an) pour des analyses illimitées.",
+    cta: {
+      label: "Upgrade — 9€/an",
+      detail: envelope || {}
+    }
+  };
+}
+
+// One-shot guard so we don't re-trigger the modal on every health
+// poll (the splash hits this every 30s in dev mode). Reset when the
+// status flips back to healthy so a future quota exhaustion (after
+// the rolling window resets) still surfaces.
+let freeTierExhaustedModalShown = false;
+
 async function refreshHealthPill(checkAuth = false) {
   const tauriInvoke = window?.__TAURI__?.core?.invoke;
   if (!tauriInvoke) return;
@@ -1522,6 +1592,21 @@ async function refreshHealthPill(checkAuth = false) {
     }
     latestStackHealthPayload = payload;
     renderStatusPill(payload, null, null);
+
+    // v0.4.0 P0-13: surface free-tier exhaustion modal at splash time
+    // — the user shouldn't have to click Run to discover the quota
+    // is full. Modal carries the structured envelope so the (future)
+    // P0-15 upgrade flow can pick it up via the dispatched event.
+    const exhaustion = extractFreeTierExhaustion(payload);
+    if (exhaustion && !freeTierExhaustedModalShown) {
+      const copy = buildFreeTierExhaustedModalCopy(exhaustion);
+      showErrorModal(copy.title, copy.message, copy.hint, copy.cta);
+      freeTierExhaustedModalShown = true;
+    } else if (!exhaustion) {
+      // Reset so a re-exhaustion after a paid upgrade lapse can
+      // re-fire the modal in the same session.
+      freeTierExhaustedModalShown = false;
+    }
   } catch {
     latestStackHealthPayload = { status: "unreachable", ok: false, services: [] };
     renderStatusPill(latestStackHealthPayload, null, null);
@@ -1532,6 +1617,24 @@ function isApiHealthy() {
   if (!latestStackHealthPayload) return true; // unknown = assume ok
   const status = latestStackHealthPayload.status || "unknown";
   return status === "healthy" || status === "degraded";
+}
+
+// v0.4.0 P0-13: stub listener for the upgrade-requested event the
+// error modal dispatches when the user clicks "Upgrade — 9€/an". The
+// real LS overlay integration is P0-15; until then we show a toast
+// so the click feels acknowledged rather than dead. The listener
+// is intentionally idempotent (no de-dup needed) — addEventListener
+// is called once at module load, never per-modal.
+//
+// REMOVE THIS STUB when P0-15 ships `upgrade-view.js` and wires the
+// listener there. See `docs/plans/po-plan-2026-05.md#P0-15`.
+if (typeof window !== "undefined") {
+  window.addEventListener("alfred://upgrade-requested", () => {
+    showToast(
+      "Lemon Squeezy checkout coming soon — Premium activation lands in v0.4.0 (P0-15).",
+      "info"
+    );
+  });
 }
 
 const bootstrap = initBootstrap({

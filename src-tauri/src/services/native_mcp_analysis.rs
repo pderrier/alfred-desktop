@@ -117,15 +117,31 @@ pub fn line_memory_reset_for_tests() {
 /// Test-only wrapper around the private `sync_line_memory` so unit tests can
 /// exercise the v0.3 #22 canonical-key dedup contract without going through
 /// the full codex/native batch dispatch.
+///
+/// v0.3.3 P0-8: the price argument is now `Option<(price, stale)>` to pin the
+/// contract that `current_price=0` must never be persisted. Tests pass `None`
+/// for the "no source available" case.
 #[cfg(test)]
 pub fn sync_line_memory_for_test(
     run_id: &str,
     ticker: &str,
     resolved_symbol: Option<&str>,
     rec: &Value,
-    current_price: f64,
+    current_price: Option<(f64, bool)>,
 ) {
     sync_line_memory(run_id, ticker, resolved_symbol, rec, current_price);
+}
+
+/// Test-only wrapper around `resolve_current_price` so unit tests can exercise
+/// the v0.3.3 P0-8 fallback chain without faking the full run-state.
+#[cfg(test)]
+pub fn resolve_current_price_for_test(
+    position: Option<&Value>,
+    market_entry: Option<&Value>,
+    technical_snapshot: Option<&Value>,
+    previous_price: Option<f64>,
+) -> Option<(f64, bool)> {
+    resolve_current_price(position, market_entry, technical_snapshot, previous_price)
 }
 
 /// Test-only alias for `line_memory_read` to keep test naming consistent
@@ -230,8 +246,16 @@ fn merge_mcp_results(run_id: &str, data_dir: &str) {
                         // Sync line memory for codex mode (V2 schema).
                         // v0.3 (#22): look up resolved_symbol from the position
                         // row so cross-account dups collapse under canonical_key.
-                        let price = extract_market_price_from_run_state(data_path, run_id, ticker);
+                        // v0.3.3 P0-8: route through resolve_current_price_from_state
+                        // so the 4-step fallback chain populates current_price
+                        // rather than relying on market-row only.
                         let resolved_owned = lookup_resolved_symbol_from_state(data_path, run_id, ticker);
+                        let price = resolve_current_price_from_state(
+                            data_path,
+                            run_id,
+                            ticker,
+                            resolved_owned.as_deref(),
+                        );
                         sync_line_memory(run_id, ticker, resolved_owned.as_deref(), &rec, price);
                     }
                     merged_count += 1;
@@ -631,7 +655,159 @@ pub(crate) fn resolve_line_memory_key<'a>(store: &'a Value, raw_ticker: &str) ->
 /// so cross-account duplicates of the same security share a single entry.
 /// `resolved_symbol` may be empty for tickers without ISIN resolution; in that
 /// case the key falls back to the uppercased ticker (legacy shape).
-fn sync_line_memory(run_id: &str, ticker: &str, resolved_symbol: Option<&str>, rec: &Value, current_price: f64) {
+/// v0.3.3 P0-8 — resolve a usable `current_price` for a ticker via a four-step
+/// fallback chain. NEVER returns `Some(0.0)` — a zero price has no measurable
+/// drift and the scorecard treats it as "no data", so persisting 0 would mask
+/// the failure. Returns `None` when every source is empty/zero: callers MUST
+/// leave the field absent rather than writing 0.
+///
+/// Fallback order (P1 covers ~99% of cases in practice):
+///   P1 — `portfolio.positions[i].prix_actuel` when > 0
+///        Finary always populates it; priced CSVs and backfilled CSVs too.
+///   P2 — `market[ticker].spot` (or `price`/`last_price`/`cours`/`prix_actuel`)
+///        when > 0 AND the source is real (not the `"none"` PRU fallback).
+///   P3 — derived from technicals: `high_52w * (1 + current_vs_high_52w_pct / 100)`
+///        when both indicators are present and positive.
+///   P4 — last-known-good (previous run's `current_price`) with `stale=true`.
+///
+/// The boolean component of the tuple flags P4 (stale = `true`); P1-P3 are
+/// considered fresh.
+pub(crate) fn resolve_current_price(
+    position: Option<&Value>,
+    market_entry: Option<&Value>,
+    technical_snapshot: Option<&Value>,
+    previous_price: Option<f64>,
+) -> Option<(f64, bool)> {
+    fn as_f64_loose(v: Option<&Value>) -> Option<f64> {
+        match v {
+            Some(Value::Number(n)) => n.as_f64(),
+            Some(Value::String(s)) => s.trim().replace(',', ".").parse::<f64>().ok(),
+            _ => None,
+        }
+    }
+    fn positive(v: Option<f64>) -> Option<f64> {
+        v.filter(|x| x.is_finite() && *x > 0.0)
+    }
+
+    // P1 — portfolio prix_actuel
+    if let Some(p) = position.and_then(|p| as_f64_loose(p.get("prix_actuel"))) {
+        if let Some(p) = positive(Some(p)) {
+            return Some((p, false));
+        }
+    }
+
+    // P2 — market spot, guarded by source != "none"
+    if let Some(market) = market_entry {
+        let source = market
+            .get("source")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if crate::native_collection_helpers::is_real_market_source(source) {
+            let spot = market
+                .get("spot")
+                .or_else(|| market.get("price"))
+                .or_else(|| market.get("last_price"))
+                .or_else(|| market.get("cours"))
+                .or_else(|| market.get("prix_actuel"));
+            if let Some(p) = positive(as_f64_loose(spot)) {
+                return Some((p, false));
+            }
+        }
+    }
+
+    // P3 — derive from technicals
+    if let Some(indicators) = technical_snapshot.and_then(|t| t.get("indicators")) {
+        let high = positive(as_f64_loose(indicators.get("high_52w")));
+        let from_high = as_f64_loose(indicators.get("current_vs_high_52w_pct"));
+        if let (Some(h), Some(pct)) = (high, from_high) {
+            let derived = h * (1.0 + pct / 100.0);
+            if let Some(p) = positive(Some(derived)) {
+                return Some((p, false));
+            }
+        }
+    }
+
+    // P4 — last-known-good
+    if let Some(p) = positive(previous_price) {
+        return Some((p, true));
+    }
+
+    None
+}
+
+/// Wrap `resolve_current_price` so it can be driven from the run-state cache
+/// (codex batch path: only `data_dir + run_id + ticker` are available at merge
+/// time). Pulls `portfolio.positions[ticker]`, `market[ticker]`,
+/// `technicals[ticker]`, and the previous run's `price_tracking.current_price`
+/// from cached line-memory, then defers to `resolve_current_price`.
+pub(crate) fn resolve_current_price_from_state(
+    data_dir: &std::path::Path,
+    run_id: &str,
+    ticker: &str,
+    resolved_symbol: Option<&str>,
+) -> Option<(f64, bool)> {
+    let ticker_upper = ticker.trim().to_uppercase();
+    if ticker_upper.is_empty() {
+        return None;
+    }
+    let state = crate::run_state_cache::load(data_dir, run_id).ok()?;
+
+    let position = state
+        .get("portfolio")
+        .and_then(|p| p.get("positions"))
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .find(|row| {
+            row.get("ticker")
+                .and_then(|v| v.as_str())
+                .map(|t| t.trim().eq_ignore_ascii_case(&ticker_upper))
+                .unwrap_or(false)
+        })
+        .cloned();
+
+    let ticker_lower = ticker_upper.to_lowercase();
+    let market_entry = state
+        .get("market")
+        .and_then(|m| m.get(ticker_upper.as_str()).or_else(|| m.get(ticker_lower.as_str())))
+        .cloned();
+
+    let technical_snapshot = state
+        .get("technicals")
+        .and_then(|t| t.get(ticker_upper.as_str()).or_else(|| t.get(ticker_lower.as_str())))
+        .cloned();
+
+    let previous_price = {
+        let store = line_memory_read();
+        let entry = read_line_memory_entry(&store, &ticker_upper, resolved_symbol);
+        entry
+            .get("price_tracking")
+            .and_then(|pt| pt.get("current_price"))
+            .and_then(|v| v.as_f64())
+            .filter(|p| p.is_finite() && *p > 0.0)
+    };
+
+    resolve_current_price(
+        position.as_ref(),
+        market_entry.as_ref(),
+        technical_snapshot.as_ref(),
+        previous_price,
+    )
+}
+
+/// Sync a validated recommendation into the persistent line-memory store.
+///
+/// v0.3.3 P0-8: `current_price` is `Option<(price, stale)>`. `None` means "no
+/// source produced a usable price" — `current_price` is left absent in the
+/// persisted `price_tracking` (NEVER 0). `Some((p, true))` means we kept the
+/// last-known-good and the UI surfaces a staleness marker.
+fn sync_line_memory(
+    run_id: &str,
+    ticker: &str,
+    resolved_symbol: Option<&str>,
+    rec: &Value,
+    current_price: Option<(f64, bool)>,
+) {
     let ticker = ticker.trim().to_uppercase();
     if ticker.is_empty() { return; }
     let canonical_key = canonical_line_memory_key(&ticker, resolved_symbol);
@@ -653,12 +829,24 @@ fn sync_line_memory(run_id: &str, ticker: &str, resolved_symbol: Option<&str>, r
     let conviction = as_str(rec.get("conviction"));
     let synthese = as_str(rec.get("synthese"));
 
+    // For signal_history.price_at_signal we want the freshest non-stale value
+    // (so an analysis dated today is anchored to today's market), but never 0.
+    // When even the stale fallback is empty, omit the anchor by writing null —
+    // downstream scorecard already gates on `price_at_signal > 0`.
+    let (price_value, price_is_stale) = match current_price {
+        Some((p, s)) => (Some(p), s),
+        None => (None, false),
+    };
+    let signal_anchor_price: Value = price_value
+        .map(|p| json!(p))
+        .unwrap_or(Value::Null);
+
     // ── V2: signal_history (dedup same-day same-signal, else prepend, cap at 10) ──
     let new_signal_entry = json!({
         "date": today,
         "signal": signal,
         "conviction": conviction,
-        "price_at_signal": current_price,
+        "price_at_signal": signal_anchor_price,
         "run_id": run_id,
     });
 
@@ -690,7 +878,7 @@ fn sync_line_memory(run_id: &str, ticker: &str, resolved_symbol: Option<&str>, r
     // ── V2: trend (computed from last 3 signal_history entries) ─────
 
     // ── V2: price_tracking (accuracy vs previous signal) ───────────
-    let price_tracking = compute_price_tracking(&current, current_price, &signal);
+    let price_tracking = compute_price_tracking(&current, price_value, price_is_stale, &signal);
 
     // ── Deep news fields (preserved across V1→V2) ──────────────────
     let deep_news_summary = {
@@ -722,10 +910,11 @@ fn sync_line_memory(run_id: &str, ticker: &str, resolved_symbol: Option<&str>, r
         .collect();
 
     // Bug B follow-up — clear the zero-price repair flag as soon as a real
-    // price comes in. If the new run also has current_price == 0, carry the
-    // flag forward so the next prompt build still suppresses the bogus
-    // "prix: 0.00€" line.
-    let price_data_unavailable = if current_price > 0.0 {
+    // fresh price comes in. If the new run has no fresh price (None or stale),
+    // carry the flag forward so the next prompt build still suppresses the
+    // bogus "prix: 0.00€" line.
+    let has_fresh_price = matches!(current_price, Some((_, false)));
+    let price_data_unavailable = if has_fresh_price {
         false
     } else {
         current.get("price_data_unavailable")
@@ -1094,8 +1283,8 @@ fn build_memory_narrative(
 /// entry has `price_at_signal == 0.0` but the existing head carries a
 /// non-zero price, KEEP the existing head's `price_at_signal`. This guards
 /// against a fresh run where the PRU-fallback chain (see
-/// `apply_pru_fallback_to_market_row` /
-/// `extract_market_price_from_run_state`) produced a zero current price;
+/// `apply_pru_fallback_to_market_row` / `resolve_current_price`) produced no
+/// usable current price;
 /// the previously-recorded real price is more truthful than the regression
 /// to zero. `run_id`/`conviction` from the new entry are still adopted.
 pub(crate) fn build_signal_history(new_entry: &Value, prior: Option<&Vec<Value>>) -> Vec<Value> {
@@ -1228,7 +1417,23 @@ fn is_bullish_signal(signal: &str) -> bool {
 }
 
 /// Compute price_tracking from previous signal data and current price.
-fn compute_price_tracking(current: &Value, current_price: f64, current_signal: &str) -> Value {
+/// Compute the `price_tracking` block for line-memory.
+///
+/// v0.3.3 P0-8: `current_price` is `Option<f64>` and the `stale` flag is
+/// surfaced as a sibling field. When no fresh OR stale price is available, the
+/// block's `current_price` field is `null` rather than `0.0` — the scorecard
+/// gates on `> 0`, and writing 0 would silently mark every signal "pending".
+fn compute_price_tracking(
+    current: &Value,
+    current_price: Option<f64>,
+    stale: bool,
+    current_signal: &str,
+) -> Value {
+    let price_value: Value = current_price
+        .filter(|p| p.is_finite() && *p > 0.0)
+        .map(|p| json!(p))
+        .unwrap_or(Value::Null);
+
     // Get the most recent signal_history entry from the PREVIOUS run
     let prev_entry = current.get("signal_history")
         .and_then(|v| v.as_array())
@@ -1237,26 +1442,28 @@ fn compute_price_tracking(current: &Value, current_price: f64, current_signal: &
     if let Some(prev) = prev_entry {
         let prev_signal = prev.get("signal").and_then(|v| v.as_str()).unwrap_or("");
         let prev_date = prev.get("date").and_then(|v| v.as_str()).unwrap_or("");
-        let price_at_signal = prev.get("price_at_signal").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let prev_anchor = prev.get("price_at_signal").and_then(|v| v.as_f64()).unwrap_or(0.0);
 
-        let return_pct = if price_at_signal > 0.0 && current_price > 0.0 {
-            ((current_price - price_at_signal) / price_at_signal * 100.0 * 10.0).round() / 10.0
-        } else {
-            0.0
-        };
-
-        let accuracy = if price_at_signal > 0.0 && current_price > 0.0 {
-            let positive_return = return_pct > 0.0;
-            if is_bullish_signal(prev_signal) == positive_return { "correct" } else { "incorrect" }
-        } else {
-            "unknown"
+        let (return_pct, accuracy) = match current_price {
+            Some(p) if p > 0.0 && prev_anchor > 0.0 => {
+                let r = ((p - prev_anchor) / prev_anchor * 100.0 * 10.0).round() / 10.0;
+                let positive_return = r > 0.0;
+                let acc = if is_bullish_signal(prev_signal) == positive_return {
+                    "correct"
+                } else {
+                    "incorrect"
+                };
+                (r, acc)
+            }
+            _ => (0.0, "unknown"),
         };
 
         json!({
             "last_signal": prev_signal,
             "last_signal_date": prev_date,
-            "price_at_signal": price_at_signal,
-            "current_price": current_price,
+            "price_at_signal": prev_anchor,
+            "current_price": price_value,
+            "stale": stale,
             "return_since_signal_pct": return_pct,
             "signal_accuracy": accuracy,
         })
@@ -1265,8 +1472,9 @@ fn compute_price_tracking(current: &Value, current_price: f64, current_signal: &
         json!({
             "last_signal": current_signal,
             "last_signal_date": &chrono::Utc::now().format("%Y-%m-%d").to_string(),
-            "price_at_signal": current_price,
-            "current_price": current_price,
+            "price_at_signal": price_value.clone(),
+            "current_price": price_value,
+            "stale": stale,
             "return_since_signal_pct": 0.0,
             "signal_accuracy": "first_analysis",
         })
@@ -1274,27 +1482,6 @@ fn compute_price_tracking(current: &Value, current_price: f64, current_signal: &
 }
 
 // ── Line memory helpers ─────────────────────────────────────────
-
-/// Extract market price for a ticker from the cached run state.
-/// Used by codex path where line_data isn't directly available.
-///
-/// Sources tagged `"none"` are PRU fallbacks written by
-/// `apply_pru_fallback_to_market_row` when every provider failed. They must
-/// NOT be treated as a real current price — propagating them into
-/// `sync_line_memory` would clear the `price_data_unavailable` flag and
-/// poison `signal_history[].price_at_signal` with the cost basis. Return
-/// `0.0` so the caller carries the flag forward instead.
-pub(crate) fn extract_market_price_from_run_state(
-    data_dir: &std::path::Path,
-    run_id: &str,
-    ticker: &str,
-) -> f64 {
-    let ticker_upper = ticker.to_uppercase();
-    let Ok(state) = crate::run_state_cache::load(data_dir, run_id) else {
-        return 0.0;
-    };
-    extract_market_price_from_state_value(&state, &ticker_upper)
-}
 
 /// Look up `resolved_symbol` for `ticker` from the cached run state's
 /// `portfolio.positions`. Returns `None` when the run state can't be loaded,
@@ -1330,37 +1517,6 @@ pub(crate) fn lookup_resolved_symbol_from_state_value(state: &Value, ticker: &st
         .and_then(|row| row.get("resolved_symbol").and_then(|v| v.as_str()))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-}
-
-/// Pure-function core of `extract_market_price_from_run_state`, exposed for
-/// unit tests so we don't have to round-trip through the run-state cache.
-pub(crate) fn extract_market_price_from_state_value(state: &Value, ticker_upper: &str) -> f64 {
-    fn as_f64_loose(v: Option<&Value>) -> Option<f64> {
-        match v {
-            Some(Value::Number(n)) => n.as_f64(),
-            Some(Value::String(s)) => s.trim().replace(',', ".").parse::<f64>().ok(),
-            _ => None,
-        }
-    }
-    let Some(market_row) = state.get("market").and_then(|m| m.get(ticker_upper)) else {
-        return 0.0;
-    };
-    let source = market_row
-        .get("source")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    if !crate::native_collection_helpers::is_real_market_source(source) {
-        // PRU fallback or missing source — refuse to expose this as a price.
-        return 0.0;
-    }
-    as_f64_loose(
-        market_row
-            .get("price")
-            .or_else(|| market_row.get("last_price"))
-            .or_else(|| market_row.get("cours"))
-            .or_else(|| market_row.get("prix_actuel")),
-    )
-    .unwrap_or(0.0)
 }
 
 fn as_str(v: Option<&Value>) -> String {
@@ -1432,30 +1588,40 @@ fn json_str_array(v: Option<&Value>) -> impl Iterator<Item = &str> {
 
 /// Persist extracted fundamentals, shared insights, deep news, and line memory from the recommendation.
 fn persist_line_extras(data_dir: &std::path::Path, run_id: &str, ticker: &str, line_data: &Value, rec: &Value) {
-    fn as_f64_loose(v: Option<&Value>) -> Option<f64> {
-        match v {
-            Some(Value::Number(n)) => n.as_f64(),
-            Some(Value::String(s)) => s.trim().replace(',', ".").parse::<f64>().ok(),
-            _ => None,
-        }
-    }
-    // Extract current market price for V2 signal tracking
-    let current_price = line_data.get("market_data")
-        .and_then(|m| as_f64_loose(m.get("price")
-            .or_else(|| m.get("last_price"))
-            .or_else(|| m.get("cours"))
-            .or_else(|| m.get("prix_actuel"))))
-        .unwrap_or(0.0);
-    // Sync line memory (cross-run persistent state, V2 schema).
-    // v0.3 (#22): resolved_symbol drives canonical key — when present, cross-
-    // account dups (PEA STMPA + CTO STM.MI) collapse into a single by_ticker
-    // entry keyed by the resolved Yahoo symbol.
+    // v0.3.3 P0-8: resolve current price via the four-step fallback chain so
+    // line-memory never carries a stale 0.0. Previous code read only
+    // market_data and wrote 0 when it was missing.
     let resolved_symbol = line_data
         .get("position")
         .and_then(|p| p.get("resolved_symbol"))
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty());
+
+    let previous_price = {
+        let store = line_memory_read();
+        let entry = read_line_memory_entry(&store, ticker, resolved_symbol);
+        entry
+            .get("price_tracking")
+            .and_then(|pt| pt.get("current_price"))
+            .and_then(|v| v.as_f64())
+            .filter(|p| p.is_finite() && *p > 0.0)
+    };
+
+    let position = line_data.get("position");
+    let market_data = line_data.get("market_data");
+    let technical_snapshot = line_data.get("technical_snapshot");
+    let current_price = resolve_current_price(
+        position,
+        market_data,
+        technical_snapshot,
+        previous_price,
+    );
+
+    // Sync line memory (cross-run persistent state, V2 schema).
+    // v0.3 (#22): resolved_symbol drives canonical key — when present, cross-
+    // account dups (PEA STMPA + CTO STM.MI) collapse into a single by_ticker
+    // entry keyed by the resolved Yahoo symbol.
     sync_line_memory(run_id, ticker, resolved_symbol, rec, current_price);
     let isin = line_data.get("position")
         .and_then(|p| p.get("isin"))

@@ -324,6 +324,84 @@ export function renderTechnicalIndicatorRows(snapshot) {
 }
 
 /**
+ * Render the Signal Accuracy scorecard from a `data` payload returned by
+ * `get_signal_scorecard_local`. Pure function: takes the raw JSON, returns an
+ * HTML string. Exported for unit tests.
+ *
+ * v0.3.3 P0-8 contract:
+ *  - Column header reads "Price drift" (not "Return") — disambiguates from
+ *    P&L. The value is `(current - price_at_signal) / price_at_signal`, not
+ *    an investment return.
+ *  - Icon per `accuracy`:
+ *      "correct"    → ✅
+ *      "incorrect"  → ❌
+ *      "pending"    → ➖  (tooltip: "éval dans N jours" if pending_days_remaining)
+ *      "neutral"    → 👁️ when `kind === "watch"` (SURVEILLANCE)
+ *                   → ➖ otherwise
+ *  - Watch signals with `flag === "watch_missed_drop"` render ⚠️ next to the
+ *    icon — visible regret marker for SURVEILLANCE that missed a >5% drop.
+ *  - `price_stale === true` on a signal renders a 🕒 marker next to the price.
+ */
+export function renderSignalScorecardHtml(data) {
+  if (!data || !Array.isArray(data.signals) || data.signals.length === 0) {
+    return "";
+  }
+  const trendIcon = data.trend === "improving" ? "↗️"
+    : data.trend === "declining" ? "↘️"
+    : "➡️";
+  const pct = Number.isFinite(data.overall_accuracy_pct) ? data.overall_accuracy_pct : 0;
+  const barColor = pct >= 70 ? "#2a9d8f" : pct >= 40 ? "#e9c46a" : "#e76f51";
+
+  let html = `<h3 class="scorecard-title">Signal Accuracy</h3>`;
+  html += `<div class="scorecard-accuracy-bar"><div style="width:${pct}%;background:${barColor}"></div></div>`;
+  const scored = Number.isFinite(data.scored_count) ? data.scored_count : 0;
+  const correct = Number.isFinite(data.correct_count) ? data.correct_count : 0;
+  html += `<div class="scorecard-summary">${pct}% accurate (${correct}/${scored} scored) ${trendIcon} ${data.trend || "stable"}</div>`;
+  html += `<table class="scorecard-table"><thead><tr><th>Date</th><th>Signal</th><th>Price</th><th title="Drift = (current − price@signal) / price@signal. Not an investment return.">Price drift</th><th></th></tr></thead><tbody>`;
+
+  for (const s of data.signals.slice(0, 8)) {
+    const accuracy = s.accuracy || "neutral";
+    const kind = s.kind || "";
+    let icon;
+    if (accuracy === "correct") icon = "✅";
+    else if (accuracy === "incorrect") icon = "❌";
+    else if (accuracy === "pending") icon = "➖";
+    else if (kind === "watch") icon = "\u{1F441}️"; // 👁️
+    else icon = "➖";
+
+    if (s.flag === "watch_missed_drop") {
+      icon = `⚠️${icon}`; // ⚠️ + base icon
+    }
+
+    let titleAttr = "";
+    if (accuracy === "pending") {
+      const days = Number.isFinite(s.pending_days_remaining) ? s.pending_days_remaining : null;
+      const tip = days != null && days > 0
+        ? `Évaluation possible dans ${days} jour${days > 1 ? "s" : ""}`
+        : "En attente — laisser le marché jouer";
+      titleAttr = ` title="${tip}"`;
+    } else if (s.flag === "watch_missed_drop") {
+      titleAttr = ` title="SURVEILLANCE non suivie d'action sur une baisse marquée"`;
+    } else if (kind === "watch") {
+      titleAttr = ` title="SURVEILLANCE — l'analyste n'a pas pris position"`;
+    }
+
+    const stale = s.stale === true;
+    const priceStr = (typeof s.price_at_signal === "number" && Number.isFinite(s.price_at_signal))
+      ? s.price_at_signal.toFixed(1)
+      : "?";
+    const driftStr = (typeof s.return_pct === "number" && Number.isFinite(s.return_pct))
+      ? `${s.return_pct >= 0 ? "+" : ""}${s.return_pct.toFixed(1)}%`
+      : "—";
+    const staleMarker = stale ? ` <span class="scorecard-stale" title="Prix antérieur réutilisé — sync prix actuel a échoué ce run">\u{1F552}</span>` : "";
+    const cls = `scorecard-${accuracy}`;
+    html += `<tr class="${cls}"${titleAttr}><td>${s.date || ""}</td><td>${s.signal || ""}</td><td>${priceStr}${staleMarker}</td><td>${driftStr}</td><td>${icon}</td></tr>`;
+  }
+  html += `</tbody></table>`;
+  return html;
+}
+
+/**
  * Mapping from Yahoo exchange suffix to human-readable venue label.
  * Module-level constant so it can be reused by both the renderer and the
  * test fixtures without duplication. Add new suffixes as we encounter them
@@ -972,19 +1050,7 @@ export function initLineModal() {
       if (!invoke) { container.classList.add("hidden"); return; }
       const data = await invoke("get_signal_scorecard_local", { ticker });
       if (!data?.signals?.length) { container.classList.add("hidden"); return; }
-      const trendIcon = data.trend === "improving" ? "\u2197\uFE0F" : data.trend === "declining" ? "\u2198\uFE0F" : "\u27A1\uFE0F";
-      const barColor = data.overall_accuracy_pct >= 70 ? "#2a9d8f" : data.overall_accuracy_pct >= 40 ? "#e9c46a" : "#e76f51";
-      let html = `<h3 class="scorecard-title">Signal Accuracy</h3>`;
-      html += `<div class="scorecard-accuracy-bar"><div style="width:${data.overall_accuracy_pct}%;background:${barColor}"></div></div>`;
-      html += `<div class="scorecard-summary">${data.overall_accuracy_pct}% accurate (${data.correct_count}/${data.scored_count} scored) ${trendIcon} ${data.trend}</div>`;
-      html += `<table class="scorecard-table"><thead><tr><th>Date</th><th>Signal</th><th>Price</th><th>Return</th><th></th></tr></thead><tbody>`;
-      for (const s of data.signals.slice(0, 8)) {
-        const icon = s.accuracy === "correct" ? "\u2705" : s.accuracy === "incorrect" ? "\u274C" : "\u2796";
-        const cls = `scorecard-${s.accuracy}`;
-        html += `<tr class="${cls}"><td>${s.date}</td><td>${s.signal}</td><td>${s.price_at_signal?.toFixed(1) || "?"}</td><td>${s.return_pct >= 0 ? "+" : ""}${s.return_pct?.toFixed(1) || 0}%</td><td>${icon}</td></tr>`;
-      }
-      html += `</tbody></table>`;
-      container.innerHTML = html;
+      container.innerHTML = renderSignalScorecardHtml(data);
       container.classList.remove("hidden");
     } catch {
       container.classList.add("hidden");

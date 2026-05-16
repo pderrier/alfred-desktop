@@ -420,7 +420,78 @@ pub fn run_get_stale_positions() -> Result<serde_json::Value> {
     Ok(json!({ "stale_count": count, "stale_tickers": stale }))
 }
 
-// ── Signal Scorecard (Phase 3b) ──
+// ── Signal Scorecard (Phase 3b — v0.3.3 P0-8) ──
+//
+// Scorecard tuning constants. Each is documented with the "why" so future
+// edits don't drift away from product intent:
+//   * SCOREABLE_AGE_DAYS: a signal needs market time to play out. Anything
+//     < 5d old with near-zero drift is "too early to call" → "pending".
+//   * RECENT_NEAR_ZERO_RETURN_TOL: 2%. Within this band AND under the age
+//     window, the signal stays pending.
+//   * HOLD_NEUTRAL_TOL: 1%. CONSERVER between -1%/+1% is "noise", not
+//     a thesis pass or fail.
+//   * WATCH_ALERT_THRESHOLD: 5%. SURVEILLANCE that misses a drop deeper
+//     than 5% earns a `watch_missed_drop` flag — visible regret marker but
+//     not counted as incorrect (no action was taken).
+const SCOREABLE_AGE_DAYS: i64 = 5;
+const RECENT_NEAR_ZERO_RETURN_TOL: f64 = 2.0; // %
+const HOLD_NEUTRAL_TOL: f64 = 1.0; // %
+const WATCH_ALERT_THRESHOLD: f64 = 5.0; // %
+
+/// Maps an LLM signal string to a coarse semantic kind.
+///
+/// v0.3.3 P0-8: introduced to separate CONSERVER (Hold) from SURVEILLANCE
+/// (Watch) — previously both fell through to "neutral" and were never scored.
+/// The mapping is single-sourced here so the scorecard, the audit tools, and
+/// any future consumer all read the same intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalKind {
+    /// Active long: ACHAT / ACHAT_FORT / RENFORCEMENT / BUY.
+    Buy,
+    /// Active short or trim: VENTE / VENDRE / ALLEGEMENT / SELL.
+    Sell,
+    /// Active hold: CONSERVER / MAINTIEN / HOLD — analyst confirmed the
+    /// position; thesis is validated by appreciation, invalidated by drop.
+    Hold,
+    /// Watch-only: SURVEILLANCE / MONITORING / WATCH — analyst did NOT take
+    /// a position. Never counts toward accuracy; deep drops earn a regret
+    /// flag but not an "incorrect" mark.
+    Watch,
+    /// Unknown / unmapped (or empty).
+    Other,
+}
+
+pub fn classify_signal(raw: &str) -> SignalKind {
+    let upper = raw.trim().to_uppercase();
+    if upper.is_empty() {
+        return SignalKind::Other;
+    }
+    if upper.contains("ACHAT") || upper.contains("RENFORC") || upper == "BUY" {
+        return SignalKind::Buy;
+    }
+    if upper.contains("VENTE")
+        || upper.contains("VENDR")
+        || upper.contains("ALLEG")
+        || upper == "SELL"
+    {
+        return SignalKind::Sell;
+    }
+    if upper.contains("CONSERV") || upper.contains("MAINTIEN") || upper == "HOLD" {
+        return SignalKind::Hold;
+    }
+    if upper.contains("SURVEILLANCE")
+        || upper.contains("MONITOR")
+        || upper == "WATCH"
+    {
+        return SignalKind::Watch;
+    }
+    SignalKind::Other
+}
+
+#[cfg(test)]
+pub fn classify_signal_for_test(raw: &str) -> SignalKind {
+    classify_signal(raw)
+}
 
 pub fn run_get_signal_scorecard(ticker: String) -> Result<serde_json::Value> {
     fn as_f64_loose(v: Option<&serde_json::Value>) -> Option<f64> {
@@ -430,15 +501,10 @@ pub fn run_get_signal_scorecard(ticker: String) -> Result<serde_json::Value> {
             _ => None,
         }
     }
-    fn classify_signal(raw: &str) -> &'static str {
-        let upper = raw.trim().to_uppercase();
-        if upper.contains("ACHAT") || upper.contains("RENFORC") || upper == "BUY" {
-            return "buy";
-        }
-        if upper.contains("VENTE") || upper.contains("VENDR") || upper.contains("ALLEG") || upper == "SELL" {
-            return "sell";
-        }
-        "neutral"
+    fn days_between(today: &str, date: &str) -> Option<i64> {
+        let d_today = chrono::NaiveDate::parse_from_str(today, "%Y-%m-%d").ok()?;
+        let d_signal = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+        Some(d_today.signed_duration_since(d_signal).num_days())
     }
 
     let ticker = ticker.trim().to_uppercase();
@@ -486,13 +552,26 @@ pub fn run_get_signal_scorecard(ticker: String) -> Result<serde_json::Value> {
     });
     let history = &sorted_history;
 
-    // Current price from most recent signal or price_tracking
-    let current_price = entry.get("price_tracking")
-        .and_then(|pt| as_f64_loose(pt.get("current_price").or_else(|| pt.get("price_at_signal"))))
-        .or_else(|| history.first()
-            .and_then(|h| h.get("price_at_signal"))
-            .and_then(|v| as_f64_loose(Some(v))))
-        .unwrap_or(0.0);
+    // v0.3.3 P0-8: only the freshly-resolved `price_tracking.current_price`
+    // is acceptable as the "today" anchor. Falling back to
+    // `history.first().price_at_signal` would re-introduce the bug where a
+    // signal's drift is measured against itself — every recent signal would
+    // then read "0% drift, no thesis evolved" and stay incorrectly marked.
+    // When `current_price` is missing or <= 0, every signal stays pending
+    // and we log a warning (silent skip masked the production bug for weeks).
+    let current_price_opt = entry.get("price_tracking")
+        .and_then(|pt| as_f64_loose(pt.get("current_price")))
+        .filter(|p| p.is_finite() && *p > 0.0);
+    let price_is_stale = entry.get("price_tracking")
+        .and_then(|pt| pt.get("stale"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if current_price_opt.is_none() {
+        crate::debug_log(&format!(
+            "scorecard: {ticker} has no usable current_price — all signals will read as pending. \
+             This indicates `sync_line_memory` could not resolve a fresh or stale price."
+        ));
+    }
 
     // Fix 5.2/5.3: collapse contaminated legacy histories (multiple same-day
     // same-signal entries from before sync_line_memory dedup-on-write) into
@@ -504,6 +583,7 @@ pub fn run_get_signal_scorecard(ticker: String) -> Result<serde_json::Value> {
     let bucketed_history =
         crate::native_mcp_analysis::dedupe_signal_history_by_date_signal(history);
 
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let mut signals = Vec::new();
     let mut correct_dates: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut scored_dates: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -513,24 +593,48 @@ pub fn run_get_signal_scorecard(ticker: String) -> Result<serde_json::Value> {
         let conviction = sig.get("conviction").and_then(|v| v.as_str()).unwrap_or("");
         let date = sig.get("date").and_then(|v| v.as_str()).unwrap_or("");
         let price_at = as_f64_loose(sig.get("price_at_signal")).unwrap_or(0.0);
-        // Measurable return requires a non-zero anchor price — a
-        // price_at_signal == 0 is the "indisponible" repair flag, not a real
-        // datapoint, so it must not count toward scored/incorrect.
-        let has_measurable_return = price_at > 0.0 && current_price > 0.0;
+        // Measurable return requires both a non-zero anchor price AND a usable
+        // current_price. price_at_signal == 0 is the "indisponible" repair
+        // flag, not a real datapoint.
+        let has_measurable_return = price_at > 0.0 && current_price_opt.is_some();
         let return_pct = if has_measurable_return {
-            (current_price - price_at) / price_at * 100.0
+            (current_price_opt.unwrap() - price_at) / price_at * 100.0
         } else {
             0.0
         };
         let kind = classify_signal(signal);
-        let accuracy = if has_measurable_return {
-            match kind {
-                "buy" => if return_pct > 0.0 { "correct" } else { "incorrect" },
-                "sell" => if return_pct < 0.0 { "correct" } else { "incorrect" },
-                _ => "neutral",
-            }
+        let age_days = days_between(&today, date).unwrap_or(i64::MAX);
+
+        // Time-window guard: signals < SCOREABLE_AGE_DAYS old AND with
+        // near-zero drift stay "pending" — they haven't had time to play out.
+        let in_pending_window = has_measurable_return
+            && age_days < SCOREABLE_AGE_DAYS
+            && return_pct.abs() < RECENT_NEAR_ZERO_RETURN_TOL;
+
+        let mut flag: Option<&'static str> = None;
+        let accuracy: &'static str = if !has_measurable_return || in_pending_window {
+            "pending"
         } else {
-            "neutral"
+            match kind {
+                SignalKind::Buy => if return_pct > 0.0 { "correct" } else { "incorrect" },
+                SignalKind::Sell => if return_pct < 0.0 { "correct" } else { "incorrect" },
+                SignalKind::Hold => {
+                    if return_pct.abs() < HOLD_NEUTRAL_TOL {
+                        "neutral"
+                    } else if return_pct > 0.0 {
+                        "correct"
+                    } else {
+                        "incorrect"
+                    }
+                }
+                SignalKind::Watch => {
+                    if return_pct < -WATCH_ALERT_THRESHOLD {
+                        flag = Some("watch_missed_drop");
+                    }
+                    "neutral"
+                }
+                SignalKind::Other => "neutral",
+            }
         };
 
         // Count distinct dates only — defensive even though bucketed_history
@@ -544,24 +648,44 @@ pub fn run_get_signal_scorecard(ticker: String) -> Result<serde_json::Value> {
             }
         }
 
-        signals.push(json!({
+        let kind_str = match kind {
+            SignalKind::Buy => "buy",
+            SignalKind::Sell => "sell",
+            SignalKind::Hold => "hold",
+            SignalKind::Watch => "watch",
+            SignalKind::Other => "other",
+        };
+
+        let mut signal_obj = json!({
             "date": date,
             "signal": signal,
+            "kind": kind_str,
             "conviction": conviction,
             "price_at_signal": price_at,
-            "current_price": current_price,
+            "current_price": current_price_opt,
+            "stale": price_is_stale,
             "return_pct": (return_pct * 10.0).round() / 10.0,
             "accuracy": accuracy,
-        }));
+            "age_days": age_days,
+        });
+        if accuracy == "pending" {
+            let days_remaining = (SCOREABLE_AGE_DAYS - age_days).max(0);
+            signal_obj["pending_days_remaining"] = json!(days_remaining);
+        }
+        if let Some(f) = flag {
+            signal_obj["flag"] = json!(f);
+        }
+        signals.push(signal_obj);
     }
 
     let scored = scored_dates.len();
     let correct = correct_dates.len();
     let accuracy_pct = if scored > 0 { (correct as f64 / scored as f64 * 100.0).round() } else { 0.0 };
 
-    // Trend: compare recent 3 distinct-date buckets vs older. `signals` is
-    // already deduped by (date, signal), but we still walk per date to defer
-    // to dates as the natural bucket for the widget's "↘️ declining" badge.
+    // Trend: compare recent 3 distinct-date buckets vs older. Only signals
+    // that scored (correct/incorrect) count toward the trend — pending and
+    // neutral are excluded so a streak of watch/hold signals doesn't muddy
+    // the badge.
     let mut seen_recent_dates: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut recent_correct = 0usize;
     let mut recent_scored = 0usize;
@@ -571,13 +695,14 @@ pub fn run_get_signal_scorecard(ticker: String) -> Result<serde_json::Value> {
         let date = sig.get("date").and_then(|v| v.as_str()).unwrap_or("");
         let accuracy = sig.get("accuracy").and_then(|v| v.as_str()).unwrap_or("neutral");
         let is_recent = seen_recent_dates.len() < 3 || seen_recent_dates.contains(date);
+        let contributes = accuracy == "correct" || accuracy == "incorrect";
         if is_recent {
             seen_recent_dates.insert(date);
             if accuracy == "correct" { recent_correct += 1; }
-            if accuracy != "neutral" { recent_scored += 1; }
+            if contributes { recent_scored += 1; }
         } else {
             if accuracy == "correct" { older_correct += 1; }
-            if accuracy != "neutral" { older_scored += 1; }
+            if contributes { older_scored += 1; }
         }
     }
     let trend = if recent_scored < 2 || older_scored < 2 { "stable" }
@@ -596,6 +721,7 @@ pub fn run_get_signal_scorecard(ticker: String) -> Result<serde_json::Value> {
         "scored_count": scored,
         "correct_count": correct,
         "trend": trend,
+        "price_stale": price_is_stale,
     }))
 }
 

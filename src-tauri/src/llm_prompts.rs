@@ -189,6 +189,13 @@ Regles strictes:
 - Ne presente PAS les watchlist comme deja detenues
 - Si ecart strategie, le dire clairement dans synthese_marche
 
+OBLIGATIONS de remplissage (P2-7) — non negociable:
+- TU DOIS peupler `limit_price` pour chaque action LIMIT et `estimated_amount_eur`
+  pour CHAQUE action. Si la rationale mentionne un prix (ex: "Vendre 10 titres a
+  12,09 EUR"), reprends-le. JAMAIS `null` quand le prix est dans la rationale.
+- `estimated_amount_eur` = quantity x prix d'execution. JAMAIS `null` si
+  quantity et un prix existent.
+
 Reponds uniquement en JSON valide."#,
         total_value = portfolio.get("valeur_totale").and_then(|v| v.as_f64()).unwrap_or(0.0),
         total_gain = portfolio.get("plus_value_totale").and_then(|v| v.as_f64()).unwrap_or(0.0),

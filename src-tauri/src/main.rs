@@ -48,6 +48,8 @@ mod mcp_progress_relay;
 mod mcp_server;
 #[path = "services/native_mcp_analysis.rs"]
 mod native_mcp_analysis;
+#[path = "services/llm_post_processing.rs"]
+mod llm_post_processing;
 mod openai_client;
 mod paths;
 mod report;

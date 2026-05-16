@@ -11,6 +11,53 @@
  * `ui-display-utils.js::escapeHtml` (same character set).
  */
 
+/**
+ * Render the P2-6 "données partielles" badge next to the recommendation
+ * signal in the line modal KPI strip.
+ *
+ * Contract pinned by `apps/desktop-ui/test/data-quality-badge.test.js`:
+ * - `rec.data_quality === "fundamentals_missing"` → badge visible with
+ *   the warning glyph + "données partielles" label.
+ * - Any other value (null, undefined, missing key, empty string) → badge
+ *   hidden (additive UI only — never replaces the signal text).
+ *
+ * The badge is placed inside the existing `lm-kpi-signal` strong tag's
+ * containing `<span class="lm-kpi">` so layout stays unchanged. A
+ * pre-existing badge from a prior open is always cleared first
+ * (idempotent).
+ *
+ * @param {object|null} rec       Recommendation payload (may carry data_quality).
+ * @param {HTMLElement|null} signalKpiNode  The `<span class="lm-kpi">`
+ *        wrapping `#lm-kpi-signal`. Pass `null` to no-op.
+ * @returns {boolean} `true` when the badge is rendered, `false` otherwise.
+ */
+export function updateDataQualityBadge(rec, signalKpiNode) {
+  if (!signalKpiNode) return false;
+
+  // Always strip the previous badge first — idempotent open/close.
+  const existing = signalKpiNode.querySelector(".lm-data-quality-badge");
+  if (existing && existing.parentNode === signalKpiNode) {
+    signalKpiNode.removeChild(existing);
+  }
+
+  const flag = rec && typeof rec === "object" ? rec.data_quality : null;
+  if (flag !== "fundamentals_missing") {
+    return false;
+  }
+
+  const badge = document.createElement("span");
+  badge.className = "lm-data-quality-badge";
+  badge.setAttribute(
+    "title",
+    "Donnees fondamentales partielles — le signal s'appuie sur la memoire et la technique."
+  );
+  badge.setAttribute("aria-label", "Donnees partielles");
+  // Warning glyph + label — additive next to the existing signal value.
+  badge.innerHTML = `<span class="lm-data-quality-icon" aria-hidden="true">⚠</span> donnees partielles`;
+  signalKpiNode.appendChild(badge);
+  return true;
+}
+
 function escapeHtml(text) {
   return String(text || "")
     .replace(/&/g, "&amp;")

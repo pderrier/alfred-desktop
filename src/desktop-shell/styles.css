@@ -1960,7 +1960,22 @@ main {
 .lm-kpi-signal.signal-sell { background: #4a1a1a; color: #f87171; }
 .lm-kpi-signal.signal-hold { background: #3a3520; color: #fbbf24; }
 .lm-kpi-signal.signal-reinforce { background: #1a3a4a; color: #38bdf8; }
+/* P2-6: degraded data quality badge — additive next to the signal pill. */
+.lm-data-quality-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  margin-left: 0.4rem;
+  padding: 0.1rem 0.45rem;
+  border-radius: 4px;
+  background: #3a2a14;
+  color: #fbbf24;
+  font-size: 0.68rem;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  cursor: help;
 }
+.lm-data-quality-icon { font-size: 0.85rem; }
 .lm-hero {
   background: rgba(14, 24, 34, 0.92);
   border: 1px solid rgba(47, 143, 93, 0.25);

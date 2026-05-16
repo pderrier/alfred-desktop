@@ -406,7 +406,26 @@ pub fn persist_retry_global_synthesis(run_id: &str, generated_draft: &serde_json
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    let actions = enrich_actions_from_recommendations(&llm_actions, &pending_recommendations);
+    let mut actions = enrich_actions_from_recommendations(&llm_actions, &pending_recommendations);
+    // P2-7 — backfill `limit_price` and `estimated_amount_eur` from rationale.
+    // This is the SECOND funnel point (the first is `tool_validate_synthesis`
+    // in the MCP path). All non-MCP synthesis flows converge here:
+    //   - UI retry button (codex backend, command_handlers.rs:61)
+    //   - synthesis fallback in native_mcp_analysis.rs (LLM failed validation)
+    //   - MCP finalize_report (already-backfilled actions pass through idempotent)
+    // Calling the helper twice in the MCP success path is intentional and safe:
+    // `backfill_action_immediate` is idempotent (never overwrites populated values).
+    {
+        let mut actions_value = serde_json::Value::Array(actions);
+        let mutated_count =
+            crate::llm_post_processing::backfill_actions_immediates(&mut actions_value);
+        if mutated_count > 0 {
+            crate::debug_log(&format!(
+                "[p2-7] backfilled {mutated_count} action_immediate(s) at persist for run {run_id}"
+            ));
+        }
+        actions = actions_value.as_array().cloned().unwrap_or_default();
+    }
     let expected_line_ids = derive_expected_line_ids(&run_state);
     let synthesis_errors = validate_synthesis_quality(&synthese);
     let (action_errors, action_by_ticker) = validate_immediate_actions(&actions);

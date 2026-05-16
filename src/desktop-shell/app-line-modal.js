@@ -5,7 +5,7 @@
 import { escapeHtml } from "/desktop-shell/ui-display-utils.js";
 import { openChatWizard } from "/desktop-shell/app-chat-wizard.js";
 import { openDiscussionHistoryModal, saveDiscussionThread, getDiscussionThreads } from "/desktop-shell/discussion-memory.js";
-import { renderDiscussionThreadsList } from "/desktop-shell/line-modal-helpers.js";
+import { renderDiscussionThreadsList, updateDataQualityBadge } from "/desktop-shell/line-modal-helpers.js";
 
 // ── DOM nodes ────────────────────────────────────────────────────
 
@@ -846,6 +846,10 @@ export function initLineModal() {
         else if (su.includes("RENFOR") || su === "REINFORCE") signalNode.classList.add("signal-reinforce");
         else signalNode.classList.add("signal-hold");
       }
+      // P2-6: render the "données partielles" badge when the backend stamped
+      // data_quality=fundamentals_missing on the recommendation. Helper is
+      // additive only — never replaces the existing signal text.
+      updateDataQualityBadge(rec, signalNode?.parentElement || null);
       const fmt = (v) => v != null && Number.isFinite(v) ? v.toLocaleString("fr-FR", { maximumFractionDigits: 2 }) : "—";
       const fmtPct = (v) => v != null && Number.isFinite(v) ? `${v >= 0 ? "+" : ""}${v.toFixed(1)}%` : "—";
       const el = (id) => document.getElementById(id);

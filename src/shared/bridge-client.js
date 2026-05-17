@@ -805,6 +805,44 @@ export function createDesktopBridgeClient({
     async clearDebugLog() {
       const payload = await invoke("storage_clear_log_local");
       return normalizeTauriPayload(payload, ["storage_clear_log_local"]);
+    },
+    // ── Admin observability (v0.4.0 P0-14) ────────────────────────────
+    //
+    // Two-layer whitelist:
+    //   - Server: `ALFRED_ADMIN_HASHES` env var → 403 on miss.
+    //   - Desktop: `admin_config::ADMIN_HASHES_WHITELIST` (compile-time)
+    //     → tab hidden when no match. Both gates must agree.
+    //
+    // The desktop never invokes admin endpoints for non-admin users
+    // (the gear panel hides the tab), so a 403 here is defensive — the
+    // tab consumer treats it as "remove the tab and stop polling" to
+    // match the server's authoritative view.
+    /**
+     * Returns `{is_admin: boolean}` after the Rust layer compares the
+     * local user's hash against the baked-in whitelist. The whitelist
+     * itself is never sent to JS — only the boolean answer, so a
+     * leaked frontend bundle does not expose admin identities.
+     */
+    async isAdminUser() {
+      const payload = await invoke("is_admin_hash_local");
+      return normalizeTauriPayload(payload, ["is_admin_hash_local"]);
+    },
+    /**
+     * Returns the admin usage envelope as documented in
+     * `apps/alfred-api/src/admin.rs::admin_usage_handler`. Parsed
+     * server-side through the typed `AdminUsage` struct.
+     */
+    async getAdminUsage() {
+      const payload = await invoke("get_admin_usage_local");
+      return normalizeTauriPayload(payload, ["get_admin_usage_local"]);
+    },
+    /**
+     * Returns the admin VPS stats envelope as documented in
+     * `apps/alfred-api/src/admin.rs::admin_vps_stats_handler`.
+     */
+    async getAdminVpsStats() {
+      const payload = await invoke("get_admin_vps_stats_local");
+      return normalizeTauriPayload(payload, ["get_admin_vps_stats_local"]);
     }
   };
   return bridge;

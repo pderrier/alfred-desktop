@@ -78,6 +78,7 @@ import {
   accountAccentColor,
   renderCashLinkHint
 } from "/desktop-shell/shell-layout.js";
+import { installAdminPanel } from "/desktop-shell/admin-panel.js";
 
 // ── Live DOM nodes ───────────────────────────────────────────────
 
@@ -2107,6 +2108,74 @@ settingsFinaryReconnectBtn?.addEventListener("click", () => handleFinaryConnect(
 document.getElementById("gear-btn")?.addEventListener("click", () => {
   refreshAccountStatus();
   refreshStorageUsage();
+  ensureAdminPanelMaybe();
+});
+
+// ── Admin observability tab (v0.4.0 P0-14) ─────────────────────────
+//
+// The admin tab is dynamically built in JS only when the local user
+// hash is on the baked-in `ADMIN_HASHES_WHITELIST` (Rust-side). The
+// gate is delegated to the bridge: `isAdminUser()` proxies to a Tauri
+// command that checks the compile-time list. No admin metadata leaks
+// to the frontend bundle.
+//
+// Lifecycle:
+//   - gear panel opens → ensureAdminPanelMaybe() asks the bridge if the
+//     user is admin. On yes, install + start the 30s refresh loop. On
+//     no, do nothing — the card is never created in the DOM.
+//   - gear panel closes → adminPanelController.stop() pauses the loop
+//     (the card stays in the DOM so reopening is instant). If the
+//     server later 403s (whitelist drift), the controller destroys
+//     itself and the card is removed.
+//
+// Mounted inside `#gear-panel .modal-card.gear-panel-card` so it
+// renders with the other settings-card elements; the controller picks
+// its own position (appendChild → bottom of the panel) which keeps it
+// visually below the Advanced fold for non-confusing layout.
+
+let adminPanelController = null;
+
+async function ensureAdminPanelMaybe() {
+  // Idempotent: if the controller is already installed and live, just
+  // resume polling. Avoids double-creating cards across repeat opens.
+  if (adminPanelController) {
+    adminPanelController.start();
+    return;
+  }
+  try {
+    const result = await bridge.isAdminUser();
+    const isAdmin = Boolean(result?.is_admin);
+    if (!isAdmin) {
+      return;
+    }
+  } catch {
+    // If the bridge fails (no Tauri runtime in dev, etc.), silently
+    // skip — the admin tab is not user-essential and noise here would
+    // be confusing for normal users.
+    return;
+  }
+  const host =
+    document.querySelector("#gear-panel .modal-card.gear-panel-card") ||
+    document.getElementById("gear-panel");
+  if (!host) {
+    return;
+  }
+  try {
+    adminPanelController = installAdminPanel({ host, bridge });
+    adminPanelController.start();
+  } catch (e) {
+    console.warn("admin panel install failed:", e);
+  }
+}
+
+// Stop polling when the gear panel closes. The button is wired in the
+// inline script at the bottom of index.html (`gear-close-btn` toggles
+// the `hidden` class on `#gear-panel`); we hook the same node to stop
+// our refresh timer. Card stays in the DOM so a reopen is instant.
+document.getElementById("gear-close-btn")?.addEventListener("click", () => {
+  if (adminPanelController) {
+    adminPanelController.stop();
+  }
 });
 
 // ── Storage management ──────────────────────────────────────────

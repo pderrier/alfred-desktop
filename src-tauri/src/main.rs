@@ -29,6 +29,7 @@ mod native_line_analysis;
 mod sqlite_migrations;
 
 // ── Extracted domain modules ────────────────────────────────────────────────
+mod admin_config;
 mod agentos_artifacts;
 mod alfred_api_client;
 mod analysis_ops;
@@ -706,6 +707,59 @@ async fn export_report_markdown_local(
     .map_err(|e| e.to_string())
 }
 
+/// `get_admin_usage_local` — fetch `/admin/usage`. v0.4.0 P0-14.
+///
+/// Gated client-side by `admin_config::is_whitelisted_admin(currentUserHash)`
+/// in the JS layer ; the desktop never invokes this for non-admin users.
+/// The server is the source of truth (403 on miss) ; this command just
+/// proxies the response envelope.
+#[tauri::command]
+async fn get_admin_usage_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_get_admin_usage)
+        .await
+        .map_err(|e| format!("get_admin_usage_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+/// `get_admin_vps_stats_local` — fetch `/admin/vps-stats`. v0.4.0 P0-14.
+#[tauri::command]
+async fn get_admin_vps_stats_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_get_admin_vps_stats)
+        .await
+        .map_err(|e| format!("get_admin_vps_stats_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+/// `current_user_hash_local` — return the FNV-1a hash of the local OpenAI
+/// JWT. v0.4.0 P0-14. Used by the JS layer to decide whether to render
+/// the Admin tab (compared against `admin_config::ADMIN_HASHES_WHITELIST`
+/// via a separate `is_admin_hash_local` command). Never returns the raw
+/// JWT — only the irreversible 16-char hex hash.
+#[tauri::command]
+async fn current_user_hash_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_current_user_hash)
+        .await
+        .map_err(|e| format!("current_user_hash_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+/// `is_admin_hash_local` — return `{is_admin: bool}` after checking the
+/// current user's hash against the baked-in
+/// `admin_config::ADMIN_HASHES_WHITELIST`. v0.4.0 P0-14.
+///
+/// Why a Tauri command and not a JS-side comparison? The whitelist lives
+/// in the compiled Rust binary so it's only embedded in builds Pierre
+/// produces. Exposing the list to JS would leak it back into a public
+/// repo via build artefacts. The Rust-side check returns just the
+/// boolean.
+#[tauri::command]
+async fn is_admin_hash_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_is_admin_hash)
+        .await
+        .map_err(|e| format!("is_admin_hash_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
 fn run_tauri_app() -> anyhow::Result<()> {
     load_local_env();
 
@@ -800,7 +854,11 @@ fn run_tauri_app() -> anyhow::Result<()> {
             get_run_diff_local,
             save_alfred_state_local,
             load_alfred_state_local,
-            export_report_markdown_local
+            export_report_markdown_local,
+            get_admin_usage_local,
+            get_admin_vps_stats_local,
+            current_user_hash_local,
+            is_admin_hash_local
         ])
         .run(tauri::generate_context!())
         .map_err(|e| anyhow!("tauri_app_launch_failed:{e}"))?;

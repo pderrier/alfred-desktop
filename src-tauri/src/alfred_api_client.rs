@@ -80,6 +80,18 @@ fn get_client_hash() -> Option<String> {
 /// they 401 with `run_session_invalid`. `/run/start` itself does NOT
 /// require the header (it's the source of sessions) — the active-session
 /// context is `None` when this function runs for that endpoint.
+///
+/// v0.4.0 (P0-14): `/admin/*` paths are explicitly exempted from
+/// X-Run-Session injection even when the slot is filled. Rationale: if an
+/// admin clicks the Admin tab while a run is in flight, the active session
+/// slot is non-empty, but admin endpoints are NOT mounted under
+/// `require_run_session` server-side (see `apps/alfred-api/src/lib.rs` —
+/// admin routes layered with `require_admin`, not `require_run_session`).
+/// Sending the header would not break anything (the server middleware
+/// simply doesn't consume it), but the contract is "endpoints get exactly
+/// the auth headers they require, no more". Defense-in-depth — and it
+/// keeps the request payload smaller for admin polls. See
+/// `is_admin_path` for the path-prefix rule.
 fn apply_auth(req: ureq::Request, path: &str) -> ureq::Request {
     let ts = now_epoch_secs();
     let client_hash = get_client_hash().unwrap_or_default();
@@ -88,8 +100,10 @@ fn apply_auth(req: ureq::Request, path: &str) -> ureq::Request {
     let mut req = req
         .set("X-Client-Hash", &client_hash)
         .set("X-Timestamp", &ts.to_string());
-    if let Some(session_id) = active_run_session() {
-        req = req.set("X-Run-Session", &session_id);
+    if !is_admin_path(sign_path) {
+        if let Some(session_id) = active_run_session() {
+            req = req.set("X-Run-Session", &session_id);
+        }
     }
     let runtime_secret = env::var("ALFRED_API_SECRET").ok();
     let secret = API_SECRET.or(runtime_secret.as_deref());
@@ -99,6 +113,20 @@ fn apply_auth(req: ureq::Request, path: &str) -> ureq::Request {
     } else {
         req
     }
+}
+
+/// Pure helper: is this request path under the admin surface? Used by
+/// `apply_auth` to skip `X-Run-Session` injection (the admin endpoints are
+/// not nested under the `require_run_session` middleware server-side, so
+/// the header is dead weight there).
+///
+/// Match rule: path equals `/admin` or starts with `/admin/`. The exact
+/// match guards against a future `/admin` collection root; the slash-prefix
+/// match covers every sub-route. Anything else returns false — there is no
+/// fuzzy / partial / case-insensitive match because the server-side routes
+/// are case-sensitive too.
+fn is_admin_path(path: &str) -> bool {
+    path == "/admin" || path.starts_with("/admin/")
 }
 
 // ── Run-session context (v0.4.0 P0-11) ──────────────────────────────
@@ -527,6 +555,150 @@ pub fn remote_fetch_resolve(isin: &str) -> Result<Option<String>> {
 fn build_resolve_path(isin: &str) -> String {
     let code = isin.trim();
     format!("/api/resolve?isin={}", urlenc(code))
+}
+
+// ── Admin observability (v0.4.0 P0-14) ───────────────────────────────
+
+/// Typed mirror of the `/admin/usage` response envelope.
+///
+/// Pinning the shape via serde — instead of leaving it as `serde_json::Value`
+/// — gives us a parse-time contract test: if the server-side
+/// `apps/alfred-api/src/admin.rs::admin_usage_handler` renames or drops a
+/// field, deserialization fails loudly here rather than silently rendering
+/// an empty table client-side. All fields default to safe zeros / empty
+/// collections so an older server that doesn't yet emit a particular field
+/// degrades gracefully.
+///
+/// The server hash is already truncated to 8 chars before wire (see
+/// `admin.rs::anonymize_user_hash`); this struct simply forwards the
+/// anonymised value — no further truncation needed.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct AdminUsage {
+    /// Top-N users by `runs_7d`, anonymised hashes only.
+    #[serde(default)]
+    pub top_users: Vec<AdminTopUser>,
+    /// Most-recently-seen tickers (ISIN + epoch timestamp).
+    #[serde(default)]
+    pub top_tickers: Vec<AdminTopTicker>,
+    /// Sum of `runs_7d` across all users.
+    #[serde(default)]
+    pub runs_7d: u64,
+    /// Sum of `runs_24h` across all users.
+    #[serde(default)]
+    pub runs_24h: u64,
+    /// Today's `metrics:429:<date>` counter.
+    #[serde(default)]
+    pub errors_429_today: u64,
+    /// v1 placeholder — per-endpoint counters deferred. Forwarded verbatim
+    /// so the UI can surface the server's "tracked: false" hint.
+    #[serde(default)]
+    pub by_endpoint: Value,
+    /// Server timestamp at response emission (epoch seconds).
+    #[serde(default)]
+    pub generated_at: u64,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct AdminTopUser {
+    pub user_hash: String,
+    pub runs_7d: u64,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct AdminTopTicker {
+    pub isin: String,
+    pub last_seen: u64,
+}
+
+/// Typed mirror of the `/admin/vps-stats` response envelope. Same contract
+/// rationale as [`AdminUsage`]: parse-time validation against the server's
+/// `admin_vps_stats_handler` shape.
+///
+/// All numeric fields default to 0 so an older server that doesn't yet
+/// emit a particular sub-field degrades gracefully.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct AdminVpsStats {
+    #[serde(default)]
+    pub redis: AdminRedisStats,
+    #[serde(default)]
+    pub process: AdminProcessStats,
+    #[serde(default)]
+    pub generated_at: u64,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+pub struct AdminRedisStats {
+    #[serde(default)]
+    pub memory_used: Option<u64>,
+    #[serde(default)]
+    pub memory_peak: Option<u64>,
+    #[serde(default)]
+    pub connected_clients: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+pub struct AdminProcessStats {
+    #[serde(default)]
+    pub rss_bytes: u64,
+    #[serde(default)]
+    pub uptime_secs: u64,
+}
+
+/// Fetch `/admin/usage`. Returns the raw envelope :
+/// `{ok, top_users, top_tickers, runs_7d, runs_24h, errors_429_today,
+///   by_endpoint, generated_at}`.
+///
+/// Requires the user's client_hash to be on the server-side
+/// `ALFRED_ADMIN_HASHES` allowlist; otherwise the server responds 403 and
+/// this function surfaces `alfred_api_http_error:403`. The desktop UI
+/// hides the Admin tab unless the same hash is on the local
+/// [`admin_config::ADMIN_HASHES_WHITELIST`](crate::admin_config) so the
+/// 403 path is normally unreachable.
+///
+/// Admin endpoints are NOT under the run-session middleware (verified in
+/// `apps/alfred-api/src/lib.rs::build_router` — admin_routes are mounted
+/// at the root, not nested under `/api/`). `apply_auth` exempts
+/// `/admin/*` paths from `X-Run-Session` injection so the header is
+/// guaranteed absent here — see `is_admin_path` and the contract test
+/// `admin_endpoint_calls_do_not_inject_run_session_header`.
+///
+/// The response is parsed through [`AdminUsage`] for contract validation
+/// (a server-side field rename will surface as a parse error rather than
+/// a silently-empty UI), then re-serialised back to `Value` for forwarding
+/// through Tauri to the JS layer. JS reads the same key shape as before.
+pub fn get_admin_usage() -> Result<Value> {
+    let raw = api_get("/admin/usage", TIMEOUT_SECS)?;
+    let parsed: AdminUsage = serde_json::from_value(raw)
+        .map_err(|e| anyhow!("alfred_api_parse_failed:admin_usage:{e}"))?;
+    serde_json::to_value(parsed)
+        .map_err(|e| anyhow!("alfred_api_serialize_failed:admin_usage:{e}"))
+}
+
+/// Fetch `/admin/vps-stats`. Returns the raw envelope :
+/// `{ok, redis: {memory_used, memory_peak, connected_clients},
+///   process: {rss_bytes, uptime_secs}, generated_at}`.
+///
+/// Same auth contract as [`get_admin_usage`]. Parsed through
+/// [`AdminVpsStats`] for contract validation then re-serialised back to
+/// `Value` for Tauri forwarding.
+pub fn get_admin_vps_stats() -> Result<Value> {
+    let raw = api_get("/admin/vps-stats", TIMEOUT_SECS)?;
+    let parsed: AdminVpsStats = serde_json::from_value(raw)
+        .map_err(|e| anyhow!("alfred_api_parse_failed:admin_vps_stats:{e}"))?;
+    serde_json::to_value(parsed)
+        .map_err(|e| anyhow!("alfred_api_serialize_failed:admin_vps_stats:{e}"))
+}
+
+/// Compute the current user's client hash. Exposes the previously-private
+/// `get_client_hash` so the admin tab visibility check can run on the
+/// same value the server sees in `X-Client-Hash`. Returns `None` when no
+/// OpenAI JWT is available locally (e.g. user not signed in to Codex).
+///
+/// Kept under a dedicated public function rather than re-exporting the
+/// internal helper, so the contract ("the hash sent on every request") is
+/// stable and the doc-comment can pin the format.
+pub fn current_user_hash() -> Option<String> {
+    get_client_hash()
 }
 
 /// Persist shared insights (generic analysis) back to the API for other users.
@@ -977,6 +1149,211 @@ mod tests {
             !dbg.to_lowercase().contains("x-run-session"),
             "X-Run-Session must not be injected when no session is active — request would 401",
         );
+    }
+
+    // ── /admin/* path exemption from X-Run-Session (v0.4.0 P0-14) ───
+    //
+    // CRITICAL contract — if a future refactor of apply_auth ever
+    // injects X-Run-Session unconditionally, admin calls fired during
+    // an active run would leak a session header into endpoints that
+    // are NOT under `require_run_session`. The server would ignore the
+    // header (no harm), but the contract is "endpoints get exactly the
+    // auth headers they need". Pinned here so a regression fails CI
+    // instead of degrading silently to a payload bloat.
+
+    #[test]
+    fn is_admin_path_matches_admin_root_and_subroutes() {
+        // /admin equals the collection root (defensive — not actually
+        // a server-side route today but the rule must cover it).
+        assert!(is_admin_path("/admin"));
+        // Documented sub-routes from `apps/alfred-api/src/admin.rs`.
+        assert!(is_admin_path("/admin/usage"));
+        assert!(is_admin_path("/admin/vps-stats"));
+        // Future admin routes must inherit the rule.
+        assert!(is_admin_path("/admin/anything/nested/here"));
+    }
+
+    #[test]
+    fn is_admin_path_rejects_non_admin_paths() {
+        // Make sure we don't accidentally over-match. Every gated
+        // analysis endpoint must continue to receive X-Run-Session.
+        assert!(!is_admin_path("/api/market"));
+        assert!(!is_admin_path("/api/news"));
+        assert!(!is_admin_path("/api/admin"));        // suffix, not prefix
+        assert!(!is_admin_path("/run/start"));
+        assert!(!is_admin_path("/healthz"));
+        assert!(!is_admin_path(""));
+        assert!(!is_admin_path("/"));
+        // Case-sensitive — server routes are case-sensitive too.
+        assert!(!is_admin_path("/Admin/usage"));
+        assert!(!is_admin_path("/ADMIN/usage"));
+    }
+
+    #[test]
+    fn admin_endpoint_calls_do_not_inject_run_session_header() {
+        // CRITICAL: when an admin clicks the Admin tab while a run is
+        // active, the session slot is populated. apply_auth must NOT
+        // leak X-Run-Session into /admin/* requests — those endpoints
+        // are not gated by require_run_session server-side.
+        let _guard = run_session_test_lock();
+        clear_active_run_session();
+        set_active_run_session("active-run-while-admin-polls");
+
+        for path in ["/admin/usage", "/admin/vps-stats"] {
+            let raw = ureq::get(&format!("https://example.test{path}"));
+            let signed = apply_auth(raw, path);
+            let dbg = format!("{signed:?}");
+            assert!(
+                !dbg.to_lowercase().contains("x-run-session"),
+                "X-Run-Session must be exempt for {path} — leaked into admin call. Debug: {dbg}",
+            );
+        }
+
+        // Sanity: a non-admin path during the same run still gets the
+        // header. Pins the exemption to the path, not a global toggle.
+        let raw = ureq::get("https://example.test/api/news");
+        let signed = apply_auth(raw, "/api/news");
+        let dbg = format!("{signed:?}");
+        assert!(
+            dbg.to_lowercase().contains("x-run-session"),
+            "Non-admin paths must still receive X-Run-Session during an active run",
+        );
+
+        clear_active_run_session();
+    }
+
+    #[test]
+    fn admin_endpoint_calls_still_inject_hmac_auth() {
+        // The X-Run-Session exemption must NOT cascade into the HMAC
+        // signing path — admin endpoints are still wrapped by
+        // `require_auth` server-side, so X-Client-Hash + X-Timestamp +
+        // X-Signature are mandatory. Verify all three headers survive
+        // the admin-path branch.
+        let _guard = run_session_test_lock();
+        clear_active_run_session();
+        // Set a compile-time-style secret via the runtime env fallback
+        // so apply_auth signs the request even in test builds (the
+        // option_env! const is None when ALFRED_API_SECRET wasn't
+        // injected at compile time).
+        std::env::set_var("ALFRED_API_SECRET", "test-secret-for-hmac");
+
+        let raw = ureq::get("https://example.test/admin/usage");
+        let signed = apply_auth(raw, "/admin/usage");
+        let dbg = format!("{signed:?}").to_lowercase();
+        assert!(
+            dbg.contains("x-client-hash"),
+            "X-Client-Hash header missing from /admin/usage request. Debug: {dbg}",
+        );
+        assert!(
+            dbg.contains("x-timestamp"),
+            "X-Timestamp header missing from /admin/usage request. Debug: {dbg}",
+        );
+        assert!(
+            dbg.contains("x-signature"),
+            "X-Signature header missing from /admin/usage request. Debug: {dbg}",
+        );
+
+        std::env::remove_var("ALFRED_API_SECRET");
+    }
+
+    // ── Admin response shape contract (v0.4.0 P0-14) ────────────────
+
+    #[test]
+    fn admin_usage_deserializes_full_server_envelope() {
+        // Mirror the exact shape emitted by `admin_usage_handler` in
+        // apps/alfred-api/src/admin.rs. If the server ever renames or
+        // drops a field, this parse fails loudly — a much better
+        // failure mode than silently rendering an empty table.
+        let body = serde_json::json!({
+            "ok": true,
+            "top_users": [
+                { "user_hash": "abc12345", "runs_7d": 12 },
+                { "user_hash": "def67890", "runs_7d": 3 }
+            ],
+            "top_tickers": [
+                { "isin": "FR0010163345", "last_seen": 1_700_000_000u64 }
+            ],
+            "runs_7d": 15u64,
+            "runs_24h": 4u64,
+            "errors_429_today": 2u64,
+            "by_endpoint": { "tracked": false, "note": "deferred" },
+            "generated_at": 1_700_000_100u64,
+        });
+        let parsed: AdminUsage = serde_json::from_value(body).unwrap();
+        assert_eq!(parsed.top_users.len(), 2);
+        assert_eq!(parsed.top_users[0].user_hash, "abc12345");
+        assert_eq!(parsed.top_users[0].runs_7d, 12);
+        assert_eq!(parsed.top_tickers.len(), 1);
+        assert_eq!(parsed.top_tickers[0].isin, "FR0010163345");
+        assert_eq!(parsed.runs_7d, 15);
+        assert_eq!(parsed.runs_24h, 4);
+        assert_eq!(parsed.errors_429_today, 2);
+        assert_eq!(parsed.generated_at, 1_700_000_100);
+        assert!(parsed.by_endpoint.is_object());
+    }
+
+    #[test]
+    fn admin_usage_degrades_gracefully_on_missing_fields() {
+        // An older server (deployed before today's full payload) might
+        // omit a sub-field. We default to zero/empty so the UI renders
+        // a benign "nothing yet" state instead of erroring out.
+        let body = serde_json::json!({ "ok": true });
+        let parsed: AdminUsage = serde_json::from_value(body).unwrap();
+        assert!(parsed.top_users.is_empty());
+        assert!(parsed.top_tickers.is_empty());
+        assert_eq!(parsed.runs_7d, 0);
+        assert_eq!(parsed.runs_24h, 0);
+        assert_eq!(parsed.errors_429_today, 0);
+        assert_eq!(parsed.generated_at, 0);
+    }
+
+    #[test]
+    fn admin_vps_stats_deserializes_full_server_envelope() {
+        let body = serde_json::json!({
+            "ok": true,
+            "redis": {
+                "memory_used": 1_048_576u64,
+                "memory_peak": 2_097_152u64,
+                "connected_clients": 3u64,
+            },
+            "process": {
+                "rss_bytes": 52_428_800u64,
+                "uptime_secs": 3600u64,
+            },
+            "generated_at": 1_700_000_100u64,
+        });
+        let parsed: AdminVpsStats = serde_json::from_value(body).unwrap();
+        assert_eq!(parsed.redis.memory_used, Some(1_048_576));
+        assert_eq!(parsed.redis.memory_peak, Some(2_097_152));
+        assert_eq!(parsed.redis.connected_clients, Some(3));
+        assert_eq!(parsed.process.rss_bytes, 52_428_800);
+        assert_eq!(parsed.process.uptime_secs, 3600);
+        assert_eq!(parsed.generated_at, 1_700_000_100);
+    }
+
+    #[test]
+    fn admin_vps_stats_handles_optional_redis_fields() {
+        // Redis INFO parse can return None for any field (older Redis,
+        // non-numeric value). The wire shape sends explicit null in
+        // that case; deserialization must accept it as Option::None
+        // rather than erroring.
+        let body = serde_json::json!({
+            "ok": true,
+            "redis": {
+                "memory_used": null,
+                "memory_peak": null,
+                "connected_clients": null,
+            },
+            "process": {
+                "rss_bytes": 0,
+                "uptime_secs": 0,
+            },
+            "generated_at": 0,
+        });
+        let parsed: AdminVpsStats = serde_json::from_value(body).unwrap();
+        assert!(parsed.redis.memory_used.is_none());
+        assert!(parsed.redis.memory_peak.is_none());
+        assert!(parsed.redis.connected_clients.is_none());
     }
 
     // ── /run/start response classification (v0.4.0 P0-11) ───────────

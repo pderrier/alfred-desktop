@@ -1875,6 +1875,76 @@ main {
   cursor: pointer;
 }
 
+/* ── Admin observability panel (v0.4.0 P0-14) ─────────────────────── */
+
+.settings-admin-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 0.55rem;
+}
+
+.settings-admin-metric {
+  display: grid;
+  gap: 0.18rem;
+  background: rgba(10, 17, 24, 0.55);
+  border: 1px solid rgba(73, 100, 126, 0.25);
+  border-radius: 10px;
+  padding: 0.55rem 0.7rem;
+}
+
+.settings-admin-label {
+  color: var(--sea-muted, #90a6bc);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.settings-admin-value {
+  color: inherit;
+  font-size: 1.05rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.settings-admin-subtitle {
+  margin: 0.4rem 0 0.15rem;
+  font-size: 0.85rem;
+  color: var(--sea-muted, #90a6bc);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.settings-admin-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.settings-admin-table th,
+.settings-admin-table td {
+  text-align: left;
+  padding: 0.3rem 0.5rem;
+  border-bottom: 1px solid rgba(73, 100, 126, 0.2);
+}
+
+.settings-admin-table thead th {
+  color: var(--sea-muted, #90a6bc);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.settings-admin-status {
+  margin-top: 0.4rem;
+  font-size: 0.7rem;
+}
+
+.settings-admin-status-error {
+  color: #c96a5a;
+}
+
 /* ── Recommendations (kept for app.js compat) ──────────────────── */
 
 .recommendations-list {

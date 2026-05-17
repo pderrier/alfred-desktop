@@ -48,6 +48,7 @@ import {
 import { initAlfredOverlay } from "/desktop-shell/app-alfred-overlay.js";
 import { registerDefaultTriggers } from "/desktop-shell/app-alfred-triggers.js";
 import { startIdleTimer } from "/desktop-shell/app-alfred-idle.js";
+import { installUpgradeFlow } from "/desktop-shell/upgrade-view.js";
 import {
   initShellLayout,
   renderSidebar,
@@ -1620,21 +1621,40 @@ function isApiHealthy() {
   return status === "healthy" || status === "degraded";
 }
 
-// v0.4.0 P0-13: stub listener for the upgrade-requested event the
-// error modal dispatches when the user clicks "Upgrade — 9€/an". The
-// real LS overlay integration is P0-15; until then we show a toast
-// so the click feels acknowledged rather than dead. The listener
-// is intentionally idempotent (no de-dup needed) — addEventListener
-// is called once at module load, never per-modal.
+// v0.4.0 P0-15: wire the Lemon Squeezy overlay to the upgrade-requested
+// event the error modal dispatches when the user clicks "Upgrade —
+// 9€/an". The flow:
 //
-// REMOVE THIS STUB when P0-15 ships `upgrade-view.js` and wires the
-// listener there. See `docs/plans/po-plan-2026-05.md#P0-15`.
+//   1. P0-13 free-tier modal dispatches `alfred://upgrade-requested`.
+//   2. This listener opens the upgrade-view overlay (lazy-loaded
+//      lemon.js + LS checkout URL fetched from Rust).
+//   3. On `Checkout.Success` (or `alfred://license-activated` deep-link
+//      fallback), upgrade-view fires `alfred://upgrade-activated`.
+//   4. We surface a French toast and refresh the health pill so the
+//      next analysis picks up the new tier without a manual reload.
+//
+// Listener is idempotent (addEventListener at module load, never per
+// modal). The factory is built once and reused across clicks — the
+// overlay flow itself is stateful but resets on open()/close().
 if (typeof window !== "undefined") {
+  const upgradeFlow = installUpgradeFlow({
+    doc: document,
+    bridge,
+    showToast,
+  });
   window.addEventListener("alfred://upgrade-requested", () => {
+    upgradeFlow.open();
+  });
+  window.addEventListener("alfred://upgrade-activated", () => {
     showToast(
-      "Lemon Squeezy checkout coming soon — Premium activation lands in v0.4.0 (P0-15).",
-      "info"
+      "Tu es passé en Premium. Bon investissement !",
+      "success"
     );
+    // Refresh the health pill so the next analysis picks up the new
+    // tier without waiting for the 30s poll. The free-tier-exhausted
+    // one-shot modal guard also resets here (cleared automatically
+    // when status flips back to healthy).
+    refreshHealthPill().catch(() => { /* health refresh is best-effort */ });
   });
 }
 

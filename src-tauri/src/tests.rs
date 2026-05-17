@@ -6746,3 +6746,109 @@ use crate::storage::read_json_file;
             "expected no zero price_at_signal after a healthy full run, found offenders: {zero_offenders:?}",
         );
     }
+
+    // ── Item 2 (2026-05-17): collective_memory=0 parity fix ──────────────
+    //
+    // Production audit revealed `deep_news_persisted=0`, `fundamentals_persisted=0`,
+    // `insights_persisted=0` on 3 consecutive native/native-oauth runs. Root
+    // cause traced to `services/native_mcp_analysis::persist_line_extras`
+    // dispatching tools without `run_id` (legacy bug) and routing deep-news
+    // through `llm_parsing::persist_deep_news_if_present` (bypassed the MCP
+    // tool entirely, so the `caching deep news` progress event never fired).
+    //
+    // Tests pin the URL-selection helper extracted as part of the fix so the
+    // on-disk write target stays parity-aligned with the codex-mode path
+    // (which already routed through the same MCP tool).
+
+    #[test]
+    fn pick_deep_news_target_prefers_uncached_article() {
+        let news = json!([
+            {"url": "https://old.example/a", "title": "old", "deep_summary_cached": true},
+            {"url": "https://new.example/b", "title": "new", "deep_summary_cached": false},
+            {"url": "https://other.example/c", "title": "other", "deep_summary_cached": true},
+        ]);
+        let picked = crate::native_mcp_analysis::pick_deep_news_target(&news);
+        assert_eq!(
+            picked,
+            Some(("https://new.example/b".to_string(), "new".to_string())),
+            "must prefer un-cached article (the one the LLM just read)",
+        );
+    }
+
+    #[test]
+    fn pick_deep_news_target_falls_back_to_first_article_when_all_cached() {
+        let news = json!([
+            {"url": "https://a.example", "title": "first", "deep_summary_cached": true},
+            {"url": "https://b.example", "title": "second", "deep_summary_cached": true},
+        ]);
+        let picked = crate::native_mcp_analysis::pick_deep_news_target(&news);
+        assert_eq!(
+            picked,
+            Some(("https://a.example".to_string(), "first".to_string())),
+            "fallback path takes the first URL when no un-cached article exists",
+        );
+    }
+
+    #[test]
+    fn pick_deep_news_target_handles_items_envelope() {
+        // News payload variation: `{items: [...]}` rather than bare array.
+        // Mirrors the legacy `persist_deep_news_if_present` envelope support.
+        let news = json!({
+            "items": [
+                {"url": "https://x.example", "title": "x", "deep_summary_cached": false},
+            ]
+        });
+        let picked = crate::native_mcp_analysis::pick_deep_news_target(&news);
+        assert_eq!(
+            picked,
+            Some(("https://x.example".to_string(), "x".to_string())),
+        );
+    }
+
+    #[test]
+    fn pick_deep_news_target_handles_link_alias() {
+        // Some upstream feeds emit `link` instead of `url`. Stay
+        // parity-compatible with the legacy helper.
+        let news = json!([
+            {"link": "https://aliased.example", "title": "aliased"},
+        ]);
+        let picked = crate::native_mcp_analysis::pick_deep_news_target(&news);
+        assert_eq!(
+            picked,
+            Some(("https://aliased.example".to_string(), "aliased".to_string())),
+        );
+    }
+
+    #[test]
+    fn pick_deep_news_target_returns_none_when_no_url() {
+        // Defensive: an article with title but no URL should not produce
+        // a synthetic key — dropping the summary is the safer choice.
+        let news = json!([
+            {"title": "no url here"},
+            {"title": "also no url"},
+        ]);
+        assert_eq!(crate::native_mcp_analysis::pick_deep_news_target(&news), None);
+    }
+
+    #[test]
+    fn pick_deep_news_target_returns_none_when_articles_empty() {
+        assert_eq!(crate::native_mcp_analysis::pick_deep_news_target(&json!([])), None);
+        assert_eq!(crate::native_mcp_analysis::pick_deep_news_target(&json!({})), None);
+        assert_eq!(crate::native_mcp_analysis::pick_deep_news_target(&serde_json::Value::Null), None);
+    }
+
+    #[test]
+    fn pick_deep_news_target_skips_empty_url_strings() {
+        // Production safety: an empty-string URL must not be selected as
+        // the cache key — would silently overwrite the per-ticker bucket
+        // keyed by "".
+        let news = json!([
+            {"url": "", "title": "empty", "deep_summary_cached": false},
+            {"url": "https://real.example", "title": "real", "deep_summary_cached": false},
+        ]);
+        let picked = crate::native_mcp_analysis::pick_deep_news_target(&news);
+        assert_eq!(
+            picked,
+            Some(("https://real.example".to_string(), "real".to_string())),
+        );
+    }

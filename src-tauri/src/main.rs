@@ -760,10 +760,151 @@ async fn is_admin_hash_local() -> Result<serde_json::Value, String> {
         .map_err(|e| e.to_string())
 }
 
+// ── License flow (v0.4.0 P0-15) ──────────────────────────────────────
+
+/// `license_activate_local` — activate a Lemon Squeezy license key via
+/// `POST /license/activate`. v0.4.0 P0-15.
+///
+/// Called by the upgrade-view.js module from two paths:
+///   1. LS overlay success callback (primary) — `LemonSqueezy.Setup({...})`
+///      eventHandler fires with the new license_key.
+///   2. Deep-link fallback (`alfred://license-activated?key=...`) — the
+///      Tauri deep-link listener forwards the key to JS via event, JS
+///      calls this command.
+///
+/// `instance_name` is optional — when null the Rust side derives one
+/// from the hostname so the LS dashboard shows "Activated from <host>".
+#[tauri::command]
+async fn license_activate_local(
+    license_key: String,
+    instance_name: Option<String>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        command_handlers::run_license_activate(license_key, instance_name)
+    })
+    .await
+    .map_err(|e| format!("license_activate_local_failed:join:{e}"))?
+    .map_err(|e| e.to_string())
+}
+
+/// `license_validate_local` — revalidate an already-activated license
+/// key. v0.4.0 P0-15. Wired today as a thin proxy; full integration
+/// with cold-start cache refresh is P1-6.
+#[tauri::command]
+async fn license_validate_local(license_key: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        command_handlers::run_license_validate(license_key)
+    })
+    .await
+    .map_err(|e| format!("license_validate_local_failed:join:{e}"))?
+    .map_err(|e| e.to_string())
+}
+
+/// `license_status_local` — read the cached tier + pending-notice for
+/// the current user. v0.4.0 P0-15. No LS round-trip.
+#[tauri::command]
+async fn license_status_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_license_status)
+        .await
+        .map_err(|e| format!("license_status_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+/// `license_checkout_url_local` — return the Lemon Squeezy checkout URL
+/// the upgrade-view overlay opens. v0.4.0 P0-15.
+///
+/// Returns `{url: string|null, configured: bool}`. When `configured` is
+/// false (public-repo default — no `ALFRED_LS_CHECKOUT_URL` compile-time
+/// or runtime env), the JS layer surfaces a clean "temporarily
+/// unavailable" banner instead of opening a bogus checkout.
+#[tauri::command]
+async fn license_checkout_url_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_license_checkout_url)
+        .await
+        .map_err(|e| format!("license_checkout_url_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+/// Parse a `alfred://license-activated?key=...` deep-link URL and return
+/// the extracted license key, when present.
+///
+/// Defensive parser — accepts trailing whitespace, alternate query
+/// orderings, and missing key (returns None). Centralised so the deep-link
+/// dispatch path is unit-testable without spinning up a Tauri runtime.
+///
+/// Why hand-rolled instead of `url` crate? Adds zero new dependencies,
+/// and the URL shape is fixed by LS's `redirect_url` config — a tiny
+/// substring scan is sufficient and easier to audit.
+fn parse_license_activated_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let prefix = "alfred://license-activated";
+    if !trimmed.starts_with(prefix) {
+        return None;
+    }
+    let rest = &trimmed[prefix.len()..];
+    let query = rest.strip_prefix('?').unwrap_or(rest);
+    for pair in query.split('&') {
+        let mut kv = pair.splitn(2, '=');
+        let k = kv.next()?.trim();
+        let v = kv.next()?.trim();
+        if k == "key" && !v.is_empty() {
+            return Some(url_decode(v));
+        }
+    }
+    None
+}
+
+/// Minimal URL percent-decode for the license-key extraction path. LS
+/// license keys are conventionally alphanumeric-with-dashes — full
+/// percent-encoding support isn't needed, but `%XX` sequences appear in
+/// some edge cases (legacy LS sandbox keys) so handle them defensively.
+///
+/// Pure helper kept here (not `helpers.rs`) because it's only used by
+/// the deep-link path and over-exposing it would invite reuse in
+/// contexts that need the full URL crate semantics.
+fn url_decode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let h1 = chars.next();
+            let h2 = chars.next();
+            if let (Some(a), Some(b)) = (h1, h2) {
+                let mut hex = String::with_capacity(2);
+                hex.push(a);
+                hex.push(b);
+                if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                    out.push(byte as char);
+                    continue;
+                }
+            }
+            // Malformed — keep the literal `%` and any trailing chars
+            // we already consumed.
+            out.push('%');
+            if let Some(a) = h1 { out.push(a); }
+            if let Some(b) = h2 { out.push(b); }
+        } else if c == '+' {
+            out.push(' ');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn run_tauri_app() -> anyhow::Result<()> {
     load_local_env();
 
     tauri::Builder::default()
+        // Deep-link plugin (v0.4.0 P0-15). Registers the `alfred://` URI
+        // scheme on Win/macOS/Linux per the `plugins.deep-link.schemes`
+        // entries in tauri.conf.json. The setup handler below subscribes
+        // to the plugin's `on_open_url` event and forwards
+        // `alfred://license-activated?key=...` payloads to the JS layer
+        // via the Tauri `alfred://license-activated` event — same shape
+        // the LS overlay success-callback uses, so the JS handler is one
+        // pipeline.
+        .plugin(tauri_plugin_deep_link::init())
         .setup(|app| {
             let _ = APP_HANDLE.set(app.handle().clone());
 
@@ -784,6 +925,50 @@ fn run_tauri_app() -> anyhow::Result<()> {
                 let _ = win.show();
                 let _ = win.set_focus();
             }
+
+            // Deep-link listener (v0.4.0 P0-15). Fires when the OS hands
+            // us an `alfred://...` URL — typically the LS checkout
+            // fallback path: LS redirects to a server endpoint that 302s
+            // to `alfred://license-activated?key=<key>` which the OS
+            // routes to this running instance (after registering the
+            // scheme via the plugin config).
+            //
+            // We parse the key here in Rust (single-source-of-truth for
+            // the URL shape — same `parse_license_activated_url`
+            // helper exercised by unit tests) and emit a Tauri event
+            // the JS upgrade-view module consumes. The JS handler is
+            // the same one wired to the LS overlay success callback,
+            // so the activation flow is one path regardless of trigger.
+            //
+            // Window focus: pull the running window forward so the
+            // user lands on the app immediately after the system browser
+            // hands off — without focus, the activation toast would
+            // fire silently behind the user's browser window.
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                let handle = app.handle().clone();
+                app.deep_link().on_open_url(move |event| {
+                    use tauri::Emitter;
+                    for url in event.urls() {
+                        let raw = url.as_str();
+                        crate::debug_log(&format!("deep-link: received {raw}"));
+                        if let Some(key) = parse_license_activated_url(raw) {
+                            if let Some(win) = handle.get_webview_window("main") {
+                                let _ = win.show();
+                                let _ = win.set_focus();
+                                let _ = win.unminimize();
+                            }
+                            let payload = serde_json::json!({ "key": key });
+                            if let Err(e) = handle.emit("alfred://license-activated", payload) {
+                                crate::debug_log(&format!(
+                                    "deep-link: emit alfred://license-activated failed: {e}"
+                                ));
+                            }
+                        }
+                    }
+                });
+            }
+
             // Cleanup orphaned runs — uses the in-memory index so it's instant.
             run_state::cleanup_orphaned_runs();
             // Bug B follow-up — one-shot line-memory zero-price repair, gated
@@ -858,7 +1043,11 @@ fn run_tauri_app() -> anyhow::Result<()> {
             get_admin_usage_local,
             get_admin_vps_stats_local,
             current_user_hash_local,
-            is_admin_hash_local
+            is_admin_hash_local,
+            license_activate_local,
+            license_validate_local,
+            license_status_local,
+            license_checkout_url_local
         ])
         .run(tauri::generate_context!())
         .map_err(|e| anyhow!("tauri_app_launch_failed:{e}"))?;
@@ -910,3 +1099,79 @@ fn main() {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod deep_link_tests {
+    //! Unit tests for the `alfred://license-activated` deep-link parse path.
+    //!
+    //! Covers the v0.4.0 P0-15 fallback flow: LS overlay can't close
+    //! cleanly on Linux WebKitGTK → LS redirects to a server endpoint
+    //! that 302s to `alfred://license-activated?key=...` → OS dispatches
+    //! to the running Alfred via the registered scheme → main.rs setup
+    //! handler parses + emits a Tauri event. Exercising the parser
+    //! directly is the cheapest way to pin the URL contract; the
+    //! plugin / emit path requires a full Tauri runtime which we don't
+    //! spin up in unit tests.
+    use super::*;
+
+    #[test]
+    fn deep_link_handler_parses_alfred_license_activated_uri() {
+        // Happy path: well-formed LS-style fallback URL.
+        let key = parse_license_activated_url("alfred://license-activated?key=ABCD-1234-EFGH-5678");
+        assert_eq!(key.as_deref(), Some("ABCD-1234-EFGH-5678"));
+    }
+
+    #[test]
+    fn deep_link_handler_returns_none_for_other_alfred_paths() {
+        // Future routes under the alfred:// scheme must NOT be silently
+        // treated as activation URLs. Pin the host-segment check.
+        assert!(parse_license_activated_url("alfred://something-else?key=ABC").is_none());
+        assert!(parse_license_activated_url("alfred://upgrade?key=ABC").is_none());
+        // Non-alfred schemes are out-of-scope entirely.
+        assert!(parse_license_activated_url("https://example.com/license-activated?key=ABC").is_none());
+        assert!(parse_license_activated_url("").is_none());
+    }
+
+    #[test]
+    fn deep_link_handler_handles_extra_query_params() {
+        // LS may add tracking params (`?token=...&key=...`) in addition
+        // to `key`. The parser must extract `key` regardless of position.
+        let key = parse_license_activated_url(
+            "alfred://license-activated?token=xyz&key=THE-KEY&utm_source=ls",
+        );
+        assert_eq!(key.as_deref(), Some("THE-KEY"));
+        let key = parse_license_activated_url("alfred://license-activated?key=K1&extra=2");
+        assert_eq!(key.as_deref(), Some("K1"));
+    }
+
+    #[test]
+    fn deep_link_handler_returns_none_when_key_missing() {
+        // Defensive — empty / no-query URLs must NOT trigger activation.
+        // Sending an empty license to /license/activate would just 400,
+        // but bailing here keeps the contract clean.
+        assert!(parse_license_activated_url("alfred://license-activated").is_none());
+        assert!(parse_license_activated_url("alfred://license-activated?").is_none());
+        assert!(parse_license_activated_url("alfred://license-activated?key=").is_none());
+        assert!(parse_license_activated_url("alfred://license-activated?other=val").is_none());
+    }
+
+    #[test]
+    fn deep_link_handler_percent_decodes_license_keys() {
+        // LS sandbox keys occasionally include `%XX` sequences when the
+        // redirect URL was URL-encoded twice. Decode them so the key
+        // we forward to /license/activate matches what LS issued.
+        let key = parse_license_activated_url("alfred://license-activated?key=A%2DB%2DC");
+        assert_eq!(key.as_deref(), Some("A-B-C"));
+        // `+` decodes to space (legacy form encoding).
+        let key = parse_license_activated_url("alfred://license-activated?key=K%201");
+        assert_eq!(key.as_deref(), Some("K 1"));
+    }
+
+    #[test]
+    fn deep_link_handler_tolerates_whitespace_around_url() {
+        // OS shells sometimes hand us URLs with a trailing newline /
+        // surrounding spaces. Trim defensively.
+        let key = parse_license_activated_url("  alfred://license-activated?key=ABC  ");
+        assert_eq!(key.as_deref(), Some("ABC"));
+    }
+}

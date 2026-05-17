@@ -27,5 +27,12 @@
     "active": true,
     "targets": "all",
     "icon": ["icons/icon.png", "icons/icon.icns", "icons/icon.ico"]
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["alfred"]
+      }
+    }
   }
 }

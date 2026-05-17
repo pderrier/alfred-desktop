@@ -6852,3 +6852,160 @@ use crate::storage::read_json_file;
             Some(("https://real.example".to_string(), "real".to_string())),
         );
     }
+
+    // ── License user-preferences merge semantics (v0.4.0 P0-15) ──────
+    //
+    // The desktop persists `tier`, `license_key`, `license_validated_at`,
+    // and `tier_pending_notice` to `user-preferences.json` after a
+    // successful activation. The merge-only `save_user_preferences`
+    // path must round-trip these without disturbing pre-existing keys
+    // (account-scoped wizard state, cash mapping, etc.) — that's the
+    // promise of the merge-only contract documented in
+    // `docs/desktop-api-integration.md` § user-preferences.json.
+
+    fn isolate_user_prefs_dir() -> std::path::PathBuf {
+        // Each test gets its own data dir so the global user-preferences.json
+        // doesn't leak between tests. Uses the same pattern as the existing
+        // csv_run helpers in this file — env var ALFRED_DATA_DIR is read by
+        // `paths::default_data_dir`.
+        let base = std::env::temp_dir().join(format!("alfred-license-prefs-{}", now_epoch_ms()));
+        std::fs::create_dir_all(&base).expect("create temp prefs dir");
+        std::env::set_var("ALFRED_DATA_DIR", base.display().to_string());
+        base
+    }
+
+    #[test]
+    fn save_user_preferences_persists_license_tier_keys() {
+        let _guard = env_lock();
+        let base = isolate_user_prefs_dir();
+
+        // Activate Premium: write all four license keys.
+        let prefs = json!({
+            "tier": "paid",
+            "license_key": "LS-KEY-ABCD-1234",
+            "license_validated_at": "2026-05-17T12:34:56Z",
+            "tier_pending_notice": null,
+        });
+        crate::runtime_settings::save_user_preferences(&prefs)
+            .expect("save user preferences");
+
+        let read_back = crate::runtime_settings::get_user_preferences();
+        assert_eq!(read_back.get("tier").and_then(|v| v.as_str()), Some("paid"));
+        assert_eq!(
+            read_back.get("license_key").and_then(|v| v.as_str()),
+            Some("LS-KEY-ABCD-1234"),
+        );
+        assert_eq!(
+            read_back
+                .get("license_validated_at")
+                .and_then(|v| v.as_str()),
+            Some("2026-05-17T12:34:56Z"),
+        );
+        // tier_pending_notice was null → must be ABSENT from disk
+        // (null-sentinel semantics per save_user_preferences contract).
+        assert!(
+            read_back.get("tier_pending_notice").is_none(),
+            "null sentinel must remove the key; got: {:?}",
+            read_back.get("tier_pending_notice"),
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn save_user_preferences_merge_preserves_unrelated_keys_when_updating_license() {
+        // The promise of save_user_preferences: writing license keys
+        // must NOT wipe account-scoped wizard state / cash mapping
+        // / guidelines_by_account. Pin the merge invariant.
+        let _guard = env_lock();
+        let base = isolate_user_prefs_dir();
+
+        // Seed unrelated pre-existing prefs (mimics a returning user).
+        let seed = json!({
+            "default_account": "Boursorama",
+            "cash_account_links": { "live cash CTO": "Cash CTO" },
+            "guidelines_by_account": {
+                "Boursorama": { "objective": "growth", "horizon": "5y" }
+            },
+        });
+        crate::runtime_settings::save_user_preferences(&seed).expect("seed");
+
+        // Now write license keys (post-activation).
+        let license_patch = json!({
+            "tier": "paid",
+            "license_key": "K1",
+            "license_validated_at": "2026-05-17T00:00:00Z",
+        });
+        crate::runtime_settings::save_user_preferences(&license_patch)
+            .expect("save license patch");
+
+        let read_back = crate::runtime_settings::get_user_preferences();
+        // License keys present.
+        assert_eq!(read_back.get("tier").and_then(|v| v.as_str()), Some("paid"));
+        assert_eq!(read_back.get("license_key").and_then(|v| v.as_str()), Some("K1"));
+        // Pre-existing keys preserved.
+        assert_eq!(
+            read_back.get("default_account").and_then(|v| v.as_str()),
+            Some("Boursorama"),
+        );
+        assert!(read_back.get("cash_account_links").is_some(), "cash mapping wiped");
+        assert_eq!(
+            read_back
+                .get("guidelines_by_account")
+                .and_then(|g| g.get("Boursorama"))
+                .and_then(|b| b.get("objective"))
+                .and_then(|v| v.as_str()),
+            Some("growth"),
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn save_user_preferences_revokes_tier_when_set_to_null() {
+        // Webhook-triggered downgrade path (P1-8): when /license/status
+        // reports tier=free + pending_notice=refunded, the desktop
+        // clears the local license fields by writing nulls. Verify
+        // the null-sentinel removes those keys but leaves the rest of
+        // user-preferences intact.
+        let _guard = env_lock();
+        let base = isolate_user_prefs_dir();
+
+        // Activate then explicitly clear.
+        crate::runtime_settings::save_user_preferences(&json!({
+            "tier": "paid",
+            "license_key": "K1",
+            "license_validated_at": "2026-05-17T00:00:00Z",
+            "default_account": "Boursorama",
+        }))
+        .expect("seed activated state");
+
+        crate::runtime_settings::save_user_preferences(&json!({
+            "tier": null,
+            "license_key": null,
+            "license_validated_at": null,
+            "tier_pending_notice": "refunded",
+        }))
+        .expect("revoke license");
+
+        let read_back = crate::runtime_settings::get_user_preferences();
+        // License keys gone via null-sentinel.
+        assert!(read_back.get("tier").is_none(), "tier should be removed");
+        assert!(read_back.get("license_key").is_none(), "license_key should be removed");
+        assert!(
+            read_back.get("license_validated_at").is_none(),
+            "license_validated_at should be removed",
+        );
+        // Pending notice persisted.
+        assert_eq!(
+            read_back.get("tier_pending_notice").and_then(|v| v.as_str()),
+            Some("refunded"),
+        );
+        // Unrelated keys preserved.
+        assert_eq!(
+            read_back.get("default_account").and_then(|v| v.as_str()),
+            Some("Boursorama"),
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }

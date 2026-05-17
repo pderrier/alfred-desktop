@@ -1342,3 +1342,44 @@ pub fn run_codex_has_oauth_backup() -> Result<serde_json::Value> {
         "result": { "has_backup": crate::codex::has_oauth_backup() }
     }))
 }
+
+// ── Admin observability (v0.4.0 P0-14) ───────────────────────────────
+
+/// Proxy `/admin/usage`. Server 403s for non-admins; the desktop UI hides
+/// the Admin tab unless `is_admin_hash_local` returned `{is_admin: true}`,
+/// so the typical 403 path is unreachable in normal use.
+pub fn run_get_admin_usage() -> Result<serde_json::Value> {
+    let payload = crate::alfred_api_client::get_admin_usage()?;
+    Ok(bridge_envelope("admin:usage-local", payload))
+}
+
+/// Proxy `/admin/vps-stats`. Same auth contract as `run_get_admin_usage`.
+pub fn run_get_admin_vps_stats() -> Result<serde_json::Value> {
+    let payload = crate::alfred_api_client::get_admin_vps_stats()?;
+    Ok(bridge_envelope("admin:vps-stats-local", payload))
+}
+
+/// Return the current user's client hash (FNV-1a of OpenAI JWT). Used by
+/// the JS layer for diagnostic display ("logged in as <hash-prefix>...").
+/// Returns `{user_hash: null}` when no JWT is available (user not signed
+/// in to Codex).
+pub fn run_current_user_hash() -> Result<serde_json::Value> {
+    let hash = crate::alfred_api_client::current_user_hash();
+    Ok(bridge_envelope(
+        "admin:current-user-hash-local",
+        json!({ "user_hash": hash }),
+    ))
+}
+
+/// Check whether the current user's hash is on the baked-in
+/// `admin_config::ADMIN_HASHES_WHITELIST`. Returns `{is_admin: bool}`.
+/// The whitelist itself is never sent to JS — only the boolean answer.
+pub fn run_is_admin_hash() -> Result<serde_json::Value> {
+    let is_admin = crate::alfred_api_client::current_user_hash()
+        .map(|h| crate::admin_config::is_whitelisted_admin(&h))
+        .unwrap_or(false);
+    Ok(bridge_envelope(
+        "admin:is-admin-hash-local",
+        json!({ "is_admin": is_admin }),
+    ))
+}

@@ -1748,12 +1748,25 @@ fn persist_line_extras(data_dir: &std::path::Path, run_id: &str, ticker: &str, l
         .and_then(|v| v.as_str())
         .unwrap_or(ticker);
 
-    // Persist shared insights (with optional sector analysis)
+    // Persist shared insights (with optional sector analysis).
+    //
+    // PARITY FIX (2026-05-17): `run_id` is now forwarded to every
+    // `dispatch_tool_direct` call so the MCP tool can emit a `line_progress`
+    // event with the matching `"sharing insights"` / `"persisting
+    // fundamentals"` / `"caching deep news"` string. Without `run_id` the
+    // event is silently skipped (see `mcp_server::tool_persist_*` —
+    // `if !run_id.is_empty()` gate) and the `run_stats` aggregator counts
+    // `insights_persisted=0`, `fundamentals_persisted=0`,
+    // `deep_news_persisted=0` for every native / native-oauth run even
+    // though the writes actually happened. This was the root cause of the
+    // `collective_memory=0` artifact observed in the 2026-05-17 cache audit
+    // — H2 confirmed (audit: docs/audits/collective-memory-zero-2026-05-17.md).
     if let Some(insights) = rec.get("shared_insights") {
         if !insights.is_null() {
             let mut params = json!({
                 "ticker": ticker,
                 "isin": isin,
+                "run_id": run_id,
                 "insights": serde_json::to_string(insights).unwrap_or_default(),
             });
             if let Some(sector) = rec.get("sector").and_then(|v| v.as_str()) {
@@ -1776,26 +1789,102 @@ fn persist_line_extras(data_dir: &std::path::Path, run_id: &str, ticker: &str, l
             crate::mcp_server::dispatch_tool_direct(
                 data_dir,
                 "persist_extracted_fundamentals",
-                &json!({"ticker": ticker, "isin": isin, "fundamentals": serde_json::to_string(fundamentals).unwrap_or_default()}),
+                &json!({
+                    "ticker": ticker,
+                    "isin": isin,
+                    "run_id": run_id,
+                    "fundamentals": serde_json::to_string(fundamentals).unwrap_or_default(),
+                }),
             );
         }
     }
 
-    // Persist deep news summary to the per-URL API cache
+    // Persist deep news summary to the per-URL API cache.
+    //
+    // Route through `dispatch_tool_direct("persist_deep_news", …)` rather
+    // than calling `persist_deep_news_if_present` directly, so the MCP tool
+    // emits the `caching deep news` progress event (same parity reason as
+    // insights/fundamentals above). The URL-selection logic mirrors the
+    // legacy `persist_deep_news_if_present` body — prefer the first un-cached
+    // article, fall back to the first article with a URL — so the on-disk
+    // write shape is unchanged. Codex mode already goes through this MCP
+    // tool path so it is byte-equivalent.
     let deep_news_summary = rec.get("deep_news_summary")
         .or_else(|| rec.get("deep_news_memory_summary"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
     if !deep_news_summary.is_empty() {
-        // Build a minimal line_context for persist_deep_news_if_present
-        let line_context = json!({
-            "ticker": ticker,
-            "row": { "isin": isin },
-            "news": line_data.get("news").cloned().unwrap_or(Value::Null),
-            "market": line_data.get("market_data").cloned().unwrap_or(Value::Null),
-        });
-        crate::llm_parsing::persist_deep_news_if_present(rec, &line_context);
+        let news_value = line_data.get("news").cloned().unwrap_or(Value::Null);
+        if let Some((best_url, best_title)) = pick_deep_news_target(&news_value) {
+            let quality_score = rec.get("deep_news_quality_score")
+                .and_then(|v| v.as_u64()).unwrap_or(50);
+            let relevance = rec.get("deep_news_relevance")
+                .and_then(|v| v.as_str()).unwrap_or("medium");
+            let staleness = rec.get("deep_news_staleness")
+                .and_then(|v| v.as_str()).unwrap_or("recent");
+            crate::mcp_server::dispatch_tool_direct(
+                data_dir,
+                "persist_deep_news",
+                &json!({
+                    "ticker": ticker,
+                    "isin": isin,
+                    "run_id": run_id,
+                    "url": best_url,
+                    "title": best_title,
+                    "summary": deep_news_summary,
+                    "quality_score": quality_score,
+                    "relevance": relevance,
+                    "staleness": staleness,
+                }),
+            );
+        }
     }
+}
+
+/// Pick the article URL to associate a fresh deep_news_summary with.
+///
+/// Prefers articles where `deep_summary_cached=false` (these are the ones
+/// the LLM just read), otherwise falls back to the first article with a
+/// URL. Returns `None` when no article has a URL — in that case we drop
+/// the summary on the floor rather than caching it against a synthetic
+/// key. Pure helper so the URL-selection policy is unit-testable and
+/// stays parity-aligned with `llm_parsing::persist_deep_news_if_present`.
+pub(crate) fn pick_deep_news_target(news: &Value) -> Option<(String, String)> {
+    let articles = news.as_array()
+        .or_else(|| news.get("items").and_then(|i| i.as_array()))
+        .or_else(|| news.get("articles").and_then(|i| i.as_array()))?;
+
+    // First pass: prefer an un-cached article (the one just read).
+    for item in articles {
+        let is_cached = item.get("deep_summary_cached")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if is_cached {
+            continue;
+        }
+        if let Some(url) = item.get("url").or_else(|| item.get("link"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            let title = item.get("title").or_else(|| item.get("titre"))
+                .and_then(|v| v.as_str()).unwrap_or("").to_string();
+            return Some((url.to_string(), title));
+        }
+    }
+
+    // Fallback: any article with a URL.
+    for item in articles {
+        if let Some(url) = item.get("url").or_else(|| item.get("link"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            let title = item.get("title").or_else(|| item.get("titre"))
+                .and_then(|v| v.as_str()).unwrap_or("").to_string();
+            return Some((url.to_string(), title));
+        }
+    }
+
+    None
 }
 
 fn build_batch_prompt(run_id: &str, tickers: &[(String, String, String)]) -> String {

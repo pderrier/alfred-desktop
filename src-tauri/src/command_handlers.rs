@@ -1383,3 +1383,228 @@ pub fn run_is_admin_hash() -> Result<serde_json::Value> {
         json!({ "is_admin": is_admin }),
     ))
 }
+
+// ── License flow (v0.4.0 P0-15) ──────────────────────────────────────
+
+/// Default instance name forwarded to Lemon Squeezy on activation. LS
+/// displays this string in the user's account dashboard
+/// ("Activated from Alfred on Pierre's MacBook Pro"). We default to the
+/// machine's hostname when available, otherwise the constant fallback —
+/// the server-side `activate_handler` accepts an empty value too and
+/// substitutes its own default, but sending a meaningful value here is
+/// better UX.
+fn resolve_instance_name() -> String {
+    std::env::var("ALFRED_LICENSE_INSTANCE_NAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            // Best-effort hostname lookup. The `hostname` env var is the
+            // most portable signal across the OSes we ship; on Linux/macOS
+            // `HOSTNAME` (lowercase via /etc/hostname read) and on Windows
+            // `COMPUTERNAME` are the canonical sources. Try both before
+            // giving up.
+            std::env::var("HOSTNAME")
+                .ok()
+                .or_else(|| std::env::var("COMPUTERNAME").ok())
+                .filter(|s| !s.is_empty())
+                .map(|h| format!("alfred-desktop@{h}"))
+        })
+        .unwrap_or_else(|| "alfred-desktop".to_string())
+}
+
+/// `POST /license/activate` — activate a Lemon Squeezy license key.
+///
+/// On success the server has already written `tier:<hash> = paid` to
+/// Redis and returned the typed envelope; we forward it verbatim through
+/// the bridge so the JS layer can persist `license_key`,
+/// `license_validated_at`, and `tier` to user-preferences.
+///
+/// `instance_name` is auto-derived from hostname when blank — the user
+/// never has to fill it in. Pass through any explicit value the caller
+/// supplied (e.g. an admin override during testing).
+pub fn run_license_activate(
+    license_key: String,
+    instance_name: Option<String>,
+) -> Result<serde_json::Value> {
+    let trimmed_key = license_key.trim();
+    if trimmed_key.is_empty() {
+        return Err(anyhow!("license_key_required"));
+    }
+    let name = instance_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .unwrap_or_else(resolve_instance_name);
+    let resp = crate::alfred_api_client::activate_license(trimmed_key, &name)?;
+    let payload = serde_json::to_value(resp)
+        .map_err(|e| anyhow!("license_activate_serialize_failed:{e}"))?;
+    Ok(bridge_envelope("license:activate-local", payload))
+}
+
+/// `POST /license/validate` — revalidate an already-activated key against
+/// LS. Today thin proxy (full P1-6 cold-start orchestration deferred);
+/// returns the raw server response so the desktop API client has a stable
+/// surface when P1-6 lands.
+pub fn run_license_validate(license_key: String) -> Result<serde_json::Value> {
+    let trimmed = license_key.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("license_key_required"));
+    }
+    let raw = crate::alfred_api_client::validate_license(trimmed)?;
+    Ok(bridge_envelope("license:validate-local", raw))
+}
+
+/// `GET /license/status` — read the cached tier + pending notice for
+/// the current user. No LS round-trip.
+pub fn run_license_status() -> Result<serde_json::Value> {
+    let resp = crate::alfred_api_client::get_license_status()?;
+    let payload = serde_json::to_value(resp)
+        .map_err(|e| anyhow!("license_status_serialize_failed:{e}"))?;
+    Ok(bridge_envelope("license:status-local", payload))
+}
+
+/// Return the Lemon Squeezy checkout URL the desktop overlay opens via
+/// `LemonSqueezy.Url.Open(...)`. v0.4.0 P0-15.
+///
+/// The actual URL is sourced from a compile-time env var
+/// (`ALFRED_LS_CHECKOUT_URL`, baked at build time) so:
+///   1. It is never checked into the public submodule repo.
+///   2. Pierre can rebuild with a different URL for sandbox vs prod
+///      without touching JS code.
+///   3. The desktop never hard-codes a Lemon Squeezy product identifier.
+///
+/// When the env var is empty (the public-repo default, before Pierre
+/// wires his LS dashboard) the function returns `null` for the URL +
+/// a structured `not_configured` flag so the JS layer can surface a
+/// clean "Activation Premium temporairement indisponible — réessaie
+/// dans quelques heures." banner instead of opening a bogus checkout.
+///
+/// Why not query the alfred-api server for this? Because the LS
+/// checkout URL has nothing user-specific — it's a static product URL
+/// shared by all customers. Routing through the server would add an
+/// HTTP round-trip on every Upgrade click with no benefit, and the URL
+/// belongs to the Tauri build (rebuild to change), matching how we
+/// handle `ALFRED_ADMIN_HASHES` whitelist.
+pub fn run_license_checkout_url() -> Result<serde_json::Value> {
+    // Compile-time first so the URL ships baked into Pierre's private
+    // builds; runtime env fallback for local dev / CI.
+    const COMPILE_TIME_URL: Option<&str> = option_env!("ALFRED_LS_CHECKOUT_URL");
+    let runtime = std::env::var("ALFRED_LS_CHECKOUT_URL").ok();
+    let url = COMPILE_TIME_URL
+        .map(|s| s.to_string())
+        .or(runtime)
+        .filter(|s| !s.trim().is_empty());
+    let configured = url.is_some();
+    Ok(bridge_envelope(
+        "license:checkout-url-local",
+        json!({
+            "url": url,
+            "configured": configured,
+        }),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_instance_name_uses_override_when_set() {
+        // ALFRED_LICENSE_INSTANCE_NAME wins over hostname inference so
+        // tests + admin overrides don't drift between OSes.
+        std::env::set_var("ALFRED_LICENSE_INSTANCE_NAME", "ci-fixture-machine");
+        assert_eq!(resolve_instance_name(), "ci-fixture-machine");
+        std::env::remove_var("ALFRED_LICENSE_INSTANCE_NAME");
+    }
+
+    #[test]
+    fn resolve_instance_name_falls_back_to_constant_when_no_hostname() {
+        // With no override and no HOSTNAME/COMPUTERNAME, the constant
+        // fallback must apply — never an empty string. Defensive
+        // because LS rejects empty instance_name on some plans.
+        std::env::remove_var("ALFRED_LICENSE_INSTANCE_NAME");
+        std::env::remove_var("HOSTNAME");
+        std::env::remove_var("COMPUTERNAME");
+        let name = resolve_instance_name();
+        assert!(!name.is_empty(), "instance name must never be empty");
+    }
+
+    #[test]
+    fn run_license_activate_rejects_empty_key() {
+        let err = run_license_activate("".into(), None).unwrap_err();
+        assert!(
+            err.to_string().contains("license_key_required"),
+            "empty license key must surface a clear error code, got: {err}",
+        );
+        let err = run_license_activate("   ".into(), None).unwrap_err();
+        assert!(
+            err.to_string().contains("license_key_required"),
+            "whitespace-only key must also fail, got: {err}",
+        );
+    }
+
+    #[test]
+    fn run_license_validate_rejects_empty_key() {
+        let err = run_license_validate("".into()).unwrap_err();
+        assert!(err.to_string().contains("license_key_required"));
+        let err = run_license_validate("   ".into()).unwrap_err();
+        assert!(err.to_string().contains("license_key_required"));
+    }
+
+    #[test]
+    fn run_license_checkout_url_returns_not_configured_when_unset() {
+        // Public-repo default: no compile-time URL, no runtime override.
+        // The desktop must receive `configured: false` so the JS layer
+        // shows the "temporarily unavailable" banner instead of opening
+        // a bogus checkout.
+        //
+        // Note: this test runs against the compile-time
+        // option_env!("ALFRED_LS_CHECKOUT_URL") which IS None for the
+        // public repo's CI build. If Pierre rebuilds with the env var
+        // set, this test will fail at his build time — expected, and
+        // a clear signal to add his URL to a .env or build.rs override
+        // for `cargo test` runs.
+        std::env::remove_var("ALFRED_LS_CHECKOUT_URL");
+        let payload = run_license_checkout_url().unwrap();
+        let result = payload.get("result").unwrap();
+        let configured = result.get("configured").unwrap().as_bool().unwrap();
+        let url = result.get("url").unwrap();
+        // The public-repo build has no compile-time URL → both must
+        // reflect "not configured".
+        assert!(
+            !configured,
+            "checkout URL should be unconfigured in the public-repo build",
+        );
+        assert!(
+            url.is_null(),
+            "url must be null when not configured, got: {url:?}",
+        );
+    }
+
+    #[test]
+    fn run_license_checkout_url_uses_runtime_env_when_compile_time_absent() {
+        // When Pierre runs `ALFRED_LS_CHECKOUT_URL=https://...
+        // cargo run` locally without recompiling, the runtime env
+        // fallback kicks in. Verify the path is wired.
+        //
+        // Skipped if a compile-time URL is baked in (Pierre's private
+        // build), because compile-time wins and the test premise
+        // doesn't hold.
+        if option_env!("ALFRED_LS_CHECKOUT_URL").is_some() {
+            return;
+        }
+        std::env::set_var(
+            "ALFRED_LS_CHECKOUT_URL",
+            "https://example.lemonsqueezy.com/buy/test-product",
+        );
+        let payload = run_license_checkout_url().unwrap();
+        let result = payload.get("result").unwrap();
+        assert!(result.get("configured").unwrap().as_bool().unwrap());
+        assert_eq!(
+            result.get("url").unwrap().as_str().unwrap(),
+            "https://example.lemonsqueezy.com/buy/test-product",
+        );
+        std::env::remove_var("ALFRED_LS_CHECKOUT_URL");
+    }
+}

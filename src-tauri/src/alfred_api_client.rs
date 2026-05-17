@@ -81,17 +81,20 @@ fn get_client_hash() -> Option<String> {
 /// require the header (it's the source of sessions) — the active-session
 /// context is `None` when this function runs for that endpoint.
 ///
-/// v0.4.0 (P0-14): `/admin/*` paths are explicitly exempted from
-/// X-Run-Session injection even when the slot is filled. Rationale: if an
-/// admin clicks the Admin tab while a run is in flight, the active session
-/// slot is non-empty, but admin endpoints are NOT mounted under
-/// `require_run_session` server-side (see `apps/alfred-api/src/lib.rs` —
-/// admin routes layered with `require_admin`, not `require_run_session`).
-/// Sending the header would not break anything (the server middleware
-/// simply doesn't consume it), but the contract is "endpoints get exactly
-/// the auth headers they require, no more". Defense-in-depth — and it
-/// keeps the request payload smaller for admin polls. See
-/// `is_admin_path` for the path-prefix rule.
+/// v0.4.0 (P0-14 + P0-15): account-level endpoints are explicitly exempted
+/// from X-Run-Session injection even when the slot is filled. Rationale: if
+/// an admin clicks the Admin tab while a run is in flight, or if the user
+/// clicks Upgrade and the LS overlay activation handler hits `/license/*`,
+/// the active session slot is non-empty, but those endpoints are NOT
+/// mounted under `require_run_session` server-side (see
+/// `apps/alfred-api/src/lib.rs` — admin routes layered with `require_admin`,
+/// license routes layered with `require_auth` only, neither under
+/// `require_run_session`). Sending the header would not break anything
+/// (the server middleware simply doesn't consume it), but the contract is
+/// "endpoints get exactly the auth headers they require, no more".
+/// Defense-in-depth — and it keeps the request payload smaller for
+/// account-scope polls. See `is_session_exempt_path` for the path-prefix
+/// rule.
 fn apply_auth(req: ureq::Request, path: &str) -> ureq::Request {
     let ts = now_epoch_secs();
     let client_hash = get_client_hash().unwrap_or_default();
@@ -100,7 +103,7 @@ fn apply_auth(req: ureq::Request, path: &str) -> ureq::Request {
     let mut req = req
         .set("X-Client-Hash", &client_hash)
         .set("X-Timestamp", &ts.to_string());
-    if !is_admin_path(sign_path) {
+    if !is_session_exempt_path(sign_path) {
         if let Some(session_id) = active_run_session() {
             req = req.set("X-Run-Session", &session_id);
         }
@@ -115,18 +118,31 @@ fn apply_auth(req: ureq::Request, path: &str) -> ureq::Request {
     }
 }
 
-/// Pure helper: is this request path under the admin surface? Used by
-/// `apply_auth` to skip `X-Run-Session` injection (the admin endpoints are
-/// not nested under the `require_run_session` middleware server-side, so
-/// the header is dead weight there).
+/// Pure helper: is this request path an account-level surface that does
+/// NOT live under the `require_run_session` middleware? Used by
+/// `apply_auth` to skip `X-Run-Session` injection — sending the header
+/// would be dead weight (the server middleware doesn't consume it on
+/// these routes) and silently leaks a per-run identifier into an
+/// account-scope call.
 ///
-/// Match rule: path equals `/admin` or starts with `/admin/`. The exact
-/// match guards against a future `/admin` collection root; the slash-prefix
-/// match covers every sub-route. Anything else returns false — there is no
-/// fuzzy / partial / case-insensitive match because the server-side routes
-/// are case-sensitive too.
-fn is_admin_path(path: &str) -> bool {
-    path == "/admin" || path.starts_with("/admin/")
+/// Match rules:
+///   - `/admin` or anything under `/admin/` (v0.4.0 P0-14 — admin
+///     observability endpoints, gated by `require_admin` server-side)
+///   - `/license` or anything under `/license/` (v0.4.0 P0-15 — LS
+///     activation/validation/status, gated by `require_auth` only)
+///
+/// Anything else returns false — there is no fuzzy / partial /
+/// case-insensitive match because the server-side routes are
+/// case-sensitive too.
+///
+/// Renamed from `is_admin_path` in v0.4.0 P0-15 (P3-40 follow-up) when
+/// `/license/*` joined the exemption set. The behavioural contract is
+/// pinned by `session_exempt_endpoints_skip_run_session_header`.
+fn is_session_exempt_path(path: &str) -> bool {
+    path == "/admin"
+        || path.starts_with("/admin/")
+        || path == "/license"
+        || path.starts_with("/license/")
 }
 
 // ── Run-session context (v0.4.0 P0-11) ──────────────────────────────
@@ -701,6 +717,205 @@ pub fn current_user_hash() -> Option<String> {
     get_client_hash()
 }
 
+// ── License client (v0.4.0 P0-15) ─────────────────────────────────────
+//
+// Proxies the Lemon Squeezy License API via the alfred-api server (the
+// desktop never talks to LS directly — see `docs/monetization-architecture.md`
+// § "Lemon Squeezy authoritative + Redis cache"). All requests follow the
+// HMAC auth contract (`X-Client-Hash` + `X-Timestamp` + `X-Signature`)
+// but are exempt from `X-Run-Session` injection — license endpoints are
+// account-level, not per-run (see `is_session_exempt_path`).
+//
+// Server response shapes pinned in `apps/alfred-api/src/license.rs`. Each
+// struct here uses `#[serde(default)]` on every field so an older server
+// (one wire-compatible release behind) degrades gracefully — missing
+// fields default to None / empty rather than parse-failing.
+
+/// Typed mirror of the `/license/activate` success response envelope.
+///
+/// Wire shape (from `license.rs::activate_handler` Activated arm):
+/// ```json
+/// { "ok": true, "tier": "paid", "instance_id": "...", "expires_at": "ISO",
+///   "validated_at": 1700000000 }
+/// ```
+///
+/// The error path (LS rejected, key revoked, etc.) is HTTP 400 with a
+/// `{error: "license_invalid", reason: "..."}` body that surfaces through
+/// the standard `map_api_error` chain — not this struct.
+///
+/// The 503 `license_provider_not_configured` path (LEMON_SQUEEZY_API_KEY
+/// empty) is mapped to the structured error code
+/// `alfred_license_provider_not_configured` in `map_license_error`
+/// below so the desktop UI can render a clean banner instead of a
+/// vague HTTP error.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct LicenseActivationResponse {
+    /// Always `true` on success; defaults to `false` if the server omits.
+    #[serde(default)]
+    pub ok: bool,
+    /// `"paid"` on success — pinned for an extra sanity check at the call
+    /// site (we can assert this in tests + when persisting to user-prefs).
+    #[serde(default)]
+    pub tier: String,
+    /// LS-assigned instance identifier. Used by P2-8 multi-device
+    /// deactivation. May be `None` on older server versions.
+    #[serde(default)]
+    pub instance_id: Option<String>,
+    /// ISO-8601 expiry timestamp (LS-native format). `None` when the
+    /// subscription has no fixed end date.
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    /// Epoch seconds when the activation was validated (server clock).
+    /// Used as the source for the desktop's `license_validated_at`
+    /// user-preference.
+    #[serde(default)]
+    pub validated_at: u64,
+}
+
+/// Typed mirror of the `/license/status` response envelope.
+///
+/// Wire shape (from `license.rs::status_handler`):
+/// ```json
+/// { "ok": true, "tier": "free"|"paid", "expires_at": <epoch>|null,
+///   "validated_at": <epoch>|null, "pending_notice": "refunded"|"expired"|null }
+/// ```
+///
+/// Note `expires_at` is an epoch second here (different from the
+/// activation response's ISO string) — the status endpoint reads back
+/// from the Redis `TierRecord` which stores epoch seconds.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct LicenseStatusResponse {
+    #[serde(default)]
+    pub ok: bool,
+    /// `"free"` or `"paid"`. Defaults to empty string if the server omits.
+    #[serde(default)]
+    pub tier: String,
+    /// Epoch seconds when the subscription expires. `None` when the user
+    /// is on the free tier or when the paid tier has no fixed end.
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+    /// Epoch seconds of the last successful activation/revalidation.
+    #[serde(default)]
+    pub validated_at: Option<u64>,
+    /// Sticky banner set by webhook events: `"refunded"`, `"expired"`,
+    /// or `None`. The desktop reads this on cold start to surface a
+    /// one-shot notice to the user (P1-8 — separate item).
+    #[serde(default)]
+    pub pending_notice: Option<String>,
+}
+
+/// Activate a Lemon Squeezy license key against the server.
+///
+/// `POST /license/activate` body `{license_key, instance_name}`. The
+/// server proxies to LS, sets `tier:<hash> = paid` on success, and
+/// returns the typed envelope above.
+///
+/// Error semantics:
+/// - HTTP 400 `license_invalid` → bubbled up as
+///   `alfred_api_http_error:400` through `map_api_error` (caller can
+///   parse the body via `inferCodedErrorFromText` JS-side).
+/// - HTTP 503 `license_provider_not_configured` → mapped to the clean
+///   structured code `alfred_license_provider_not_configured` so the
+///   desktop renders a "service temporarily unavailable" banner
+///   instead of a confusing "auth failure" message.
+/// - Any other status / transport error → standard `map_api_error`.
+///
+/// `instance_name` is forwarded to LS for display in the user's LS
+/// dashboard ("Activated from Alfred on Pierre's MacBook Pro"). Pass
+/// the OS hostname or a fixed `"alfred-desktop"` when unknown — the
+/// server defaults to the latter when this is empty.
+pub fn activate_license(
+    license_key: &str,
+    instance_name: &str,
+) -> Result<LicenseActivationResponse> {
+    let body = serde_json::json!({
+        "license_key": license_key,
+        "instance_name": instance_name,
+    });
+    let raw = api_post_json("/license/activate", &body)?;
+    serde_json::from_value(raw)
+        .map_err(|e| anyhow!("alfred_api_parse_failed:license_activate:{e}"))
+}
+
+/// Validate a Lemon Squeezy license key against the server.
+///
+/// `POST /license/validate` body `{license_key}`. The server proxies to
+/// the LS validate endpoint and returns the raw LS response — full
+/// integration deferred to P1-6 (cold-start revalidation orchestration).
+/// Today wired so the desktop API client has a stable surface to call
+/// when P1-6 lands; this method just returns the parsed JSON envelope.
+///
+/// Same error semantics as [`activate_license`].
+pub fn validate_license(license_key: &str) -> Result<Value> {
+    let body = serde_json::json!({
+        "license_key": license_key,
+    });
+    api_post_json("/license/validate", &body)
+}
+
+/// Fetch the cached license status for the current user.
+///
+/// `GET /license/status`. Reads the Redis `tier:<hash>` record (no LS
+/// round-trip). Returns the typed envelope above.
+///
+/// The desktop reads this on cold start (P1-6 separate item) and after
+/// every successful activation to refresh the user-pref cache. A
+/// non-paid `tier` here means the cache is stale or the user has never
+/// upgraded — the `pending_notice` field surfaces refund/expired
+/// banners set by webhooks.
+pub fn get_license_status() -> Result<LicenseStatusResponse> {
+    let raw = api_get("/license/status", TIMEOUT_SECS)?;
+    serde_json::from_value(raw)
+        .map_err(|e| anyhow!("alfred_api_parse_failed:license_status:{e}"))
+}
+
+/// Authenticated POST request with a JSON body that parses and returns
+/// the response envelope. Used by `/license/*` calls where the server
+/// returns a structured response we want to consume (unlike `api_post`
+/// which is fire-and-forget).
+///
+/// Centralises the body-shape handling for the license codes:
+/// - HTTP 503 with body `error=license_provider_not_configured` →
+///   structured code `alfred_license_provider_not_configured`.
+/// - Other 4xx/5xx → `alfred_api_http_error:<code>` (existing contract).
+/// - Transport failures → `alfred_api_request_failed:<e>` (existing).
+fn api_post_json(path: &str, body: &Value) -> Result<Value> {
+    let base = api_url().ok_or_else(|| anyhow!("alfred_api_not_configured"))?;
+    let url = format!("{base}{path}");
+    let req = apply_auth(ureq::post(&url), path)
+        .set("Content-Type", "application/json")
+        .timeout(Duration::from_secs(TIMEOUT_SECS));
+    let result = req.send_string(&serde_json::to_string(body).unwrap_or_default());
+    match result {
+        Ok(resp) => resp
+            .into_json::<Value>()
+            .map_err(|e| anyhow!("alfred_api_parse_failed:{e}")),
+        Err(ureq::Error::Status(503, resp)) => {
+            let body_text = resp.into_string().unwrap_or_default();
+            let parsed: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
+            Err(anyhow!("{}", classify_503_body(&parsed)))
+        }
+        Err(e) => Err(map_api_error(e)),
+    }
+}
+
+/// Classify a 503 response body. Returns:
+/// - `"alfred_license_provider_not_configured"` when the body identifies
+///   an unconfigured LS provider (server-side `LEMON_SQUEEZY_API_KEY`
+///   env var empty). The desktop renders a clean "temporarily unavailable"
+///   banner rather than a vague HTTP error — see `monetization-architecture.md`.
+/// - `"alfred_api_http_error:503"` for any other 503 (server overloaded,
+///   upstream failure with no body, etc.) so existing transport handling
+///   continues to work.
+pub(crate) fn classify_503_body(body: &Value) -> String {
+    let code = body.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    if code == "license_provider_not_configured" {
+        "alfred_license_provider_not_configured".to_string()
+    } else {
+        "alfred_api_http_error:503".to_string()
+    }
+}
+
 /// Persist shared insights (generic analysis) back to the API for other users.
 /// Optionally includes sector classification and sector analysis memo.
 pub fn persist_shared_insights(ticker: &str, isin: &str, insights: &Value, sector: Option<&str>, sector_analysis: Option<&str>) {
@@ -1151,84 +1366,120 @@ mod tests {
         );
     }
 
-    // ── /admin/* path exemption from X-Run-Session (v0.4.0 P0-14) ───
+    // ── Session-exempt path exemption from X-Run-Session ────────────
+    //
+    // v0.4.0 P0-14 added /admin/*; v0.4.0 P0-15 (P3-40) extended to
+    // /license/* and renamed `is_admin_path` → `is_session_exempt_path`.
     //
     // CRITICAL contract — if a future refactor of apply_auth ever
-    // injects X-Run-Session unconditionally, admin calls fired during
-    // an active run would leak a session header into endpoints that
-    // are NOT under `require_run_session`. The server would ignore the
-    // header (no harm), but the contract is "endpoints get exactly the
-    // auth headers they need". Pinned here so a regression fails CI
+    // injects X-Run-Session unconditionally, account-level calls fired
+    // during an active run would leak a session header into endpoints
+    // that are NOT under `require_run_session`. The server would ignore
+    // the header (no harm), but the contract is "endpoints get exactly
+    // the auth headers they need". Pinned here so a regression fails CI
     // instead of degrading silently to a payload bloat.
 
     #[test]
-    fn is_admin_path_matches_admin_root_and_subroutes() {
+    fn is_session_exempt_path_matches_admin_root_and_subroutes() {
         // /admin equals the collection root (defensive — not actually
         // a server-side route today but the rule must cover it).
-        assert!(is_admin_path("/admin"));
+        assert!(is_session_exempt_path("/admin"));
         // Documented sub-routes from `apps/alfred-api/src/admin.rs`.
-        assert!(is_admin_path("/admin/usage"));
-        assert!(is_admin_path("/admin/vps-stats"));
+        assert!(is_session_exempt_path("/admin/usage"));
+        assert!(is_session_exempt_path("/admin/vps-stats"));
         // Future admin routes must inherit the rule.
-        assert!(is_admin_path("/admin/anything/nested/here"));
+        assert!(is_session_exempt_path("/admin/anything/nested/here"));
     }
 
     #[test]
-    fn is_admin_path_rejects_non_admin_paths() {
+    fn is_session_exempt_path_matches_license_root_and_subroutes() {
+        // v0.4.0 P0-15: /license/* added to the exempt set. License
+        // endpoints are account-level (activation / validation /
+        // status) and not under `require_run_session` server-side.
+        assert!(is_session_exempt_path("/license"));
+        // Documented sub-routes from `apps/alfred-api/src/license.rs`.
+        assert!(is_session_exempt_path("/license/activate"));
+        assert!(is_session_exempt_path("/license/validate"));
+        assert!(is_session_exempt_path("/license/status"));
+        // Future license routes must inherit the rule (e.g. P2-8
+        // device deactivation).
+        assert!(is_session_exempt_path("/license/devices/abc/deactivate"));
+    }
+
+    #[test]
+    fn is_session_exempt_path_rejects_non_exempt_paths() {
         // Make sure we don't accidentally over-match. Every gated
         // analysis endpoint must continue to receive X-Run-Session.
-        assert!(!is_admin_path("/api/market"));
-        assert!(!is_admin_path("/api/news"));
-        assert!(!is_admin_path("/api/admin"));        // suffix, not prefix
-        assert!(!is_admin_path("/run/start"));
-        assert!(!is_admin_path("/healthz"));
-        assert!(!is_admin_path(""));
-        assert!(!is_admin_path("/"));
+        assert!(!is_session_exempt_path("/api/market"));
+        assert!(!is_session_exempt_path("/api/news"));
+        assert!(!is_session_exempt_path("/api/admin"));        // suffix, not prefix
+        assert!(!is_session_exempt_path("/api/license"));      // suffix, not prefix
+        assert!(!is_session_exempt_path("/run/start"));
+        assert!(!is_session_exempt_path("/healthz"));
+        assert!(!is_session_exempt_path(""));
+        assert!(!is_session_exempt_path("/"));
         // Case-sensitive — server routes are case-sensitive too.
-        assert!(!is_admin_path("/Admin/usage"));
-        assert!(!is_admin_path("/ADMIN/usage"));
+        assert!(!is_session_exempt_path("/Admin/usage"));
+        assert!(!is_session_exempt_path("/ADMIN/usage"));
+        assert!(!is_session_exempt_path("/License/activate"));
+        assert!(!is_session_exempt_path("/LICENSE/activate"));
     }
 
     #[test]
-    fn admin_endpoint_calls_do_not_inject_run_session_header() {
+    fn session_exempt_endpoints_skip_run_session_header() {
         // CRITICAL: when an admin clicks the Admin tab while a run is
-        // active, the session slot is populated. apply_auth must NOT
-        // leak X-Run-Session into /admin/* requests — those endpoints
-        // are not gated by require_run_session server-side.
+        // active, or the user clicks Upgrade and the LS activation
+        // handler fires `/license/activate`, the session slot is
+        // populated. apply_auth must NOT leak X-Run-Session into these
+        // account-level requests — those endpoints are not gated by
+        // `require_run_session` server-side.
+        //
+        // Renamed from `admin_endpoint_calls_do_not_inject_run_session_header`
+        // in v0.4.0 P0-15 (P3-40) when /license/* joined the exempt
+        // set. Same assertions, expanded coverage.
         let _guard = run_session_test_lock();
         clear_active_run_session();
-        set_active_run_session("active-run-while-admin-polls");
+        set_active_run_session("active-run-while-account-call-fires");
 
-        for path in ["/admin/usage", "/admin/vps-stats"] {
+        for path in [
+            "/admin/usage",
+            "/admin/vps-stats",
+            "/license/activate",
+            "/license/validate",
+            "/license/status",
+        ] {
             let raw = ureq::get(&format!("https://example.test{path}"));
             let signed = apply_auth(raw, path);
             let dbg = format!("{signed:?}");
             assert!(
                 !dbg.to_lowercase().contains("x-run-session"),
-                "X-Run-Session must be exempt for {path} — leaked into admin call. Debug: {dbg}",
+                "X-Run-Session must be exempt for {path} — leaked into account-level call. Debug: {dbg}",
             );
         }
 
-        // Sanity: a non-admin path during the same run still gets the
+        // Sanity: a non-exempt path during the same run still gets the
         // header. Pins the exemption to the path, not a global toggle.
         let raw = ureq::get("https://example.test/api/news");
         let signed = apply_auth(raw, "/api/news");
         let dbg = format!("{signed:?}");
         assert!(
             dbg.to_lowercase().contains("x-run-session"),
-            "Non-admin paths must still receive X-Run-Session during an active run",
+            "Non-exempt paths must still receive X-Run-Session during an active run",
         );
 
         clear_active_run_session();
     }
 
     #[test]
-    fn admin_endpoint_calls_still_inject_hmac_auth() {
+    fn session_exempt_endpoints_still_inject_hmac_auth() {
         // The X-Run-Session exemption must NOT cascade into the HMAC
-        // signing path — admin endpoints are still wrapped by
-        // `require_auth` server-side, so X-Client-Hash + X-Timestamp +
-        // X-Signature are mandatory. Verify all three headers survive
-        // the admin-path branch.
+        // signing path — admin AND license endpoints are still wrapped
+        // by `require_auth` server-side, so X-Client-Hash + X-Timestamp
+        // + X-Signature are mandatory. Verify all three headers survive
+        // the session-exempt branch.
+        //
+        // Renamed from `admin_endpoint_calls_still_inject_hmac_auth` in
+        // v0.4.0 P0-15 when license was added to the exempt set.
         let _guard = run_session_test_lock();
         clear_active_run_session();
         // Set a compile-time-style secret via the runtime env fallback
@@ -1237,21 +1488,23 @@ mod tests {
         // injected at compile time).
         std::env::set_var("ALFRED_API_SECRET", "test-secret-for-hmac");
 
-        let raw = ureq::get("https://example.test/admin/usage");
-        let signed = apply_auth(raw, "/admin/usage");
-        let dbg = format!("{signed:?}").to_lowercase();
-        assert!(
-            dbg.contains("x-client-hash"),
-            "X-Client-Hash header missing from /admin/usage request. Debug: {dbg}",
-        );
-        assert!(
-            dbg.contains("x-timestamp"),
-            "X-Timestamp header missing from /admin/usage request. Debug: {dbg}",
-        );
-        assert!(
-            dbg.contains("x-signature"),
-            "X-Signature header missing from /admin/usage request. Debug: {dbg}",
-        );
+        for path in ["/admin/usage", "/license/activate"] {
+            let raw = ureq::get(&format!("https://example.test{path}"));
+            let signed = apply_auth(raw, path);
+            let dbg = format!("{signed:?}").to_lowercase();
+            assert!(
+                dbg.contains("x-client-hash"),
+                "X-Client-Hash header missing from {path} request. Debug: {dbg}",
+            );
+            assert!(
+                dbg.contains("x-timestamp"),
+                "X-Timestamp header missing from {path} request. Debug: {dbg}",
+            );
+            assert!(
+                dbg.contains("x-signature"),
+                "X-Signature header missing from {path} request. Debug: {dbg}",
+            );
+        }
 
         std::env::remove_var("ALFRED_API_SECRET");
     }
@@ -1550,6 +1803,117 @@ mod tests {
         assert_eq!(
             classify_401_body(&serde_json::json!({"error": "unauthorized"})),
             "alfred_api_unauthorized",
+        );
+    }
+
+    // ── License response contract (v0.4.0 P0-15) ────────────────────
+
+    #[test]
+    fn license_activation_response_parses_full_envelope() {
+        // Mirror the exact shape emitted by `activate_handler` in
+        // apps/alfred-api/src/license.rs (Activated arm). A server-side
+        // rename or drop of any of these fields would surface here as a
+        // parse error rather than a silently-empty user-pref write.
+        let body = serde_json::json!({
+            "ok": true,
+            "tier": "paid",
+            "instance_id": "inst-abc123",
+            "expires_at": "2027-05-17T00:00:00Z",
+            "validated_at": 1_700_000_100u64,
+        });
+        let parsed: LicenseActivationResponse = serde_json::from_value(body).unwrap();
+        assert!(parsed.ok);
+        assert_eq!(parsed.tier, "paid");
+        assert_eq!(parsed.instance_id.as_deref(), Some("inst-abc123"));
+        assert_eq!(parsed.expires_at.as_deref(), Some("2027-05-17T00:00:00Z"));
+        assert_eq!(parsed.validated_at, 1_700_000_100);
+    }
+
+    #[test]
+    fn license_activation_response_degrades_on_missing_fields() {
+        // A wire-compatible older server (one ship behind) may omit a
+        // sub-field — defaults must keep parse green so the desktop
+        // doesn't dead-end on an upgrade flow.
+        let body = serde_json::json!({ "ok": true, "tier": "paid" });
+        let parsed: LicenseActivationResponse = serde_json::from_value(body).unwrap();
+        assert!(parsed.ok);
+        assert_eq!(parsed.tier, "paid");
+        assert!(parsed.instance_id.is_none());
+        assert!(parsed.expires_at.is_none());
+        assert_eq!(parsed.validated_at, 0);
+    }
+
+    #[test]
+    fn license_status_response_parses_full_envelope() {
+        // Mirror the exact shape emitted by `status_handler` in
+        // apps/alfred-api/src/license.rs. Note: `expires_at` is an
+        // epoch second here (distinct from activate's ISO string) —
+        // pin the type so they don't drift.
+        let body = serde_json::json!({
+            "ok": true,
+            "tier": "paid",
+            "expires_at": 1_810_857_600u64,
+            "validated_at": 1_700_000_100u64,
+            "pending_notice": "refunded",
+        });
+        let parsed: LicenseStatusResponse = serde_json::from_value(body).unwrap();
+        assert!(parsed.ok);
+        assert_eq!(parsed.tier, "paid");
+        assert_eq!(parsed.expires_at, Some(1_810_857_600));
+        assert_eq!(parsed.validated_at, Some(1_700_000_100));
+        assert_eq!(parsed.pending_notice.as_deref(), Some("refunded"));
+    }
+
+    #[test]
+    fn license_status_response_handles_free_tier_null_fields() {
+        // Free-tier users have `tier: "free"` and the timestamp +
+        // notice fields are explicit nulls (default TierRecord).
+        let body = serde_json::json!({
+            "ok": true,
+            "tier": "free",
+            "expires_at": null,
+            "validated_at": null,
+            "pending_notice": null,
+        });
+        let parsed: LicenseStatusResponse = serde_json::from_value(body).unwrap();
+        assert!(parsed.ok);
+        assert_eq!(parsed.tier, "free");
+        assert!(parsed.expires_at.is_none());
+        assert!(parsed.validated_at.is_none());
+        assert!(parsed.pending_notice.is_none());
+    }
+
+    #[test]
+    fn classify_503_body_detects_license_provider_not_configured() {
+        // The server returns this when LEMON_SQUEEZY_API_KEY is empty —
+        // common on first deploy before Pierre wires the LS account.
+        // The desktop must show a clean "temporarily unavailable" banner.
+        let body = serde_json::json!({
+            "error": "license_provider_not_configured",
+            "hint": "Server admin must populate LEMON_SQUEEZY_API_KEY",
+        });
+        assert_eq!(
+            classify_503_body(&body),
+            "alfred_license_provider_not_configured",
+        );
+    }
+
+    #[test]
+    fn classify_503_body_falls_back_to_generic_http_error() {
+        // Any other 503 (overload, upstream failure with no body) must
+        // surface as the standard `alfred_api_http_error:503` so existing
+        // transport handling continues to work.
+        assert_eq!(
+            classify_503_body(&Value::Null),
+            "alfred_api_http_error:503",
+        );
+        assert_eq!(
+            classify_503_body(&serde_json::json!({})),
+            "alfred_api_http_error:503",
+        );
+        assert_eq!(
+            classify_503_body(&serde_json::json!({"error": "service_unavailable"})),
+            "alfred_api_http_error:503",
         );
     }
 }

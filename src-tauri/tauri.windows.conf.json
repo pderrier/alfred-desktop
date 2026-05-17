@@ -28,5 +28,12 @@
     "targets": ["msi", "nsis"],
     "icon": ["icons/icon.png", "icons/icon.icns", "icons/icon.ico"],
     "resources": ["codex-runtime/**/*"]
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["alfred"]
+      }
+    }
   }
 }

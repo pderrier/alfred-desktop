@@ -843,6 +843,61 @@ export function createDesktopBridgeClient({
     async getAdminVpsStats() {
       const payload = await invoke("get_admin_vps_stats_local");
       return normalizeTauriPayload(payload, ["get_admin_vps_stats_local"]);
+    },
+    // ── License flow (v0.4.0 P0-15) ───────────────────────────────────
+    //
+    // Activation pipeline (from `docs/desktop-api-integration.md` §
+    // License flow):
+    //   - `licenseCheckoutUrl()` returns the LS checkout URL the
+    //     `upgrade-view.js` overlay opens.
+    //   - `licenseActivate(key, instanceName)` proxies the user's
+    //     license key to the server, which validates against LS and
+    //     sets `tier:<hash> = paid` in Redis.
+    //   - `licenseValidate(key)` revalidates an active key (P1-6
+    //     scaffold).
+    //   - `licenseStatus()` reads the cached tier + pending notice.
+    //
+    // None of these endpoints carry an `X-Run-Session` header — see
+    // `is_session_exempt_path` in alfred_api_client.rs.
+    /**
+     * Returns `{tier, instance_id, expires_at, validated_at, ok}` on
+     * success per `apps/alfred-api/src/license.rs::activate_handler`.
+     * Surfaces `alfred_api_http_error:400` with body `license_invalid`
+     * for rejected keys, and `alfred_license_provider_not_configured`
+     * (mapped from 503) when the LS provider env vars are unset.
+     */
+    async licenseActivate(licenseKey, instanceName = "") {
+      const payload = await invoke("license_activate_local", {
+        licenseKey,
+        instanceName: instanceName || null,
+      });
+      return normalizeTauriPayload(payload, ["license:activate-local"]);
+    },
+    /**
+     * Revalidate an already-activated license key. Thin proxy today;
+     * full integration with cold-start cache refresh ships with P1-6.
+     */
+    async licenseValidate(licenseKey) {
+      const payload = await invoke("license_validate_local", { licenseKey });
+      return normalizeTauriPayload(payload, ["license:validate-local"]);
+    },
+    /**
+     * Returns `{tier, expires_at, validated_at, pending_notice, ok}`
+     * from the Redis cache. No LS round-trip.
+     */
+    async licenseStatus() {
+      const payload = await invoke("license_status_local");
+      return normalizeTauriPayload(payload, ["license:status-local"]);
+    },
+    /**
+     * Returns `{url: string|null, configured: bool}` — the Lemon
+     * Squeezy checkout URL the upgrade overlay opens. `configured`
+     * is false until Pierre rebuilds with `ALFRED_LS_CHECKOUT_URL`
+     * baked in (or sets it at runtime for local dev).
+     */
+    async licenseCheckoutUrl() {
+      const payload = await invoke("license_checkout_url_local");
+      return normalizeTauriPayload(payload, ["license:checkout-url-local"]);
     }
   };
   return bridge;

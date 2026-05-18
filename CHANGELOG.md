@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.4.0
+
+**Mandatory upgrade.** Earlier desktop versions can no longer talk to the API — please install this release.
+
+### What's new
+
+- **Free tier** — every user can run up to 3 analyses per rolling 7-day window without an account. Quota tracking lives server-side ; the local app shows a clear modal when the limit is hit, with a reset countdown and an upgrade option.
+- **Premium plan — 9 €/an, unlimited analyses.** Click "Upgrade" in the modal to open the checkout overlay (Lemon Squeezy as merchant of record, EU VAT handled). Activation is one-click once payment goes through, and your subscription survives reinstalls.
+- **Admin observability** for the operator (Pierre only) — a hidden Settings tab surfacing API usage, top tickers, and VPS health. Visible only when the running build's hash matches the whitelist baked into the binary.
+
+### Under the hood
+
+- The desktop opens each analysis run with a single `/run/start` round-trip ; the API gates downstream calls on a short-lived session token. Repo is open-source — quota cannot be bypassed by patching the client.
+- Tier status is cached locally so paid users keep working through brief API outages.
+- The Lemon Squeezy webhook handler is wired end-to-end (cancel / refund / expire events flip the tier back) but the account itself remains to be activated externally — until then, the upgrade button shows a clean "temporarily unavailable" banner.
+
+### Compatibility
+
+- **Breaking** : v0.3.x desktops will fail authentication against the v0.4.0 API. The auto-updater will prompt you on next launch.
+- **Privacy** : OpenAI JWT is never sent to our servers ; only a one-way hash is used as a quota identifier. Your portfolio data is unchanged.
+
+### Caveats tracked for v0.4.x point releases
+
+- Splash-screen quota probe still requires a small server-side endpoint to flag exhaustion before the first run attempt — until then, the upgrade modal fires on the first blocked call.
+- Manual deep-link smoke test pending on Windows + macOS first packaging round.
+- Lemon Squeezy webhook return-URL handler (Linux WebKitGTK fallback) ships in the next release once the LS dashboard is configured.
+
+---
+
 ## v0.3.3
 
 Six items shipped in one bundle across four worktrees: scorecard correctness, rate-limit hardening, LLM post-processing, line-memory sync fixes. No mandatory upgrade flag — real-provider QA gate (P3-15/P3-16) must pass before flipping `mandatory: true`.

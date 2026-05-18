@@ -1437,9 +1437,68 @@ pub fn run_license_activate(
         .map(String::from)
         .unwrap_or_else(resolve_instance_name);
     let resp = crate::alfred_api_client::activate_license(trimmed_key, &name)?;
+
+    // P3-51: persist `{tier, license_key, license_validated_at}` to
+    // user-preferences.json so the desktop has a local record of being
+    // paid. The server's Redis `tier:<hash>` is authoritative (TTL 24h),
+    // but if Redis evicts the key OR the server is unreachable on next
+    // cold start, the desktop would silently fall back to the free tier.
+    // The local cache covers that gap.
+    //
+    // Failure to persist is logged + swallowed — the activation itself
+    // succeeded server-side, and the user will see their paid status on
+    // the next `/license/status` round-trip. Don't fail the whole
+    // activation flow over a local-file write hiccup.
+    persist_license_to_user_prefs(trimmed_key, &resp);
+
     let payload = serde_json::to_value(resp)
         .map_err(|e| anyhow!("license_activate_serialize_failed:{e}"))?;
     Ok(bridge_envelope("license:activate-local", payload))
+}
+
+/// Build the user-preferences patch for a successful activation and call
+/// `save_user_preferences` with merge-only semantics. Extracted into its
+/// own fn so the unit test can drive the prefs serialisation contract
+/// without needing the full LS HTTP round-trip.
+///
+/// On any error (serde, file I/O), log to debug.log and return — the
+/// caller treats this as best-effort. Tier remains authoritative on the
+/// server.
+fn persist_license_to_user_prefs(
+    license_key: &str,
+    resp: &crate::alfred_api_client::LicenseActivationResponse,
+) {
+    let patch = build_license_prefs_patch(license_key, resp);
+    if let Err(e) = crate::runtime_settings::save_user_preferences(&patch) {
+        crate::debug_log(&format!(
+            "license: failed to persist tier to user-preferences: {e} (server-side tier authoritative, cold-start may need /license/status round-trip)"
+        ));
+    }
+}
+
+/// Build the `{tier, license_key, license_validated_at}` JSON patch from
+/// an `LicenseActivationResponse`. Pure helper so the contract can be
+/// pinned by a unit test without any I/O.
+fn build_license_prefs_patch(
+    license_key: &str,
+    resp: &crate::alfred_api_client::LicenseActivationResponse,
+) -> serde_json::Value {
+    // `validated_at` is epoch seconds from the server; convert to ISO
+    // 8601 so the user-preferences schema stays self-describing (other
+    // timestamp prefs use ISO 8601). Falls back to "" if the conversion
+    // ever fails — safer than dropping the key entirely.
+    let iso_ts = if resp.validated_at == 0 {
+        String::new()
+    } else {
+        chrono::DateTime::<chrono::Utc>::from_timestamp(resp.validated_at as i64, 0)
+            .map(|dt| dt.to_rfc3339())
+            .unwrap_or_default()
+    };
+    serde_json::json!({
+        "tier": resp.tier.clone(),
+        "license_key": license_key,
+        "license_validated_at": iso_ts,
+    })
 }
 
 /// `POST /license/validate` — revalidate an already-activated key against
@@ -1550,6 +1609,72 @@ mod tests {
         assert!(err.to_string().contains("license_key_required"));
         let err = run_license_validate("   ".into()).unwrap_err();
         assert!(err.to_string().contains("license_key_required"));
+    }
+
+    // ── P3-51: user-preferences persistence contract ─────────────────
+
+    #[test]
+    fn build_license_prefs_patch_shapes_payload_correctly() {
+        // Contract: the patch sent to save_user_preferences must contain
+        // exactly { tier, license_key, license_validated_at }. Any extra
+        // key would merge into user-prefs and clutter the JSON. Any
+        // missing key would defeat the cold-start cache fallback purpose.
+        let resp = crate::alfred_api_client::LicenseActivationResponse {
+            ok: true,
+            tier: "paid".to_string(),
+            instance_id: Some("inst-123".to_string()),
+            expires_at: Some("2027-05-18T22:00:00Z".to_string()),
+            validated_at: 1_777_000_000,
+        };
+        let patch = build_license_prefs_patch("ABCD-1234", &resp);
+        let obj = patch.as_object().expect("patch must be a JSON object");
+        assert_eq!(obj.get("tier").and_then(|v| v.as_str()), Some("paid"));
+        assert_eq!(obj.get("license_key").and_then(|v| v.as_str()), Some("ABCD-1234"));
+        let iso = obj.get("license_validated_at").and_then(|v| v.as_str()).unwrap();
+        assert!(iso.starts_with("2026-"), "ISO 8601 starts with year, got: {iso}");
+        // No other keys leak — the patch is merge-only into user-prefs.
+        assert_eq!(obj.len(), 3, "patch must contain exactly 3 keys, got: {obj:?}");
+    }
+
+    #[test]
+    fn build_license_prefs_patch_handles_zero_validated_at() {
+        // Edge case: a misconfigured server returning validated_at=0
+        // (e.g. fresh deploy where the field wasn't populated). Falling
+        // back to "" rather than dropping the key keeps the patch shape
+        // stable for the merge-only writer.
+        let resp = crate::alfred_api_client::LicenseActivationResponse {
+            ok: true,
+            tier: "paid".to_string(),
+            instance_id: None,
+            expires_at: None,
+            validated_at: 0,
+        };
+        let patch = build_license_prefs_patch("KEY-NO-TS", &resp);
+        let iso = patch
+            .get("license_validated_at")
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert_eq!(iso, "", "validated_at=0 maps to empty string sentinel");
+    }
+
+    #[test]
+    fn build_license_prefs_patch_preserves_original_license_key() {
+        // The license_key field in the patch is the RAW key sent to
+        // activate_license, not anything derived from the server response.
+        // This matters because the server doesn't echo the key back (it
+        // would be redundant) — the desktop must remember what it sent.
+        let resp = crate::alfred_api_client::LicenseActivationResponse {
+            ok: true,
+            tier: "paid".to_string(),
+            instance_id: None,
+            expires_at: None,
+            validated_at: 1_777_000_000,
+        };
+        let patch = build_license_prefs_patch("XYZ-VERY-LONG-KEY-9999", &resp);
+        assert_eq!(
+            patch.get("license_key").and_then(|v| v.as_str()),
+            Some("XYZ-VERY-LONG-KEY-9999"),
+        );
     }
 
     #[test]

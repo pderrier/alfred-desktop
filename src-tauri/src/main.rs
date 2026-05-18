@@ -854,6 +854,42 @@ fn parse_license_activated_url(raw: &str) -> Option<String> {
     None
 }
 
+/// Redact the `key=...` segment of a license-activated deep-link URL for
+/// safe logging. Keeps the first 4 chars of the key as a debugging hint
+/// (so we can correlate a log line with a specific LS license without
+/// exposing the full key in the local debug.log). Non-license URLs are
+/// passed through unchanged.
+///
+/// Local-file impact only — debug.log is never transmitted — but per the
+/// stated security property "license key never logged in cleartext", we
+/// redact at the source.
+fn redact_license_key_in_url(raw: &str) -> String {
+    let trimmed = raw.trim_start();
+    let prefix = "alfred://license-activated";
+    if !trimmed.starts_with(prefix) {
+        return raw.to_string();
+    }
+    let rest = &trimmed[prefix.len()..];
+    let query = rest.strip_prefix('?').unwrap_or(rest);
+    let mut redacted_pairs: Vec<String> = Vec::new();
+    for pair in query.split('&') {
+        let mut kv = pair.splitn(2, '=');
+        let k = kv.next().unwrap_or("").trim();
+        let v = kv.next().map(|s| s.trim()).unwrap_or("");
+        if k == "key" && !v.is_empty() {
+            let head: String = v.chars().take(4).collect();
+            redacted_pairs.push(format!("key={head}<redacted>"));
+        } else if !k.is_empty() {
+            redacted_pairs.push(format!("{k}={v}"));
+        }
+    }
+    if redacted_pairs.is_empty() {
+        format!("{prefix}")
+    } else {
+        format!("{prefix}?{}", redacted_pairs.join("&"))
+    }
+}
+
 /// Minimal URL percent-decode for the license-key extraction path. LS
 /// license keys are conventionally alphanumeric-with-dashes — full
 /// percent-encoding support isn't needed, but `%XX` sequences appear in
@@ -951,7 +987,10 @@ fn run_tauri_app() -> anyhow::Result<()> {
                     use tauri::Emitter;
                     for url in event.urls() {
                         let raw = url.as_str();
-                        crate::debug_log(&format!("deep-link: received {raw}"));
+                        crate::debug_log(&format!(
+                            "deep-link: received {}",
+                            redact_license_key_in_url(raw)
+                        ));
                         if let Some(key) = parse_license_activated_url(raw) {
                             if let Some(win) = handle.get_webview_window("main") {
                                 let _ = win.show();
@@ -1173,5 +1212,58 @@ mod deep_link_tests {
         // surrounding spaces. Trim defensively.
         let key = parse_license_activated_url("  alfred://license-activated?key=ABC  ");
         assert_eq!(key.as_deref(), Some("ABC"));
+    }
+
+    // ── License key redaction (P3-47) ────────────────────────────────
+
+    #[test]
+    fn redact_license_key_preserves_4_char_head() {
+        // Debug log must keep a short prefix for correlation but never
+        // expose the full key. 4 chars is enough to distinguish runs
+        // without making the redacted log a credential.
+        let redacted = redact_license_key_in_url("alfred://license-activated?key=ABCD-1234-EFGH-5678");
+        assert_eq!(redacted, "alfred://license-activated?key=ABCD<redacted>");
+    }
+
+    #[test]
+    fn redact_license_key_handles_short_keys() {
+        // Keys shorter than 4 chars are still partly visible, but the
+        // <redacted> suffix is always appended so a grep for the marker
+        // catches every leak attempt.
+        let redacted = redact_license_key_in_url("alfred://license-activated?key=K1");
+        assert_eq!(redacted, "alfred://license-activated?key=K1<redacted>");
+    }
+
+    #[test]
+    fn redact_license_key_keeps_other_params_intact() {
+        // Tracking params like utm_source aren't sensitive and helpful in
+        // debug logs. Only the `key` field is redacted.
+        let redacted = redact_license_key_in_url(
+            "alfred://license-activated?utm_source=ls&key=THE-KEY&token=xyz",
+        );
+        assert!(redacted.contains("utm_source=ls"), "utm preserved: {redacted}");
+        assert!(redacted.contains("token=xyz"), "token preserved: {redacted}");
+        assert!(redacted.contains("key=THE-<redacted>"), "key redacted: {redacted}");
+        assert!(!redacted.contains("THE-KEY"), "full key MUST be absent: {redacted}");
+    }
+
+    #[test]
+    fn redact_license_key_passes_through_non_alfred_urls() {
+        // Non-license deep-link URLs (or HTTPS noise) pass through
+        // unchanged — redaction only applies to the activation path.
+        let redacted = redact_license_key_in_url("https://example.com/something?key=ABC");
+        assert_eq!(redacted, "https://example.com/something?key=ABC");
+        let redacted = redact_license_key_in_url("alfred://upgrade?key=ABC");
+        assert_eq!(redacted, "alfred://upgrade?key=ABC");
+    }
+
+    #[test]
+    fn redact_license_key_handles_missing_key() {
+        // Edge case: deep-link with no key field at all. Should not panic
+        // and should not insert <redacted> spuriously.
+        let redacted = redact_license_key_in_url("alfred://license-activated");
+        assert_eq!(redacted, "alfred://license-activated");
+        let redacted = redact_license_key_in_url("alfred://license-activated?other=val");
+        assert_eq!(redacted, "alfred://license-activated?other=val");
     }
 }

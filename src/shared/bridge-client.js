@@ -850,6 +850,17 @@ export function createDesktopBridgeClient({
       const payload = await invoke("get_admin_vps_stats_local");
       return normalizeTauriPayload(payload, ["get_admin_vps_stats_local"]);
     },
+    /**
+     * P0-20 (2026-05-23) — count of runs whose `updated_at` falls in
+     * the rolling 7-day window. Used by the home tier+quota header.
+     * Returns `{count, limit, period}` (limit hardcoded to 3 desktop-
+     * side until P3-31 ships `/quota/status` server-side). Read-only,
+     * no quota consumption — safe to call repeatedly.
+     */
+    async runsCountLast7d() {
+      const payload = await invoke("runs_count_last_7d_local");
+      return normalizeTauriPayload(payload, ["runs_count_last_7d_local"]);
+    },
     // ── License flow (v0.4.0 P0-15) ───────────────────────────────────
     //
     // Activation pipeline (from `docs/desktop-api-integration.md` §

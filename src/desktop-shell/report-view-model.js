@@ -482,7 +482,10 @@ function aggregateRisksFromRecommendations(recommendations = []) {
     });
 }
 
-function buildCrossAccountThemeView(snapshot, currentAccount = "") {
+// P0-20 (2026-05-23) — exported so the home page (`app.js` welcome
+// view) can render top cross-portfolio themes directly without
+// duplicating the aggregation logic. Consumed via the named import.
+export function buildCrossAccountThemeView(snapshot, currentAccount = "") {
   const runs = Array.isArray(snapshot?.runs) ? snapshot.runs : [];
   const latestByAccount = new Map();
   for (const run of runs) {

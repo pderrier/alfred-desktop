@@ -130,3 +130,91 @@ pub fn rebuild_from_disk() -> Result<()> {
     crate::debug_log(&format!("[run-index] rebuilt with {} entries", summaries.len()));
     Ok(())
 }
+
+/// P0-20 (2026-05-23) — count runs whose `updated_at` falls within the
+/// last 7 days (rolling window from `now_ms`). Used by the home page's
+/// tier+quota header strip to show `Gratuit · X/3 cette semaine` in
+/// the free tier path.
+///
+/// `now_ms` is taken from the caller (Tauri command passes
+/// `std::time::SystemTime::now()`) so unit tests can pin the window
+/// against fixed fixtures without touching the system clock.
+///
+/// Skips entries with missing/empty/unparseable `updated_at` — they
+/// shouldn't count toward quota since we can't prove they fall in the
+/// rolling window. Reads from the in-memory index (no disk I/O).
+pub fn count_runs_last_7d(now_ms: i64) -> usize {
+    let cutoff_ms = now_ms - 7 * 24 * 3_600 * 1000;
+    let entries = load_index();
+    count_runs_after_cutoff(&entries, cutoff_ms)
+}
+
+/// Pure helper exposed for unit tests — accepts an explicit entries
+/// slice instead of reading the in-memory cache. Filters entries with
+/// `updated_at` parseable as RFC 3339 and ≥ `cutoff_ms`.
+pub fn count_runs_after_cutoff(entries: &[Value], cutoff_ms: i64) -> usize {
+    entries
+        .iter()
+        .filter_map(|e| e.get("updated_at").and_then(|v| v.as_str()))
+        .filter(|s| !s.trim().is_empty())
+        .filter_map(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .filter(|dt| dt.timestamp_millis() >= cutoff_ms)
+        .count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(updated_at: &str) -> Value {
+        json!({ "run_id": "x", "updated_at": updated_at })
+    }
+
+    #[test]
+    fn count_includes_run_within_window() {
+        let now_ms = 1_700_000_000_000_i64; // 2023-11-14T22:13:20Z
+        let three_days_ago = chrono::DateTime::<chrono::Utc>::from_timestamp(
+            (now_ms - 3 * 24 * 3_600 * 1000) / 1000, 0,
+        ).unwrap().to_rfc3339();
+        let entries = vec![run(&three_days_ago)];
+        let cutoff = now_ms - 7 * 24 * 3_600 * 1000;
+        assert_eq!(count_runs_after_cutoff(&entries, cutoff), 1);
+    }
+
+    #[test]
+    fn count_excludes_run_older_than_7d() {
+        let now_ms = 1_700_000_000_000_i64;
+        let eight_days_ago = chrono::DateTime::<chrono::Utc>::from_timestamp(
+            (now_ms - 8 * 24 * 3_600 * 1000) / 1000, 0,
+        ).unwrap().to_rfc3339();
+        let entries = vec![run(&eight_days_ago)];
+        let cutoff = now_ms - 7 * 24 * 3_600 * 1000;
+        assert_eq!(count_runs_after_cutoff(&entries, cutoff), 0);
+    }
+
+    #[test]
+    fn count_skips_empty_or_unparseable_timestamps() {
+        let now_ms = 1_700_000_000_000_i64;
+        let cutoff = now_ms - 7 * 24 * 3_600 * 1000;
+        let entries = vec![
+            run(""),
+            run("not-a-date"),
+            json!({ "run_id": "y" }), // no updated_at field at all
+        ];
+        assert_eq!(count_runs_after_cutoff(&entries, cutoff), 0);
+    }
+
+    #[test]
+    fn count_aggregates_multiple_recent_runs() {
+        let now_ms = 1_700_000_000_000_i64;
+        let cutoff = now_ms - 7 * 24 * 3_600 * 1000;
+        let one_day = chrono::DateTime::<chrono::Utc>::from_timestamp(
+            (now_ms - 24 * 3_600 * 1000) / 1000, 0,
+        ).unwrap().to_rfc3339();
+        let six_days = chrono::DateTime::<chrono::Utc>::from_timestamp(
+            (now_ms - 6 * 24 * 3_600 * 1000) / 1000, 0,
+        ).unwrap().to_rfc3339();
+        let entries = vec![run(&one_day), run(&six_days), run(&one_day)];
+        assert_eq!(count_runs_after_cutoff(&entries, cutoff), 3);
+    }
+}

@@ -745,6 +745,18 @@ async fn current_user_hash_local() -> Result<serde_json::Value, String> {
         .map_err(|e| e.to_string())
 }
 
+/// `runs_count_last_7d_local` — P0-20 (2026-05-23) home tier+quota
+/// header strip. Returns the number of runs in the rolling 7-day
+/// window plus the desktop-side limit. Read-only against the in-memory
+/// run-index, no network round-trip.
+#[tauri::command]
+async fn runs_count_last_7d_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_runs_count_last_7d)
+        .await
+        .map_err(|e| format!("runs_count_last_7d_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
 /// `admin_check_local` — server-driven admin tab visibility probe.
 /// v0.4.1 P0-16 (2026-05-23) — replaces the baked-in
 /// `ADMIN_HASHES_WHITELIST` constant. The desktop calls this at
@@ -1087,6 +1099,7 @@ fn run_tauri_app() -> anyhow::Result<()> {
             get_admin_vps_stats_local,
             current_user_hash_local,
             admin_check_local,
+            runs_count_last_7d_local,
             license_activate_local,
             license_validate_local,
             license_status_local,

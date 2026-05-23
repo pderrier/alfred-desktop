@@ -1371,6 +1371,31 @@ pub fn run_current_user_hash() -> Result<serde_json::Value> {
     ))
 }
 
+/// P0-20 (2026-05-23) — count runs whose `updated_at` falls in the last
+/// 7 days, for the home page tier+quota header strip. Used by the JS
+/// helper `quota-local-counter.js`. Returns
+/// `{count: <integer>, limit: 3, period: "rolling_7d"}` so the JS can
+/// render `Gratuit · X/3 cette semaine` without further math. The
+/// `limit` is reported by the desktop for now (matches the server
+/// default `FREE_TIER_RUNS_PER_WEEK = 3`); P3-31 will replace this with
+/// a server-side `/quota/status` once that endpoint lands.
+pub fn run_runs_count_last_7d() -> Result<serde_json::Value> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let count = crate::run_index::count_runs_last_7d(now_ms);
+    Ok(bridge_envelope(
+        "home:runs-count-last-7d-local",
+        json!({
+            "count": count,
+            "limit": 3,
+            "period": "rolling_7d",
+        }),
+    ))
+}
+
 /// P0-16 (2026-05-23) — server-driven admin tab visibility probe.
 /// Calls `GET /admin/check` ; returns `{is_admin: true}` on 204 (server
 /// confirmed admin), `{is_admin: false}` on 403 or any error (fail-safe

@@ -41,6 +41,10 @@ import {
 } from "/desktop-shell/ui-display-utils.js";
 import { resolveShellRefreshPlan } from "/desktop-shell/refresh-policy.js";
 import { buildGlobalPortfolioSynthesis } from "/desktop-shell/global-portfolio-synthesis.js";
+// P0-20 (2026-05-23) — home backbone v0.4.1
+import { buildCrossAccountThemeView } from "/desktop-shell/report-view-model.js";
+import { getThemeLabel } from "/desktop-shell/theme-labels.js";
+import { getLocalQuotaState, resetLocalQuotaCache } from "/desktop-shell/quota-local-counter.js";
 import { openDiscussionHistoryModal, saveDiscussionThread } from "/desktop-shell/discussion-memory.js";
 import {
   reduceRunActivityState
@@ -134,6 +138,10 @@ let selectedReportArtifact = null;
 let selectedHistoricalRun = null;
 let selectedTimelineRunId = null;
 let globalHomeSynthesis = { status: "idle", snapshotKey: null, data: null, error: null };
+// P0-20 — separate state for the tier+quota header strip. Loaded
+// independently of the synthesis since it doesn't depend on the run
+// snapshot — only the license_status + local run-index.
+let homeHeader = { status: "idle", data: null, error: null };
 
 // ── Bridge + run operations ──────────────────────────────────────
 
@@ -1127,6 +1135,44 @@ function computeHomeSnapshotKey(snapshot) {
   return `${latestSnapshotTs}|${latestRunId}|${latestRunTs}|${runsCount}`;
 }
 
+// P0-20 (2026-05-23) — refresh tier + quota count for the home header
+// strip. Tier comes from `bridge.licenseStatus()` (Redis cache, no LS
+// round-trip). Quota count comes from the local run-index helper. The
+// two are loaded in parallel ; whichever resolves first triggers a
+// re-render (the strip degrades gracefully — partial data still
+// renders the strip with `?` for the missing half).
+async function refreshHomeHeader() {
+  homeHeader = { status: "loading", data: null, error: null };
+  renderWelcome();
+
+  try {
+    const [licenseResult, quotaResult] = await Promise.allSettled([
+      bridge.licenseStatus(),
+      getLocalQuotaState(bridge),
+    ]);
+    const license = licenseResult.status === "fulfilled" ? licenseResult.value : null;
+    const quota = quotaResult.status === "fulfilled" ? quotaResult.value : null;
+    homeHeader = {
+      status: "ready",
+      data: {
+        tier: license?.tier || "free",
+        expires_at: license?.expires_at || null,
+        pending_notice: license?.pending_notice || null,
+        count: quota?.count ?? 0,
+        limit: quota?.limit ?? 3,
+      },
+      error: null,
+    };
+  } catch (e) {
+    homeHeader = {
+      status: "error",
+      data: null,
+      error: String(e?.message || e || "home_header_failed"),
+    };
+  }
+  renderWelcome();
+}
+
 function scheduleGlobalHomeSynthesis(snapshot) {
   const snapshotKey = computeHomeSnapshotKey(snapshot || {});
   if (globalHomeSynthesis.snapshotKey === snapshotKey && globalHomeSynthesis.status !== "error") {
@@ -1187,6 +1233,10 @@ async function refreshDashboardInner() {
   latestDashboardPayload = mergeDashboardPayloads(latestDashboardPayload, { ...payload, snapshot: hydratedSnapshot });
   const snapshot = latestDashboardPayload?.snapshot || {};
   scheduleGlobalHomeSynthesis(snapshot);
+  // P0-20 — refresh the tier+quota header strip on every dashboard
+  // refresh. Reuses the 60s memoisation in quota-local-counter to
+  // avoid extra Tauri calls when the snapshot churns.
+  refreshHomeHeader();
 
   // Keep live run context up to date with positions (for enriching done rows)
   const positions = snapshot.latest_run?.portfolio?.positions || [];
@@ -2368,40 +2418,109 @@ function renderWelcome() {
   }
 
 
+  // ── P0-20 Section 1 : Header strip — tier + quota ───────────────
+  const homeHeaderStrip = (() => {
+    const data = homeHeader.data;
+    if (!data) return "";
+    const isPaid = (data.tier || "free") === "paid";
+    const pendingNotice = data.pending_notice
+      ? `<span style="color:var(--sea-muted);margin-left:0.5rem">${escapeHtml(data.pending_notice)}</span>`
+      : "";
+    if (isPaid) {
+      return `
+        <div class="welcome-step welcome-home-header" style="padding:0.55rem 0.8rem;background:var(--surface-2);border-radius:6px;margin-bottom:0.6rem">
+          <strong>Premium · illimité</strong>${pendingNotice}
+        </div>
+      `;
+    }
+    const count = Number.isFinite(data.count) ? data.count : 0;
+    const limit = Number.isFinite(data.limit) ? data.limit : 3;
+    return `
+      <div class="welcome-step welcome-home-header" style="padding:0.55rem 0.8rem;background:var(--surface-2);border-radius:6px;margin-bottom:0.6rem;display:flex;justify-content:space-between;align-items:center;gap:0.6rem;flex-wrap:wrap">
+        <span><strong>Gratuit</strong> · ${count}/${limit} cette semaine</span>
+        <a href="#" class="welcome-upgrade-link" onclick="event.preventDefault(); window.dispatchEvent(new CustomEvent('alfred://upgrade-requested'));" style="color:var(--accent);text-decoration:none">Passe en illimité · 9 €/an →</a>
+        ${pendingNotice}
+      </div>
+    `;
+  })();
+
+  // ── P0-20 Section 5 : Themes transverses (top 3 globalThemes) ───
+  const themesCard = (() => {
+    if (!snapshot) return "";
+    try {
+      const view = buildCrossAccountThemeView(snapshot, "");
+      const globalThemes = Array.isArray(view?.globalThemes) ? view.globalThemes : [];
+      if (globalThemes.length === 0) return "";
+      const top3 = [...globalThemes]
+        .sort((a, b) => (b.totalCount || 0) - (a.totalCount || 0))
+        .slice(0, 3);
+      const rows = top3.map((t) => {
+        const label = getThemeLabel(t.theme);
+        const accountCount = Number(t.accountCount || 0);
+        const blurb = label.blurb
+          ? `<div style="color:var(--sea-muted);font-style:italic;font-size:0.9em;margin-top:0.15rem">${escapeHtml(label.blurb)}</div>`
+          : "";
+        return `
+          <li style="margin-bottom:0.45rem">
+            <strong>${escapeHtml(label.label)}</strong>
+            <span style="color:var(--sea-muted)"> · présent dans ${accountCount} compte${accountCount > 1 ? "s" : ""}</span>
+            ${blurb}
+          </li>
+        `;
+      }).join("");
+      return `
+        <div class="welcome-step welcome-themes-card">
+          <h3>Thèmes transverses</h3>
+          <ul style="list-style:none;padding:0;margin:0.3rem 0 0">${rows}</ul>
+        </div>
+      `;
+    } catch {
+      // Defensive — if the snapshot shape is unexpected, hide the card
+      // rather than crash the welcome view. The user just doesn't see
+      // themes that render ; nothing to surface here.
+      return "";
+    }
+  })();
+
+  // ── P0-20 Section 6 : Répartition (rewrite FR, no generic verdict) ──
   const globalSynthesisCard = (() => {
     if (accounts.length === 0 && runs.length === 0) return "";
     if (globalHomeSynthesis.status === "loading") {
       return `
       <div class="welcome-step welcome-global-summary">
-        <h3>Portfolio-wide summary</h3>
-        <p class="welcome-global-loading">Computing cross-portfolio allocation insights…</p>
+        <h3>Répartition</h3>
+        <p class="welcome-global-loading" style="color:var(--sea-muted)">Calcul en cours…</p>
       </div>
       `;
     }
     if (globalHomeSynthesis.status === "error") {
       return `
       <div class="welcome-step welcome-global-summary">
-        <h3>Portfolio-wide summary</h3>
-        <p style="color:var(--sea-muted)">Global synthesis is temporarily unavailable (${escapeHtml(globalHomeSynthesis.error || "unknown_error")}).</p>
+        <h3>Répartition</h3>
+        <p style="color:var(--sea-muted)">Synthèse globale momentanément indisponible (${escapeHtml(globalHomeSynthesis.error || "unknown_error")}).</p>
       </div>
       `;
     }
     const data = globalHomeSynthesis.data;
     if (!data) return "";
-    const topSupport = Array.isArray(data.supportBreakdown) ? data.supportBreakdown[0] : null;
-    const suggestions = Array.isArray(data.suggestions) ? data.suggestions.slice(0, 3) : [];
+    const supports = Array.isArray(data.supportBreakdown) ? data.supportBreakdown.slice(0, 3) : [];
+    const suggestion = Array.isArray(data.suggestions) ? data.suggestions[0] : null;
+    const supportLine = supports.length > 0
+      ? supports.map((s) => `${escapeHtml(s.name)} ${s.weightPct.toFixed(0)}%`).join(" · ")
+      : "";
     return `
       <div class="welcome-step welcome-global-summary">
-        <h3>Portfolio-wide summary</h3>
-        <p style="margin-bottom:0.45rem"><strong>${escapeHtml(data.verdict)}</strong> · ${data.accountCount} account(s) · Cash ${data.cashWeightPct.toFixed(1)}%</p>
-        <p style="margin-bottom:0.45rem">Total assets: <strong>${formatCurrency(data.totalValue)}</strong> · P/L: <strong>${formatCurrency(data.totalGain)}</strong></p>
-        <p style="color:var(--sea-muted);margin-bottom:0.5rem">Top support: ${topSupport ? `${escapeHtml(topSupport.name)} (${topSupport.weightPct.toFixed(1)}%)` : "Not enough data"}</p>
-        ${suggestions.length > 0
-          ? `<ul class="welcome-global-suggestions">${suggestions.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`
-          : `<p style="color:var(--sea-muted)">No major imbalance detected across your current account and support mix.</p>`}
-        <div style="display:flex;gap:0.4rem;margin-top:0.6rem">
-          <button class="ghost-btn" type="button" onclick="window.__askGlobalHomeSummary()">💬 Ask about this</button>
-          <button class="ghost-btn" type="button" onclick="window.__openGlobalSummaryDiscussions()">Previous discussions</button>
+        <h3>Répartition</h3>
+        <p style="margin-bottom:0.35rem">Total <strong>${formatCurrency(data.totalValue)}</strong> · P/L <strong>${formatCurrency(data.totalGain)}</strong> · Cash ${data.cashWeightPct.toFixed(1)}%</p>
+        ${supportLine
+          ? `<p style="color:var(--sea-muted);margin-bottom:0.5rem">${supportLine}</p>`
+          : ""}
+        ${suggestion
+          ? `<p style="margin-bottom:0.5rem"><span class="chip chip-suggestion">${escapeHtml(suggestion)}</span></p>`
+          : ""}
+        <div style="display:flex;gap:0.4rem;margin-top:0.4rem">
+          <button class="ghost-btn" type="button" onclick="window.__askGlobalHomeSummary()">💬 Demander à Alfred</button>
+          <button class="ghost-btn" type="button" onclick="window.__openGlobalSummaryDiscussions()">Discussions précédentes</button>
         </div>
       </div>
     `;
@@ -2416,7 +2535,10 @@ function renderWelcome() {
 
   if (titleNode) titleNode.textContent = accountRuns.size > 0 ? "Latest runs" : "Ready";
 
+  // P0-20 home composition order : header strip → themes → répartition.
+  if (homeHeaderStrip) html += homeHeaderStrip;
   if (globalSynthesisCard) html += globalSynthesisCard;
+  if (themesCard) html += themesCard;
 
   if (accountRuns.size > 0) {
     html += `<div class="welcome-accounts">`;

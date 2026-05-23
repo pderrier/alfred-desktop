@@ -1,5 +1,121 @@
 # Changelog
 
+## v0.4.1 (unreleased — consolidating)
+
+Two thematic clusters shipped in this point release : a CSV-import regression
+class that surfaced on Pierre's 2026-05-23 PEA run, and the v0.4.1 home page
+redesign Pierre asked for after the v0.4.0 launch.
+
+### CSV import — regression class
+
+- **P0-53 — ticker reconciliation after ISIN resolve.** `derive_ticker_from_name`
+  used to produce e.g. `LVMH` instead of the canonical `MC` ; the post-analysis
+  line-memory write-back would then fork `by_ticker` keys. Fix : new
+  `ticker_from_resolved` helper rewrites the `ticker` field to the canonical
+  short form (stripping the Yahoo suffix) after `/api/resolve` succeeds.
+  Idempotent — Finary positions that arrive already canonical are untouched.
+- **P0-54 — ISIN validation + outlier sanity-check (defense-in-depth).**
+  ISO 6166 regex + Luhn-mod-10 checksum guard the resolver against malformed
+  ISINs like `000007764440`. Outlier prices (>10 000 €/unit, with a
+  whitelist for BRK.A / NVR) surface as `csv_parsing_issues` on the
+  preview wizard.
+- **P0-55 — enrichment.fetch_market false-match guard (ROOT CAUSE).**
+  `derive_ticker_from_name` could produce generic tokens like `PARTS` or
+  `THE` that match the wrong instrument on Google Finance, returning a
+  bogus price that then overwrote the correct CSV value (PARTS SOCIALES
+  922 € → fake 3 140 793 €). New `has_canonical_resolution` integrity gate
+  in `apply_collection_result` skips the market sync when `resolved_symbol`
+  is absent, preserves the CSV-parsed price, pushes a
+  `enrichment_skipped_unresolved` collection issue, and emits the new
+  `alfred://collection-issue-detected` Tauri event (P1-56 lite consumer).
+- **P1-56 lite — pre-run visibility in the CSV preview wizard.** Surfaces
+  parser-level findings (outliers / malformed ISINs / generic tickers at
+  risk) and a balanced "Ce qui va bien ✓ / Ce qui mérite ton attention ⚠"
+  view so Alfred never looks like he only complains. Open chat wizard
+  on high-confidence parses too when findings exist.
+
+### Home page redesign (v0.4.1 backbone)
+
+Pierre's feedback after v0.4.0 launch : "la home page n'est jamais très
+intéressante". This release replaces the English boilerplate
+"Portfolio-wide summary / Balanced allocation / Top support: Not enough
+data" with seven French-tutoiement sections composed in priority order :
+
+1. **Tier + quota header strip** (P0-20). `Gratuit · X/3 cette semaine`
+   with inline upgrade CTA, or `Premium · illimité` for paid. Quota count
+   read locally from `run-index.json` until P3-31 ships `/quota/status`
+   server-side. Pending-notice line surfaced when present.
+2. **Alfred t'a dit quoi** (P1-21). First sentence of the latest run's
+   `synthese_marche` plus a chip counting non-hold pending recommandations.
+   Click → opens the run.
+3. **Ce qui a bougé** (P1-21). Existing `run-diff-section` re-skinned :
+   `"3 signaux ont changé · 1 upgrade, 2 downgrades · 4 mouvements
+   significatifs"`. Hidden silently when nothing changed.
+4. **Tes derniers ordres Finary** (P1-22). 5 last trade-like transactions
+   from `snapshot.transactions` (no longer empty for Pierre — pre-fix the
+   data was fetched but never consumed UI). Format
+   `"Tu as renforcé THERMADOR le 14 mai · -139,63 €"`.
+5. **Thèmes transverses** (P0-20). Top 3 cross-account themes with French
+   labels from the new `theme-labels.js` dictionary (~35 slugs covering
+   tariffs / margin / sector / catalysts) ; unknown slugs humanised
+   safely (LLM endpoint deferred to v0.4.2). Now triggers the
+   `alfred-theme-concentration` overlay (previously dead code — P3-52)
+   when 2+ accounts share a theme with 4+ occurrences.
+6. **Répartition** (P0-19 + P0-20). The supportBreakdown bug ("Top
+   support: Not enough data" while Finary had complete data) is fixed via
+   a Finary-accounts fallback when `latest_run.portfolio.positions` is
+   empty. Rewritten line `"Total <X> · P/L <±Y> · Cash <Z>%"` plus top 3
+   supports — no more generic "Balanced allocation" verdict.
+7. **Catalyseurs cette semaine** (P2-25). Top 3 dated catalysts in the
+   [now, now+30d] window, parsed from `recommandations[].catalyseurs[]`
+   with an FR-month regex that rejects percentages and verifies dates
+   are non-rolling. Format `"MC · AG du 27 mai 2026 · dans 4 jours"`.
+8. **Rétro-précision Alfred** (P2-24). Cross-portfolio aggregation of
+   `price_tracking.signal_accuracy` : `"Sur 57 derniers signaux scorés,
+   37 ont eu raison (65 %)"` plus a "Bonne pioche" + "Mauvaise pioche"
+   chip. Section hidden when fewer than 5 scored signals (sub-5 = noise).
+
+### Server fixes
+
+- **P0-16 — server-driven Admin tab visibility.** `/admin/check` returns
+  204 to admins, 403 to others — replaces the previous compile-time
+  `ADMIN_HASHES_WHITELIST` constant. Adding an admin is now a single
+  env-var update, no desktop rebuild.
+- **P0-17 — `/api/market` cache freshness gate.** Extended to require a
+  non-null `price` alongside the fundamentals. Pre-fix, cold watchlist
+  tickers (RBT, BEN) surfaced as `prix_actuel: null` on the desktop.
+  New `market_cache_is_full` / `market_cache_stale_reason` pure helpers
+  extracted for unit testability.
+
+### Deferred to v0.4.2
+
+- **P1-23 — LLM-backed long-tail theme labels.** `/themes/describe`
+  endpoint with Redis 30j cache. Deferred : alfred-api has no LLM
+  dispatcher (purely a proxy layer), and the manual dict covers ~80 %
+  of observed slugs.
+
+### Tests / under the hood
+
+- Submodule : 371 cargo tests + ~320 JS tests, +60 new across these
+  items. 0 regressions.
+- alfred-api : 206 lib + 22 integration (3 new for `/admin/check`,
+  +5 for `market_cache_is_full`).
+- Submodule files added : `theme-labels.js`, `quota-local-counter.js`,
+  `home-last-synthesis.js`, `home-recent-trades.js`,
+  `catalyst-calendar.js`, `services/signal_accuracy.rs`.
+- 4 new Tauri commands : `admin_check_local`, `runs_count_last_7d_local`,
+  `compute_signal_accuracy_local` (and the P0-53/54/55 changes piggy-
+  backed on `resolve_canonical_symbols` + `apply_collection_result`).
+- 1 deleted Rust module : `admin_config.rs` (120 LOC, 3 tests removed).
+
+### Voice
+
+The home page is now French-tutoiement throughout. No "Balanced allocation"
+generic verdict. Each section either renders a fact (numbers), an action
+(CTA + click target), or hides itself silently.
+
+---
+
 ## v0.4.0
 
 **Mandatory upgrade.** Earlier desktop versions can no longer talk to the API — please install this release.

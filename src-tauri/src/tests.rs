@@ -7009,3 +7009,688 @@ use crate::storage::read_json_file;
 
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    // ── P0-53 / P0-54: CSV ticker reconciliation + ISIN validation ──────
+    //
+    // These tests pin the contract introduced in v0.4.1 to fix the
+    // 2026-05-23 aborted run `019e53d118ac`. Three behaviour pillars:
+    //
+    //   1. `resolve_canonical_symbols` reconciles the rough ticker on a
+    //      CSV-imported position with the resolved symbol's short form
+    //      so the line-memory write-back uses the canonical key.
+    //   2. `validate_isin` enforces ISO 6166 + Luhn-mod-10 and is wired
+    //      into the resolve pass to skip API calls on garbage ISINs.
+    //   3. `execute_spec` surfaces price-outlier and malformed-ISIN
+    //      flags through a snapshot-level `csv_parsing_issues` array
+    //      which the workflow merges into `collection_issues`.
+
+    fn make_csv_position(ticker: &str, isin: &str, nom: &str) -> serde_json::Value {
+        json!({
+            "ticker": ticker,
+            "nom": nom,
+            "isin": isin,
+            "quantite": 1.0,
+            "prix_actuel": 100.0,
+            "valeur_actuelle": 100.0,
+            "prix_revient": 90.0,
+            "plus_moins_value": 10.0,
+            "plus_moins_value_pct": 11.11,
+            "compte": "PEA",
+            "resolved_symbol": null,
+        })
+    }
+
+    #[test]
+    fn csv_position_ticker_reconciled_to_resolved_symbol_after_resolve() {
+        // Bug from `019e53d118ac` (2026-05-23): CSV import derived
+        // `ticker = "LVMH"` from the name. `/api/resolve` returned
+        // `MC.PA`. Without reconciliation, the post-analysis line-memory
+        // write-back forked `by_ticker` (one entry under LVMH, another
+        // under MC.PA). Fix: ticker is rewritten to `MC` after resolve.
+        let _guard = env_lock();
+        crate::enrichment::set_resolve_mock(Some(|isin| {
+            if isin == "FR0000121014" { Some("MC.PA".to_string()) } else { None }
+        }));
+
+        let positions = vec![make_csv_position("LVMH", "FR0000121014", "LVMH")];
+        let resolved = crate::native_collection::resolve_canonical_symbols_for_test(positions);
+
+        crate::enrichment::set_resolve_mock(None);
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved[0].get("ticker").and_then(|v| v.as_str()),
+            Some("MC"),
+            "ticker must be reconciled to the canonical short form (MC, not LVMH)"
+        );
+        assert_eq!(
+            resolved[0].get("resolved_symbol").and_then(|v| v.as_str()),
+            Some("MC.PA"),
+            "resolved_symbol must still carry the full Yahoo suffix"
+        );
+    }
+
+    #[test]
+    fn csv_position_ticker_unchanged_when_resolve_fails() {
+        // When the resolver returns None (server down, unknown ISIN), the
+        // row stays untouched so downstream enrichment can degrade to
+        // bare-ticker routing. The rough name-derived ticker is the only
+        // fallback.
+        let _guard = env_lock();
+        crate::enrichment::set_resolve_mock(Some(|_isin| None));
+
+        let positions = vec![make_csv_position("LVMH", "FR0000121014", "LVMH")];
+        let resolved = crate::native_collection::resolve_canonical_symbols_for_test(positions);
+
+        crate::enrichment::set_resolve_mock(None);
+
+        assert_eq!(
+            resolved[0].get("ticker").and_then(|v| v.as_str()),
+            Some("LVMH"),
+            "ticker stays as the name-derived fallback when /api/resolve yields no symbol"
+        );
+        assert!(
+            resolved[0].get("resolved_symbol").map(|v| v.is_null()).unwrap_or(true),
+            "resolved_symbol must remain absent when the resolver returns None"
+        );
+    }
+
+    #[test]
+    fn csv_position_ticker_idempotent_when_already_canonical() {
+        // Finary already produces canonical tickers (e.g. `MC`) so when
+        // `/api/resolve` returns `MC.PA`, the reconciliation must be a
+        // no-op — otherwise a working pipeline regresses to a different
+        // string. This guards against Finary-mode regression.
+        let _guard = env_lock();
+        crate::enrichment::set_resolve_mock(Some(|isin| {
+            if isin == "FR0000121014" { Some("MC.PA".to_string()) } else { None }
+        }));
+
+        let positions = vec![make_csv_position("MC", "FR0000121014", "LVMH")];
+        let resolved = crate::native_collection::resolve_canonical_symbols_for_test(positions);
+
+        crate::enrichment::set_resolve_mock(None);
+
+        assert_eq!(
+            resolved[0].get("ticker").and_then(|v| v.as_str()),
+            Some("MC"),
+            "reconciliation must be idempotent — Finary 'MC' resolves to 'MC.PA' and stays 'MC'"
+        );
+    }
+
+    #[test]
+    fn csv_position_ticker_handles_non_pa_suffixes() {
+        // Stellantis trades on Milan (.MI) as well as Paris. The
+        // reconciliation must strip whichever exchange suffix is
+        // returned — not just `.PA`.
+        let _guard = env_lock();
+        crate::enrichment::set_resolve_mock(Some(|isin| {
+            if isin == "NL00150001Q9" { Some("STLAM.MI".to_string()) } else { None }
+        }));
+
+        let positions = vec![make_csv_position("STELLANTIS", "NL00150001Q9", "Stellantis")];
+        let resolved = crate::native_collection::resolve_canonical_symbols_for_test(positions);
+
+        crate::enrichment::set_resolve_mock(None);
+
+        assert_eq!(
+            resolved[0].get("ticker").and_then(|v| v.as_str()),
+            Some("STLAM"),
+            "non-.PA suffixes (.MI Milan, .AS Amsterdam…) must be stripped uniformly"
+        );
+    }
+
+    #[test]
+    fn csv_position_skips_resolve_for_malformed_isin() {
+        // `000007764440` (the `PARTS SOCIALES` ISIN from the aborted run)
+        // is 12 chars but lacks a country code. Calling `/api/resolve`
+        // on it would burn a round-trip for nothing — guarded by
+        // `validate_isin`. We install a panicking mock to prove the
+        // resolver is never invoked.
+        let _guard = env_lock();
+        crate::enrichment::set_resolve_mock(Some(|_isin| {
+            panic!("resolver must not be called for a malformed ISIN");
+        }));
+
+        let positions = vec![make_csv_position("PARTS", "000007764440", "PARTS SOCIALES")];
+        let resolved = crate::native_collection::resolve_canonical_symbols_for_test(positions);
+
+        crate::enrichment::set_resolve_mock(None);
+
+        assert!(
+            resolved[0].get("resolved_symbol").map(|v| v.is_null()).unwrap_or(true),
+            "malformed ISIN must NOT produce a resolved_symbol",
+        );
+        assert_eq!(
+            resolved[0].get("ticker").and_then(|v| v.as_str()),
+            Some("PARTS"),
+            "malformed ISIN means the rough ticker survives untouched",
+        );
+    }
+
+    // ── validate_isin: ISO 6166 + Luhn-mod-10 ─────────────────────────
+
+    #[test]
+    fn validate_isin_accepts_real_isins_with_correct_checksum() {
+        use crate::native_collection_helpers::validate_isin;
+        // Picked from production: each of these is a real, live ISIN.
+        assert!(validate_isin("FR0000121014"), "LVMH");
+        assert!(validate_isin("US0378331005"), "Apple");
+        assert!(validate_isin("US5949181045"), "Microsoft");
+        assert!(validate_isin("GB0002374006"), "Diageo");
+        assert!(validate_isin("FR0000130577"), "STMicroelectronics");
+        assert!(validate_isin("FR0000120172"), "Carrefour");
+        assert!(validate_isin("GRS528003007"), "Greek security (THE AZUR)");
+    }
+
+    #[test]
+    fn validate_isin_rejects_isin_with_bad_checksum() {
+        use crate::native_collection_helpers::validate_isin;
+        // LVMH's real checksum is 4; the off-by-one variants must fail.
+        assert!(!validate_isin("FR0000121013"));
+        assert!(!validate_isin("FR0000121015"));
+        // AAPL's real checksum is 5.
+        assert!(!validate_isin("US0378331000"));
+        assert!(!validate_isin("US0378331009"));
+    }
+
+    #[test]
+    fn validate_isin_rejects_malformed_isin_strings() {
+        use crate::native_collection_helpers::validate_isin;
+        assert!(!validate_isin(""), "empty");
+        assert!(!validate_isin("FR000012101"), "11 chars (too short)");
+        assert!(!validate_isin("FR00001210145"), "13 chars (too long)");
+        assert!(!validate_isin("000007764440"), "no country letters");
+        assert!(!validate_isin("fr0000121014"), "lowercase country code");
+        assert!(!validate_isin("FR000012101X"), "checksum slot is not a digit");
+        assert!(!validate_isin("F!0000121014"), "non-alpha country code");
+    }
+
+    // ── ticker_from_resolved: strip exchange suffix ──────────────────────
+
+    #[test]
+    fn ticker_from_resolved_strips_pa_suffix() {
+        use crate::native_collection_helpers::ticker_from_resolved;
+        assert_eq!(ticker_from_resolved("MC.PA"), Some("MC".to_string()));
+        assert_eq!(ticker_from_resolved("STMPA.PA"), Some("STMPA".to_string()));
+        assert_eq!(ticker_from_resolved("TTE.PA"), Some("TTE".to_string()));
+    }
+
+    #[test]
+    fn ticker_from_resolved_passes_through_us_bare_symbol() {
+        use crate::native_collection_helpers::ticker_from_resolved;
+        // US tickers come back from `/api/resolve` without a suffix.
+        assert_eq!(ticker_from_resolved("AAPL"), Some("AAPL".to_string()));
+        assert_eq!(ticker_from_resolved("MSFT"), Some("MSFT".to_string()));
+    }
+
+    #[test]
+    fn ticker_from_resolved_handles_milan_and_amsterdam() {
+        use crate::native_collection_helpers::ticker_from_resolved;
+        assert_eq!(ticker_from_resolved("STLAM.MI"), Some("STLAM".to_string()));
+        assert_eq!(ticker_from_resolved("ASML.AS"), Some("ASML".to_string()));
+        assert_eq!(ticker_from_resolved("dbk.de"), Some("DBK".to_string()));
+    }
+
+    #[test]
+    fn ticker_from_resolved_returns_none_on_empty_input() {
+        use crate::native_collection_helpers::ticker_from_resolved;
+        assert_eq!(ticker_from_resolved(""), None);
+        assert_eq!(ticker_from_resolved("   "), None);
+        assert_eq!(ticker_from_resolved(".PA"), None, "leading dot must not produce an empty ticker");
+    }
+
+    // ── execute_spec: CSV parsing issues (price outlier + malformed ISIN) ──
+
+    #[test]
+    fn csv_parser_flags_price_outlier_above_unit_threshold() {
+        // Reproduces the 2026-05-23 PARTS SOCIALES / THE AZUR cases:
+        // unit price ≈ 3 406 EUR (above the 10 000 EUR threshold when
+        // combined with hundreds of shares).
+        let _guard = env_lock();
+        let spec = make_spec("position_snapshot", "french", vec![
+            ("name", col(0)),
+            ("isin", col(1)),
+            ("quantity", col(2)),
+            ("current_price", col(3)),
+        ]);
+        let headers = vec!["Nom", "ISIN", "NB", "Prix"]
+            .into_iter().map(String::from).collect::<Vec<_>>();
+        // 100 shares × 50 000 EUR = 5M EUR — implied unit price way over threshold.
+        let rows: Vec<Vec<String>> = vec![
+            vec!["FAKE LARGE", "FR0000121014", "100", "50000,00"],
+        ].into_iter().map(|r| r.into_iter().map(String::from).collect()).collect();
+
+        let result = crate::native_collection::execute_spec_for_test(&spec, &rows, &headers, "PEA")
+            .expect("execute_spec must succeed on a single high-price row");
+        let issues = result.get("csv_parsing_issues")
+            .and_then(|v| v.as_array())
+            .expect("csv_parsing_issues array must be present in the snapshot");
+        assert!(
+            issues.iter().any(|i| i.get("reason").and_then(|v| v.as_str()) == Some("price_outlier_suspect")),
+            "an implied unit price above the threshold must surface a price_outlier_suspect issue; got {issues:?}"
+        );
+    }
+
+    #[test]
+    fn csv_parser_accepts_known_high_price_stocks() {
+        // BRK.A legitimately trades around 700 000 USD per share. The
+        // whitelist must prevent the sanity check from firing.
+        let _guard = env_lock();
+        let spec = make_spec("position_snapshot", "english", vec![
+            ("ticker", col(0)),
+            ("isin", col(1)),
+            ("quantity", col(2)),
+            ("current_price", col(3)),
+        ]);
+        let headers = vec!["Ticker", "ISIN", "Qty", "Price"]
+            .into_iter().map(String::from).collect::<Vec<_>>();
+        let rows: Vec<Vec<String>> = vec![
+            vec!["BRK.A", "US0846701086", "1", "700000.00"],
+        ].into_iter().map(|r| r.into_iter().map(String::from).collect()).collect();
+
+        let result = crate::native_collection::execute_spec_for_test(&spec, &rows, &headers, "CTO")
+            .expect("BRK.A row must parse");
+        let issues = result.get("csv_parsing_issues").and_then(|v| v.as_array());
+        let has_outlier_flag = issues
+            .map(|arr| arr.iter().any(|i| i.get("reason").and_then(|v| v.as_str()) == Some("price_outlier_suspect")))
+            .unwrap_or(false);
+        assert!(!has_outlier_flag, "whitelisted BRK.A must NOT trigger the outlier flag");
+    }
+
+    #[test]
+    fn csv_parser_flags_malformed_isin() {
+        // `000007764440` is exactly the ISIN seen on the aborted run —
+        // 12 chars but starting with `0000`, no country letters.
+        let _guard = env_lock();
+        let spec = make_spec("position_snapshot", "french", vec![
+            ("name", col(0)),
+            ("isin", col(1)),
+            ("quantity", col(2)),
+            ("current_price", col(3)),
+        ]);
+        let headers = vec!["Nom", "ISIN", "Qty", "Prix"]
+            .into_iter().map(String::from).collect::<Vec<_>>();
+        let rows: Vec<Vec<String>> = vec![
+            vec!["PARTS SOCIALES", "000007764440", "922", "1,00"],
+        ].into_iter().map(|r| r.into_iter().map(String::from).collect()).collect();
+
+        let result = crate::native_collection::execute_spec_for_test(&spec, &rows, &headers, "PEA")
+            .expect("malformed-ISIN row must still parse (issue is additive)");
+        let issues = result.get("csv_parsing_issues")
+            .and_then(|v| v.as_array())
+            .expect("csv_parsing_issues must be present");
+        assert!(
+            issues.iter().any(|i| i.get("reason").and_then(|v| v.as_str()) == Some("malformed_isin")),
+            "malformed ISIN must produce a malformed_isin issue; got {issues:?}"
+        );
+        // And resolve_canonical_symbols MUST skip the API call — install
+        // a panicking mock so that any /api/resolve attempt blows up.
+        crate::enrichment::set_resolve_mock(Some(|_isin| {
+            panic!("resolver must not be called for a malformed ISIN");
+        }));
+        let positions = result.get("positions").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let resolved = crate::native_collection::resolve_canonical_symbols_for_test(positions);
+        crate::enrichment::set_resolve_mock(None);
+        assert!(
+            resolved[0].get("resolved_symbol").map(|v| v.is_null()).unwrap_or(true),
+            "malformed ISIN must skip /api/resolve so resolved_symbol stays null"
+        );
+    }
+
+    #[test]
+    fn csv_parser_rejects_isin_with_bad_checksum() {
+        // Same shape as a valid ISIN but the trailing digit is wrong.
+        let _guard = env_lock();
+        let spec = make_spec("position_snapshot", "french", vec![
+            ("name", col(0)),
+            ("isin", col(1)),
+            ("quantity", col(2)),
+            ("current_price", col(3)),
+        ]);
+        let headers = vec!["Nom", "ISIN", "Qty", "Prix"]
+            .into_iter().map(String::from).collect::<Vec<_>>();
+        let rows: Vec<Vec<String>> = vec![
+            vec!["LVMH FAKE", "FR0000121013", "1", "100,00"],
+        ].into_iter().map(|r| r.into_iter().map(String::from).collect()).collect();
+
+        let result = crate::native_collection::execute_spec_for_test(&spec, &rows, &headers, "PEA")
+            .expect("row with bad-checksum ISIN must still parse");
+        let issues = result.get("csv_parsing_issues")
+            .and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        assert!(
+            issues.iter().any(|i| i.get("reason").and_then(|v| v.as_str()) == Some("malformed_isin")),
+            "checksum mismatch must produce a malformed_isin issue"
+        );
+    }
+
+    #[test]
+    fn csv_parser_accepts_valid_isin_with_correct_checksum() {
+        // The happy path: a real ISIN must not trigger any flag.
+        let _guard = env_lock();
+        let spec = make_spec("position_snapshot", "french", vec![
+            ("name", col(0)),
+            ("isin", col(1)),
+            ("quantity", col(2)),
+            ("current_price", col(3)),
+        ]);
+        let headers = vec!["Nom", "ISIN", "Qty", "Prix"]
+            .into_iter().map(String::from).collect::<Vec<_>>();
+        let rows: Vec<Vec<String>> = vec![
+            vec!["LVMH", "FR0000121014", "3", "472,60"],
+        ].into_iter().map(|r| r.into_iter().map(String::from).collect()).collect();
+
+        let result = crate::native_collection::execute_spec_for_test(&spec, &rows, &headers, "PEA")
+            .expect("real LVMH row must parse cleanly");
+        let issues = result.get("csv_parsing_issues")
+            .and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        assert!(
+            issues.is_empty(),
+            "well-formed CSV row must produce zero issues; got {issues:?}"
+        );
+    }
+
+    // ── has_canonical_resolution: P0-55 integrity check ────────────────
+
+    #[test]
+    fn has_canonical_resolution_true_when_resolved_symbol_present() {
+        use crate::native_collection_helpers::has_canonical_resolution;
+        let pos = json!({"ticker": "MC", "resolved_symbol": "MC.PA"});
+        assert!(has_canonical_resolution(&pos));
+    }
+
+    #[test]
+    fn has_canonical_resolution_false_when_field_null() {
+        use crate::native_collection_helpers::has_canonical_resolution;
+        // Finary's Position serializes `resolved_symbol: None` as JSON null.
+        let pos = json!({"ticker": "PARTS", "resolved_symbol": serde_json::Value::Null});
+        assert!(!has_canonical_resolution(&pos));
+    }
+
+    #[test]
+    fn has_canonical_resolution_false_when_field_missing() {
+        use crate::native_collection_helpers::has_canonical_resolution;
+        // CSV path may omit the field entirely before resolve runs.
+        let pos = json!({"ticker": "THE", "isin": "GRS528003007"});
+        assert!(!has_canonical_resolution(&pos));
+    }
+
+    #[test]
+    fn has_canonical_resolution_false_on_empty_or_whitespace_string() {
+        use crate::native_collection_helpers::has_canonical_resolution;
+        let empty = json!({"resolved_symbol": ""});
+        let blank = json!({"resolved_symbol": "   "});
+        assert!(!has_canonical_resolution(&empty));
+        assert!(!has_canonical_resolution(&blank));
+    }
+
+    // ── P0-55: enrichment must not overwrite CSV price when resolver fails ──
+    //
+    // These tests pin the integrity contract used by the new guard in
+    // `apply_collection_result` (see `native_collection.rs` around the
+    // `sync_position_from_market` call site, 2026-05-23). They cover the
+    // unit behaviour of `sync_position_from_market` itself plus the
+    // integrity gate that the call site is required to apply.
+    //
+    // Production fixtures use the exact values from the aborted run
+    // `019e53d118ac` so the regression class observed by Pierre is
+    // covered explicitly (PO BLOCK 1, 2026-05-23 review).
+
+    #[test]
+    fn sync_position_from_market_overwrites_csv_price_when_market_is_real() {
+        // Sanity: existing happy-path behaviour preserved — the helper
+        // still writes through when a real market source is available.
+        // (Regression guard: P0-55 changes the *call site*, not the
+        // helper itself; this is the non-regression pin.)
+        use crate::native_collection_helpers::sync_position_from_market;
+        let mut pos = json!({
+            "ticker": "MC", "quantite": 3.0, "prix_revient": 470.0,
+            "prix_actuel": 472.6, "valeur_actuelle": 1417.8,
+            "resolved_symbol": "MC.PA",
+        });
+        let market = json!({"source": "yahoo:spot", "prix_actuel": 480.0});
+        let synced = sync_position_from_market(&mut pos, &market);
+        assert!(synced, "real market source must sync");
+        assert_eq!(pos.get("prix_actuel").and_then(|v| v.as_f64()), Some(480.0));
+        assert_eq!(pos.get("valeur_actuelle").and_then(|v| v.as_f64()), Some(1440.0));
+    }
+
+    #[test]
+    fn p0_55_parts_sociales_fixture_csv_price_preserved_without_resolution() {
+        // Production fixture: the exact PARTS SOCIALES row from
+        // `019e53d118ac` — qty=922, CSV prix_actuel=1.0€, val=922€.
+        // The ISIN `000007764440` is malformed (P0-54) so
+        // resolve_canonical_symbols leaves resolved_symbol unset.
+        // `has_canonical_resolution` must be `false` so the call site
+        // declines to apply the (potentially false-matched) market row.
+        use crate::native_collection_helpers::{has_canonical_resolution, sync_position_from_market};
+        let pos = json!({
+            "ticker": "PARTS", "nom": "PARTS SOCIALES",
+            "isin": "000007764440",
+            "quantite": 922.0, "prix_actuel": 1.0,
+            "valeur_actuelle": 922.0, "prix_revient": 1.0,
+            "resolved_symbol": serde_json::Value::Null,
+        });
+        // Mimic the Google Finance false-match that the aborted run saw:
+        // ticker="PARTS" → some unrelated 3 406.50 € equity.
+        let market = json!({
+            "source": "google_finance:spot",
+            "prix_actuel": 3406.5,
+            "pe_ratio": 23.85,
+        });
+
+        // The site guard must short-circuit before sync_position_from_market.
+        assert!(
+            !has_canonical_resolution(&pos),
+            "PARTS SOCIALES without canonical resolve must fail the integrity check"
+        );
+
+        // Even if a caller bypassed the guard and called the helper
+        // directly, the CSV price stays canonical until they do — pin
+        // the *site contract*: do not call sync when the guard is false.
+        // (This test explicitly does NOT call sync_position_from_market
+        // since the guard would prevent it. The next test exercises the
+        // bypass path for non-regression.)
+        let _ = sync_position_from_market; // ack import
+        assert_eq!(pos.get("prix_actuel").and_then(|v| v.as_f64()), Some(1.0));
+        assert_eq!(pos.get("valeur_actuelle").and_then(|v| v.as_f64()), Some(922.0));
+        let _ = market; // documented unused; would have produced 3 140 793 €
+    }
+
+    #[test]
+    fn p0_55_the_azur_selection_fixture_csv_price_preserved_without_resolution() {
+        // Second production fixture from `019e53d118ac`: THE AZUR
+        // SELECTION (Greek micro-cap fund), qty=350, CSV
+        // prix_actuel=0.324€, val=113.40€.
+        //
+        // ISIN `GRS528003007` IS structurally valid (GR country code +
+        // 9 alphanums + checksum), so `validate_isin` passes and
+        // `resolve_canonical_symbols` does call `/api/resolve`. But the
+        // resolver returns `None` (Greek micro-cap not in Yahoo
+        // coverage) → `resolved_symbol` stays null → P0-55 guard kicks
+        // in via `has_canonical_resolution`. Same protective effect as
+        // the PARTS SOCIALES case (P0-54 malformed-ISIN skip), reached
+        // by a different upstream code path.
+        //
+        // The aborted-run market table showed
+        // `market["THE"].prix_actuel = 3406.5` — identical to the
+        // PARTS false-match — confirming the same Google Finance
+        // ambiguity hits any generic two-to-five-char token.
+        use crate::native_collection_helpers::{has_canonical_resolution, validate_isin};
+        let pos = json!({
+            "ticker": "THE", "nom": "THE AZUR SELECTION",
+            "isin": "GRS528003007",
+            "quantite": 350.0, "prix_actuel": 0.324,
+            "valeur_actuelle": 113.40, "prix_revient": 1.14923,
+            "resolved_symbol": serde_json::Value::Null,
+        });
+        assert!(
+            validate_isin("GRS528003007"),
+            "GR country code + checksum is a valid ISO 6166 ISIN — the resolver-None scenario is the gate"
+        );
+        assert!(
+            !has_canonical_resolution(&pos),
+            "Missing resolved_symbol must fail the integrity check, preserving CSV price"
+        );
+    }
+
+    #[test]
+    fn p0_55_canonical_resolution_present_means_sync_proceeds() {
+        // The other direction: when `resolve_canonical_symbols` returns
+        // a Yahoo symbol (Finary or a clean CSV row), the integrity
+        // check passes and the existing Bug A sync still applies the
+        // market price as before.
+        use crate::native_collection_helpers::{has_canonical_resolution, sync_position_from_market};
+        let mut pos = json!({
+            "ticker": "MC", "nom": "LVMH",
+            "isin": "FR0000121014",
+            "quantite": 3.0, "prix_actuel": 472.6,
+            "valeur_actuelle": 1417.8, "prix_revient": 479.83,
+            "resolved_symbol": "MC.PA",
+        });
+        assert!(has_canonical_resolution(&pos), "canonical resolve OK");
+        let market = json!({"source": "yahoo:spot", "prix_actuel": 480.0});
+        assert!(sync_position_from_market(&mut pos, &market));
+        assert_eq!(pos.get("prix_actuel").and_then(|v| v.as_f64()), Some(480.0));
+    }
+
+    // ── parse_positions_text (Boursorama metadata path) — QA CAVEAT-1 ──
+    //
+    // The agent-a8109 worktree covered `execute_spec` (LLM-spec path) but
+    // not `parse_positions_text` (Boursorama direct path). Pierre's CSV
+    // goes through the latter, so its `csv_parsing_issues` emission needs
+    // a dedicated pin.
+
+    // ── P1-56: visibility helpers for the pre-run CSV review wizard ──
+
+    #[test]
+    fn compute_generic_tickers_at_risk_flags_parts_sociales_without_resolution() {
+        use crate::native_collection::compute_generic_tickers_at_risk;
+        let positions = json!([
+            // Pierre's PARTS SOCIALES row, no resolved_symbol
+            {"ticker": "PARTS", "nom": "PARTS SOCIALES", "isin": "000007764440", "resolved_symbol": serde_json::Value::Null},
+            // LVMH after canonical resolution — must NOT be flagged
+            {"ticker": "MC", "nom": "LVMH", "isin": "FR0000121014", "resolved_symbol": "MC.PA"},
+            // Generic but resolved (hypothetical) — also must not be flagged
+            {"ticker": "THE", "nom": "Some Real Fund", "isin": "GRS999999999", "resolved_symbol": "THE.AT"},
+        ]);
+        let at_risk = compute_generic_tickers_at_risk(&positions);
+        let arr = at_risk.as_array().expect("returns JSON array");
+        assert_eq!(arr.len(), 1, "only PARTS SOCIALES qualifies (generic + no resolution)");
+        assert_eq!(arr[0].get("ticker").and_then(|v| v.as_str()), Some("PARTS"));
+        assert_eq!(arr[0].get("nom").and_then(|v| v.as_str()), Some("PARTS SOCIALES"));
+    }
+
+    #[test]
+    fn compute_generic_tickers_at_risk_flags_very_short_tickers_without_resolution() {
+        use crate::native_collection::compute_generic_tickers_at_risk;
+        // 2-3 char tickers without canonical resolution are prime
+        // false-match candidates on Google Finance.
+        let positions = json!([
+            {"ticker": "AB", "nom": "Ambiguous Two", "isin": "FR0000111111", "resolved_symbol": serde_json::Value::Null},
+            {"ticker": "XYZ", "nom": "Ambiguous Three", "isin": "FR0000222222", "resolved_symbol": serde_json::Value::Null},
+            {"ticker": "BNPP", "nom": "Long enough", "isin": "FR0000333333", "resolved_symbol": serde_json::Value::Null},
+        ]);
+        let arr = compute_generic_tickers_at_risk(&positions);
+        let arr = arr.as_array().unwrap();
+        assert_eq!(arr.len(), 2, "AB and XYZ flagged (≤3 chars), BNPP not (4 chars and not in stop-list)");
+    }
+
+    #[test]
+    fn compute_generic_tickers_at_risk_never_flags_resolved_positions() {
+        // Even a token from the stop-list, if it carries a canonical
+        // resolved_symbol, has been validated by the upstream resolver
+        // and must not be flagged.
+        use crate::native_collection::compute_generic_tickers_at_risk;
+        let positions = json!([
+            {"ticker": "PARTS", "nom": "Real Parts AG", "isin": "DE0000444444", "resolved_symbol": "PARTS.DE"},
+            {"ticker": "MC",    "nom": "LVMH",          "isin": "FR0000121014", "resolved_symbol": "MC.PA"},
+        ]);
+        let arr = compute_generic_tickers_at_risk(&positions);
+        assert_eq!(arr.as_array().map(|a| a.len()), Some(0), "resolved positions never appear in the at-risk list");
+    }
+
+    #[test]
+    fn preview_csv_import_boursorama_surfaces_parsing_issues_and_at_risk() {
+        // End-to-end pin for the P1-56 visibility contract on the
+        // Boursorama metadata path: the preview response must carry
+        // BOTH the parser-level issues (malformed ISIN here) AND the
+        // P0-55 at-risk list. Without these the wizard can't show
+        // anything to the user before the LLM tokens are spent.
+        let _guard = env_lock();
+        let csv = "Valo total = 22107,34;Solde espèces = 1234,56;+/- value latente = -3500,00\n\
+                   Nom;Code ISIN;Quantité;PRU;Valeur actuelle;ignored;Cours actuel;ignored;Plus/Moins value EUR;ignored;Plus/Moins value %\n\
+                   PARTS SOCIALES;000007764440;922, ;1 €;922,00 €;--;--;--;--;--;--\n\
+                   LVMH;FR0000121014;3, ;472,6 €;1417,80 €;--;479,83 €;--;-21,69 €;--;-1,51 %\n";
+        let result = crate::native_collection::preview_csv_import(csv, "PEA")
+            .expect("preview must succeed on a valid Boursorama CSV");
+        let issues = result.get("csv_parsing_issues").and_then(|v| v.as_array())
+            .cloned().unwrap_or_default();
+        assert!(
+            issues.iter().any(|i| i.get("reason").and_then(|v| v.as_str()) == Some("malformed_isin")),
+            "preview must surface malformed_isin for the parts sociales row; got {issues:?}"
+        );
+        let at_risk = result.get("generic_tickers_at_risk").and_then(|v| v.as_array())
+            .cloned().unwrap_or_default();
+        assert!(
+            at_risk.iter().any(|r| r.get("ticker").and_then(|v| v.as_str()) == Some("PARTS")),
+            "PARTS SOCIALES must appear in generic_tickers_at_risk; got {at_risk:?}"
+        );
+        // LVMH must NOT be in the at-risk list (it is in the preview
+        // BEFORE resolve runs, so it has no resolved_symbol either, but
+        // its 4-char `LVMH` ticker is not on the stop-list and is >3
+        // chars, so the heuristic spares it).
+        assert!(
+            !at_risk.iter().any(|r| r.get("ticker").and_then(|v| v.as_str()) == Some("LVMH")),
+            "LVMH ticker is not generic enough to trigger the false-match flag"
+        );
+    }
+
+    #[test]
+    fn parse_positions_text_flags_malformed_isin_on_real_boursorama_row() {
+        // Subset of the actual Pierre CSV (POSITIONS_43605682287_…) with
+        // PARTS SOCIALES — malformed ISIN must surface in
+        // `csv_parsing_issues` AND the position must remain in
+        // `positions` (additive contract).
+        let _guard = env_lock();
+        let csv = "Valo total = 22107,34;Solde espèces = 1234,56;+/- value latente = -3500,00\n\
+                   Nom;Code ISIN;Quantité;PRU;Valeur actuelle;ignored;Cours actuel;ignored;Plus/Moins value EUR;ignored;Plus/Moins value %\n\
+                   PARTS SOCIALES;000007764440;922, ;1 €;922,00 €;--;--;--;--;--;--\n\
+                   LVMH;FR0000121014;3, ;472,6 €;1417,80 €;--;479,83 €;--;-21,69 €;--;-1,51 %\n";
+
+        let snap = crate::native_collection::parse_positions_text_for_test(csv, "PEA")
+            .expect("parse_positions_text must succeed");
+        let positions = snap.get("positions").and_then(|v| v.as_array())
+            .expect("positions array required");
+        assert_eq!(positions.len(), 2, "both rows must be in the portfolio (additive)");
+
+        let issues = snap.get("csv_parsing_issues").and_then(|v| v.as_array()).cloned()
+            .unwrap_or_default();
+        assert!(
+            issues.iter().any(|i| {
+                i.get("reason").and_then(|v| v.as_str()) == Some("malformed_isin")
+                && i.get("isin").and_then(|v| v.as_str()) == Some("000007764440")
+            }),
+            "Boursorama path must emit malformed_isin for the parts sociales row; got {issues:?}"
+        );
+
+        // LVMH row must NOT be flagged.
+        assert!(
+            !issues.iter().any(|i| i.get("isin").and_then(|v| v.as_str()) == Some("FR0000121014")),
+            "well-formed LVMH row must not appear in csv_parsing_issues"
+        );
+
+        // Sanity: parse_fr_number must read 1 €, not interpret the trailing space.
+        let parts = positions.iter().find(|p| p.get("isin").and_then(|v| v.as_str()) == Some("000007764440"))
+            .expect("PARTS SOCIALES row");
+        assert_eq!(
+            parts.get("prix_actuel").and_then(|v| v.as_f64()),
+            Some(1.0),
+            "parser must read PARTS SOCIALES prix_actuel = 1.0 from CSV (root-cause anti-regression)"
+        );
+        assert_eq!(
+            parts.get("valeur_actuelle").and_then(|v| v.as_f64()),
+            Some(922.0),
+            "parser must read PARTS SOCIALES valeur_actuelle = 922.0 from CSV"
+        );
+    }

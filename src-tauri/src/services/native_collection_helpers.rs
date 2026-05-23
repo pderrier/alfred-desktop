@@ -89,6 +89,27 @@ pub(crate) fn is_real_market_source(source: &str) -> bool {
     !s.is_empty() && s != "none"
 }
 
+/// P0-55 integrity check — `true` when the position carries a canonical
+/// `resolved_symbol` (set by `resolve_canonical_symbols` after a successful
+/// `/api/resolve` call). When `false`, the upstream ISIN resolver either
+/// skipped the call (malformed ISIN, P0-54) or got `None` back from the
+/// server. Callers must not apply market data on a position that fails
+/// this check, since the market row was fetched with the raw `ticker`
+/// (often a generic name-derived token like `PARTS` / `THE`) and can be a
+/// Google Finance false-match on an unrelated instrument.
+///
+/// Treats `null` and empty string the same as missing — both shapes are
+/// observed depending on the upstream caller (Finary path serializes
+/// `None` as null; CSV path may leave the key out entirely until resolve
+/// runs).
+pub(crate) fn has_canonical_resolution(position: &Value) -> bool {
+    position
+        .get("resolved_symbol")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
 /// Bug A fix — re-sync `prix_actuel` / `valeur_actuelle` / `plus_moins_value(_pct)`
 /// on a position row from the freshly enriched `market` row.
 ///
@@ -104,6 +125,12 @@ pub(crate) fn is_real_market_source(source: &str) -> bool {
 /// - `valeur_actuelle`       : quantite * prix_actuel
 /// - `plus_moins_value`      : valeur_actuelle - quantite * prix_revient
 /// - `plus_moins_value_pct`  : (prix_actuel / prix_revient - 1) * 100, or 0 if PRU is 0
+///
+/// P0-55 guard — `apply_collection_result` calls this only when
+/// `has_canonical_resolution` returns `true`, i.e. when `resolved_symbol`
+/// is present on the position. Without that signal the market row may be a
+/// Google Finance false-match on a generic name-derived ticker and must
+/// not be applied.
 pub(crate) fn sync_position_from_market(position: &mut Value, market: &Value) -> bool {
     let source = market
         .get("source")
@@ -280,6 +307,13 @@ pub(crate) fn normalize_csv_snapshot(snapshot: &Value) -> Value {
             obj.insert("reconciliation".to_string(), reconciliation.clone());
         }
     }
+    // P0-54: pass csv_parsing_issues (price outliers, malformed ISIN) through
+    // so the workflow loop can merge them into collection_issues.
+    if let Some(issues) = snapshot.get("csv_parsing_issues") {
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert("csv_parsing_issues".to_string(), issues.clone());
+        }
+    }
     result
 }
 
@@ -336,6 +370,123 @@ pub(crate) fn parse_number_with_format(raw: &str, number_format: &str) -> f64 {
             parse_fr_number(&trimmed)
         }
     }
+}
+
+// ── CSV ingestion sanity checks (P0-53, P0-54) ───────────────────────
+//
+// Two helpers introduced for the CSV pipeline:
+//
+// * `ticker_from_resolved` — derive a short, broker-agnostic ticker from a
+//   canonical Yahoo symbol (e.g. `MC.PA` → `MC`, `AAPL` → `AAPL`). Used to
+//   reconcile the rough name-derived ticker on a CSV position with the
+//   canonical symbol returned by `/api/resolve`. Without this reconciliation
+//   the line-memory write-back after analysis forks the `by_ticker` map
+//   (one entry under `LVMH`, another under `MC.PA`).
+//
+// * `validate_isin` — strict ISO 6166 check: 2 uppercase country letters +
+//   9 alphanumerics + 1 numeric checksum digit, with the Luhn-mod-10
+//   verification step. Lets us skip `/api/resolve` for obvious garbage
+//   ISINs and surface a `malformed_isin` issue to the UI.
+
+/// Maximum acceptable unit price (in account currency) for a CSV-imported
+/// position. Anything above this triggers a `price_outlier_suspect` issue.
+/// `BRK.A` at ~700k$ is the only widely-held single share above 50 000 EUR,
+/// so a 10 000 EUR threshold cleanly separates normal equities from parser
+/// glitches (Boursorama-style PEA CSVs occasionally fill the price column
+/// with a totals figure for non-actively-priced lines).
+pub(crate) const CSV_PRICE_OUTLIER_THRESHOLD_EUR: f64 = 10_000.0;
+
+/// Securities whose normal unit price exceeds the outlier threshold. The
+/// list is intentionally minimal — adding too many entries weakens the
+/// sanity check.
+pub(crate) const CSV_HIGH_PRICE_WHITELIST: &[&str] = &[
+    // Berkshire Hathaway class A (~700 000 USD per share, ISIN US0846701086)
+    "US0846701086", "BRK.A", "BRK-A", "BRKA",
+    // NVR Inc (~9 000 USD per share, ISIN US62944T1051) — close to threshold
+    // but legitimately a high-priced single share.
+    "US62944T1051", "NVR",
+];
+
+/// Strip an exchange suffix from a Yahoo-style symbol to produce a short,
+/// human-readable ticker. `MC.PA` → `MC`, `STMPA.PA` → `STMPA`, `AAPL` →
+/// `AAPL`. Empty input returns `None`.
+pub(crate) fn ticker_from_resolved(resolved: &str) -> Option<String> {
+    let trimmed = resolved.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let base = trimmed.split('.').next().unwrap_or(trimmed);
+    if base.is_empty() {
+        return None;
+    }
+    Some(base.to_uppercase())
+}
+
+/// Strict ISO 6166 ISIN validator.
+///
+/// Returns true iff `isin` matches the format `[A-Z]{2}[A-Z0-9]{9}[0-9]`
+/// AND the trailing digit is the correct Luhn-mod-10 checksum over the
+/// 11-character body (each letter is expanded to its `A=10 .. Z=35`
+/// decimal pair before applying the standard Luhn algorithm right-to-left).
+///
+/// Examples:
+/// * `FR0000121014` (LVMH) — valid, checksum 4
+/// * `US0378331005` (AAPL) — valid, checksum 5
+/// * `000007764440` — invalid, no country code letters at positions 0-1
+/// * `FR0000121013` — invalid, checksum mismatch (real LVMH ISIN ends with 4)
+///
+/// Garbage in, false out — never panics.
+pub(crate) fn validate_isin(isin: &str) -> bool {
+    let bytes = isin.as_bytes();
+    if bytes.len() != 12 {
+        return false;
+    }
+    // Position 0..2 — uppercase letters.
+    if !bytes[..2].iter().all(|b| b.is_ascii_uppercase()) {
+        return false;
+    }
+    // Position 2..11 — alphanumeric uppercase or digit.
+    if !bytes[2..11]
+        .iter()
+        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    {
+        return false;
+    }
+    // Position 11 — single digit.
+    if !bytes[11].is_ascii_digit() {
+        return false;
+    }
+    luhn_isin_checksum_matches(bytes)
+}
+
+/// Compute and verify the ISIN Luhn-mod-10 checksum.
+///
+/// Algorithm (ISO 6166): expand letters to their two-digit `A=10 .. Z=35`
+/// representation, producing a long decimal string. Walk that string
+/// right-to-left, doubling every other digit (starting with the
+/// second-from-right). Sum all digits, including those produced by the
+/// doubling (split into tens and units). The total must be a multiple
+/// of 10.
+fn luhn_isin_checksum_matches(bytes: &[u8]) -> bool {
+    let mut digits: Vec<u32> = Vec::with_capacity(24);
+    for &b in bytes {
+        if b.is_ascii_digit() {
+            digits.push((b - b'0') as u32);
+        } else if b.is_ascii_uppercase() {
+            let n = (b - b'A') as u32 + 10;
+            digits.push(n / 10);
+            digits.push(n % 10);
+        } else {
+            return false;
+        }
+    }
+    // Right-to-left, double every second digit (positions 1, 3, 5… from the right).
+    let mut sum = 0u32;
+    for (i, d) in digits.iter().rev().enumerate() {
+        let weighted = if i % 2 == 1 { d * 2 } else { *d };
+        sum += weighted / 10 + weighted % 10;
+    }
+    sum % 10 == 0
 }
 
 pub(crate) fn normalize_url(raw: &str) -> String {

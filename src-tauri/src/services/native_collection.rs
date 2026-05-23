@@ -15,7 +15,8 @@ use crate::native_collection_helpers::{
     aggregate_cash_by_currency, as_array, as_text, build_collection_state, build_holdings_metadata,
     build_portfolio_summary, diagnose_run_quality, extract_with_pattern, infer_issue_code,
     normalize_csv_snapshot, normalize_finary_snapshot, parse_fr_number, parse_number_with_format,
-    HttpRequestFn,
+    ticker_from_resolved, validate_isin, HttpRequestFn, CSV_HIGH_PRICE_WHITELIST,
+    CSV_PRICE_OUTLIER_THRESHOLD_EUR,
 };
 
 const LOCAL_FINARY_SOURCE_ID: &str = "finary_local_default";
@@ -249,6 +250,7 @@ fn execute_spec(spec: &CsvParsingSpec, rows: &[Vec<String>], _headers: &[String]
         "position_snapshot" => {
             // Build a ColumnMapping and delegate to apply_column_mapping, but with pattern extraction
             let mut positions = Vec::new();
+            let mut csv_parsing_issues: Vec<Value> = Vec::new();
             for row in rows {
                 let ticker_raw = col_for("ticker")
                     .map(|c| read_cell(row, c, "ticker", &patterns))
@@ -314,6 +316,31 @@ fn execute_spec(spec: &CsvParsingSpec, rows: &[Vec<String>], _headers: &[String]
                     0.0
                 };
 
+                // ── P0-54: CSV ingestion sanity checks ────────────────
+                //
+                // Two issues we flag (additively, never blocking the row):
+                //   1. Price outlier  — implied unit price > 10 000 EUR.
+                //      Real cause (observed 2026-05-23 on Boursorama PEA
+                //      CSV): the price column was filled with a totals
+                //      figure for fund-style lines, producing positions
+                //      of 3.1M EUR and 1.2M EUR.
+                //   2. Malformed ISIN — does not match ISO 6166 (12 chars
+                //      + Luhn checksum). Observed: `000007764440` (no
+                //      country code). Without the flag, `/api/resolve`
+                //      burns one round-trip per bad ISIN.
+                //
+                // Both checks emit a `csv_parsing_issues` entry that is
+                // surfaced into `collection_issues` by the workflow loop
+                // so the existing UI rendering path picks them up.
+                let nom_for_issue = if name_raw.is_empty() { ticker.as_str() } else { name_raw.as_str() };
+                csv_parsing_issues.extend(build_csv_parsing_issues(
+                    &ticker,
+                    nom_for_issue,
+                    &isin_raw,
+                    quantity,
+                    valeur_actuelle,
+                ));
+
                 positions.push(
                     serde_json::to_value(crate::models::Position {
                         ticker: ticker.clone(),
@@ -338,7 +365,8 @@ fn execute_spec(spec: &CsvParsingSpec, rows: &[Vec<String>], _headers: &[String]
                 "positions": positions,
                 "valeur_totale": positions.iter().filter_map(|p| p.get("valeur_actuelle").and_then(|v| v.as_f64())).sum::<f64>(),
                 "plus_value_totale": positions.iter().filter_map(|p| p.get("plus_moins_value").and_then(|v| v.as_f64())).sum::<f64>(),
-                "liquidites": 0.0
+                "liquidites": 0.0,
+                "csv_parsing_issues": csv_parsing_issues,
             }))
         }
         other => Err(anyhow!("csv_spec_unknown_format_type:{other}"))
@@ -538,6 +566,7 @@ fn parse_positions_text(text: &str, account_name: &str) -> Result<Value> {
                 .unwrap_or(false)
     });
     let mut positions = Vec::new();
+    let mut csv_parsing_issues: Vec<Value> = Vec::new();
     if let Some(index) = header_index {
         for line in lines.iter().skip(index + 1) {
             let cols = split_semicolon(line);
@@ -547,14 +576,23 @@ fn parse_positions_text(text: &str, account_name: &str) -> Result<Value> {
             let nom = cols[0].clone();
             let isin = cols[1].clone();
             let ticker = derive_ticker_from_name(&nom, &isin);
+            let quantite = parse_fr_number(&cols[2]);
+            let valeur_actuelle = parse_fr_number(&cols[4]);
+            csv_parsing_issues.extend(build_csv_parsing_issues(
+                &ticker,
+                &nom,
+                &isin,
+                quantite,
+                valeur_actuelle,
+            ));
             positions.push(serde_json::to_value(crate::models::Position {
                 ticker,
                 nom,
                 isin: if isin.trim().is_empty() { None } else { Some(isin) },
                 resolved_symbol: None,
-                quantite: parse_fr_number(&cols[2]),
+                quantite,
                 prix_actuel: parse_fr_number(&cols[3]),
-                valeur_actuelle: parse_fr_number(&cols[4]),
+                valeur_actuelle,
                 prix_revient: parse_fr_number(&cols[6]),
                 plus_moins_value: parse_fr_number(&cols[8]),
                 plus_moins_value_pct: parse_fr_number(&cols[10]),
@@ -567,7 +605,8 @@ fn parse_positions_text(text: &str, account_name: &str) -> Result<Value> {
         "positions": positions,
         "valeur_totale": valeur_totale,
         "plus_value_totale": plus_value_totale,
-        "liquidites": liquidites
+        "liquidites": liquidites,
+        "csv_parsing_issues": csv_parsing_issues,
     }))
 }
 
@@ -770,6 +809,13 @@ fn wrap_snapshot(portfolio: Value) -> Result<Value> {
     if let Some(reconciliation) = portfolio.get("reconciliation") {
         if let Some(obj) = result.as_object_mut() {
             obj.insert("reconciliation".to_string(), reconciliation.clone());
+        }
+    }
+    // Preserve csv_parsing_issues (P0-54) through wrapping so the workflow
+    // loop can merge them into collection_issues. Defaults to an empty array.
+    if let Some(issues) = portfolio.get("csv_parsing_issues") {
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert("csv_parsing_issues".to_string(), issues.clone());
         }
     }
     Ok(result)
@@ -1150,13 +1196,29 @@ pub fn preview_csv_import(raw: &str, account: &str) -> Result<Value> {
             let pos = snap.get("positions").and_then(|v| v.as_array());
             if pos.map(|a| !a.is_empty()).unwrap_or(false) {
                 let count = pos.map(|a| a.len()).unwrap_or(0);
+                let positions_value = snap.get("positions").cloned().unwrap_or_else(|| json!([]));
+                // P1-56 visibility — forward the parser's own findings so the
+                // pre-run wizard can surface them BEFORE the LLM analysis
+                // burns through tokens. Two distinct sources:
+                //   1. `csv_parsing_issues` is populated by parse_positions_text
+                //      when it detects outliers or malformed ISINs.
+                //   2. `generic_tickers_at_risk` flags positions whose
+                //      derive_ticker_from_name fallback produced a token so
+                //      generic the upstream /api/resolve cannot anchor it —
+                //      these are the rows the P0-55 guard will skip from
+                //      enrichment, and the user should know up-front.
+                let parsing_issues = snap.get("csv_parsing_issues").cloned()
+                    .unwrap_or_else(|| json!([]));
+                let generic_at_risk = compute_generic_tickers_at_risk(&positions_value);
                 return Ok(json!({
                     "preview": true,
                     "source": "cache",
                     "detected_format": "position_snapshot",
                     "detected_broker": "Boursorama",
-                    "positions": snap.get("positions").cloned().unwrap_or_else(|| json!([])),
+                    "positions": positions_value,
                     "warnings": [],
+                    "csv_parsing_issues": parsing_issues,
+                    "generic_tickers_at_risk": generic_at_risk,
                     "stats": {
                         "position_count": count,
                         "valeur_totale": snap.get("valeur_totale").cloned().unwrap_or_else(|| json!(0.0)),
@@ -1244,6 +1306,12 @@ fn build_preview_response(
     let pos_count = pos_array.map(|a| a.len()).unwrap_or(0);
     let needs_chat = spec.confidence == "low";
 
+    // P1-56 visibility — forward `csv_parsing_issues` emitted by execute_spec
+    // (price outliers, malformed ISINs detected from build_csv_parsing_issues)
+    // and compute the generic-ticker at-risk list, so the wizard can surface
+    // both BEFORE the LLM analysis runs.
+    let parsing_issues = snapshot.get("csv_parsing_issues").cloned().unwrap_or_else(|| json!([]));
+    let generic_at_risk = compute_generic_tickers_at_risk(positions);
     let mut result = json!({
         "preview": true,
         "source": source,
@@ -1252,6 +1320,8 @@ fn build_preview_response(
         "positions": positions,
         "confidence": spec.confidence,
         "warnings": [],
+        "csv_parsing_issues": parsing_issues,
+        "generic_tickers_at_risk": generic_at_risk,
         "ready": !needs_chat,
         "needs_chat_confirmation": needs_chat,
         "headers": headers,
@@ -1978,6 +2048,114 @@ fn build_cash_mapping_with_links(
     CashMappingResult { mapping: result, ambiguous_groups }
 }
 
+/// Check whether a position whose implied unit price exceeds the outlier
+/// threshold is on the high-price whitelist (e.g. BRK.A at ~700 000 USD).
+/// Match is case-insensitive against either the ticker or the ISIN.
+fn is_high_price_whitelisted(ticker: &str, isin: &str) -> bool {
+    let t = ticker.trim().to_uppercase();
+    let i = isin.trim().to_uppercase();
+    CSV_HIGH_PRICE_WHITELIST
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(&t) || allowed.eq_ignore_ascii_case(&i))
+}
+
+/// Build a CSV parsing issue record for a position, returning one JSON
+/// entry per detected issue (price outlier, malformed ISIN). Shared by
+/// both `execute_spec` (`position_snapshot` branch) and
+/// `parse_positions_text` (Boursorama metadata path) so the surface area
+/// of CSV ingestion is uniformly covered.
+fn build_csv_parsing_issues(
+    ticker: &str,
+    nom: &str,
+    isin: &str,
+    quantite: f64,
+    valeur_actuelle: f64,
+) -> Vec<Value> {
+    let mut issues = Vec::new();
+    let implied_unit_price = if quantite > 0.0 { valeur_actuelle / quantite } else { 0.0 };
+    let outlier = implied_unit_price > CSV_PRICE_OUTLIER_THRESHOLD_EUR
+        && !is_high_price_whitelisted(ticker, isin);
+    if outlier {
+        issues.push(json!({
+            "type": "csv_parsing",
+            "reason": "price_outlier_suspect",
+            "ticker": ticker,
+            "nom": nom,
+            "isin": if isin.is_empty() { Value::Null } else { json!(isin) },
+            "quantite": quantite,
+            "valeur_actuelle": valeur_actuelle,
+            "implied_unit_price": implied_unit_price,
+        }));
+    }
+    if !isin.trim().is_empty() && !validate_isin(isin.trim()) {
+        issues.push(json!({
+            "type": "csv_parsing",
+            "reason": "malformed_isin",
+            "ticker": ticker,
+            "nom": nom,
+            "isin": isin,
+            "quantite": quantite,
+            "valeur_actuelle": valeur_actuelle,
+            "implied_unit_price": implied_unit_price,
+        }));
+    }
+    issues
+}
+
+/// P1-56 visibility — short list of generic French-language tokens that
+/// `derive_ticker_from_name` is known to produce when a CSV row has no
+/// dedicated ticker column. These names usually point to instruments the
+/// ISIN resolver can't anchor (parts sociales coopératives, funds with
+/// product-line names) so they are exactly the rows where P0-55 will
+/// preserve the CSV price instead of trusting market enrichment.
+///
+/// The list is intentionally short: false negatives here (a "real"
+/// short-ticker like `MC` for LVMH) come back with `resolved_symbol`
+/// set by the upstream resolver so the helper never tags them — the
+/// `resolved_symbol` check is the integrity gate in
+/// `compute_generic_tickers_at_risk`, this list is just a quick first
+/// filter to keep the wizard summary signal-dense.
+const GENERIC_TICKER_RISK_LIST: &[&str] = &[
+    "PARTS", "THE", "LA", "LE", "LES", "DE", "DU", "DES",
+    "FONDS", "OPCVM", "ETF", "PEA", "PME", "ACTIONS",
+    "OBLIGATIONS", "OBLIG", "GROUP", "GROUPE", "SOCIETE",
+    "BANK", "BANQUE", "ASSURANCE",
+];
+
+/// P1-56 visibility — list positions whose `ticker` is a generic token
+/// AND that lack a canonical `resolved_symbol`. These are the rows where
+/// the P0-55 guard will skip enrichment (see `has_canonical_resolution`
+/// in `native_collection_helpers`) — the wizard can warn the user up-front
+/// so they decide whether to abort or proceed with degraded coverage on
+/// these specific lines.
+///
+/// Returns one JSON object per at-risk row: `{ ticker, nom, isin }`.
+pub(crate) fn compute_generic_tickers_at_risk(positions: &Value) -> Value {
+    let Some(arr) = positions.as_array() else { return json!([]); };
+    let mut out: Vec<Value> = Vec::new();
+    for p in arr {
+        let ticker = p.get("ticker").and_then(|v| v.as_str()).unwrap_or("").to_uppercase();
+        if ticker.is_empty() { continue; }
+        let has_resolution = p.get("resolved_symbol")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if has_resolution { continue; }
+        let is_risky = GENERIC_TICKER_RISK_LIST.iter().any(|g| *g == ticker)
+            // Also flag very short tickers (≤3 chars) without resolution.
+            // 2-3 char tickers without a canonical anchor are prime
+            // false-match candidates on Google Finance.
+            || ticker.len() <= 3;
+        if !is_risky { continue; }
+        out.push(json!({
+            "ticker": ticker,
+            "nom": p.get("nom").and_then(|v| v.as_str()).unwrap_or(""),
+            "isin": p.get("isin").and_then(|v| v.as_str()).unwrap_or(""),
+        }));
+    }
+    Value::Array(out)
+}
+
 /// Derive a short, human-readable ticker from the security name when Finary
 /// doesn't provide a symbol. Falls back to ISIN if name is empty.
 fn derive_ticker_from_name(name: &str, isin: &str) -> String {
@@ -2073,6 +2251,19 @@ fn patch_source_ingestion_failed(run_id: &str, portfolio_source: &str, error: &a
 /// the endpoint is unreachable, the row stays untouched (`resolved_symbol`
 /// remains null) and downstream enrichment falls back to ticker routing.
 ///
+/// P0-53: when a canonical symbol is returned, the row's raw `ticker` is
+/// also reconciled to the broker-agnostic short ticker (e.g. `LVMH` →
+/// `MC` after resolving `FR0000121014` to `MC.PA`). Without this, the
+/// post-analysis line-memory write-back forks the `by_ticker` map (one
+/// entry under the name-derived ticker, another under the canonical
+/// resolved symbol). The reconciliation is idempotent — when the ticker
+/// is already canonical (`MC` resolves to `MC.PA` and stays `MC`), the
+/// write is a no-op.
+///
+/// P0-54: rows with an ISIN that fails the ISO 6166 + Luhn check skip
+/// the resolve call entirely. Without this guard, every malformed ISIN
+/// triggers one wasted `/api/resolve` round-trip per run.
+///
 /// Pure function — no run_state writes, no side effects beyond the
 /// `/api/resolve` calls. Logged via `debug_log` so a missing v0.3 server is
 /// visible in the debug log without surfacing user-facing errors.
@@ -2088,13 +2279,24 @@ fn resolve_canonical_symbols(positions: Vec<Value>) -> Vec<Value> {
                 return row;
             }
             let key = trimmed.to_uppercase();
+            // P0-54: don't burn API calls on malformed ISINs.
+            if !validate_isin(&key) {
+                return row;
+            }
             let resolved = cache
                 .entry(key.clone())
                 .or_insert_with(|| crate::enrichment::fetch_resolved_symbol(&key))
                 .clone();
             if let Some(symbol) = resolved {
                 if let Some(obj) = row.as_object_mut() {
-                    obj.insert("resolved_symbol".to_string(), json!(symbol));
+                    obj.insert("resolved_symbol".to_string(), json!(symbol.clone()));
+                    // P0-53: reconcile the broker ticker with the resolved
+                    // symbol so post-analysis line-memory write-back uses
+                    // the canonical key (and not the name-derived
+                    // fallback like `LVMH` / `CARREFOUR`).
+                    if let Some(canonical_ticker) = ticker_from_resolved(&symbol) {
+                        obj.insert("ticker".to_string(), json!(canonical_ticker));
+                    }
                 }
             }
             row
@@ -2124,13 +2326,23 @@ fn resolve_watchlist_items(items: Vec<Value>) -> Vec<Value> {
                 return item;
             }
             let key = trimmed.to_uppercase();
+            // P0-54 parity: skip malformed ISIN to avoid wasted API calls.
+            if !validate_isin(&key) {
+                return item;
+            }
             let resolved = cache
                 .entry(key.clone())
                 .or_insert_with(|| crate::enrichment::fetch_resolved_symbol(&key))
                 .clone();
             if let Some(symbol) = resolved {
                 if let Some(obj) = item.as_object_mut() {
-                    obj.insert("resolved_symbol".to_string(), json!(symbol));
+                    obj.insert("resolved_symbol".to_string(), json!(symbol.clone()));
+                    // P0-53 parity: reconcile ticker to canonical when LLM
+                    // suggested a name-style identifier (e.g. raw `LVMH`
+                    // becomes `MC` once `FR0000121014` resolves to `MC.PA`).
+                    if let Some(canonical_ticker) = ticker_from_resolved(&symbol) {
+                        obj.insert("ticker".to_string(), json!(canonical_ticker));
+                    }
                 }
             }
             item
@@ -2361,11 +2573,46 @@ fn apply_collection_result(
         // enrichment did produce a valid price. The `is_real_market_source`
         // guard inside the helper ensures the PRU fallback (`source == "none"`)
         // never contaminates the position fields.
+        //
+        // P0-55 guard (2026-05-23) — refuse to overwrite the CSV-parsed price
+        // when the ISIN resolver failed (resolved_symbol absent). A generic
+        // name-derived ticker (`PARTS`, `THE`, …) sent to Google Finance can
+        // match the wrong instrument and produce a bogus quote
+        // (incident 019e53d118ac: PARTS SOCIALES 1€ → fake 3406.5€).
+        // The presence of `resolved_symbol` is the integrity signal: it is
+        // set by `resolve_canonical_symbols` only when `/api/resolve`
+        // returned a canonical Yahoo symbol. Without it, the market row is
+        // suspect, so we preserve the CSV-parsed prix_actuel verbatim and
+        // emit a `collection-issue-detected` event so the UI can surface
+        // the skip (P1-56 will render this as a pre-run warning).
         if let Some(slot) = positions_by_index[result.index].as_mut() {
-            crate::native_collection_helpers::sync_position_from_market(
-                slot,
-                &result.market_row,
-            );
+            if crate::native_collection_helpers::has_canonical_resolution(slot) {
+                crate::native_collection_helpers::sync_position_from_market(
+                    slot,
+                    &result.market_row,
+                );
+            } else {
+                let issue_isin = slot
+                    .get("isin")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                collection_issues.push(json!({
+                    "type": "data_quality_weak",
+                    "ticker": ticker.clone(),
+                    "nom": name.clone(),
+                    "isin": issue_isin,
+                    "reasons": ["enrichment_skipped_unresolved"],
+                    "at": now_iso_string(),
+                }));
+                crate::emit_event("alfred://collection-issue-detected", json!({
+                    "run_id": run_id,
+                    "ticker": ticker,
+                    "nom": name,
+                    "reason": "enrichment_skipped_unresolved",
+                    "detail": "ISIN resolver failed — CSV price preserved to prevent market false-match",
+                }));
+            }
         }
     }
     incremental_positions.clear();
@@ -2728,7 +2975,15 @@ pub(crate) fn execute_native_local_analysis_workflow_with(
     let mut market_by_ticker = Map::new();
     let mut news_by_ticker = Map::new();
     let mut technicals_by_ticker: Map<String, Value> = Map::new();
-    let mut collection_issues = Vec::new();
+    // P0-54: seed collection_issues with any CSV-ingestion issues already
+    // detected during snapshot parsing (price outliers, malformed ISIN).
+    // These are surfaced to the UI through the same channel as enrichment
+    // issues so the user sees them before the analysis runs.
+    let mut collection_issues: Vec<Value> = snapshot
+        .get("csv_parsing_issues")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
     let mut failures = Vec::new();
     let mut hydration_totals = json!({
         "tickers_hydrated": 0,
@@ -3140,6 +3395,22 @@ pub fn compute_header_fingerprint_for_test(headers: &[String]) -> String {
 #[cfg(test)]
 pub fn execute_spec_for_test(spec: &CsvParsingSpec, rows: &[Vec<String>], headers: &[String], account: &str) -> Result<Value> {
     execute_spec(spec, rows, headers, account)
+}
+
+#[cfg(test)]
+#[allow(dead_code)] // consumed by integration tests in src/tests.rs
+pub fn resolve_canonical_symbols_for_test(positions: Vec<Value>) -> Vec<Value> {
+    resolve_canonical_symbols(positions)
+}
+
+// QA caveat P0-54 (2026-05-23) — the Boursorama metadata path
+// (`parse_positions_text`) is private but emits its own `csv_parsing_issues`
+// list, so a dedicated test seam pins the contract independently of the
+// LLM-spec path (`execute_spec`).
+#[cfg(test)]
+#[allow(dead_code)]
+pub fn parse_positions_text_for_test(text: &str, account_name: &str) -> Result<Value> {
+    parse_positions_text(text, account_name)
 }
 
 #[cfg(test)]

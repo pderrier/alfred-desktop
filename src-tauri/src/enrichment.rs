@@ -66,10 +66,22 @@ pub fn fetch_cot(ticker: &str, isin: &str, canonical: Option<&str>) -> Result<Va
 /// Callers must treat `None` as "no canonical resolution available" — they
 /// fall back to using the raw ticker as before. Additive contract per
 /// `feedback_snapshot_ui_contract`.
+///
+/// In tests, the network round trip can be overridden via
+/// `set_resolve_mock` — the workflow under test then exercises every
+/// downstream code path without hitting `/api/resolve`. This mirrors the
+/// `set_codex_mock` seam in `codex.rs`.
 pub fn fetch_resolved_symbol(isin: &str) -> Option<String> {
     let code = isin.trim();
     if code.is_empty() {
         return None;
+    }
+    if let Some(slot) = RESOLVE_MOCK.get() {
+        if let Ok(guard) = slot.lock() {
+            if let Some(mock_fn) = *guard {
+                return mock_fn(code);
+            }
+        }
     }
     match crate::alfred_api_client::remote_fetch_resolve(code) {
         Ok(symbol) => symbol,
@@ -78,6 +90,21 @@ pub fn fetch_resolved_symbol(isin: &str) -> Option<String> {
             None
         }
     }
+}
+
+/// Test-only mock: when set, `fetch_resolved_symbol` calls this instead of
+/// `/api/resolve`. Thread-safe static function pointer, mirroring
+/// `codex::set_codex_mock`.
+pub type ResolveMockFn = fn(&str) -> Option<String>;
+static RESOLVE_MOCK: std::sync::OnceLock<std::sync::Mutex<Option<ResolveMockFn>>> =
+    std::sync::OnceLock::new();
+
+/// Install (or clear with `None`) the resolver mock. Tests should call this
+/// inside an `env_lock()` guard to keep parallel test threads from racing.
+#[allow(dead_code)] // called from #[cfg(test)] code paths only
+pub fn set_resolve_mock(mock: Option<ResolveMockFn>) {
+    let slot = RESOLVE_MOCK.get_or_init(|| std::sync::Mutex::new(None));
+    *slot.lock().unwrap_or_else(|e| e.into_inner()) = mock;
 }
 
 /// Fetch the 250-day technical snapshot for a ticker.

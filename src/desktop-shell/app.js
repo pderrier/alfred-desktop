@@ -45,6 +45,7 @@ import { buildGlobalPortfolioSynthesis } from "/desktop-shell/global-portfolio-s
 import { buildCrossAccountThemeView } from "/desktop-shell/report-view-model.js";
 import { getThemeLabel } from "/desktop-shell/theme-labels.js";
 import { getLocalQuotaState, resetLocalQuotaCache } from "/desktop-shell/quota-local-counter.js";
+import { extractFirstSentence, countPendingRecos } from "/desktop-shell/home-last-synthesis.js";
 import { openDiscussionHistoryModal, saveDiscussionThread } from "/desktop-shell/discussion-memory.js";
 import {
   reduceRunActivityState
@@ -668,9 +669,21 @@ async function renderRunDiff(recommendations = []) {
       }
       if (c.significant_price_move) s.significant_moves++;
     }
+    // P1-21 (2026-05-23) \u2014 FR-tutoiement rewrite. Pierre's voice :
+    // factuel ou actionnable, jamais g\u00e9n\u00e9rique.
     let html = `<section class="card run-diff-section">`;
-    html += `<h2>What Changed</h2>`;
-    html += `<p class="run-diff-summary">${s.signal_changes} signal change${s.signal_changes !== 1 ? "s" : ""} (${s.upgrades} upgrade${s.upgrades !== 1 ? "s" : ""}, ${s.downgrades} downgrade${s.downgrades !== 1 ? "s" : ""}), ${s.significant_moves} significant price move${s.significant_moves !== 1 ? "s" : ""}</p>`;
+    html += `<h2>Ce qui a boug\u00e9</h2>`;
+    const signalLabel = s.signal_changes === 0
+      ? "Aucun signal n'a chang\u00e9"
+      : `${s.signal_changes} signal${s.signal_changes > 1 ? "s ont" : " a"} chang\u00e9`;
+    const breakdownParts = [];
+    if (s.upgrades > 0) breakdownParts.push(`${s.upgrades} upgrade${s.upgrades > 1 ? "s" : ""}`);
+    if (s.downgrades > 0) breakdownParts.push(`${s.downgrades} downgrade${s.downgrades > 1 ? "s" : ""}`);
+    const breakdown = breakdownParts.length > 0 ? ` (${breakdownParts.join(", ")})` : "";
+    const movesLabel = s.significant_moves === 0
+      ? ""
+      : ` \u00b7 ${s.significant_moves} mouvement${s.significant_moves > 1 ? "s" : ""} significatif${s.significant_moves > 1 ? "s" : ""}`;
+    html += `<p class="run-diff-summary">${signalLabel}${breakdown}${movesLabel}</p>`;
     html += `<ul class="run-diff-list">`;
     for (const c of scopedChanges) {
       const parts = [];
@@ -678,7 +691,7 @@ async function renderRunDiff(recommendations = []) {
         const cls = c.curr_signal > c.prev_signal ? "diff-upgrade" : "diff-downgrade";
         parts.push(`<span class="${cls}">${c.prev_signal} \u2192 ${c.curr_signal}</span>`);
       }
-      if (c.conviction_changed) parts.push(`conviction: ${c.prev_conviction} \u2192 ${c.curr_conviction}`);
+      if (c.conviction_changed) parts.push(`conviction : ${c.prev_conviction} \u2192 ${c.curr_conviction}`);
       if (c.significant_price_move) parts.push(`<span class="diff-price-move">${c.price_change_pct >= 0 ? "+" : ""}${c.price_change_pct}%</span>`);
       html += `<li><strong>${c.ticker}</strong> — ${parts.join(" · ")}</li>`;
     }
@@ -2418,6 +2431,25 @@ function renderWelcome() {
   }
 
 
+  // ── P1-21 Section 2 : Alfred t'a dit quoi (last synthesis) ──────
+  const lastSynthesisCard = (() => {
+    const snippet = extractFirstSentence(latestRun?.composed_payload?.synthese_marche);
+    if (!snippet) return "";
+    const runId = latestRun?.run_id || "";
+    const recosCount = countPendingRecos(recos);
+    const chip = recosCount > 0
+      ? `<span class="chip chip-suggestion" style="margin-left:0.4rem">${recosCount} reco${recosCount > 1 ? "s" : ""} en attente</span>`
+      : "";
+    const clickAttr = runId ? `onclick="window.__viewRun('${escapeHtml(runId)}')"` : "";
+    const cursor = runId ? "cursor:pointer" : "";
+    return `
+      <div class="welcome-step welcome-last-synthesis" ${clickAttr} style="${cursor}">
+        <h3 style="margin-bottom:0.3rem">Alfred t'a dit quoi</h3>
+        <p style="margin:0">${escapeHtml(snippet)}${chip}</p>
+      </div>
+    `;
+  })();
+
   // ── P0-20 Section 1 : Header strip — tier + quota ───────────────
   const homeHeaderStrip = (() => {
     const data = homeHeader.data;
@@ -2535,8 +2567,10 @@ function renderWelcome() {
 
   if (titleNode) titleNode.textContent = accountRuns.size > 0 ? "Latest runs" : "Ready";
 
-  // P0-20 home composition order : header strip → themes → répartition.
+  // P0-20 + P1-21 home composition order : header strip → "Alfred
+  // t'a dit quoi" → répartition → thèmes.
   if (homeHeaderStrip) html += homeHeaderStrip;
+  if (lastSynthesisCard) html += lastSynthesisCard;
   if (globalSynthesisCard) html += globalSynthesisCard;
   if (themesCard) html += themesCard;
 

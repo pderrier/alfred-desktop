@@ -505,7 +505,12 @@ export function registerDefaultTriggers(overlay) {
     enabled: true
   });
 
-  // ── Phase D triggers (registered but disabled, ready for Phase C to enable) ──
+  // ── Phase D triggers — alfred-theme-concentration wired in P3-52 ──
+  //
+  // P3-52 (2026-05-23) — the `theme-concentration-detected` event is
+  // now emitted from `app.js` welcome view after `buildCrossAccountThemeView`
+  // produces a row passing the (`accountCount >= 2 && totalCount >= 4`)
+  // threshold. Per-snapshot dedup prevents re-fire on welcome re-renders.
 
   overlay.registerTrigger({
     id: "alfred-theme-concentration",

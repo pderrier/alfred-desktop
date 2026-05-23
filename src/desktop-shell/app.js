@@ -42,7 +42,7 @@ import {
 import { resolveShellRefreshPlan } from "/desktop-shell/refresh-policy.js";
 import { buildGlobalPortfolioSynthesis } from "/desktop-shell/global-portfolio-synthesis.js";
 // P0-20 (2026-05-23) — home backbone v0.4.1
-import { buildCrossAccountThemeView } from "/desktop-shell/report-view-model.js";
+import { buildCrossAccountThemeView, findConcentrationThemeToTrigger } from "/desktop-shell/report-view-model.js";
 import { getThemeLabel } from "/desktop-shell/theme-labels.js";
 import { getLocalQuotaState, resetLocalQuotaCache } from "/desktop-shell/quota-local-counter.js";
 import { extractFirstSentence, countPendingRecos } from "/desktop-shell/home-last-synthesis.js";
@@ -145,6 +145,12 @@ let globalHomeSynthesis = { status: "idle", snapshotKey: null, data: null, error
 // independently of the synthesis since it doesn't depend on the run
 // snapshot — only the license_status + local run-index.
 let homeHeader = { status: "idle", data: null, error: null };
+// P3-52 (2026-05-23) — per-snapshot dedup for the
+// theme-concentration-detected event. Prevents the
+// `alfred-theme-concentration` overlay from re-firing every time the
+// welcome view re-renders. Stores the snapshot key for which we
+// already notified the overlay.
+let themeConcentrationLastNotifiedSnapshotKey = null;
 
 // ── Bridge + run operations ──────────────────────────────────────
 
@@ -2517,6 +2523,32 @@ function renderWelcome() {
       const view = buildCrossAccountThemeView(snapshot, "");
       const globalThemes = Array.isArray(view?.globalThemes) ? view.globalThemes : [];
       if (globalThemes.length === 0) return "";
+
+      // P3-52 (2026-05-23) — wake the previously-dead
+      // `alfred-theme-concentration` overlay trigger when a theme is
+      // genuinely concentrated cross-account. Per-snapshot dedup so
+      // the overlay doesn't re-fire on every re-render.
+      try {
+        const snapshotKey = computeHomeSnapshotKey(snapshot);
+        const concentrated = findConcentrationThemeToTrigger(globalThemes);
+        if (
+          concentrated &&
+          themeConcentrationLastNotifiedSnapshotKey !== snapshotKey &&
+          typeof window !== "undefined" &&
+          window.__alfredOverlay?.notify
+        ) {
+          const label = getThemeLabel(concentrated.theme);
+          window.__alfredOverlay.notify("theme-concentration-detected", {
+            themeCount: concentrated.totalCount,
+            themes: [label.label || concentrated.theme],
+            accounts: concentrated.accounts,
+          });
+          themeConcentrationLastNotifiedSnapshotKey = snapshotKey;
+        }
+      } catch {
+        // Overlay not initialised yet (e.g. test env) — silent skip.
+      }
+
       const top3 = [...globalThemes]
         .sort((a, b) => (b.totalCount || 0) - (a.totalCount || 0))
         .slice(0, 3);

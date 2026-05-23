@@ -482,6 +482,34 @@ function aggregateRisksFromRecommendations(recommendations = []) {
     });
 }
 
+// P3-52 (2026-05-23) — find the first cross-account theme that meets
+// the concentration threshold (`accountCount >= 2 && totalCount >= 4`).
+// Returns the matching row or null. Used by the home view to decide
+// whether to emit `theme-concentration-detected` and wake the
+// `alfred-theme-concentration` overlay trigger (previously dead code).
+//
+// The thresholds match the trigger's intent : at least 2 accounts
+// exposed AND at least 4 distinct positions sharing the theme — both
+// criteria together prevent noise from a single account's loud
+// sector vs a real cross-portfolio concentration risk.
+export function findConcentrationThemeToTrigger(globalThemes) {
+  if (!Array.isArray(globalThemes)) return null;
+  for (const row of globalThemes) {
+    if (!row || typeof row !== "object") continue;
+    const accountCount = Number(row.accountCount || 0);
+    const totalCount = Number(row.totalCount || 0);
+    if (accountCount >= 2 && totalCount >= 4) {
+      return {
+        theme: row.theme,
+        totalCount,
+        accountCount,
+        accounts: Array.isArray(row.accounts) ? row.accounts : [],
+      };
+    }
+  }
+  return null;
+}
+
 // P0-20 (2026-05-23) — exported so the home page (`app.js` welcome
 // view) can render top cross-portfolio themes directly without
 // duplicating the aggregation logic. Consumed via the named import.

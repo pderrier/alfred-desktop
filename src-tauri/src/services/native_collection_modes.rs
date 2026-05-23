@@ -122,10 +122,26 @@ pub(crate) fn execute_refresh_synthesis_mode(
     let prev_recs = prev_recs_vec;
     let mut kept_recs = Vec::new();
     let mut expired_tickers = Vec::new();
+    let mut force_reasons: Vec<(String, &'static str)> = Vec::new();
     for rec in &prev_recs {
-        let reanalyse_after = as_text(rec.get("reanalyse_after"));
-        if !reanalyse_after.is_empty() && reanalyse_after.as_str() <= today.as_str() {
-            expired_tickers.push(as_text(rec.get("ticker")));
+        let ticker = as_text(rec.get("ticker"));
+        // `market_by_ticker` / `news_by_ticker` are per-run maps keyed by raw
+        // position ticker — unrelated to the line-memory canonical-key contract
+        // enforced by `resolve_line_memory_key`. Sanctioned sites tagged below.
+        let market_row = market_by_ticker.get(&ticker); // LINT-ALLOW: per-run raw-ticker map
+        let news_row = news_by_ticker.get(&ticker); // LINT-ALLOW: per-run raw-ticker map
+        let line_memory =
+            crate::native_mcp_analysis::resolve_line_memory_key(&*line_memory_store, &ticker);
+        let reason = crate::force_reanalyse::should_force_reanalyse(
+            rec,
+            market_row,
+            line_memory,
+            news_row,
+            today.as_str(),
+        );
+        if reason.is_force() {
+            force_reasons.push((ticker.clone(), reason.as_tag()));
+            expired_tickers.push(ticker);
         } else {
             kept_recs.push(rec.clone());
         }
@@ -152,6 +168,12 @@ pub(crate) fn execute_refresh_synthesis_mode(
             expired_tickers.len(),
             expired_tickers
         );
+        if !force_reasons.is_empty() {
+            eprintln!(
+                "[refresh_synthesis] force_reanalyse reasons: {:?}",
+                force_reasons
+            );
+        }
     }
     let _ = patch_run_state_direct_with(run_id, |rs| {
         if let Some(obj) = rs.as_object_mut() {

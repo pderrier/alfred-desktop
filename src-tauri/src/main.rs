@@ -22,6 +22,9 @@ mod native_collection_dispatch;
 mod native_collection_helpers;
 #[path = "services/native_collection_modes.rs"]
 mod native_collection_modes;
+// P0-58 (2026-05-23) — re-analysis predicate (date / cold / drift / news).
+#[path = "services/force_reanalyse.rs"]
+mod force_reanalyse;
 #[path = "services/native_line_analysis.rs"]
 mod native_line_analysis;
 // P2-24 (2026-05-23) — cross-portfolio signal accuracy aggregator.

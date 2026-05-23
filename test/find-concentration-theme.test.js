@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { findConcentrationThemeToTrigger } from "../src/desktop-shell/report-view-model.js";
+import {
+  findConcentrationThemeToTrigger,
+  shouldNotifyConcentration,
+} from "../src/desktop-shell/report-view-model.js";
 
 // ── P3-52: findConcentrationThemeToTrigger ─────────────────────────
 
@@ -72,4 +75,63 @@ test("findConcentrationThemeToTrigger: accounts defaults to [] when missing", ()
   const themes = [{ theme: "no_accounts", accountCount: 2, totalCount: 5 }];
   const result = findConcentrationThemeToTrigger(themes);
   assert.deepEqual(result.accounts, []);
+});
+
+// ── P3-64: shouldNotifyConcentration ───────────────────────────────
+// Pure dedup decision helper. The orchestrator (`app.js`) holds the
+// `lastNotifiedSnapshotKey` slot and rotates it after firing ; this
+// helper just answers "should I fire now ?".
+//
+// Pin semantics : a new run rotates `computeHomeSnapshotKey` (which
+// includes `runs.length`), so the dedup key changes and the helper
+// returns `true` — that's the intended "new run = new context"
+// behavior. Same-snapshot welcome re-renders MUST be suppressed.
+
+test("shouldNotifyConcentration: returns false when no concentrated theme", () => {
+  // Nothing to notify about — must always suppress regardless of keys.
+  assert.equal(shouldNotifyConcentration("key-a", null, null), false);
+  assert.equal(shouldNotifyConcentration("key-a", "key-a", null), false);
+  assert.equal(shouldNotifyConcentration("key-a", "key-b", null), false);
+  assert.equal(shouldNotifyConcentration("key-a", null, undefined), false);
+});
+
+test("shouldNotifyConcentration: returns true on first call with a concentrated theme", () => {
+  // First call : lastNotifiedSnapshotKey is null (initial state).
+  const theme = { theme: "tech", totalCount: 6, accountCount: 2, accounts: ["PEA", "CTO"] };
+  assert.equal(shouldNotifyConcentration("snap-1", null, theme), true);
+});
+
+test("shouldNotifyConcentration: returns false on second call with same snapshot key (re-render suppression)", () => {
+  // Welcome view re-renders without a new run → keys are identical →
+  // must suppress to avoid spamming the overlay.
+  const theme = { theme: "tech", totalCount: 6, accountCount: 2, accounts: ["PEA", "CTO"] };
+  assert.equal(shouldNotifyConcentration("snap-1", "snap-1", theme), false);
+});
+
+test("shouldNotifyConcentration: returns true when snapshot key changes (new run completes)", () => {
+  // A new completed run rotates `computeHomeSnapshotKey` via
+  // `runs.length` and updated_at — the helper MUST fire again.
+  // This is the explicit pin that closes the QA caveat for P3-52.
+  const theme = { theme: "tech", totalCount: 6, accountCount: 2, accounts: ["PEA", "CTO"] };
+  assert.equal(shouldNotifyConcentration("snap-2", "snap-1", theme), true);
+});
+
+test("shouldNotifyConcentration: returns true when last key was null and current is non-null (first notify)", () => {
+  // Same as the first-call case but explicit about the null→value
+  // transition — defends against a future refactor that initializes
+  // the slot to `""` instead of `null`.
+  const theme = { theme: "tech", totalCount: 6, accountCount: 2, accounts: ["PEA", "CTO"] };
+  assert.equal(shouldNotifyConcentration("snap-1", null, theme), true);
+});
+
+test("shouldNotifyConcentration: returns true when current key is empty/null but theme exists (degenerate but firable)", () => {
+  // Degenerate case : snapshot key is empty (shouldn't happen in prod
+  // because `computeHomeSnapshotKey` always returns a non-empty
+  // pipe-joined string, but defensive). Helper fires once and the
+  // caller still writes back the empty key — subsequent calls hit the
+  // suppression branch via the `currentSnapshotKey && ...` guard
+  // (falsy current short-circuits to "fire").
+  const theme = { theme: "tech", totalCount: 6, accountCount: 2, accounts: ["PEA", "CTO"] };
+  assert.equal(shouldNotifyConcentration("", null, theme), true);
+  assert.equal(shouldNotifyConcentration(null, null, theme), true);
 });

@@ -510,6 +510,37 @@ export function findConcentrationThemeToTrigger(globalThemes) {
   return null;
 }
 
+/**
+ * P3-64 (2026-05-23) — pure dedup decision for the
+ * theme-concentration-detected event emission.
+ *
+ * Returns `true` when the orchestrator should fire `notify(...)` on
+ * the Alfred overlay, `false` when it must suppress.
+ *
+ * Behavior :
+ *   - If `concentratedTheme` is null → return false (nothing to fire).
+ *   - If `currentSnapshotKey` equals `lastNotifiedSnapshotKey` → return
+ *     false (already notified for this snapshot ; suppresses re-renders).
+ *   - Otherwise → return true (new snapshot, new run, or first time).
+ *
+ * The caller is responsible for updating its
+ * `lastNotifiedSnapshotKey` slot to `currentSnapshotKey` after firing,
+ * and for actually invoking `notify()`. This helper makes the
+ * decision testable in isolation.
+ *
+ * Semantics note : `currentSnapshotKey` is computed from
+ * `computeHomeSnapshotKey(snapshot)` which INCLUDES `snapshot.runs.length`.
+ * That means a freshly completed run legitimately rotates the key and
+ * triggers a fresh notify — this is intended ("new run = new context").
+ * The overlay's own 24h cooldown is the second line of defense against
+ * noisy re-fires.
+ */
+export function shouldNotifyConcentration(currentSnapshotKey, lastNotifiedSnapshotKey, concentratedTheme) {
+  if (!concentratedTheme) return false;
+  if (currentSnapshotKey && currentSnapshotKey === lastNotifiedSnapshotKey) return false;
+  return true;
+}
+
 // P0-20 (2026-05-23) — exported so the home page (`app.js` welcome
 // view) can render top cross-portfolio themes directly without
 // duplicating the aggregation logic. Consumed via the named import.

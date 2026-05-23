@@ -42,7 +42,7 @@ import {
 import { resolveShellRefreshPlan } from "/desktop-shell/refresh-policy.js";
 import { buildGlobalPortfolioSynthesis } from "/desktop-shell/global-portfolio-synthesis.js";
 // P0-20 (2026-05-23) — home backbone v0.4.1
-import { buildCrossAccountThemeView, findConcentrationThemeToTrigger } from "/desktop-shell/report-view-model.js";
+import { buildCrossAccountThemeView, findConcentrationThemeToTrigger, shouldNotifyConcentration } from "/desktop-shell/report-view-model.js";
 import { getThemeLabel } from "/desktop-shell/theme-labels.js";
 import { getLocalQuotaState, resetLocalQuotaCache } from "/desktop-shell/quota-local-counter.js";
 import { extractFirstSentence, countPendingRecos } from "/desktop-shell/home-last-synthesis.js";
@@ -2583,12 +2583,16 @@ function renderWelcome() {
       // `alfred-theme-concentration` overlay trigger when a theme is
       // genuinely concentrated cross-account. Per-snapshot dedup so
       // the overlay doesn't re-fire on every re-render.
+      // P3-64 (2026-05-23) — dedup decision extracted into
+      // `shouldNotifyConcentration` (pure helper, unit-tested). The
+      // snapshot key includes `runs.length`, so a freshly completed
+      // run legitimately rotates the key and triggers a fresh notify ;
+      // the overlay's 24h cooldown is the second line of defense.
       try {
         const snapshotKey = computeHomeSnapshotKey(snapshot);
         const concentrated = findConcentrationThemeToTrigger(globalThemes);
         if (
-          concentrated &&
-          themeConcentrationLastNotifiedSnapshotKey !== snapshotKey &&
+          shouldNotifyConcentration(snapshotKey, themeConcentrationLastNotifiedSnapshotKey, concentrated) &&
           typeof window !== "undefined" &&
           window.__alfredOverlay?.notify
         ) {

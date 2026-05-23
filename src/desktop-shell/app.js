@@ -47,6 +47,7 @@ import { getThemeLabel } from "/desktop-shell/theme-labels.js";
 import { getLocalQuotaState, resetLocalQuotaCache } from "/desktop-shell/quota-local-counter.js";
 import { extractFirstSentence, countPendingRecos } from "/desktop-shell/home-last-synthesis.js";
 import { extractTradeMoves, formatTradeRow } from "/desktop-shell/home-recent-trades.js";
+import { extractDatedCatalysts, formatCatalystRow } from "/desktop-shell/catalyst-calendar.js";
 import { openDiscussionHistoryModal, saveDiscussionThread } from "/desktop-shell/discussion-memory.js";
 import {
   reduceRunActivityState
@@ -2451,6 +2452,25 @@ function renderWelcome() {
     `;
   })();
 
+  // ── P2-25 Section 7 : Catalyseurs cette semaine ─────────────────
+  const catalystCard = (() => {
+    const recos = Array.isArray(latestRun?.composed_payload?.recommandations)
+      ? latestRun.composed_payload.recommandations
+      : Array.isArray(latestRun?.composed_payload?.recommendations)
+        ? latestRun.composed_payload.recommendations
+        : [];
+    if (recos.length === 0) return "";
+    const rows = extractDatedCatalysts(recos, { limit: 3, maxDaysAhead: 30 });
+    if (rows.length === 0) return "";
+    const items = rows.map((r) => `<li style="margin-bottom:0.3rem">${escapeHtml(formatCatalystRow(r))}</li>`).join("");
+    return `
+      <div class="welcome-step welcome-catalysts">
+        <h3>Catalyseurs cette semaine</h3>
+        <ul style="list-style:none;padding:0;margin:0.3rem 0 0">${items}</ul>
+      </div>
+    `;
+  })();
+
   // ── P1-22 Section 4 : Tes derniers ordres Finary ────────────────
   const recentTradesCard = (() => {
     const trades = extractTradeMoves(snapshot, 5);
@@ -2581,13 +2601,14 @@ function renderWelcome() {
 
   if (titleNode) titleNode.textContent = accountRuns.size > 0 ? "Latest runs" : "Ready";
 
-  // P0-20 + P1-21 + P1-22 home composition order : header strip →
-  // "Alfred t'a dit quoi" → derniers ordres Finary → répartition →
-  // thèmes.
+  // P0-20 + P1-21 + P1-22 + P2-25 home composition order : header
+  // strip → "Alfred t'a dit quoi" → derniers ordres Finary →
+  // répartition → catalyseurs cette semaine → thèmes.
   if (homeHeaderStrip) html += homeHeaderStrip;
   if (lastSynthesisCard) html += lastSynthesisCard;
   if (recentTradesCard) html += recentTradesCard;
   if (globalSynthesisCard) html += globalSynthesisCard;
+  if (catalystCard) html += catalystCard;
   if (themesCard) html += themesCard;
 
   if (accountRuns.size > 0) {

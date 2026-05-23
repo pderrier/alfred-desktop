@@ -8,19 +8,20 @@
  * never exists.
  *
  * Architecture invariants (per spec):
- *   1. Two-layer whitelist : compile-time `ADMIN_HASHES_WHITELIST`
- *      Rust-side controls visibility, `ALFRED_ADMIN_HASHES` server-side
- *      controls authorisation. The desktop never invokes admin
- *      endpoints unless the local boolean check (`isAdminUser`) returns
- *      true. The server is the authoritative gate — a 403 from the
- *      server tears down the tab even if the local cache disagreed.
+ *   1. Single source of truth for the allowlist : `ALFRED_ADMIN_HASHES`
+ *      env var server-side (P0-16, 2026-05-23 — previously a compile-
+ *      time `ADMIN_HASHES_WHITELIST` Rust constant). The desktop calls
+ *      `GET /admin/check` at cold-start ; 204 → tab visible, 403 → tab
+ *      not even built in the DOM. Adding an admin = restart the API
+ *      container, no desktop rebuild needed.
  *   2. No PII : `top_users` arrives pre-anonymised (8-char hash prefix).
  *      The frontend never displays raw user hashes.
  *   3. 30s refresh : server-side SCAN on Redis is moderately expensive,
  *      so the polling cadence is fixed at 30s and pauses when the
  *      gear panel closes.
- *   4. Empty whitelist = invisible tab : current production default.
- *      Pierre rebuilds with his hash post-merge to activate.
+ *   4. Empty `ALFRED_ADMIN_HASHES` = invisible tab everywhere : the
+ *      `require_admin` middleware fail-closes when the env var is
+ *      unset, so 403 is the default and `isAdminUser()` returns false.
  *
  * Module is pure — receives its `bridge` + `host` element as args, no
  * implicit DOM lookups beyond the host. This is the testability rule

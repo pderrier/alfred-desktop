@@ -2131,13 +2131,15 @@ document.getElementById("gear-btn")?.addEventListener("click", () => {
   ensureAdminPanelMaybe();
 });
 
-// ── Admin observability tab (v0.4.0 P0-14) ─────────────────────────
+// ── Admin observability tab (v0.4.0 P0-14, server-driven P0-16) ─────
 //
-// The admin tab is dynamically built in JS only when the local user
-// hash is on the baked-in `ADMIN_HASHES_WHITELIST` (Rust-side). The
-// gate is delegated to the bridge: `isAdminUser()` proxies to a Tauri
-// command that checks the compile-time list. No admin metadata leaks
-// to the frontend bundle.
+// The admin tab is dynamically built in JS only when the cold-start
+// `GET /admin/check` probe returns 204 (admin) — P0-16 (2026-05-23)
+// replaced the previous client-side `ADMIN_HASHES_WHITELIST` constant.
+// The gate is delegated to the bridge: `isAdminUser()` proxies to the
+// `admin_check_local` Tauri command which makes the probe. Adding an
+// admin no longer requires a desktop rebuild — Pierre just updates
+// the server `ALFRED_ADMIN_HASHES` env var and restarts the container.
 //
 // Lifecycle:
 //   - gear panel opens → ensureAdminPanelMaybe() asks the bridge if the

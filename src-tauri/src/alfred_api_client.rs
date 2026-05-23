@@ -660,6 +660,38 @@ pub struct AdminProcessStats {
     pub uptime_secs: u64,
 }
 
+/// P0-16 (2026-05-23) — server-driven admin tab visibility probe.
+/// Calls `GET /admin/check`, returns `Ok(true)` on 204 (admin),
+/// `Ok(false)` on 403 (not admin). Other failures (5xx, network) are
+/// surfaced as `Err` so the caller can log the diagnostic instead of
+/// silently flipping the tab off.
+///
+/// Replaces the desktop's previous `admin_config::is_whitelisted_admin`
+/// path — the allowlist now lives only in the server's
+/// `ALFRED_ADMIN_HASHES` env var, so adding an admin no longer requires
+/// a desktop rebuild.
+pub fn admin_check() -> Result<bool> {
+    let base = api_url().ok_or_else(|| anyhow!("alfred_api_not_configured"))?;
+    let url = format!("{base}/admin/check");
+    let req = apply_auth(ureq::get(&url), "/admin/check")
+        .timeout(Duration::from_secs(TIMEOUT_SECS));
+    match req.call() {
+        // 204 NoContent is the exact contract from the server handler.
+        Ok(resp) if resp.status() == 204 => Ok(true),
+        Ok(resp) => {
+            // 2xx other than 204 isn't expected — surface as error so
+            // a future server-side regression doesn't silently degrade
+            // to "everyone is admin".
+            Err(anyhow!(
+                "alfred_api_admin_check_unexpected_status:{}",
+                resp.status()
+            ))
+        }
+        Err(ureq::Error::Status(403, _)) => Ok(false),
+        Err(e) => Err(map_api_error(e)),
+    }
+}
+
 /// Fetch `/admin/usage`. Returns the raw envelope :
 /// `{ok, top_users, top_tickers, runs_7d, runs_24h, errors_429_today,
 ///   by_endpoint, generated_at}`.
@@ -667,9 +699,9 @@ pub struct AdminProcessStats {
 /// Requires the user's client_hash to be on the server-side
 /// `ALFRED_ADMIN_HASHES` allowlist; otherwise the server responds 403 and
 /// this function surfaces `alfred_api_http_error:403`. The desktop UI
-/// hides the Admin tab unless the same hash is on the local
-/// [`admin_config::ADMIN_HASHES_WHITELIST`](crate::admin_config) so the
-/// 403 path is normally unreachable.
+/// hides the Admin tab unless the cold-start `admin_check` probe
+/// returned 204 (P0-16, 2026-05-23) so the 403 path is normally
+/// unreachable for non-admins.
 ///
 /// Admin endpoints are NOT under the run-session middleware (verified in
 /// `apps/alfred-api/src/lib.rs::build_router` — admin_routes are mounted

@@ -806,26 +806,32 @@ export function createDesktopBridgeClient({
       const payload = await invoke("storage_clear_log_local");
       return normalizeTauriPayload(payload, ["storage_clear_log_local"]);
     },
-    // ── Admin observability (v0.4.0 P0-14) ────────────────────────────
+    // ── Admin observability (v0.4.0 P0-14, server-driven gate P0-16) ──
     //
-    // Two-layer whitelist:
-    //   - Server: `ALFRED_ADMIN_HASHES` env var → 403 on miss.
-    //   - Desktop: `admin_config::ADMIN_HASHES_WHITELIST` (compile-time)
-    //     → tab hidden when no match. Both gates must agree.
+    // Single authoritative allowlist : `ALFRED_ADMIN_HASHES` env var
+    // server-side. The desktop calls `GET /admin/check` at cold-start
+    // (`isAdminUser()` below) — 204 → tab visible, 403 → tab not built.
+    // P0-16 (2026-05-23) removed the previous baked-in
+    // `ADMIN_HASHES_WHITELIST` Rust constant so adding an admin no
+    // longer requires a desktop rebuild.
     //
     // The desktop never invokes admin endpoints for non-admin users
-    // (the gear panel hides the tab), so a 403 here is defensive — the
-    // tab consumer treats it as "remove the tab and stop polling" to
-    // match the server's authoritative view.
+    // (the gear panel hides the tab), so a 403 on `/admin/usage` or
+    // `/admin/vps-stats` is defensive — the tab consumer treats it as
+    // "remove the tab and stop polling" to match the server's view if
+    // the allowlist ever drifts during a session.
     /**
-     * Returns `{is_admin: boolean}` after the Rust layer compares the
-     * local user's hash against the baked-in whitelist. The whitelist
-     * itself is never sent to JS — only the boolean answer, so a
-     * leaked frontend bundle does not expose admin identities.
+     * Returns `{is_admin: boolean}` after a server probe to /admin/check
+     * (P0-16, 2026-05-23). Replaces the previous client-side
+     * `is_admin_hash_local` comparison against a baked-in whitelist —
+     * adding an admin now means updating `ALFRED_ADMIN_HASHES`
+     * server-side, no desktop rebuild needed. The wire shape stays the
+     * same so existing consumers (`admin-panel.js`, `app.js`) only see
+     * the value flip when the user is on the list.
      */
     async isAdminUser() {
-      const payload = await invoke("is_admin_hash_local");
-      return normalizeTauriPayload(payload, ["is_admin_hash_local"]);
+      const payload = await invoke("admin_check_local");
+      return normalizeTauriPayload(payload, ["admin_check_local"]);
     },
     /**
      * Returns the admin usage envelope as documented in

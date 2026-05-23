@@ -29,7 +29,8 @@ mod native_line_analysis;
 mod sqlite_migrations;
 
 // ── Extracted domain modules ────────────────────────────────────────────────
-mod admin_config;
+// P0-16 (2026-05-23) — `admin_config` deleted, admin visibility now
+// uses a server probe (`admin_check_local`) backed by `/admin/check`.
 mod agentos_artifacts;
 mod alfred_api_client;
 mod analysis_ops;
@@ -709,10 +710,10 @@ async fn export_report_markdown_local(
 
 /// `get_admin_usage_local` — fetch `/admin/usage`. v0.4.0 P0-14.
 ///
-/// Gated client-side by `admin_config::is_whitelisted_admin(currentUserHash)`
-/// in the JS layer ; the desktop never invokes this for non-admin users.
-/// The server is the source of truth (403 on miss) ; this command just
-/// proxies the response envelope.
+/// Gated client-side by the `admin_check_local` cold-start probe
+/// (P0-16, 2026-05-23) ; the desktop never invokes this for non-admin
+/// users. The server is the source of truth (403 on miss) ; this
+/// command just proxies the response envelope.
 #[tauri::command]
 async fn get_admin_usage_local() -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(command_handlers::run_get_admin_usage)
@@ -731,10 +732,11 @@ async fn get_admin_vps_stats_local() -> Result<serde_json::Value, String> {
 }
 
 /// `current_user_hash_local` — return the FNV-1a hash of the local OpenAI
-/// JWT. v0.4.0 P0-14. Used by the JS layer to decide whether to render
-/// the Admin tab (compared against `admin_config::ADMIN_HASHES_WHITELIST`
-/// via a separate `is_admin_hash_local` command). Never returns the raw
-/// JWT — only the irreversible 16-char hex hash.
+/// JWT. v0.4.0 P0-14. Diagnostic only since P0-16 (2026-05-23) — the
+/// admin-tab visibility now uses a server probe (`admin_check_local`)
+/// instead of comparing this hash against a baked-in whitelist. Kept
+/// for debugging (Pierre may want to print his own hash when adding it
+/// to `ALFRED_ADMIN_HASHES` server-side). Never returns the raw JWT.
 #[tauri::command]
 async fn current_user_hash_local() -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(command_handlers::run_current_user_hash)
@@ -743,20 +745,22 @@ async fn current_user_hash_local() -> Result<serde_json::Value, String> {
         .map_err(|e| e.to_string())
 }
 
-/// `is_admin_hash_local` — return `{is_admin: bool}` after checking the
-/// current user's hash against the baked-in
-/// `admin_config::ADMIN_HASHES_WHITELIST`. v0.4.0 P0-14.
+/// `admin_check_local` — server-driven admin tab visibility probe.
+/// v0.4.1 P0-16 (2026-05-23) — replaces the baked-in
+/// `ADMIN_HASHES_WHITELIST` constant. The desktop calls this at
+/// cold-start to decide whether to render the Admin tab in the gear
+/// panel. The server `/admin/check` endpoint returns 204 if the
+/// current user's hash is in `ALFRED_ADMIN_HASHES`, 403 otherwise.
+/// Returning `{is_admin: bool}` keeps the JS bridge shape stable so
+/// existing callers (admin-panel.js, app.js) only see the value flip.
 ///
-/// Why a Tauri command and not a JS-side comparison? The whitelist lives
-/// in the compiled Rust binary so it's only embedded in builds Pierre
-/// produces. Exposing the list to JS would leak it back into a public
-/// repo via build artefacts. The Rust-side check returns just the
-/// boolean.
+/// Adding an admin no longer requires a desktop rebuild — Pierre just
+/// updates the server env var and restarts the container.
 #[tauri::command]
-async fn is_admin_hash_local() -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(command_handlers::run_is_admin_hash)
+async fn admin_check_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_admin_check)
         .await
-        .map_err(|e| format!("is_admin_hash_local_failed:join:{e}"))?
+        .map_err(|e| format!("admin_check_local_failed:join:{e}"))?
         .map_err(|e| e.to_string())
 }
 
@@ -1082,7 +1086,7 @@ fn run_tauri_app() -> anyhow::Result<()> {
             get_admin_usage_local,
             get_admin_vps_stats_local,
             current_user_hash_local,
-            is_admin_hash_local,
+            admin_check_local,
             license_activate_local,
             license_validate_local,
             license_status_local,

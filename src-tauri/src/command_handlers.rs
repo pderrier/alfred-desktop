@@ -1343,10 +1343,10 @@ pub fn run_codex_has_oauth_backup() -> Result<serde_json::Value> {
     }))
 }
 
-// ── Admin observability (v0.4.0 P0-14) ───────────────────────────────
+// ── Admin observability (v0.4.0 P0-14, server-driven gate P0-16) ────
 
 /// Proxy `/admin/usage`. Server 403s for non-admins; the desktop UI hides
-/// the Admin tab unless `is_admin_hash_local` returned `{is_admin: true}`,
+/// the Admin tab unless `admin_check_local` returned `{is_admin: true}`,
 /// so the typical 403 path is unreachable in normal use.
 pub fn run_get_admin_usage() -> Result<serde_json::Value> {
     let payload = crate::alfred_api_client::get_admin_usage()?;
@@ -1359,10 +1359,10 @@ pub fn run_get_admin_vps_stats() -> Result<serde_json::Value> {
     Ok(bridge_envelope("admin:vps-stats-local", payload))
 }
 
-/// Return the current user's client hash (FNV-1a of OpenAI JWT). Used by
-/// the JS layer for diagnostic display ("logged in as <hash-prefix>...").
-/// Returns `{user_hash: null}` when no JWT is available (user not signed
-/// in to Codex).
+/// Return the current user's client hash (FNV-1a of OpenAI JWT). Kept for
+/// diagnostic display (Pierre prints his own hash when adding it to the
+/// server `ALFRED_ADMIN_HASHES` env). Returns `{user_hash: null}` when
+/// no JWT is available.
 pub fn run_current_user_hash() -> Result<serde_json::Value> {
     let hash = crate::alfred_api_client::current_user_hash();
     Ok(bridge_envelope(
@@ -1371,15 +1371,24 @@ pub fn run_current_user_hash() -> Result<serde_json::Value> {
     ))
 }
 
-/// Check whether the current user's hash is on the baked-in
-/// `admin_config::ADMIN_HASHES_WHITELIST`. Returns `{is_admin: bool}`.
-/// The whitelist itself is never sent to JS — only the boolean answer.
-pub fn run_is_admin_hash() -> Result<serde_json::Value> {
-    let is_admin = crate::alfred_api_client::current_user_hash()
-        .map(|h| crate::admin_config::is_whitelisted_admin(&h))
-        .unwrap_or(false);
+/// P0-16 (2026-05-23) — server-driven admin tab visibility probe.
+/// Calls `GET /admin/check` ; returns `{is_admin: true}` on 204 (server
+/// confirmed admin), `{is_admin: false}` on 403 or any error (fail-safe
+/// to "not admin" — never spuriously show the tab). Errors are logged
+/// via debug_log so a misconfigured deploy is diagnosable without
+/// flipping the tab on.
+pub fn run_admin_check() -> Result<serde_json::Value> {
+    let is_admin = match crate::alfred_api_client::admin_check() {
+        Ok(value) => value,
+        Err(e) => {
+            crate::debug_log(&format!(
+                "[admin-check] probe failed, defaulting to is_admin=false: {e}"
+            ));
+            false
+        }
+    };
     Ok(bridge_envelope(
-        "admin:is-admin-hash-local",
+        "admin:check-local",
         json!({ "is_admin": is_admin }),
     ))
 }

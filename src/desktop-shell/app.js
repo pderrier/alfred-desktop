@@ -46,6 +46,7 @@ import { buildCrossAccountThemeView } from "/desktop-shell/report-view-model.js"
 import { getThemeLabel } from "/desktop-shell/theme-labels.js";
 import { getLocalQuotaState, resetLocalQuotaCache } from "/desktop-shell/quota-local-counter.js";
 import { extractFirstSentence, countPendingRecos } from "/desktop-shell/home-last-synthesis.js";
+import { extractTradeMoves, formatTradeRow } from "/desktop-shell/home-recent-trades.js";
 import { openDiscussionHistoryModal, saveDiscussionThread } from "/desktop-shell/discussion-memory.js";
 import {
   reduceRunActivityState
@@ -2450,6 +2451,19 @@ function renderWelcome() {
     `;
   })();
 
+  // ── P1-22 Section 4 : Tes derniers ordres Finary ────────────────
+  const recentTradesCard = (() => {
+    const trades = extractTradeMoves(snapshot, 5);
+    if (trades.length === 0) return "";
+    const rows = trades.map((t) => `<li style="margin-bottom:0.3rem">${escapeHtml(formatTradeRow(t))}</li>`).join("");
+    return `
+      <div class="welcome-step welcome-recent-trades">
+        <h3>Tes derniers ordres Finary</h3>
+        <ul style="list-style:none;padding:0;margin:0.3rem 0 0">${rows}</ul>
+      </div>
+    `;
+  })();
+
   // ── P0-20 Section 1 : Header strip — tier + quota ───────────────
   const homeHeaderStrip = (() => {
     const data = homeHeader.data;
@@ -2567,10 +2581,12 @@ function renderWelcome() {
 
   if (titleNode) titleNode.textContent = accountRuns.size > 0 ? "Latest runs" : "Ready";
 
-  // P0-20 + P1-21 home composition order : header strip → "Alfred
-  // t'a dit quoi" → répartition → thèmes.
+  // P0-20 + P1-21 + P1-22 home composition order : header strip →
+  // "Alfred t'a dit quoi" → derniers ordres Finary → répartition →
+  // thèmes.
   if (homeHeaderStrip) html += homeHeaderStrip;
   if (lastSynthesisCard) html += lastSynthesisCard;
+  if (recentTradesCard) html += recentTradesCard;
   if (globalSynthesisCard) html += globalSynthesisCard;
   if (themesCard) html += themesCard;
 

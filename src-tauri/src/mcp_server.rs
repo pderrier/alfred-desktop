@@ -36,6 +36,75 @@ fn log(msg: &str) {
     eprintln!("[mcp-server {}] {}", now_iso(), msg);
 }
 
+/// Insert `sector` into `run_state.market[ticker]`. Pure mutator — no I/O.
+///
+/// Used by `tool_get_line_data` to persist the GICS slug computed during per-
+/// line enrichment so the UI can surface it (P1-57). Behaviour :
+///   - Idempotent : repeated calls with the same slug are a no-op.
+///   - No-op when `sector_slug` is empty.
+///   - No-op when `market` is missing or not an object (caller path can't
+///     surface sector without market data anyway).
+///   - No-op when `market[ticker]` is missing or not an object (graceful : the
+///     ticker may not be in market yet — sector will be re-persisted next
+///     enrichment cycle).
+/// Additive per snapshot UI contract : never touches existing market keys.
+pub(crate) fn apply_sector_to_market(rs: &mut Value, ticker: &str, sector_slug: &str) {
+    if sector_slug.is_empty() || ticker.is_empty() {
+        return;
+    }
+    let Some(rs_obj) = rs.as_object_mut() else { return; };
+    let Some(market) = rs_obj.get_mut("market").and_then(|v| v.as_object_mut()) else { return; };
+    let Some(ticker_entry) = market.get_mut(ticker).and_then(|v| v.as_object_mut()) else { return; };
+    ticker_entry.insert("sector".to_string(), Value::String(sector_slug.to_string()));
+}
+
+/// Walk `pending_recommandations[]` and inject `sector` from
+/// `run_state.market[ticker].sector` for each reco. Returns the count of recos
+/// that were enriched (newly populated `sector`).
+///
+/// Used by `report::persist_retry_global_synthesis` as the post-processing step
+/// (P1-57 — option B in the audit). The LLM does not reliably copy `sector`
+/// from its tool context into reco output (0/15 in production run
+/// `019e3c8cce63`), so we backfill from authoritative run_state data.
+/// Pure function — no I/O, no global state. Easy to unit-test.
+///
+/// Behaviour :
+///   - Preserves existing `sector` on a reco (never overwrites — caller
+///     wins if the LLM did populate it).
+///   - Skips recos with no `ticker` (no key to look up).
+///   - Skips recos when no `sector` exists in `market[ticker]`.
+///   - Returns 0 when `recos` or `market` are not arrays/objects.
+pub(crate) fn enrich_recommendations_with_sector(
+    recos: &mut Value,
+    market: &Value,
+) -> usize {
+    let Some(market_obj) = market.as_object() else { return 0; };
+    let Some(recos_arr) = recos.as_array_mut() else { return 0; };
+    let mut count = 0usize;
+    for reco in recos_arr.iter_mut() {
+        let Some(reco_obj) = reco.as_object_mut() else { continue; };
+        // Preserve existing sector — never overwrite.
+        if reco_obj.get("sector").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).is_some() {
+            continue;
+        }
+        let ticker = reco_obj.get("ticker").and_then(|v| v.as_str()).unwrap_or("").to_ascii_uppercase();
+        if ticker.is_empty() {
+            continue;
+        }
+        let sector_opt = market_obj
+            .get(&ticker)
+            .or_else(|| market_obj.get(&ticker.to_lowercase()))
+            .and_then(|t| t.get("sector"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        if let Some(slug) = sector_opt {
+            reco_obj.insert("sector".to_string(), Value::String(slug.to_string()));
+            count += 1;
+        }
+    }
+    count
+}
+
 // ── File I/O with simple lock ───────────────────────────────────────────────
 
 fn read_json(path: &Path) -> Result<Value> {
@@ -721,6 +790,17 @@ fn tool_get_line_data(data_dir: &Path, params: &Value) -> Result<Value> {
     } else {
         Value::Null
     };
+
+    // P1-57 — persist sector slug into `run_state.market[ticker].sector` so the
+    // UI (home allocation widget, line-modal chip) can read it without round-
+    // tripping through the LLM. Additive parallel field per the snapshot UI
+    // contract (`feedback_snapshot_ui_contract`): we never modify existing
+    // market keys (price, pe_ratio, etc.), only insert a new `sector` key.
+    if !sector_slug.is_empty() {
+        let _ = crate::run_state_cache::patch(data_dir, &run_id, |rs| {
+            apply_sector_to_market(rs, &ticker, sector_slug);
+        });
+    }
 
     // Line memory (cross-run) — schema: { "by_ticker": { "AAPL": {...} } }.
     // v0.3 (#22): honour canonical_line_memory_key so a cross-account dup
@@ -1700,3 +1780,178 @@ fn run_stdio_server_with_filter(data_dir: PathBuf, tool_filter: Option<Vec<Strin
     log("stdin closed, shutting down");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── apply_sector_to_market ─────────────────────────────────────
+
+    #[test]
+    fn apply_sector_writes_to_market_ticker() {
+        let mut rs = json!({
+            "market": {
+                "AAPL": { "prix_actuel": 150.0, "pe_ratio": 28.0 }
+            }
+        });
+        apply_sector_to_market(&mut rs, "AAPL", "tech");
+        assert_eq!(rs["market"]["AAPL"]["sector"], "tech");
+        // Existing keys preserved (snapshot UI contract).
+        assert_eq!(rs["market"]["AAPL"]["prix_actuel"], 150.0);
+        assert_eq!(rs["market"]["AAPL"]["pe_ratio"], 28.0);
+    }
+
+    #[test]
+    fn apply_sector_is_idempotent_on_repeat_call() {
+        let mut rs = json!({
+            "market": {
+                "AAPL": { "prix_actuel": 150.0 }
+            }
+        });
+        apply_sector_to_market(&mut rs, "AAPL", "tech");
+        apply_sector_to_market(&mut rs, "AAPL", "tech");
+        // Second call must be a no-op (no duplication, no panic).
+        assert_eq!(rs["market"]["AAPL"]["sector"], "tech");
+        // Object shape unchanged.
+        let market_obj = rs["market"]["AAPL"].as_object().unwrap();
+        assert_eq!(market_obj.len(), 2); // prix_actuel + sector
+    }
+
+    #[test]
+    fn apply_sector_overwrites_stale_slug() {
+        // A later enrichment call must update the slug — alfred-api may
+        // re-classify a position after a cache refresh.
+        let mut rs = json!({
+            "market": {
+                "AAPL": { "prix_actuel": 150.0, "sector": "consumer_discretionary" }
+            }
+        });
+        apply_sector_to_market(&mut rs, "AAPL", "tech");
+        assert_eq!(rs["market"]["AAPL"]["sector"], "tech");
+    }
+
+    #[test]
+    fn apply_sector_skips_when_ticker_absent_from_market() {
+        // Ticker not in market → graceful no-op (no panic). Sector will be
+        // re-persisted on the next enrichment cycle once market data lands.
+        let mut rs = json!({
+            "market": {
+                "AAPL": { "prix_actuel": 150.0 }
+            }
+        });
+        apply_sector_to_market(&mut rs, "GOOG", "tech");
+        assert!(rs["market"].get("GOOG").is_none(),
+            "absent ticker must not be auto-created (sector requires market data)");
+        // Original entry untouched.
+        assert!(rs["market"]["AAPL"].get("sector").is_none());
+    }
+
+    #[test]
+    fn apply_sector_skips_when_market_missing() {
+        let mut rs = json!({ "portfolio": {} });
+        apply_sector_to_market(&mut rs, "AAPL", "tech");
+        assert!(rs.get("market").is_none(), "must not create market obj");
+    }
+
+    #[test]
+    fn apply_sector_skips_on_empty_inputs() {
+        let mut rs = json!({ "market": { "AAPL": { "prix_actuel": 150.0 } } });
+        apply_sector_to_market(&mut rs, "", "tech");
+        apply_sector_to_market(&mut rs, "AAPL", "");
+        // Neither call mutated state.
+        assert!(rs["market"]["AAPL"].get("sector").is_none());
+    }
+
+    // ── enrich_recommendations_with_sector ─────────────────────────
+
+    #[test]
+    fn enrich_recommendations_backfills_sector_from_market() {
+        let mut recos = json!([
+            { "ticker": "AAPL", "signal": "ACHAT" },
+            { "ticker": "TTE",  "signal": "VENTE" },
+            { "ticker": "UNKNOWN", "signal": "HOLD" }
+        ]);
+        let market = json!({
+            "AAPL": { "sector": "tech" },
+            "TTE":  { "sector": "energy" }
+            // UNKNOWN absent → reco passes through without sector
+        });
+        let count = enrich_recommendations_with_sector(&mut recos, &market);
+        assert_eq!(count, 2, "two recos must be enriched");
+        let arr = recos.as_array().unwrap();
+        assert_eq!(arr[0]["sector"], "tech");
+        assert_eq!(arr[1]["sector"], "energy");
+        assert!(arr[2].get("sector").is_none(),
+            "reco without market entry stays sectorless");
+    }
+
+    #[test]
+    fn enrich_recommendations_preserves_existing_sector() {
+        // If the LLM did populate sector (rare but possible), don't clobber.
+        let mut recos = json!([
+            { "ticker": "AAPL", "signal": "ACHAT", "sector": "llm_picked" }
+        ]);
+        let market = json!({
+            "AAPL": { "sector": "tech" }
+        });
+        let count = enrich_recommendations_with_sector(&mut recos, &market);
+        assert_eq!(count, 0, "existing sector preserved → no enrichment");
+        assert_eq!(recos[0]["sector"], "llm_picked");
+    }
+
+    #[test]
+    fn enrich_recommendations_uppercases_ticker_lookup() {
+        // Recos sometimes carry lowercase tickers — market keys are uppercase.
+        let mut recos = json!([
+            { "ticker": "aapl", "signal": "ACHAT" }
+        ]);
+        let market = json!({
+            "AAPL": { "sector": "tech" }
+        });
+        let count = enrich_recommendations_with_sector(&mut recos, &market);
+        assert_eq!(count, 1);
+        assert_eq!(recos[0]["sector"], "tech");
+    }
+
+    #[test]
+    fn enrich_recommendations_handles_empty_inputs() {
+        let mut empty_recos = json!([]);
+        let market = json!({ "AAPL": { "sector": "tech" } });
+        assert_eq!(enrich_recommendations_with_sector(&mut empty_recos, &market), 0);
+
+        let mut recos = json!([{ "ticker": "AAPL" }]);
+        let no_market = json!(null);
+        assert_eq!(enrich_recommendations_with_sector(&mut recos, &no_market), 0);
+        assert!(recos[0].get("sector").is_none());
+
+        let mut not_array = json!({});
+        assert_eq!(enrich_recommendations_with_sector(&mut not_array, &market), 0);
+    }
+
+    #[test]
+    fn enrich_recommendations_skips_recos_without_ticker() {
+        let mut recos = json!([
+            { "signal": "ACHAT" },           // no ticker
+            { "ticker": "", "signal": "X" }, // empty ticker
+            { "ticker": "AAPL" }
+        ]);
+        let market = json!({ "AAPL": { "sector": "tech" } });
+        let count = enrich_recommendations_with_sector(&mut recos, &market);
+        assert_eq!(count, 1);
+        let arr = recos.as_array().unwrap();
+        assert!(arr[0].get("sector").is_none());
+        assert!(arr[1].get("sector").is_none());
+        assert_eq!(arr[2]["sector"], "tech");
+    }
+
+    #[test]
+    fn enrich_recommendations_skips_when_market_sector_empty() {
+        // market entry exists but sector is empty → reco stays sectorless.
+        let mut recos = json!([{ "ticker": "AAPL" }]);
+        let market = json!({ "AAPL": { "sector": "" } });
+        let count = enrich_recommendations_with_sector(&mut recos, &market);
+        assert_eq!(count, 0);
+        assert!(recos[0].get("sector").is_none());
+    }
+}
+

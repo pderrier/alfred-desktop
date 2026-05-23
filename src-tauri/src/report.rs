@@ -457,6 +457,24 @@ pub fn persist_retry_global_synthesis(run_id: &str, generated_draft: &serde_json
     // Phase 2b: theme concentration data
     let theme_concentration = crate::native_mcp_analysis::compute_theme_concentration(run_id);
 
+    // P1-57 — backfill `sector` on each reco from `run_state.market[ticker]`.
+    // The LLM does not reliably copy the slug from its tool context into reco
+    // output (0/15 in run `019e3c8cce63`), so we enrich authoritatively here
+    // before the recos land in `composed_payload`. Pure additive field per the
+    // snapshot UI contract — never modifies existing reco fields.
+    let mut enriched_recommendations = serde_json::Value::Array(pending_recommendations.clone());
+    let market_view = run_state.get("market").cloned().unwrap_or(serde_json::Value::Null);
+    let enriched_count = crate::mcp_server::enrich_recommendations_with_sector(
+        &mut enriched_recommendations,
+        &market_view,
+    );
+    if enriched_count > 0 {
+        crate::debug_log(&format!(
+            "[p1-57] backfilled sector on {enriched_count}/{} reco(s) for run {run_id}",
+            pending_recommendations.len()
+        ));
+    }
+
     let payload = json!({
         "date": now_iso_string(),
         "valeur_portefeuille": run_state.get("portfolio").and_then(|v| v.get("valeur_totale")).and_then(|v| v.as_f64()).unwrap_or(0.0),
@@ -465,7 +483,7 @@ pub fn persist_retry_global_synthesis(run_id: &str, generated_draft: &serde_json
         "synthese_marche": synthese,
         "actions_immediates": actions,
         "llm_utilise": generated_draft.get("llm_utilise").cloned().unwrap_or_else(|| json!("litellm")),
-        "recommandations": pending_recommendations,
+        "recommandations": enriched_recommendations,
         "theme_concentration": theme_concentration
     });
     let account = run_state.get("account").and_then(|v| v.as_str()).unwrap_or("");

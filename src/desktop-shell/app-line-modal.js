@@ -6,6 +6,7 @@ import { escapeHtml } from "/desktop-shell/ui-display-utils.js";
 import { openChatWizard } from "/desktop-shell/app-chat-wizard.js";
 import { openDiscussionHistoryModal, saveDiscussionThread, getDiscussionThreads } from "/desktop-shell/discussion-memory.js";
 import { renderDiscussionThreadsList, updateDataQualityBadge } from "/desktop-shell/line-modal-helpers.js";
+import { sectorLabel } from "/desktop-shell/sector-allocation.js";
 
 // ── DOM nodes ────────────────────────────────────────────────────
 
@@ -482,6 +483,18 @@ export function renderVenueHint(resolvedSymbol, ticker) {
   return `<span class="collection-venue-hint" title="Canonical Yahoo symbol resolved from ISIN">${escapeHtml(resolved)}${tail}</span>`;
 }
 
+/**
+ * Render the GICS sector chip for the line-modal. Returns "" when no slug is
+ * available — degraded state shows nothing (per home-widget convention :
+ * sections cached silently rather than placeholder copy). P1-57.
+ */
+export function renderSectorChip(sectorSlug) {
+  const slug = String(sectorSlug || "").trim();
+  if (!slug) return "";
+  const label = sectorLabel(slug);
+  return `<span class="chip chip-sector" title="GICS sector classification">${escapeHtml(label)}</span>`;
+}
+
 export function renderCollectionDetail(details) {
   const panel = document.getElementById("line-memory-collection-detail");
   const grid = document.getElementById("line-memory-indicators-grid");
@@ -494,6 +507,10 @@ export function renderCollectionDetail(details) {
   const collectionQuality = details?.collectionQuality || null;
   const technicalSnapshot = details?.technicalSnapshot || null;
   const venueHint = renderVenueHint(details?.resolvedSymbol, details?.ticker);
+  // P1-57 — sector GICS chip surfaced alongside the venue hint. Hidden when
+  // no sector slug is available (degraded state — show nothing rather than
+  // a placeholder "Autre" badge for a single position).
+  const sectorChip = renderSectorChip(market?.sector);
 
   const indicators = [
     { key: "prix_actuel", label: "Spot Price", value: market.prix_actuel, unit: "\u20ac" },
@@ -539,7 +556,8 @@ export function renderCollectionDetail(details) {
   // v0.3 (#23): venue hint goes ABOVE the header so the user sees "STMPA · Paris"
   // before scanning the quality grid. Empty string when there's nothing useful
   // to surface — preserves the legacy layout byte-for-byte.
-  grid.innerHTML = venueHint + header + fundamentalsBlock + newsQualityRow + technicalBlock;
+  // P1-57 — sector chip sits next to the venue hint (same visual band).
+  grid.innerHTML = venueHint + sectorChip + header + fundamentalsBlock + newsQualityRow + technicalBlock;
 
   if (issuesNode) {
     issuesNode.innerHTML = issues.length > 0

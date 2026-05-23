@@ -48,6 +48,7 @@ import { getLocalQuotaState, resetLocalQuotaCache } from "/desktop-shell/quota-l
 import { extractFirstSentence, countPendingRecos } from "/desktop-shell/home-last-synthesis.js";
 import { extractTradeMoves, formatTradeRow } from "/desktop-shell/home-recent-trades.js";
 import { extractDatedCatalysts, formatCatalystRow } from "/desktop-shell/catalyst-calendar.js";
+import { aggregateBySector } from "/desktop-shell/sector-allocation.js";
 import { openDiscussionHistoryModal, saveDiscussionThread } from "/desktop-shell/discussion-memory.js";
 import {
   reduceRunActivityState
@@ -2639,6 +2640,67 @@ function renderWelcome() {
     }
   })();
 
+  // ── P1-57 : Allocation sectorielle (GICS) ───────────────────────
+  // Aggregates portfolio value by GICS sector slug (persisted into
+  // `run_state.market[ticker].sector` by mcp_server::tool_get_line_data).
+  // Hidden silently when no positions have a sector resolved — degraded
+  // state condenses the home instead of showing a placeholder.
+  const sectorAllocationCard = (() => {
+    if (!snapshot) return "";
+    let rows;
+    try {
+      rows = aggregateBySector(snapshot);
+    } catch {
+      return "";
+    }
+    if (!Array.isArray(rows) || rows.length === 0) return "";
+    // Hide entirely when EVERY position landed in the sectorless "other"
+    // bucket — the section adds no information in that case.
+    const hasAnySector = rows.some((r) => r.sector_slug && r.sector_slug.length > 0);
+    if (!hasAnySector) return "";
+
+    // Top 4 sectors, rest folded into "other" bucket along with sectorless
+    // positions. Keeps the home short while preserving 100% coverage.
+    const top = rows.slice(0, 4);
+    const rest = rows.slice(4);
+    const restValue = rest.reduce((sum, r) => sum + r.total_value, 0);
+    const restCount = rest.reduce((sum, r) => sum + r.ticker_count, 0);
+    const restWeight = rest.reduce((sum, r) => sum + r.weight_pct, 0);
+    const display = top.slice();
+    if (restValue > 0) {
+      const existingOther = display.find((r) => !r.sector_slug);
+      if (existingOther) {
+        existingOther.total_value += restValue;
+        existingOther.ticker_count += restCount;
+        existingOther.weight_pct += restWeight;
+      } else {
+        display.push({
+          sector_slug: "",
+          label: "Autre",
+          total_value: restValue,
+          weight_pct: restWeight,
+          ticker_count: restCount,
+        });
+      }
+    }
+    const items = display.map((r) => {
+      const weight = r.weight_pct.toFixed(0);
+      const countLabel = r.ticker_count > 1 ? `${r.ticker_count} tickers` : `${r.ticker_count} ticker`;
+      return `
+        <li style="margin-bottom:0.3rem">
+          <strong>${escapeHtml(r.label)}</strong>
+          <span style="color:var(--sea-muted)"> · ${weight}% (${countLabel})</span>
+        </li>
+      `;
+    }).join("");
+    return `
+      <div class="welcome-step welcome-sector-allocation">
+        <h3>Allocation sectorielle</h3>
+        <ul style="list-style:none;padding:0;margin:0.3rem 0 0">${items}</ul>
+      </div>
+    `;
+  })();
+
   // ── P0-20 Section 6 : Répartition (rewrite FR, no generic verdict) ──
   const globalSynthesisCard = (() => {
     if (accounts.length === 0 && runs.length === 0) return "";
@@ -2692,14 +2754,15 @@ function renderWelcome() {
 
   if (titleNode) titleNode.textContent = accountRuns.size > 0 ? "Latest runs" : "Ready";
 
-  // P0-20 + P1-21 + P1-22 + P2-24 + P2-25 home composition order :
+  // P0-20 + P1-21 + P1-22 + P2-24 + P2-25 + P1-57 home composition order :
   // header strip → "Alfred t'a dit quoi" → derniers ordres → ce qui
-  // a bougé (run-diff in report view) → répartition → catalyseurs →
-  // rétro-précision → thèmes.
+  // a bougé (run-diff in report view) → répartition → allocation
+  // sectorielle → catalyseurs → rétro-précision → thèmes.
   if (homeHeaderStrip) html += homeHeaderStrip;
   if (lastSynthesisCard) html += lastSynthesisCard;
   if (recentTradesCard) html += recentTradesCard;
   if (globalSynthesisCard) html += globalSynthesisCard;
+  if (sectorAllocationCard) html += sectorAllocationCard;
   if (catalystCard) html += catalystCard;
   if (retrospectiveCard) html += retrospectiveCard;
   if (themesCard) html += themesCard;

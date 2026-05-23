@@ -151,7 +151,11 @@ function normalizeAnalysisDetails(rec, latestRun) {
             pe_ratio: market?.pe_ratio ?? null,
             revenue_growth: market?.revenue_growth ?? null,
             profit_margin: market?.profit_margin ?? null,
-            debt_to_equity: market?.debt_to_equity ?? null
+            debt_to_equity: market?.debt_to_equity ?? null,
+            // P1-57 — GICS sector slug surfaced into the line modal so the chip
+            // renders without an extra fetch. Additive field per the snapshot
+            // UI contract — never replaces existing market keys.
+            sector: typeof market?.sector === "string" ? market.sector : null
           }
         : {},
     news: newsRows.map(normalizeNewsItem),

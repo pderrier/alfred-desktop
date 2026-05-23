@@ -65,6 +65,38 @@ export function buildGlobalPortfolioSynthesis(snapshot) {
     supportBuckets.set(bucket, (supportBuckets.get(bucket) || 0) + value);
   }
 
+  // P0-19 (2026-05-23) — fallback to Finary account-level data when the
+  // latest_run positions don't yield any invested value. Three cases
+  // produce that state and previously surfaced "Top support: Not enough
+  // data" on the home even though Finary had complete data:
+  //   1. Run in progress, positions not yet hydrated with `montant`.
+  //   2. Run completed but cash-only accounts (positions present but
+  //      all with value ≤ 0, the loop above skips them).
+  //   3. Cold start with no run yet — accountsMeta exists alone.
+  // The fallback splits each Finary account into a Cash slice (the
+  // `cash` field directly) and an invested slice
+  // (`total_value - cash`, bucketed via inferSupportBucket on the
+  // account name — Finary names usually carry enough signal:
+  // "PEA"/"CTO" → Stocks default, "Livret A"/"Compte courant" → Cash).
+  if (investedValue === 0 && accountsMeta.length > 0) {
+    for (const account of accountsMeta) {
+      const cash = asNumber(account?.cash, 0);
+      const total = asNumber(account?.total_value, 0);
+      const invested = Math.max(0, total - cash);
+      if (cash > 0) {
+        supportBuckets.set("Cash", (supportBuckets.get("Cash") || 0) + cash);
+      }
+      if (invested > 0) {
+        const bucket = inferSupportBucket({
+          type: account?.account_type,
+          nom: account?.name,
+        });
+        supportBuckets.set(bucket, (supportBuckets.get(bucket) || 0) + invested);
+      }
+      investedValue += Math.max(0, total);
+    }
+  }
+
   let totalValue = 0;
   let totalCash = 0;
   let totalGain = 0;

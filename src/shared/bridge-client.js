@@ -861,6 +861,16 @@ export function createDesktopBridgeClient({
       const payload = await invoke("runs_count_last_7d_local");
       return normalizeTauriPayload(payload, ["runs_count_last_7d_local"]);
     },
+    /**
+     * P2-24 (2026-05-23) — cross-portfolio signal accuracy. Aggregates
+     * `price_tracking.signal_accuracy` across all line-memory entries.
+     * Returns `{total_signals, correct, incorrect, accuracy_pct,
+     * best_pick, worst_pick}`. Read-only, no LLM/network round-trip.
+     */
+    async computeSignalAccuracy() {
+      const payload = await invoke("compute_signal_accuracy_local");
+      return normalizeTauriPayload(payload, ["compute_signal_accuracy_local"]);
+    },
     // ── License flow (v0.4.0 P0-15) ───────────────────────────────────
     //
     // Activation pipeline (from `docs/desktop-api-integration.md` §

@@ -151,6 +151,11 @@ let homeHeader = { status: "idle", data: null, error: null };
 // welcome view re-renders. Stores the snapshot key for which we
 // already notified the overlay.
 let themeConcentrationLastNotifiedSnapshotKey = null;
+// P2-24 (2026-05-23) — separate slot for the retrospective accuracy
+// section. Refreshed by `refreshSignalAccuracy()` when the welcome
+// view mounts. Independent of the per-run synthesis because the
+// accuracy aggregation walks all line-memory tickers.
+let signalAccuracy = { status: "idle", data: null, error: null };
 
 // ── Bridge + run operations ──────────────────────────────────────
 
@@ -1162,6 +1167,24 @@ function computeHomeSnapshotKey(snapshot) {
 // two are loaded in parallel ; whichever resolves first triggers a
 // re-render (the strip degrades gracefully — partial data still
 // renders the strip with `?` for the missing half).
+// P2-24 (2026-05-23) — load the retrospective accuracy stats for the
+// home Section 8 ("Rétro-précision Alfred"). Reads line-memory in the
+// Rust side, no network. Section is hidden when total_signals < 5.
+async function refreshSignalAccuracy() {
+  signalAccuracy = { status: "loading", data: null, error: null };
+  try {
+    const data = await bridge.computeSignalAccuracy();
+    signalAccuracy = { status: "ready", data, error: null };
+  } catch (e) {
+    signalAccuracy = {
+      status: "error",
+      data: null,
+      error: String(e?.message || e || "signal_accuracy_failed"),
+    };
+  }
+  renderWelcome();
+}
+
 async function refreshHomeHeader() {
   homeHeader = { status: "loading", data: null, error: null };
   renderWelcome();
@@ -1258,6 +1281,9 @@ async function refreshDashboardInner() {
   // refresh. Reuses the 60s memoisation in quota-local-counter to
   // avoid extra Tauri calls when the snapshot churns.
   refreshHomeHeader();
+  // P2-24 — fire-and-forget refresh of the retrospective accuracy
+  // stats. Loaded once at mount time, fast enough not to debounce.
+  refreshSignalAccuracy();
 
   // Keep live run context up to date with positions (for enriching done rows)
   const positions = snapshot.latest_run?.portfolio?.positions || [];
@@ -2458,6 +2484,35 @@ function renderWelcome() {
     `;
   })();
 
+  // ── P2-24 Section 8 : Rétro-précision Alfred ────────────────────
+  const retrospectiveCard = (() => {
+    const data = signalAccuracy?.data;
+    if (!data) return "";
+    const total = Number(data.total_signals || 0);
+    // Gate on >= 5 scored signals — sub-5 is statistically noise.
+    if (total < 5) return "";
+    const correct = Number(data.correct || 0);
+    const pct = Number(data.accuracy_pct || 0).toFixed(0);
+    const best = data.best_pick;
+    const worst = data.worst_pick;
+    const chips = [];
+    if (best?.ticker) {
+      const ret = Number(best.return_pct || 0).toFixed(1);
+      chips.push(`<span class="chip chip-suggestion">Bonne pioche : ${escapeHtml(best.ticker)} ${escapeHtml(best.signal || "")} · ${ret >= 0 ? "+" : ""}${ret} %</span>`);
+    }
+    if (worst?.ticker) {
+      const ret = Number(worst.return_pct || 0).toFixed(1);
+      chips.push(`<span class="chip" style="background:rgba(220,80,80,0.15);color:var(--sea-foreground)">Mauvaise pioche : ${escapeHtml(worst.ticker)} ${escapeHtml(worst.signal || "")} · ${ret >= 0 ? "+" : ""}${ret} %</span>`);
+    }
+    return `
+      <div class="welcome-step welcome-retrospective">
+        <h3>Rétro-précision Alfred</h3>
+        <p style="margin:0.2rem 0 0.45rem">Sur les ${total} derniers signaux scorés, <strong>${correct} ont eu raison</strong> (${pct} %).</p>
+        ${chips.length > 0 ? `<div style="display:flex;gap:0.4rem;flex-wrap:wrap">${chips.join("")}</div>` : ""}
+      </div>
+    `;
+  })();
+
   // ── P2-25 Section 7 : Catalyseurs cette semaine ─────────────────
   const catalystCard = (() => {
     const recos = Array.isArray(latestRun?.composed_payload?.recommandations)
@@ -2633,14 +2688,16 @@ function renderWelcome() {
 
   if (titleNode) titleNode.textContent = accountRuns.size > 0 ? "Latest runs" : "Ready";
 
-  // P0-20 + P1-21 + P1-22 + P2-25 home composition order : header
-  // strip → "Alfred t'a dit quoi" → derniers ordres Finary →
-  // répartition → catalyseurs cette semaine → thèmes.
+  // P0-20 + P1-21 + P1-22 + P2-24 + P2-25 home composition order :
+  // header strip → "Alfred t'a dit quoi" → derniers ordres → ce qui
+  // a bougé (run-diff in report view) → répartition → catalyseurs →
+  // rétro-précision → thèmes.
   if (homeHeaderStrip) html += homeHeaderStrip;
   if (lastSynthesisCard) html += lastSynthesisCard;
   if (recentTradesCard) html += recentTradesCard;
   if (globalSynthesisCard) html += globalSynthesisCard;
   if (catalystCard) html += catalystCard;
+  if (retrospectiveCard) html += retrospectiveCard;
   if (themesCard) html += themesCard;
 
   if (accountRuns.size > 0) {

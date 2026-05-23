@@ -1396,6 +1396,21 @@ pub fn run_runs_count_last_7d() -> Result<serde_json::Value> {
     ))
 }
 
+/// P2-24 (2026-05-23) — cross-portfolio signal accuracy. Aggregates
+/// the pre-computed `price_tracking.signal_accuracy` field across all
+/// line-memory entries and returns {total_signals, correct,
+/// incorrect, accuracy_pct, best_pick, worst_pick}. Used by the home
+/// Section 8 "Rétro-précision Alfred" — section gated on
+/// total_signals >= 5 by the JS renderer (sub-5 = noise).
+pub fn run_compute_signal_accuracy() -> Result<serde_json::Value> {
+    let stats = crate::signal_accuracy::compute_signal_accuracy()
+        .map_err(|e| anyhow::anyhow!("signal_accuracy_failed:{e}"))?;
+    Ok(bridge_envelope(
+        "home:signal-accuracy-local",
+        crate::signal_accuracy::stats_to_json(&stats),
+    ))
+}
+
 /// P0-16 (2026-05-23) — server-driven admin tab visibility probe.
 /// Calls `GET /admin/check` ; returns `{is_admin: true}` on 204 (server
 /// confirmed admin), `{is_admin: false}` on 403 or any error (fail-safe

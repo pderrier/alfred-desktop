@@ -2123,11 +2123,17 @@ const GENERIC_TICKER_RISK_LIST: &[&str] = &[
 ];
 
 /// P1-56 visibility — list positions whose `ticker` is a generic token
-/// AND that lack a canonical `resolved_symbol`. These are the rows where
-/// the P0-55 guard will skip enrichment (see `has_canonical_resolution`
-/// in `native_collection_helpers`) — the wizard can warn the user up-front
-/// so they decide whether to abort or proceed with degraded coverage on
-/// these specific lines.
+/// AND that lack a canonical anchor (valid ISIN or `resolved_symbol`).
+/// These are the rows where the P0-55 guard will skip enrichment (see
+/// `has_canonical_resolution` in `native_collection_helpers`) — the
+/// wizard can warn the user up-front so they decide whether to abort
+/// or proceed with degraded coverage on these specific lines.
+///
+/// P0-77 hotfix: a valid ISO-6166 + Luhn ISIN is a sufficient canonical
+/// anchor on its own — the resolver will succeed at run time even when
+/// the ticker is short/generic (e.g. AXA / FR0000120628). Only positions
+/// whose ISIN is empty OR malformed are subject to the
+/// short-ticker / generic-token heuristics.
 ///
 /// Returns one JSON object per at-risk row: `{ ticker, nom, isin }`.
 pub(crate) fn compute_generic_tickers_at_risk(positions: &Value) -> Value {
@@ -2136,6 +2142,21 @@ pub(crate) fn compute_generic_tickers_at_risk(positions: &Value) -> Value {
     for p in arr {
         let ticker = p.get("ticker").and_then(|v| v.as_str()).unwrap_or("").to_uppercase();
         if ticker.is_empty() { continue; }
+        // P0-77 hotfix v0.4.3 — if the ISIN is well-formed (passes ISO-6166
+        // + Luhn validation from P0-54), the resolver will succeed at run
+        // time regardless of how generic the ticker character is. Skip the
+        // at-risk flag for these positions. The previous logic ignored
+        // `isin` entirely and treated short/generic tickers as risky even
+        // with a valid ISIN, producing 4/5 false positives on Pierre's
+        // Boursorama position_snapshot CSV (AXA/M6/OVH/THE all have valid
+        // ISINs in column 2). Only positions whose ISIN is missing OR
+        // malformed (e.g. PARTS SOCIALES with country code "00") stay
+        // flagged — they are exactly the rows where the resolver will
+        // fail and the P0-55 guard will skip enrichment.
+        let isin = p.get("isin").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if !isin.is_empty() && validate_isin(isin) {
+            continue;
+        }
         let has_resolution = p.get("resolved_symbol")
             .and_then(|v| v.as_str())
             .map(|s| !s.trim().is_empty())
@@ -3643,6 +3664,84 @@ mod tests {
         assert_eq!(
             result.mapping.get("Plan d'Epargne en Actions PME").copied(), Some(0.82),
             "PEA-PME should match slug espece-pea-b (0.82€)"
+        );
+    }
+
+    // ── P0-77 hotfix v0.4.3 — compute_generic_tickers_at_risk ─────────
+    //
+    // Pins the rule "a position with a valid ISO-6166 + Luhn ISIN is NOT
+    // at-risk, regardless of how short or generic the ticker character
+    // is". Before the hotfix, Pierre's Boursorama CSV produced 4 false
+    // positives (AXA / M6 / OVH / THE — all real French equities with
+    // valid ISINs in column 2) which silently disabled enrichment on
+    // ~18% of the portfolio.
+
+    #[test]
+    fn generic_tickers_at_risk_skips_short_ticker_with_valid_isin() {
+        // Real AXA ISIN from Pierre's 2026-05-24 Boursorama snapshot.
+        let positions = json!([
+            { "ticker": "AXA", "nom": "AXA", "isin": "FR0000120628" }
+        ]);
+        let out = compute_generic_tickers_at_risk(&positions);
+        let arr = out.as_array().expect("must return an array");
+        assert!(
+            arr.is_empty(),
+            "AXA + valid ISIN must NOT be flagged at-risk (got {arr:?})",
+        );
+    }
+
+    #[test]
+    fn generic_tickers_at_risk_still_flags_short_ticker_with_invalid_isin() {
+        // "PARTS SOCIALES" from Pierre's CSV — ticker is in GENERIC_LIST
+        // AND the ISIN is malformed (no country letters), so the
+        // resolver cannot anchor it. This must stay flagged.
+        let positions = json!([
+            { "ticker": "PARTS", "nom": "PARTS SOCIALES", "isin": "000007764440" }
+        ]);
+        let out = compute_generic_tickers_at_risk(&positions);
+        let arr = out.as_array().expect("must return an array");
+        assert_eq!(
+            arr.len(), 1,
+            "PARTS + malformed ISIN must stay flagged (got {arr:?})",
+        );
+        assert_eq!(
+            arr[0].get("ticker").and_then(|v| v.as_str()), Some("PARTS"),
+        );
+    }
+
+    #[test]
+    fn generic_tickers_at_risk_flags_short_ticker_with_empty_isin() {
+        // Defense-in-depth: if the CSV row has no ISIN column at all,
+        // a short ticker must remain flagged so the wizard surfaces the
+        // risk to the user up-front.
+        let positions = json!([
+            { "ticker": "AXA", "nom": "AXA", "isin": "" }
+        ]);
+        let out = compute_generic_tickers_at_risk(&positions);
+        let arr = out.as_array().expect("must return an array");
+        assert_eq!(
+            arr.len(), 1,
+            "short ticker + empty ISIN must stay flagged (got {arr:?})",
+        );
+        assert_eq!(
+            arr[0].get("ticker").and_then(|v| v.as_str()), Some("AXA"),
+        );
+    }
+
+    #[test]
+    fn generic_tickers_at_risk_respects_resolved_symbol_when_isin_missing() {
+        // Belt-and-braces: if the resolver already populated
+        // `resolved_symbol` (e.g. on a re-preview pass), the row must
+        // also be cleared even without an ISIN. Pins the pre-existing
+        // resolved_symbol fast path so the hotfix doesn't regress it.
+        let positions = json!([
+            { "ticker": "AXA", "nom": "AXA", "isin": "", "resolved_symbol": "AXA.PA" }
+        ]);
+        let out = compute_generic_tickers_at_risk(&positions);
+        let arr = out.as_array().expect("must return an array");
+        assert!(
+            arr.is_empty(),
+            "ticker with resolved_symbol must NOT be flagged (got {arr:?})",
         );
     }
 }

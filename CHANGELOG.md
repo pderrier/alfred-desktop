@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.4.3 (hotfix)
+
+### Bug fixed
+
+- **CSV import wizard plus précis.** Le pré-flight check considérait les
+  tickers de 2-3 caractères (AXA, M6, OVH, THE…) comme « génériques sans
+  résolution » même quand l'ISIN était valide dans le CSV. Résultat sur
+  un portfolio Boursorama typique : ~5 positions sur 28 voyaient leur
+  enrichissement (cours, fondamentaux, news, secteur) silencieusement
+  désactivé. Le check vérifie maintenant si l'ISIN est valide
+  (ISO-6166 + Luhn) en premier — un ticker court avec un bon ISIN est
+  un cas légitime, pas un risque. Les ISINs vraiment malformés
+  (ex. parts sociales bancaires) restent correctement signalés.
+
+### Compatibility
+
+- No mandatory upgrade. v0.4.2 desktops continuent de fonctionner mais
+  bénéficient du fix dès v0.4.3 installée.
+
 ## v0.4.2
 
 Consolidated release covering the v0.4.1 home redesign + CSV safety work AND a

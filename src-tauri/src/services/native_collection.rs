@@ -2858,6 +2858,21 @@ pub(crate) fn execute_native_local_analysis_workflow_with(
         json!([]),
     );
 
+    // P1-60 — macro pre-run briefing (10Y / VIX / EUR-USD / Brent).
+    //
+    // Fetched once at run start and persisted directly to
+    // `run_state.macro_briefing` via `patch_run_state_with`. Intentionally
+    // NOT threaded through `build_collection_state` / the persist whitelist:
+    // the briefing is portfolio-agnostic, never changes per ticker, and
+    // re-emitting it on every incremental persist would be waste. Synthesis
+    // prompt builders read it back from `run_state` at prompt build time
+    // via `macro_briefing::build_macro_briefing_section`.
+    //
+    // Silent degradation by contract (server 503 / older API instance /
+    // transport error) — fetched value is just `null` and the renderer
+    // skips the macro section in that case.
+    crate::macro_briefing::refresh_macro_briefing(&run_id);
+
     // ── v0.3 (#21): canonical-symbol resolution ────────────────────
     //
     // For every unique non-empty ISIN, call `GET /api/resolve` once and stash

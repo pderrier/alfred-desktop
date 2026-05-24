@@ -54,6 +54,8 @@ mod llm_parsing;
 mod llm_prompts;
 mod mcp_progress_relay;
 mod mcp_server;
+#[path = "services/macro_briefing.rs"]
+mod macro_briefing;
 #[path = "services/native_mcp_analysis.rs"]
 mod native_mcp_analysis;
 #[path = "services/llm_post_processing.rs"]

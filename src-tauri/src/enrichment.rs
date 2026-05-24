@@ -55,6 +55,24 @@ pub fn fetch_cot(ticker: &str, isin: &str, canonical: Option<&str>) -> Result<Va
     }
 }
 
+/// Fetch the macro briefing (US 10Y / VIX / EUR-USD / Brent) once at run
+/// start. P1-60.
+///
+/// Silent degradation on any transport / auth / 5xx failure — mirrors the
+/// `fetch_sector` / `fetch_cot` pattern. The caller persists the result
+/// (whether populated or null) into `run_state.macro_briefing`; the
+/// synthesis-prompt renderer treats a null briefing as "no macro section",
+/// which is the safe display behaviour the LLM understands.
+pub fn fetch_macro_briefing() -> Result<Value> {
+    match crate::alfred_api_client::remote_fetch_macro_briefing() {
+        Ok(resp) => Ok(resp),
+        Err(e) => {
+            crate::debug_log(&format!("enrichment macro briefing unavailable: {e}"));
+            Ok(json!({ "ok": true, "macro": null }))
+        }
+    }
+}
+
 /// Resolve the canonical Yahoo symbol for an ISIN via `GET /api/resolve`.
 ///
 /// Silent on errors — mirrors `fetch_sector`/`fetch_cot` style. Returns `None`

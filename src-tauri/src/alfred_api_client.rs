@@ -525,6 +525,18 @@ pub fn remote_fetch_cot(ticker: &str, isin: &str, canonical: Option<&str>) -> Re
     api_get(&append_canonical(path, canonical), TIMEOUT_SECS)
 }
 
+/// Fetch the global macro briefing (US 10Y, VIX, EUR/USD, Brent) from
+/// `GET /api/macro` (P1-60).
+///
+/// Portfolio-agnostic, no parameters. The server caches the briefing
+/// globally for 30 min, so the desktop never needs its own caching layer.
+/// Server endpoint may not be deployed on older API instances (returns
+/// 404 in that case) — callers must degrade gracefully (treat as "no
+/// macro briefing available", same pattern as `remote_fetch_sector`).
+pub fn remote_fetch_macro_briefing() -> Result<Value> {
+    api_get("/api/macro", TIMEOUT_SECS)
+}
+
 /// Append `&canonical=<symbol>` to a query path when a non-empty resolved
 /// Yahoo symbol is present. Centralised so the trim/empty-rejection rule is
 /// applied identically across every endpoint that accepts canonical routing

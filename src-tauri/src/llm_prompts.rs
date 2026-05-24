@@ -133,6 +133,14 @@ pub(crate) fn build_report_prompt(run_state: &Value) -> String {
     let cross_account_section =
         crate::native_mcp_analysis::build_cross_account_section_with_themes(run_state);
 
+    // P1-60 — macro briefing rendered before the cross-account section so
+    // the LLM reads the macro backdrop before the portfolio rollup. Parity
+    // with `native_mcp_analysis::build_synthesis_prompt` (same renderer,
+    // same ordering) — per `product_llm_mode_parity_2026_04`, all 3 LLM
+    // modes must see identical synthesis context.
+    let macro_section =
+        crate::macro_briefing::build_macro_briefing_section(run_state);
+
     format!(
         r#"Tu es un conseiller financier bienveillant qui parle a un investisseur particulier.
 Pas de jargon technique — explique simplement, comme a un ami.
@@ -149,7 +157,7 @@ RESUME DU PORTEFEUILLE:
 
 RECOMMANDATIONS PAR LIGNE (signaux definitifs — ne pas contredire):
 {rec_lines}
-{guidelines_section}{concentration_section}{cross_account_section}{previous_syntheses}
+{guidelines_section}{concentration_section}{macro_section}{cross_account_section}{previous_syntheses}
 ---
 
 Produis un JSON avec exactement ces champs:
@@ -206,6 +214,7 @@ Reponds uniquement en JSON valide."#,
         rec_lines = rec_lines.join("\n"),
         guidelines_section = guidelines_section,
         concentration_section = concentration_section,
+        macro_section = macro_section,
         cross_account_section = cross_account_section,
     )
 }

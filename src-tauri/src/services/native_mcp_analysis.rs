@@ -2014,18 +2014,39 @@ Regles :
 
 fn build_synthesis_prompt(run_id: &str) -> String {
     let run_state = crate::load_run_by_id_direct(run_id).ok().unwrap_or_else(|| json!({}));
-    let account = run_state.get("account").and_then(|v| v.as_str()).map(String::from).unwrap_or_default();
-    let previous_syntheses = crate::llm_prompts::build_previous_syntheses_section_public(&account);
-
-    // Phase 2b: theme concentration
     let concentration = compute_theme_concentration(run_id);
     let concentration_section = build_theme_concentration_text(&concentration);
+    build_synthesis_prompt_from_state(run_id, &run_state, &concentration_section)
+}
+
+/// Pure renderer for the synthesis prompt — extracted so unit tests can
+/// drive arbitrary `run_state` fixtures and assert prompt contents
+/// (e.g. macro section presence/absence per P1-60) without touching
+/// `load_run_by_id_direct` or the theme-concentration disk path.
+///
+/// `concentration_section` is precomputed by the caller so this helper
+/// has zero I/O dependencies. The cross-account section IS computed
+/// here (off `run_state` only) since it has no disk side effects.
+pub(crate) fn build_synthesis_prompt_from_state(
+    run_id: &str,
+    run_state: &Value,
+    concentration_section: &str,
+) -> String {
+    let account = run_state.get("account").and_then(|v| v.as_str()).map(String::from).unwrap_or_default();
+    let previous_syntheses = crate::llm_prompts::build_previous_syntheses_section_public(&account);
 
     // Phase 1 cross-account section — same renderer as the native/native-oauth
     // path so 3-mode LLM parity holds. Cross-account themes are computed at
     // prompt build time (not collection time) so they reflect the current
     // line_memory state.
-    let cross_account_section = build_cross_account_section_with_themes(&run_state);
+    let cross_account_section = build_cross_account_section_with_themes(run_state);
+
+    // P1-60 — macro briefing (US 10Y / VIX / EUR-USD / Brent). Rendered
+    // BEFORE the cross-account section so the LLM reads the wider macro
+    // backdrop first, then the portfolio rollup against that backdrop.
+    // Returns "" when the briefing is absent (server unavailable or older
+    // API), so the format-string injection is a clean no-op in that case.
+    let macro_section = crate::macro_briefing::build_macro_briefing_section(run_state);
 
     format!(
         r#"Tu es Alfred, un gestionnaire de portefeuille qui conseille un investisseur particulier.
@@ -2112,6 +2133,7 @@ WORKFLOW STRICT — suis ces etapes dans l'ordre :
 
 {previous_syntheses}
 {concentration_section}
+{macro_section}
 {cross_account_section}
 REGLES:
 - Ne saute AUCUNE etape (get_run_context, check_coverage, validate_synthesis, finalize_report).
@@ -2125,6 +2147,7 @@ Le travail d'analyse de toutes les lignes sera gache. Tu DOIS appeler
 validate_synthesis puis finalize_report. Pas d'exception."#,
         run_id = run_id,
         concentration_section = concentration_section,
+        macro_section = macro_section,
         cross_account_section = cross_account_section,
     )
 }

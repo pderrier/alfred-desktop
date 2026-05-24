@@ -766,6 +766,20 @@ async fn compute_signal_accuracy_local() -> Result<serde_json::Value, String> {
         .map_err(|e| e.to_string())
 }
 
+/// `macro_briefing_local` — P2-70 (2026-05-24) home macro context tile.
+/// Returns the silent-degrade envelope `{ok, macro: {us_10y_yield, vix,
+/// eur_usd, brent_usd}, cache_hit, source, as_of}` from `/api/macro`.
+/// The JS tile hides itself when `macro` is null or every indicator is
+/// null. Thin wrapper — see `command_handlers::run_macro_briefing` for
+/// the rationale.
+#[tauri::command]
+async fn macro_briefing_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_macro_briefing)
+        .await
+        .map_err(|e| format!("macro_briefing_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
 /// `runs_count_last_7d_local` — P0-20 (2026-05-23) home tier+quota
 /// header strip. Returns the number of runs in the rolling 7-day
 /// window plus the desktop-side limit. Read-only against the in-memory
@@ -1122,6 +1136,7 @@ fn run_tauri_app() -> anyhow::Result<()> {
             admin_check_local,
             runs_count_last_7d_local,
             compute_signal_accuracy_local,
+            macro_briefing_local,
             license_activate_local,
             license_validate_local,
             license_status_local,

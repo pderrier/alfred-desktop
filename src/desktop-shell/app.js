@@ -50,6 +50,7 @@ import { extractFirstSentence, countPendingRecos } from "/desktop-shell/home-las
 import { extractTradeMoves, formatTradeRow } from "/desktop-shell/home-recent-trades.js";
 import { extractDatedCatalysts, formatCatalystRow } from "/desktop-shell/catalyst-calendar.js";
 import { aggregateBySector } from "/desktop-shell/sector-allocation.js";
+import { formatMacroTile } from "/desktop-shell/macro-home-tile.js";
 import { openDiscussionHistoryModal, saveDiscussionThread } from "/desktop-shell/discussion-memory.js";
 import {
   reduceRunActivityState
@@ -158,6 +159,14 @@ let themeConcentrationLastNotifiedSnapshotKey = null;
 // view mounts. Independent of the per-run synthesis because the
 // accuracy aggregation walks all line-memory tickers.
 let signalAccuracy = { status: "idle", data: null, error: null };
+// P2-70 (2026-05-24) — separate slot for the macro briefing home tile.
+// Refreshed by `refreshMacroBriefing()` ; the briefing is portfolio-
+// agnostic so it does not depend on the snapshot. Cached server-side
+// for 30 min, debounced client-side for 5 min (see `shouldRunRefresh`
+// slot `macro_tile`). `data` is the silent-degrade envelope from
+// `/api/macro` — the tile renderer extracts the formatted line via
+// `formatMacroTile(data)` and hides itself when that returns null.
+let macroBriefing = { status: "idle", data: null, error: null };
 
 // ── Bridge + run operations ──────────────────────────────────────
 
@@ -1203,6 +1212,30 @@ async function refreshSignalAccuracy() {
   renderWelcome();
 }
 
+// P2-70 (2026-05-24) — load the macro briefing snapshot for the home
+// tile. Portfolio-agnostic, server-cached 30 min, debounced client-side
+// 5 min (longer than the other slots — the briefing changes far less
+// frequently than the portfolio data, and `/api/macro` is HTTP not a
+// local read). Errors are silenced: a failed fetch keeps `data = null`
+// which causes the tile renderer to hide the section entirely. The
+// same silent-degrade contract as the Rust-side
+// `enrichment::fetch_macro_briefing`.
+async function refreshMacroBriefing() {
+  if (!shouldRunRefresh("macro_tile", 5 * 60 * 1000)) return;
+  macroBriefing = { status: "loading", data: null, error: null };
+  try {
+    const data = await bridge.macroBriefing();
+    macroBriefing = { status: "ready", data, error: null };
+  } catch (e) {
+    macroBriefing = {
+      status: "error",
+      data: null,
+      error: String(e?.message || e || "macro_briefing_failed"),
+    };
+  }
+  renderWelcome();
+}
+
 async function refreshHomeHeader() {
   if (!shouldRunRefresh("home_header", 5000)) return;
   homeHeader = { status: "loading", data: null, error: null };
@@ -1307,6 +1340,11 @@ async function refreshDashboardInner() {
   // ≥5s so live-run SSE churn doesn't re-run `computeSignalAccuracy`
   // on every event.
   refreshSignalAccuracy();
+  // P2-70 (2026-05-24) — fire-and-forget refresh of the macro briefing
+  // home tile. Internal debounce is 5 min — the briefing is global and
+  // server-cached for 30 min, so high-frequency dashboard churn must
+  // not stampede `/api/macro`.
+  refreshMacroBriefing();
 
   // Keep live run context up to date with positions (for enriching done rows)
   const positions = snapshot.latest_run?.portfolio?.positions || [];
@@ -2729,6 +2767,28 @@ function renderWelcome() {
     `;
   })();
 
+  // ── P2-70 : Contexte macro (10Y / VIX / EUR-USD / Brent) ────────
+  // One-liner glanceable summary of the macro snapshot also injected
+  // into the synthesis prompt by `build_macro_briefing_section`
+  // (Rust). Hides itself when the briefing is unavailable or every
+  // indicator is null — the home then condenses without leaving an
+  // empty card. Voice mirrors the other home sections : tutoiement FR,
+  // `·` separators, glyph prefix as the visual hook.
+  const macroBriefingCard = (() => {
+    const line = formatMacroTile(macroBriefing.data);
+    if (!line) return "";
+    // `escapeHtml` is required for `line` because the formatter accepts
+    // arbitrary numeric input that could in theory be NaN-rendered or
+    // contain unexpected characters from a partial server response.
+    // The label segments themselves are static FR text, but defence in
+    // depth keeps the contract safe under future schema drift.
+    return `
+      <div class="welcome-step welcome-macro-tile" style="padding:0.45rem 0.8rem;color:var(--sea-muted);font-size:0.85rem">
+        ${escapeHtml(line)}
+      </div>
+    `;
+  })();
+
   // ── P0-20 Section 6 : Répartition (rewrite FR, no generic verdict) ──
   const globalSynthesisCard = (() => {
     if (accounts.length === 0 && runs.length === 0) return "";
@@ -2782,15 +2842,18 @@ function renderWelcome() {
 
   if (titleNode) titleNode.textContent = accountRuns.size > 0 ? "Latest runs" : "Ready";
 
-  // P0-20 + P1-21 + P1-22 + P2-24 + P2-25 + P1-57 home composition order :
+  // P0-20 + P1-21 + P1-22 + P2-24 + P2-25 + P1-57 + P2-70 home
+  // composition order :
   // header strip → "Alfred t'a dit quoi" → derniers ordres → ce qui
   // a bougé (run-diff in report view) → répartition → allocation
-  // sectorielle → catalyseurs → rétro-précision → thèmes.
+  // sectorielle → contexte macro → catalyseurs → rétro-précision →
+  // thèmes.
   if (homeHeaderStrip) html += homeHeaderStrip;
   if (lastSynthesisCard) html += lastSynthesisCard;
   if (recentTradesCard) html += recentTradesCard;
   if (globalSynthesisCard) html += globalSynthesisCard;
   if (sectorAllocationCard) html += sectorAllocationCard;
+  if (macroBriefingCard) html += macroBriefingCard;
   if (catalystCard) html += catalystCard;
   if (retrospectiveCard) html += retrospectiveCard;
   if (themesCard) html += themesCard;

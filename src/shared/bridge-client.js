@@ -831,7 +831,7 @@ export function createDesktopBridgeClient({
      */
     async isAdminUser() {
       const payload = await invoke("admin_check_local");
-      return normalizeTauriPayload(payload, ["admin_check_local"]);
+      return normalizeTauriPayload(payload, ["admin:check-local"]);
     },
     /**
      * Returns the admin usage envelope as documented in
@@ -840,7 +840,7 @@ export function createDesktopBridgeClient({
      */
     async getAdminUsage() {
       const payload = await invoke("get_admin_usage_local");
-      return normalizeTauriPayload(payload, ["get_admin_usage_local"]);
+      return normalizeTauriPayload(payload, ["admin:usage-local"]);
     },
     /**
      * Returns the admin VPS stats envelope as documented in
@@ -848,7 +848,7 @@ export function createDesktopBridgeClient({
      */
     async getAdminVpsStats() {
       const payload = await invoke("get_admin_vps_stats_local");
-      return normalizeTauriPayload(payload, ["get_admin_vps_stats_local"]);
+      return normalizeTauriPayload(payload, ["admin:vps-stats-local"]);
     },
     /**
      * P0-20 (2026-05-23) — count of runs whose `updated_at` falls in
@@ -859,7 +859,7 @@ export function createDesktopBridgeClient({
      */
     async runsCountLast7d() {
       const payload = await invoke("runs_count_last_7d_local");
-      return normalizeTauriPayload(payload, ["runs_count_last_7d_local"]);
+      return normalizeTauriPayload(payload, ["home:runs-count-last-7d-local"]);
     },
     /**
      * P2-24 (2026-05-23) — cross-portfolio signal accuracy. Aggregates
@@ -869,7 +869,20 @@ export function createDesktopBridgeClient({
      */
     async computeSignalAccuracy() {
       const payload = await invoke("compute_signal_accuracy_local");
-      return normalizeTauriPayload(payload, ["compute_signal_accuracy_local"]);
+      return normalizeTauriPayload(payload, ["home:signal-accuracy-local"]);
+    },
+    /**
+     * P2-70 (2026-05-24) — macro briefing snapshot for the home tile.
+     * Wraps `enrichment::fetch_macro_briefing` Rust-side (which already
+     * hits the 30-min server-cached `/api/macro`). Returns the
+     * silent-degrade envelope `{ok, macro: {us_10y_yield, vix, eur_usd,
+     * brent_usd} | null, cache_hit, source, as_of}`. Read-only, no
+     * quota consumption. The JS tile renderer hides itself when
+     * `macro` is null or every indicator is null.
+     */
+    async macroBriefing() {
+      const payload = await invoke("macro_briefing_local");
+      return normalizeTauriPayload(payload, ["home:macro-briefing-local"]);
     },
     // ── License flow (v0.4.0 P0-15) ───────────────────────────────────
     //

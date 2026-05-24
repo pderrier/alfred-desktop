@@ -1411,6 +1411,21 @@ pub fn run_compute_signal_accuracy() -> Result<serde_json::Value> {
     ))
 }
 
+/// P2-70 (2026-05-24) — surface the macro briefing snapshot on the home
+/// page pre-run. Thin wrapper around `enrichment::fetch_macro_briefing`
+/// which already hits the 30-min server-cached `/api/macro` endpoint and
+/// silently degrades on transport/auth/5xx failures (returns
+/// `{ok: true, macro: null}` rather than propagating an error). The JS
+/// renderer treats a null briefing as "hide the tile" — matches the
+/// existing `build_macro_briefing_section` contract on the LLM side, so
+/// the tile and the synthesis prompt either both render or both fall
+/// silent. Read-only, no quota consumption, no run state mutation.
+pub fn run_macro_briefing() -> Result<serde_json::Value> {
+    let envelope = crate::enrichment::fetch_macro_briefing()
+        .map_err(|e| anyhow::anyhow!("macro_briefing_failed:{e}"))?;
+    Ok(bridge_envelope("home:macro-briefing-local", envelope))
+}
+
 /// P0-16 (2026-05-23) — server-driven admin tab visibility probe.
 /// Calls `GET /admin/check` ; returns `{is_admin: true}` on 204 (server
 /// confirmed admin), `{is_admin: false}` on 403 or any error (fail-safe

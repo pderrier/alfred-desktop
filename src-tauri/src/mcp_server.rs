@@ -105,6 +105,84 @@ pub(crate) fn enrich_recommendations_with_sector(
     count
 }
 
+/// P1-61 — enrich each recommendation with `current_weight_pct` (computed
+/// from `positions`) and `weight_delta_pct` (computed against the LLM-supplied
+/// `target_weight_pct`).
+///
+/// **Always-additive** per `feedback_snapshot_ui_contract`: never touches
+/// `target_weight_pct` (LLM output), only ADDS `current_weight_pct` and (when
+/// computable) `weight_delta_pct`.
+///
+/// Behaviour:
+///   - Recos for watchlist tickers (no matching position): `current_weight_pct = 0.0`
+///     and `weight_delta_pct = target_weight_pct` (delta == target).
+///   - Recos where `target_weight_pct` is absent or null: `current_weight_pct`
+///     is still attached; `weight_delta_pct` stays absent (CONSERVER /
+///     SURVEILLANCE case — no allocation intent to compare against).
+///   - Returns the number of recommendations that received any weight field
+///     (useful for logging).
+///
+/// Reuses `compute_weight_pct` from `services::native_collection_helpers`
+/// so the formula has exactly one source of truth — see the helper docstring.
+pub(crate) fn enrich_recommendations_with_weight(
+    recos: &mut Value,
+    positions: &[Value],
+) -> usize {
+    let Some(recos_arr) = recos.as_array_mut() else { return 0; };
+
+    // Compute total portfolio value once. Positions without a `valeur_actuelle`
+    // contribute 0 — matches `top_positions_for` semantics.
+    let total_value: f64 = positions
+        .iter()
+        .map(|p| p.get("valeur_actuelle").and_then(|v| v.as_f64()).unwrap_or(0.0))
+        .sum();
+
+    let mut count = 0usize;
+    for reco in recos_arr.iter_mut() {
+        let Some(reco_obj) = reco.as_object_mut() else { continue; };
+        let ticker = reco_obj
+            .get("ticker")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        if ticker.is_empty() {
+            continue;
+        }
+        // Look up the position with the matching ticker (case-insensitive).
+        // Recos for watchlist tickers have no position → current = 0.0.
+        let position_value: f64 = positions
+            .iter()
+            .find(|p| {
+                p.get("ticker")
+                    .and_then(|v| v.as_str())
+                    .map(|t| t.eq_ignore_ascii_case(&ticker))
+                    .unwrap_or(false)
+            })
+            .and_then(|p| p.get("valeur_actuelle").and_then(|v| v.as_f64()))
+            .unwrap_or(0.0);
+
+        let current = crate::native_collection_helpers::compute_weight_pct(
+            position_value,
+            total_value,
+        );
+        reco_obj.insert("current_weight_pct".to_string(), json!(current));
+
+        // weight_delta_pct only when target_weight_pct is a finite number.
+        // The LLM emits `null` for CONSERVER/SURVEILLANCE — we skip delta then.
+        if let Some(target) = reco_obj
+            .get("target_weight_pct")
+            .and_then(|v| v.as_f64())
+            .filter(|f| f.is_finite())
+        {
+            let raw_delta = target - current;
+            let delta = (raw_delta * 10.0).round() / 10.0;
+            reco_obj.insert("weight_delta_pct".to_string(), json!(delta));
+        }
+        count += 1;
+    }
+    count
+}
+
 // ── File I/O with simple lock ───────────────────────────────────────────────
 
 fn read_json(path: &Path) -> Result<Value> {
@@ -1021,6 +1099,103 @@ fn build_collection_quality(
     })
 }
 
+/// Pure classifier — returns `(hard_issues, soft_warnings)` for a recommendation.
+///
+/// Extracted from `tool_validate_recommendation` per
+/// `feedback_pure_helper_for_async_testability` so the validation rules can be
+/// unit-tested without spinning up a temp `data_dir`, run state, or progress
+/// sidecar. The MCP tool wraps this helper and adds I/O concerns (retry
+/// bookkeeping, sidecar writes, progress events).
+///
+/// Rules:
+///   - Hard (rejects + retries up to `MAX_VALIDATION_RETRIES`):
+///       `synthese_too_short` — under 80 chars
+///       `invalid_conviction` — not in {faible, moderee, forte}
+///       `invalid_signal`     — not in the 7-signal enum
+///       `invalid_line_id_format` — missing or no `:` separator
+///       `invalid_target_weight_pct` — present, non-null, outside `[0, 100]`
+///   - Soft (stored, surfaced in `warnings`):
+///       `analyse_technique_empty` / `analyse_fondamentale_empty` / `analyse_sentiment_empty`
+///       `raisons_principales_insufficient` — under 2 entries
+///       `action_recommandee_empty`
+///       `deep_news_summary_empty`
+///       `target_weight_too_high` — > 30 (P1-61, overridable via synthese)
+pub(crate) fn classify_recommendation_issues(rec: &Value) -> (Vec<String>, Vec<String>) {
+    let mut hard_issues: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    // ── Hard blockers ──
+    let synthese = as_text(rec.get("synthese"));
+    if synthese.chars().count() < 80 {
+        hard_issues.push("synthese_too_short".to_string());
+    }
+
+    let conviction = as_text(rec.get("conviction"))
+        .to_lowercase()
+        .replace('é', "e")
+        .replace('è', "e");
+    if !["faible", "moderee", "forte"].contains(&conviction.as_str()) {
+        hard_issues.push("invalid_conviction".to_string());
+    }
+
+    let signal = as_text(rec.get("signal")).to_ascii_uppercase();
+    let valid_signals = [
+        "ACHAT_FORT", "ACHAT", "RENFORCEMENT", "CONSERVER",
+        "ALLEGEMENT", "VENTE", "SURVEILLANCE",
+    ];
+    if !valid_signals.contains(&signal.as_str()) {
+        hard_issues.push("invalid_signal".to_string());
+    }
+
+    let line_id = as_text(rec.get("line_id"));
+    if line_id.is_empty() || !line_id.contains(':') {
+        hard_issues.push("invalid_line_id_format".to_string());
+    }
+
+    // P1-61 — target_weight_pct range validation.
+    // Acceptable: absent (key missing) OR explicit `null` (LLM marked
+    // CONSERVER/SURVEILLANCE). When present and not null:
+    //   - must parse as a finite f64
+    //   - must be in [0, 100]   → hard issue otherwise
+    //   - >30 emits a SOFT warning (overridable via synthese justification)
+    if let Some(target_value) = rec.get("target_weight_pct") {
+        if !target_value.is_null() {
+            match target_value.as_f64() {
+                Some(f) if f.is_finite() && (0.0..=100.0).contains(&f) => {
+                    if f > 30.0 {
+                        warnings.push("target_weight_too_high".to_string());
+                    }
+                }
+                _ => hard_issues.push("invalid_target_weight_pct".to_string()),
+            }
+        }
+    }
+
+    // ── Soft warnings ──
+    if as_text(rec.get("analyse_technique")).is_empty() {
+        warnings.push("analyse_technique_empty".to_string());
+    }
+    if as_text(rec.get("analyse_fondamentale")).is_empty() {
+        warnings.push("analyse_fondamentale_empty".to_string());
+    }
+    if as_text(rec.get("analyse_sentiment")).is_empty() {
+        warnings.push("analyse_sentiment_empty".to_string());
+    }
+    let raisons = rec.get("raisons_principales")
+        .and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+    if raisons < 2 {
+        warnings.push("raisons_principales_insufficient".to_string());
+    }
+    if as_text(rec.get("action_recommandee")).is_empty() {
+        warnings.push("action_recommandee_empty".to_string());
+    }
+    if as_text(rec.get("deep_news_summary")).is_empty() {
+        warnings.push("deep_news_summary_empty".to_string());
+    }
+
+    (hard_issues, warnings)
+}
+
 fn tool_validate_recommendation(data_dir: &Path, params: &Value) -> Result<Value> {
     let run_id = as_text(params.get("run_id"));
     let rec_str = as_text(params.get("recommendation"));
@@ -1053,57 +1228,11 @@ fn tool_validate_recommendation(data_dir: &Path, params: &Value) -> Result<Value
     };
     const MAX_VALIDATION_RETRIES: u32 = 2;
 
-    let mut hard_issues: Vec<String> = Vec::new();
-    let mut warnings: Vec<String> = Vec::new();
+    let (hard_issues, warnings) = classify_recommendation_issues(&rec);
 
-    // ── Hard blockers (reject + retry) ──
+    // Re-derive these locals — they're used by progress events below.
     let synthese = as_text(rec.get("synthese"));
-    if synthese.chars().count() < 80 {
-        hard_issues.push("synthese_too_short".to_string());
-    }
-
-    let conviction = as_text(rec.get("conviction"))
-        .to_lowercase()
-        .replace('é', "e")
-        .replace('è', "e");
-    if !["faible", "moderee", "forte"].contains(&conviction.as_str()) {
-        hard_issues.push("invalid_conviction".to_string());
-    }
-
     let signal = as_text(rec.get("signal")).to_ascii_uppercase();
-    let valid_signals = [
-        "ACHAT_FORT", "ACHAT", "RENFORCEMENT", "CONSERVER",
-        "ALLEGEMENT", "VENTE", "SURVEILLANCE",
-    ];
-    if !valid_signals.contains(&signal.as_str()) {
-        hard_issues.push("invalid_signal".to_string());
-    }
-
-    if line_id.is_empty() || !line_id.contains(':') {
-        hard_issues.push("invalid_line_id_format".to_string());
-    }
-
-    // ── Soft warnings (store anyway, reported but don't block) ──
-    if as_text(rec.get("analyse_technique")).is_empty() {
-        warnings.push("analyse_technique_empty".to_string());
-    }
-    if as_text(rec.get("analyse_fondamentale")).is_empty() {
-        warnings.push("analyse_fondamentale_empty".to_string());
-    }
-    if as_text(rec.get("analyse_sentiment")).is_empty() {
-        warnings.push("analyse_sentiment_empty".to_string());
-    }
-    let raisons = rec.get("raisons_principales")
-        .and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-    if raisons < 2 {
-        warnings.push("raisons_principales_insufficient".to_string());
-    }
-    if as_text(rec.get("action_recommandee")).is_empty() {
-        warnings.push("action_recommandee_empty".to_string());
-    }
-    if as_text(rec.get("deep_news_summary")).is_empty() {
-        warnings.push("deep_news_summary_empty".to_string());
-    }
 
     // Only reject on hard issues (or accept after max retries)
     let issues: Vec<String> = hard_issues.iter().chain(warnings.iter()).cloned().collect();
@@ -1952,6 +2081,299 @@ mod tests {
         let count = enrich_recommendations_with_sector(&mut recos, &market);
         assert_eq!(count, 0);
         assert!(recos[0].get("sector").is_none());
+    }
+
+    // ── P1-61 — classify_recommendation_issues (target_weight_pct rules) ──
+
+    /// Build a baseline-valid reco — all required fields populated so the
+    /// only thing under test is the target_weight_pct branch.
+    fn baseline_valid_rec() -> Value {
+        json!({
+            "line_id": "position:aapl",
+            "ticker": "AAPL",
+            "signal": "ACHAT",
+            "conviction": "moderee",
+            "synthese": "Une synthese suffisamment longue pour passer la validation de 80 caracteres minimum sans probleme.",
+            "analyse_technique": "tech",
+            "analyse_fondamentale": "fund",
+            "analyse_sentiment": "sent",
+            "raisons_principales": ["a", "b"],
+            "action_recommandee": "Acheter 3 titres",
+            "deep_news_summary": "news",
+        })
+    }
+
+    #[test]
+    fn validator_accepts_null_target_weight_pct() {
+        // null target → no hard issues, no target-related warnings.
+        let mut rec = baseline_valid_rec();
+        rec["target_weight_pct"] = Value::Null;
+        let (hard, soft) = classify_recommendation_issues(&rec);
+        assert!(hard.is_empty(), "null target must not produce hard issues: {:?}", hard);
+        assert!(!soft.contains(&"target_weight_too_high".to_string()));
+        assert!(!soft.contains(&"invalid_target_weight_pct".to_string()));
+    }
+
+    #[test]
+    fn validator_accepts_absent_target_weight_pct() {
+        // Absent key (LLM omitted it entirely) → also accepted, no warnings.
+        let rec = baseline_valid_rec();
+        assert!(rec.get("target_weight_pct").is_none(), "fixture sanity");
+        let (hard, soft) = classify_recommendation_issues(&rec);
+        assert!(hard.is_empty(), "absent target must not produce hard issues: {:?}", hard);
+        assert!(!soft.contains(&"target_weight_too_high".to_string()));
+    }
+
+    #[test]
+    fn validator_rejects_out_of_range_target_weight_pct() {
+        // Negative → hard issue.
+        let mut rec = baseline_valid_rec();
+        rec["target_weight_pct"] = json!(-2.0);
+        let (hard, _) = classify_recommendation_issues(&rec);
+        assert!(hard.contains(&"invalid_target_weight_pct".to_string()),
+            "negative target must hard-fail; got: {:?}", hard);
+
+        // > 100 → hard issue.
+        let mut rec = baseline_valid_rec();
+        rec["target_weight_pct"] = json!(150.0);
+        let (hard, _) = classify_recommendation_issues(&rec);
+        assert!(hard.contains(&"invalid_target_weight_pct".to_string()),
+            "> 100 target must hard-fail; got: {:?}", hard);
+
+        // Non-numeric (string) → hard issue.
+        let mut rec = baseline_valid_rec();
+        rec["target_weight_pct"] = json!("forty");
+        let (hard, _) = classify_recommendation_issues(&rec);
+        assert!(hard.contains(&"invalid_target_weight_pct".to_string()),
+            "non-numeric target must hard-fail; got: {:?}", hard);
+    }
+
+    #[test]
+    fn validator_emits_soft_issue_when_target_weight_above_30() {
+        // 35.0 → soft warning, no hard issue (LLM may justify in synthese).
+        let mut rec = baseline_valid_rec();
+        rec["target_weight_pct"] = json!(35.0);
+        let (hard, soft) = classify_recommendation_issues(&rec);
+        assert!(hard.is_empty(), "above-30 target must NOT hard-fail; got: {:?}", hard);
+        assert!(soft.contains(&"target_weight_too_high".to_string()),
+            "above-30 target must emit soft warning; got: {:?}", soft);
+    }
+
+    #[test]
+    fn validator_accepts_in_range_target_weight_pct() {
+        // Sane in-range values (0, mid, 30) accepted without any target warning.
+        for &value in &[0.0_f64, 8.0, 15.5, 30.0] {
+            let mut rec = baseline_valid_rec();
+            rec["target_weight_pct"] = json!(value);
+            let (hard, soft) = classify_recommendation_issues(&rec);
+            assert!(hard.is_empty(), "in-range {value} must not hard-fail; got: {:?}", hard);
+            assert!(!soft.contains(&"target_weight_too_high".to_string()),
+                "in-range {value} must not warn; got: {:?}", soft);
+        }
+    }
+
+    #[test]
+    fn validator_target_weight_at_100_is_accepted() {
+        // Boundary: exactly 100 is in-range; emits the >30 soft warning.
+        let mut rec = baseline_valid_rec();
+        rec["target_weight_pct"] = json!(100.0);
+        let (hard, soft) = classify_recommendation_issues(&rec);
+        assert!(hard.is_empty(), "100 must be in-range; got: {:?}", hard);
+        assert!(soft.contains(&"target_weight_too_high".to_string()),
+            "100 must emit soft warning; got: {:?}", soft);
+    }
+
+    // ── P1-61 — enrich_recommendations_with_weight ──
+
+    #[test]
+    fn attach_weight_fields_computes_current_and_delta() {
+        // Portfolio total = 100 000 ; AAPL = 8 000 → current = 8.0 %
+        // Target 12 → delta = +4.0
+        let mut recos = json!([
+            { "ticker": "AAPL", "signal": "ACHAT", "target_weight_pct": 12.0 }
+        ]);
+        let positions = vec![
+            json!({ "ticker": "AAPL", "valeur_actuelle": 8000.0 }),
+            json!({ "ticker": "MSFT", "valeur_actuelle": 12000.0 }),
+            json!({ "ticker": "GOOG", "valeur_actuelle": 80000.0 }),
+        ];
+        let count = enrich_recommendations_with_weight(&mut recos, &positions);
+        assert_eq!(count, 1);
+        let arr = recos.as_array().unwrap();
+        assert_eq!(arr[0]["current_weight_pct"].as_f64(), Some(8.0));
+        assert_eq!(arr[0]["weight_delta_pct"].as_f64(), Some(4.0));
+        // Target is unmutated.
+        assert_eq!(arr[0]["target_weight_pct"].as_f64(), Some(12.0));
+    }
+
+    #[test]
+    fn attach_weight_fields_handles_watchlist_zero_current() {
+        // Reco for a watchlist ticker (no matching position) → current = 0,
+        // delta = target (positive only — we never go negative on a fresh entry).
+        let mut recos = json!([
+            { "ticker": "NVDA", "signal": "ACHAT", "target_weight_pct": 5.0 }
+        ]);
+        let positions = vec![
+            json!({ "ticker": "AAPL", "valeur_actuelle": 8000.0 }),
+        ];
+        let count = enrich_recommendations_with_weight(&mut recos, &positions);
+        assert_eq!(count, 1);
+        let arr = recos.as_array().unwrap();
+        assert_eq!(arr[0]["current_weight_pct"].as_f64(), Some(0.0));
+        assert_eq!(arr[0]["weight_delta_pct"].as_f64(), Some(5.0));
+    }
+
+    #[test]
+    fn attach_weight_fields_handles_null_target() {
+        // Reco with null target_weight_pct (CONSERVER / SURVEILLANCE) →
+        // current is still attached, delta is OMITTED.
+        let mut recos = json!([
+            { "ticker": "AAPL", "signal": "CONSERVER", "target_weight_pct": null }
+        ]);
+        let positions = vec![
+            json!({ "ticker": "AAPL", "valeur_actuelle": 5000.0 }),
+            json!({ "ticker": "MSFT", "valeur_actuelle": 5000.0 }),
+        ];
+        let count = enrich_recommendations_with_weight(&mut recos, &positions);
+        assert_eq!(count, 1);
+        let arr = recos.as_array().unwrap();
+        assert_eq!(arr[0]["current_weight_pct"].as_f64(), Some(50.0));
+        assert!(arr[0].get("weight_delta_pct").is_none(),
+            "delta must be absent when target is null");
+    }
+
+    #[test]
+    fn attach_weight_fields_handles_missing_target_key() {
+        // Reco with target_weight_pct entirely absent (e.g. legacy LLM that
+        // never learned the field) — should NOT crash, just attach current
+        // and skip delta.
+        let mut recos = json!([
+            { "ticker": "AAPL", "signal": "CONSERVER" }
+        ]);
+        let positions = vec![
+            json!({ "ticker": "AAPL", "valeur_actuelle": 1000.0 }),
+            json!({ "ticker": "MSFT", "valeur_actuelle": 1000.0 }),
+        ];
+        let count = enrich_recommendations_with_weight(&mut recos, &positions);
+        assert_eq!(count, 1);
+        let arr = recos.as_array().unwrap();
+        assert_eq!(arr[0]["current_weight_pct"].as_f64(), Some(50.0));
+        assert!(arr[0].get("weight_delta_pct").is_none());
+    }
+
+    #[test]
+    fn attach_weight_fields_handles_empty_portfolio() {
+        // No positions → total = 0 → current = 0.0 (no division-by-zero panic).
+        // delta = target (since current is 0).
+        let mut recos = json!([
+            { "ticker": "AAPL", "signal": "ACHAT", "target_weight_pct": 10.0 }
+        ]);
+        let positions: Vec<Value> = vec![];
+        let count = enrich_recommendations_with_weight(&mut recos, &positions);
+        assert_eq!(count, 1);
+        let arr = recos.as_array().unwrap();
+        assert_eq!(arr[0]["current_weight_pct"].as_f64(), Some(0.0));
+        assert_eq!(arr[0]["weight_delta_pct"].as_f64(), Some(10.0));
+    }
+
+    #[test]
+    fn attach_weight_fields_ticker_case_insensitive() {
+        // LLM may emit lowercase ticker; positions use uppercase. Match must succeed.
+        let mut recos = json!([
+            { "ticker": "aapl", "signal": "ACHAT", "target_weight_pct": 10.0 }
+        ]);
+        let positions = vec![
+            json!({ "ticker": "AAPL", "valeur_actuelle": 4000.0 }),
+            json!({ "ticker": "MSFT", "valeur_actuelle": 6000.0 }),
+        ];
+        let count = enrich_recommendations_with_weight(&mut recos, &positions);
+        assert_eq!(count, 1);
+        let arr = recos.as_array().unwrap();
+        assert_eq!(arr[0]["current_weight_pct"].as_f64(), Some(40.0));
+        assert_eq!(arr[0]["weight_delta_pct"].as_f64(), Some(-30.0));
+    }
+
+    #[test]
+    fn attach_weight_fields_handles_empty_inputs() {
+        let mut empty_recos = json!([]);
+        let positions = vec![json!({ "ticker": "AAPL", "valeur_actuelle": 1000.0 })];
+        assert_eq!(enrich_recommendations_with_weight(&mut empty_recos, &positions), 0);
+
+        let mut not_array = json!({ "foo": "bar" });
+        assert_eq!(enrich_recommendations_with_weight(&mut not_array, &positions), 0);
+    }
+
+    // ── P1-61 — schema parity across the 3 line-analysis prompt builders ──
+
+    /// BINDING `product_llm_mode_parity_2026_04`: the verbatim schema line
+    /// for `target_weight_pct` must appear identically in all 3 line builders.
+    /// Pinned via a single source-of-truth constant in `llm_prompts.rs`.
+    #[test]
+    fn recommandation_schema_parity_across_three_line_builders() {
+        use crate::llm_prompts::TARGET_WEIGHT_PCT_SCHEMA_LINE;
+
+        // build_line_analysis_prompt (codex MCP).
+        let line_context = json!({
+            "ticker": "AAPL",
+            "type": "position",
+            "row": { "nom": "Apple", "quantite": 10.0, "pru": 100.0, "valeur": 1500.0 },
+            "market": {},
+            "news": [],
+            "shared_insights": null,
+            "line_memory": null,
+            "technical_snapshot": null,
+            "sector_cot": null,
+            "activity": [],
+        });
+        let run_state = json!({
+            "portfolio": { "valeur_totale": 10000.0, "liquidites": 1000.0, "plus_value_totale": 100.0 },
+            "run_id": "test-run",
+        });
+        let codex_prompt = crate::llm_prompts::build_line_analysis_prompt(
+            &line_context, &run_state, None, None,
+        );
+
+        // build_native_line_prompt (native / native-oauth).
+        let native_line_data = json!({
+            "position": {},
+            "market_data": {},
+            "news": [],
+            "shared_insights": null,
+            "quality": {},
+            "line_memory": null,
+            "technical_snapshot": null,
+            "sector_cot": {},
+            "activity": [],
+        });
+        let native_prompt = crate::native_mcp_analysis::build_native_line_prompt(
+            "test-run", "AAPL", "Apple", "position", &native_line_data,
+        );
+
+        // build_repair_prompt (all modes — repair pass).
+        let repair_ctx = json!({
+            "validation_issues": ["synthese_too_short"],
+            "recommendation_to_fix": { "signal": "ACHAT" },
+        });
+        let repair_prompt = crate::llm_prompts::build_repair_prompt(
+            &line_context, &run_state, None, &repair_ctx, None,
+        );
+
+        // Verbatim byte-equality assertion — the constant text must show up
+        // unchanged in all 3 prompts. A render-time mutation (e.g. someone
+        // re-wraps it) would break this guard.
+        for (name, prompt) in [
+            ("build_line_analysis_prompt", &codex_prompt),
+            ("build_native_line_prompt", &native_prompt),
+            ("build_repair_prompt", &repair_prompt),
+        ] {
+            assert!(
+                prompt.contains(TARGET_WEIGHT_PCT_SCHEMA_LINE),
+                "{name} is missing the verbatim target_weight_pct schema line.\n\
+                 Expected: {TARGET_WEIGHT_PCT_SCHEMA_LINE}\n\
+                 Got prompt prefix: {}",
+                &prompt.chars().take(200).collect::<String>(),
+            );
+        }
     }
 }
 

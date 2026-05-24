@@ -425,6 +425,7 @@ Reponds UNIQUEMENT avec un objet JSON (pas de texte avant ou apres) contenant :
 - ticker: "{ticker}", type: "{line_type}", nom: "{nom}"
 - signal: ACHAT_FORT | ACHAT | RENFORCEMENT | CONSERVER | ALLEGEMENT | VENTE | SURVEILLANCE
 - conviction: faible | moderee | forte
+- {target_weight_rule_line}
 - synthese: minimum 150 caracteres (explique comme a un ami)
 - memory_narrative: 4-8 phrases, construites comme un FIL HISTORIQUE (ce qui a change depuis les derniers runs), en integrant les signaux precedents, les operations recentes (transactions/orders), et les implications pour la suite
 - analyse_technique, analyse_fondamentale, analyse_sentiment
@@ -455,6 +456,7 @@ Les articles "RESUME APPROFONDI (cache)" sont deja resumes — utilise-les direc
         calibration_instruction = calibration_instruction,
         section_technical = section_technical,
         quality = quality,
+        target_weight_rule_line = crate::llm_prompts::TARGET_WEIGHT_PCT_SCHEMA_LINE,
     )
 }
 

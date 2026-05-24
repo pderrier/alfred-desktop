@@ -2072,6 +2072,24 @@ main {
   cursor: help;
 }
 .lm-data-quality-icon { font-size: 0.85rem; }
+/* P1-61: target-weight delta chip — additive after the KPI fields.
+   Empty container collapses (no padding/border) so a reco without
+   target_weight_pct shows no visual artefact. */
+.lm-kpi-weight-chip:empty { display: none; }
+.chip-weight {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.18rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  border: 1px solid transparent;
+  cursor: help;
+}
+.chip-weight-positive { background: rgba(26, 71, 42, 0.7); color: #4ade80; border-color: rgba(74, 222, 128, 0.35); }
+.chip-weight-negative { background: rgba(74, 26, 26, 0.7); color: #f87171; border-color: rgba(248, 113, 113, 0.35); }
+.chip-weight-neutral  { background: rgba(28, 42, 55, 0.7); color: #9aa9b8; border-color: rgba(154, 169, 184, 0.3); }
 .lm-hero {
   background: rgba(14, 24, 34, 0.92);
   border: 1px solid rgba(47, 143, 93, 0.25);

@@ -283,6 +283,15 @@ function normalizeRecommendation(rec, index, latestRun) {
     rec?.memoire_ligne || rec?.line_memory || positionMatch?.memoire_ligne,
     rec
   );
+  // P1-61 — target_weight_pct is LLM-supplied (may be null/absent).
+  // current_weight_pct + weight_delta_pct are Rust-computed (present on
+  // every reco that flows through `enrich_recommendations_with_weight`,
+  // absent on collected-only entries that bypass the synthesis funnel).
+  // We surface them as numbers when finite, otherwise null — the chip
+  // renderer treats null as "no chip".
+  const targetWeightPct = numberOrNull(rec?.target_weight_pct);
+  const currentWeightPct = numberOrNull(rec?.current_weight_pct);
+  const weightDeltaPct = numberOrNull(rec?.weight_delta_pct);
   return {
     id,
     lineId: asText(rec?.line_id || id, id),
@@ -296,10 +305,22 @@ function normalizeRecommendation(rec, index, latestRun) {
     reanalyseAfter: asText(rec?.reanalyse_after),
     reanalyseReason: asText(rec?.reanalyse_reason),
     keywords: normalizeKeywords(rec?.badges_keywords),
+    targetWeightPct,
+    currentWeightPct,
+    weightDeltaPct,
     provenance: buildRecommendationProvenance(rec, latestRun, { source: "recommendation" }),
     lineMemory,
     details: normalizeAnalysisDetails(rec, latestRun)
   };
+}
+
+/// P1-61 — return a finite number or null. Used to coerce LLM/Rust-supplied
+/// weight fields. Rejects NaN/Infinity so downstream renderers never face a
+/// non-finite chip value.
+function numberOrNull(v) {
+  if (v === null || v === undefined) return null;
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) ? n : null;
 }
 
 function buildCollectedOnlyRecommendation(row, index, latestRun) {

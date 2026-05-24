@@ -495,6 +495,51 @@ export function renderSectorChip(sectorSlug) {
   return `<span class="chip chip-sector" title="GICS sector classification">${escapeHtml(label)}</span>`;
 }
 
+/**
+ * P1-61 — render the target-weight delta chip for the line-modal.
+ *
+ * Inputs:
+ *   - `targetWeightPct` — LLM-supplied allocation target (0-100) or null
+ *                        (CONSERVER / SURVEILLANCE recos pass null).
+ *   - `currentWeightPct` — Rust-computed actual portfolio weight, expected on
+ *                          any reco that flowed through `enrich_recommendations_with_weight`.
+ *   - `weightDeltaPct` — Rust-computed `target - current`. Absent when target is null.
+ *
+ * Returns "" when:
+ *   - `targetWeightPct` is null (LLM passed on allocation intent), OR
+ *   - both `targetWeightPct` AND `currentWeightPct` are missing (legacy run).
+ *
+ * Otherwise renders `+3.2 pp` (positive green), `-1.5 pp` (negative red), or
+ * `0.0 pp` (neutral grey) with a tooltip carrying `cible 8 % · actuel 4.8 %`.
+ *
+ * Voice : FR-tutoiement, `pp` suffix (percent-point, the dimension of the delta).
+ */
+export function renderWeightDeltaChip(targetWeightPct, currentWeightPct, weightDeltaPct) {
+  const targetNum = Number.isFinite(targetWeightPct) ? targetWeightPct : null;
+  const currentNum = Number.isFinite(currentWeightPct) ? currentWeightPct : null;
+  if (targetNum === null) return "";
+  // Prefer the Rust-supplied delta (which has the same rounding as the
+  // current/target it was computed from). Fall back to a JS computation
+  // only when the field was dropped en route — keeps the chip visible
+  // when a legacy payload omits `weight_delta_pct` but carries the others.
+  let delta = Number.isFinite(weightDeltaPct)
+    ? weightDeltaPct
+    : (currentNum !== null ? Math.round((targetNum - currentNum) * 10) / 10 : null);
+  if (delta === null) return "";
+  // Coerce -0 to 0 so the formatted string never reads "-0.0 pp".
+  if (Object.is(delta, -0)) delta = 0;
+  let tone;
+  if (delta > 0) tone = "positive";
+  else if (delta < 0) tone = "negative";
+  else tone = "neutral";
+  const sign = delta > 0 ? "+" : "";
+  const label = `${sign}${delta.toFixed(1)} pp`;
+  const tooltipParts = [`cible ${targetNum.toFixed(1)} %`];
+  if (currentNum !== null) tooltipParts.push(`actuel ${currentNum.toFixed(1)} %`);
+  const tooltip = tooltipParts.join(" · ");
+  return `<span class="chip chip-weight chip-weight-${tone}" title="${escapeHtml(tooltip)}">${escapeHtml(label)}</span>`;
+}
+
 export function renderCollectionDetail(details) {
   const panel = document.getElementById("line-memory-collection-detail");
   const grid = document.getElementById("line-memory-indicators-grid");
@@ -958,6 +1003,17 @@ export function initLineModal() {
         pvNode.style.color = pvPct >= 0 ? "#4ade80" : "#f87171";
       }
       if (el("lm-kpi-total")) el("lm-kpi-total").textContent = total != null ? fmt(total) + " \u20ac" : "—";
+      // P1-61 — render target-weight delta chip after the KPIs. innerHTML
+      // is always assigned (even when empty) so a stale chip from a previous
+      // open never lingers on a reco without target_weight_pct.
+      const weightChipNode = el("lm-kpi-weight-chip");
+      if (weightChipNode) {
+        weightChipNode.innerHTML = renderWeightDeltaChip(
+          rec?.targetWeightPct,
+          rec?.currentWeightPct,
+          rec?.weightDeltaPct,
+        );
+      }
       kpiStrip.classList.remove("hidden");
     }
     if (lineMemorySummaryNode) lineMemorySummaryNode.textContent = String(rec?.summary || "No recommendation available.");

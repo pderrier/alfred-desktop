@@ -5,6 +5,19 @@
 
 use serde_json::{json, Value};
 
+/// P1-61 — verbatim schema line for `target_weight_pct` injected into the
+/// three line-analysis prompt builders (`build_line_analysis_prompt`,
+/// `build_repair_prompt`, and `native_mcp_analysis::build_native_line_prompt`).
+///
+/// Single source per the parity contract — see
+/// `docs/llm-mode-parity-contract.md`. The test
+/// `recommandation_schema_parity_across_three_line_builders` pins
+/// byte-equality across all three sites.
+///
+/// Voice: FR no-accent, matching the rest of the prompts.
+pub(crate) const TARGET_WEIGHT_PCT_SCHEMA_LINE: &str =
+    "target_weight_pct: float 0-100 ou null (taille cible de cette ligne dans le portefeuille apres execution de tes recos). Mets null si signal=CONSERVER ou SURVEILLANCE. Plafond : 30 % par ligne sauf justification explicite dans synthese.";
+
 // ── Previous syntheses loader ───────────────────────────────────
 
 /// Load the last N global syntheses from report history for narrative continuity.
@@ -310,6 +323,7 @@ Produis ton analyse en JSON UNIQUEMENT avec cette structure exacte:
     "type": "{line_type}",
     "signal": "ACHAT_FORT|ACHAT|RENFORCEMENT|CONSERVER|ALLEGEMENT|VENTE|SURVEILLANCE",
     "conviction": "forte|moderee|faible",
+    "target_weight_pct": null,
     "synthese": "4-6 phrases: actualite cle, indicateurs determinants, plan court et moyen terme",
     "analyse_technique": "3-4 phrases sur la tendance du prix",
     "analyse_fondamentale": "3-4 phrases sur la sante de l'entreprise",
@@ -332,6 +346,7 @@ Produis ton analyse en JSON UNIQUEMENT avec cette structure exacte:
 Regles strictes:
 - synthese: minimum 150 caracteres, explique comme a un ami
 - action_recommandee: TOUJOURS chiffree (nb titres, montant €, prix si pertinent)
+- {target_weight_rule_line}
 - badges_keywords: 3-8 mots courts, specifiques, orientes decision (pas de signal/conviction/secteur seul)
   - au moins 1 badge "fait d'actualite" (ex: "restructuration en cours")
   - au moins 1 badge "risque/chiffre" (ex: "PER 35x eleve")
@@ -385,6 +400,7 @@ Reponds uniquement en JSON valide."#,
         },
         mcp_suffix = mcp_suffix,
         calibration_instruction = calibration_instruction,
+        target_weight_rule_line = TARGET_WEIGHT_PCT_SCHEMA_LINE,
     )
 }
 
@@ -1130,11 +1146,13 @@ RECOMMANDATION PRECEDENTE (a ameliorer):
 Regles:
 - Corrige les champs identifies comme defaillants
 - Garde les champs corrects de la recommandation precedente
-- Utilise les donnees fournies (pas de recherche web){calibration_instruction}
+- Utilise les donnees fournies (pas de recherche web)
+- {target_weight_rule_line}{calibration_instruction}
 
 JSON valide uniquement, cle "recommendation"."#,
         ticker = ticker,
         issues = issues,
+        target_weight_rule_line = TARGET_WEIGHT_PCT_SCHEMA_LINE,
         section_position = section_position,
         section_market = section_market,
         section_news = section_news,

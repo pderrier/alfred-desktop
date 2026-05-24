@@ -11,6 +11,23 @@ pub(crate) fn as_text(value: Option<&Value>) -> String {
     value.and_then(|v| v.as_str()).unwrap_or_default().trim().to_string()
 }
 
+/// Compute a portfolio weight percentage with 1-decimal rounding.
+///
+/// Single source of truth for the `value / total * 100` formula used in
+/// multiple call sites (top_positions_for, attach_weight_fields, etc.).
+/// Returns `0.0` when `total <= 0.0` so the math never panics on empty or
+/// uninitialised portfolios.
+///
+/// P1-61 — factorised out of `top_positions_for` to be reusable by the
+/// per-recommendation enrichment pass without duplicating the formula.
+pub(crate) fn compute_weight_pct(value: f64, total: f64) -> f64 {
+    if total <= 0.0 {
+        return 0.0;
+    }
+    let raw = (value / total) * 100.0;
+    (raw * 10.0).round() / 10.0
+}
+
 pub(crate) fn as_array<'a>(value: Option<&'a Value>) -> &'a [Value] {
     value.and_then(|v| v.as_array()).map(Vec::as_slice).unwrap_or(&[])
 }
@@ -1098,11 +1115,10 @@ fn top_positions_for(account_name: &str, all_positions: &[Value]) -> Value {
         .sum();
     let top: Vec<Value> = filtered.iter().take(3).map(|p| {
         let value = p.get("valeur_actuelle").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let weight_pct = if total_value > 0.0 { (value / total_value) * 100.0 } else { 0.0 };
         json!({
             "ticker": as_text(p.get("ticker")),
             "nom": as_text(p.get("nom")),
-            "weight_pct": (weight_pct * 10.0).round() / 10.0,
+            "weight_pct": compute_weight_pct(value, total_value),
         })
     }).collect();
     Value::Array(top)
@@ -1292,4 +1308,36 @@ pub(crate) fn build_collection_state(
         }
     }
     state
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P1-61 — pin the single source of truth for the weight formula. Two
+    /// call sites (`top_positions_for`, `enrich_recommendations_with_weight`)
+    /// depend on identical rounding behaviour; this test prevents drift.
+    #[test]
+    fn compute_weight_pct_rounds_to_one_decimal() {
+        assert_eq!(compute_weight_pct(8000.0, 100_000.0), 8.0);
+        assert_eq!(compute_weight_pct(12_345.6, 100_000.0), 12.3);
+        // Halfway rounding: 12.35 → 12.4 (banker's or simple? f64 math here
+        // routes to .round() which is "round half away from zero" → 12.4).
+        assert_eq!(compute_weight_pct(12_350.0, 100_000.0), 12.4);
+    }
+
+    #[test]
+    fn compute_weight_pct_returns_zero_on_empty_total() {
+        // No portfolio yet → never divide by zero.
+        assert_eq!(compute_weight_pct(123.0, 0.0), 0.0);
+        assert_eq!(compute_weight_pct(0.0, 0.0), 0.0);
+        // Negative total is treated the same way (defensive).
+        assert_eq!(compute_weight_pct(50.0, -10.0), 0.0);
+    }
+
+    #[test]
+    fn compute_weight_pct_clamps_value_zero() {
+        // value = 0 → 0 regardless of total.
+        assert_eq!(compute_weight_pct(0.0, 100_000.0), 0.0);
+    }
 }

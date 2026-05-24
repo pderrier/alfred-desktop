@@ -406,6 +406,10 @@
           <span class="lm-kpi">Price <strong id="lm-kpi-price">—</strong></span>
           <span class="lm-kpi">PV <strong id="lm-kpi-pv">—</strong></span>
           <span class="lm-kpi">Total <strong id="lm-kpi-total">—</strong></span>
+          <!-- P1-61 — target-weight delta chip. Populated by app-line-modal.js
+               when `targetWeightPct` is present on the recommendation. Empty
+               container hides itself via :empty CSS selector. -->
+          <span id="lm-kpi-weight-chip" class="lm-kpi-weight-chip"></span>
         </div>
 
         <!-- ① Recommendation (hero) + discuss CTA -->

@@ -475,6 +475,28 @@ pub fn persist_retry_global_synthesis(run_id: &str, generated_draft: &serde_json
         ));
     }
 
+    // P1-61 — attach `current_weight_pct` (Rust-computed from positions) and
+    // `weight_delta_pct` (target − current) to every recommendation. The LLM
+    // is responsible for `target_weight_pct`; everything else is server-side.
+    // Pure additive per the snapshot UI contract — `target_weight_pct` is
+    // never mutated, only consulted.
+    let positions_view = run_state
+        .get("portfolio")
+        .and_then(|p| p.get("positions"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let weighted_count = crate::mcp_server::enrich_recommendations_with_weight(
+        &mut enriched_recommendations,
+        &positions_view,
+    );
+    if weighted_count > 0 {
+        crate::debug_log(&format!(
+            "[p1-61] attached weight fields on {weighted_count}/{} reco(s) for run {run_id}",
+            pending_recommendations.len()
+        ));
+    }
+
     let payload = json!({
         "date": now_iso_string(),
         "valeur_portefeuille": run_state.get("portfolio").and_then(|v| v.get("valeur_totale")).and_then(|v| v.as_f64()).unwrap_or(0.0),

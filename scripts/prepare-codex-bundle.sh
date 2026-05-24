@@ -63,19 +63,41 @@ echo "Installing @openai/codex via portable npm..."
 "$NPM_CMD" install -g "@openai/codex" --prefix="$STAGE_DIR" 2>&1
 
 # ── 4. Locate native binary and copy to output ──────────────────
-# npm global install on macOS puts packages in lib/node_modules/
-VENDOR_DIR="$STAGE_DIR/lib/node_modules/@openai/codex/node_modules/${CODEX_PKG}/vendor/${VENDOR_TRIPLE}"
+# 2026-05-24 : @openai/codex@0.133+ ships the native binaries via npm-alias
+# optional dependencies (e.g. @openai/codex-darwin-arm64) at the FLAT path
+# `node_modules/@openai/codex-darwin-arm64/...`, not nested under codex/.
+# Layout inside vendor/{triple}/ also changed : `codex/codex` → `bin/codex`
+# and `path/rg` → `codex-path/rg`.
+# Try flat layout first, fall back to legacy nested for older pinned versions.
+VENDOR_DIR=""
+for candidate in \
+    "$STAGE_DIR/lib/node_modules/${CODEX_PKG}/vendor/${VENDOR_TRIPLE}" \
+    "$STAGE_DIR/node_modules/${CODEX_PKG}/vendor/${VENDOR_TRIPLE}" \
+    "$STAGE_DIR/lib/node_modules/@openai/codex/node_modules/${CODEX_PKG}/vendor/${VENDOR_TRIPLE}" \
+    "$STAGE_DIR/node_modules/@openai/codex/node_modules/${CODEX_PKG}/vendor/${VENDOR_TRIPLE}"
+do
+    if [ -d "$candidate" ]; then
+        VENDOR_DIR="$candidate"
+        break
+    fi
+done
 
-# Fallback: some npm versions put globals directly in node_modules/
-if [ ! -d "$VENDOR_DIR" ]; then
-    VENDOR_DIR="$STAGE_DIR/node_modules/@openai/codex/node_modules/${CODEX_PKG}/vendor/${VENDOR_TRIPLE}"
+if [ -z "$VENDOR_DIR" ]; then
+    echo "ERROR: vendor dir not found for ${CODEX_PKG} / ${VENDOR_TRIPLE}"
+    echo "Staging tree under @openai:"
+    find "$STAGE_DIR" -type d -name "codex*" 2>/dev/null || true
+    rm -rf "$STAGE_DIR"
+    exit 1
 fi
 
-NATIVE_BIN="$VENDOR_DIR/codex/codex"
+# New layout (0.133+): bin/codex ; fallback to legacy codex/codex
+NATIVE_BIN="$VENDOR_DIR/bin/codex"
 if [ ! -f "$NATIVE_BIN" ]; then
-    echo "ERROR: Native codex binary not found at $NATIVE_BIN"
-    echo "Searching for codex binary in staging dir..."
-    find "$STAGE_DIR" -name "codex" -type f 2>/dev/null || true
+    NATIVE_BIN="$VENDOR_DIR/codex/codex"
+fi
+if [ ! -f "$NATIVE_BIN" ]; then
+    echo "ERROR: Native codex binary not found in $VENDOR_DIR (tried bin/codex + codex/codex)"
+    find "$VENDOR_DIR" -type f 2>/dev/null || true
     rm -rf "$STAGE_DIR"
     exit 1
 fi
@@ -83,17 +105,20 @@ fi
 # Copy native binary
 cp "$NATIVE_BIN" "$OUT_DIR/codex"
 chmod +x "$OUT_DIR/codex"
-echo "codex binary OK"
+echo "codex binary OK ($NATIVE_BIN)"
 
-# Copy rg from vendor path/ dir
-RG_BIN="$VENDOR_DIR/path/rg"
+# Copy rg — new layout `codex-path/rg`, legacy `path/rg`
+RG_BIN="$VENDOR_DIR/codex-path/rg"
+if [ ! -f "$RG_BIN" ]; then
+    RG_BIN="$VENDOR_DIR/path/rg"
+fi
 if [ -f "$RG_BIN" ]; then
     mkdir -p "$OUT_DIR/path"
     cp "$RG_BIN" "$OUT_DIR/path/rg"
     chmod +x "$OUT_DIR/path/rg"
-    echo "rg binary OK"
+    echo "rg binary OK ($RG_BIN)"
 else
-    echo "WARNING: rg not found at $RG_BIN"
+    echo "WARNING: rg not found in $VENDOR_DIR (tried codex-path/rg + path/rg)"
 fi
 
 # Verify version

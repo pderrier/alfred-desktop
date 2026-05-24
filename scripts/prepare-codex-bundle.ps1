@@ -64,26 +64,48 @@ Write-Host "Installing @openai/codex via portable npm..."
 & $NpmCmd install -g "@openai/codex" --prefix="$StageDir" 2>&1 | Write-Host
 
 # ── 4. Locate native binary and copy to output ──────────────────
-$VendorDir = JP (JP (JP (JP (JP (JP (JP (JP $StageDir "node_modules") "@openai") "codex") "node_modules") "@openai") "codex-win32-x64") "vendor") "x86_64-pc-windows-msvc"
-$NativeBin = JP (JP $VendorDir "codex") "codex.exe"
-if (-not (Test-Path $NativeBin)) {
-    throw "Native codex.exe not found at $NativeBin"
+# 2026-05-24 : @openai/codex@0.133+ ships the native binaries via npm-alias
+# optional dependencies (`@openai/codex-win32-x64`) at the FLAT path
+# `node_modules/@openai/codex-win32-x64/...`, not nested under `codex/`.
+# Layout inside vendor/{triple}/ also changed : `codex/codex.exe` → `bin/codex.exe`
+# and `path/rg.exe` → `codex-path/rg.exe`. Search-based resolution avoids
+# brittleness if the upstream re-shuffles further.
+$VendorDir = JP (JP (JP (JP $StageDir "node_modules") "@openai") "codex-win32-x64") "vendor"
+$TripleDir = JP $VendorDir "x86_64-pc-windows-msvc"
+if (-not (Test-Path $TripleDir)) {
+    Write-Host "Expected triple dir not found at $TripleDir — searching staging tree..." -ForegroundColor Yellow
+    $found = Get-ChildItem -Path $StageDir -Recurse -Filter "codex.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $found) { throw "codex.exe not found anywhere under $StageDir after npm install" }
+    $NativeBin = $found.FullName
+} else {
+    $NativeBin = JP (JP $TripleDir "bin") "codex.exe"
+    if (-not (Test-Path $NativeBin)) {
+        # Pre-0.133 fallback for older pinned versions
+        $LegacyBin = JP (JP $TripleDir "codex") "codex.exe"
+        if (Test-Path $LegacyBin) { $NativeBin = $LegacyBin } else {
+            throw "Native codex.exe not found at $NativeBin or $LegacyBin"
+        }
+    }
 }
 
 # Copy native binary
 Copy-Item $NativeBin -Destination $OutDir
-Write-Host "codex.exe OK" -ForegroundColor Green
+Write-Host "codex.exe OK ($NativeBin)" -ForegroundColor Green
 
-# Copy rg.exe from vendor path/ dir
-$RgBin = JP (JP $VendorDir "path") "rg.exe"
+# Copy rg.exe — new path is `codex-path/rg.exe`, legacy is `path/rg.exe`
+$RgBin = JP (JP $TripleDir "codex-path") "rg.exe"
+if (-not (Test-Path $RgBin)) {
+    $RgLegacy = JP (JP $TripleDir "path") "rg.exe"
+    if (Test-Path $RgLegacy) { $RgBin = $RgLegacy }
+}
 if (Test-Path $RgBin) {
     # Put rg in a path/ subdir matching the vendor layout
     $PathDir = JP $OutDir "path"
     New-Item -ItemType Directory -Force $PathDir | Out-Null
     Copy-Item $RgBin -Destination $PathDir
-    Write-Host "rg.exe OK" -ForegroundColor Green
+    Write-Host "rg.exe OK ($RgBin)" -ForegroundColor Green
 } else {
-    Write-Host "WARNING: rg.exe not found at $RgBin" -ForegroundColor Yellow
+    Write-Host "WARNING: rg.exe not found at $RgBin or legacy path" -ForegroundColor Yellow
 }
 
 # Verify version

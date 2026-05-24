@@ -1,8 +1,55 @@
 # Changelog
 
-## v0.4.1
+## v0.4.2
 
-### What's new
+Consolidated release covering the v0.4.1 home redesign + CSV safety work AND a
+substance pass on analysis quality. v0.4.1 was never tagged ; users on v0.4.0
+move directly to v0.4.2.
+
+### What's new in v0.4.2 (substance pass)
+
+- **Alfred now sees the macro backdrop before reasoning.** Every analysis run
+  starts with a one-shot briefing — US 10-year yield, VIX, EUR/USD, Brent —
+  injected at the top of the synthesis prompt. The synthese_marche output
+  contextualizes the portfolio against the rates / risk / FX / commodities
+  state of the moment, instead of reasoning in a vacuum. The /api/macro
+  endpoint (alfred-api) is cached 30 min, so this costs effectively zero
+  per-run.
+
+- **GICS sector allocation surfaced on the home + line modal.** The GICS
+  classification was always computed but never visible. The home now shows a
+  top-4 sector breakdown ("Tech 42 % · Financials 18 %…"), distinct from the
+  NLP `news_themes` (which remain a separate, complementary signal). Each
+  line modal carries a sector chip.
+
+- **Alfred calibrates conviction against its own track record.** Every line
+  analysis now sees a "CALIBRATION CONVICTION" block reporting the LLM's own
+  per-tier accuracy (forte / moderee / faible). If the "forte" tier has been
+  durably <50 % correct, the prompt instructs Alfred to be humbler on new
+  "forte" calls. Run-scoped cache keeps the disk read once per run.
+
+- **Recommendations carry a target allocation.** Each reco now exposes
+  `target_weight_pct` (the LLM's intended share of the portfolio for this
+  position), `current_weight_pct` (Rust-computed from your actual values),
+  and a colored chip "+3.2 pp" / "-1.5 pp" / "0.0 pp" in the line modal,
+  with a tooltip "cible X % · actuel Y %". A soft validator warning fires
+  when a single line exceeds 30 % (subject to LLM justification in
+  synthese).
+
+- **Delta-only re-analysis is smarter.** Previously, the "refresh synthesis"
+  mode only re-analyzed tickers whose `reanalyse_after` date had expired.
+  Now it also force-triggers on price drift > 5 %, fresh material news,
+  and cold tickers (no signal in last 90 d).
+
+### Robustness
+
+- The home page's signal accuracy section is now backed by a 5-min Rust
+  cache, invalidated at run completion. The 1 MB line-memory file is no
+  longer re-read on every render.
+- `refreshHomeHeader` and `refreshSignalAccuracy` are debounced (5 s and
+  30 s respectively) so live SSE bursts don't thrash the Tauri layer.
+
+### What's new in v0.4.1 (home redesign — never tagged separately)
 
 - **A home page that actually tells you something.** The "Portfolio-wide
   summary" boilerplate is gone. The new home stacks up to eight short
@@ -47,15 +94,11 @@
 - Cold market quotes that previously came back as `null` for fresh
   watchlist tickers now correctly trigger a re-fetch.
 
-### Deferred to a later release
-
-- A long-tail dictionary for cross-portfolio themes powered by an LLM
-  endpoint with caching. The built-in dictionary covers the common cases ;
-  rare slugs fall back to a clean humanised display.
-
 ### Compatibility
 
 - No mandatory upgrade. v0.4.0 desktops keep working.
+- The new /api/macro endpoint requires the v0.4.2 alfred-api deploy
+  (already shipped to production) ; older binaries fall back gracefully.
 - Privacy and authentication unchanged from v0.4.0.
 
 ---

@@ -2,7 +2,9 @@
 //!
 //! Prompt building lives in `llm_prompts.rs`, response parsing in `llm_parsing.rs`.
 
+use std::collections::HashMap;
 use std::env;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -16,7 +18,51 @@ use crate::llm_parsing::{
 };
 use crate::llm_prompts::{build_line_analysis_prompt, build_repair_prompt, build_report_prompt, build_watchlist_prompt};
 use crate::paths::{resolve_report_history_dir, resolve_reports_dir};
+use crate::signal_accuracy::SignalAccuracyStats;
 use crate::storage::read_json_file;
+
+// ── P1-59 follow-up: per-run calibration cache ─────────────────────
+//
+// `generate_line_analysis` is the codex/MCP shim entry point — called
+// once per line, with no batch boundary. Reading and aggregating
+// line-memory.json on every call would be redundant work for a
+// portfolio-level statistic that is constant within a run. We memoize
+// the computed `SignalAccuracyStats` by `run_id` here so the codex path
+// pays the cost exactly once per run (mirroring `flush_batch` in
+// `native_mcp_analysis.rs` which computes once per batch).
+//
+// The cache is intentionally simple: a Mutex<HashMap>. Memory cost is
+// trivial (one struct per run_id, bounded by simultaneous active
+// runs, typically 1). No eviction logic — entries are dropped on
+// process restart; stale entries from finished runs are harmless.
+static CALIBRATION_CACHE: OnceLock<Mutex<HashMap<String, SignalAccuracyStats>>> =
+    OnceLock::new();
+
+fn calibration_cache() -> &'static Mutex<HashMap<String, SignalAccuracyStats>> {
+    CALIBRATION_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn calibration_for_run(run_id: &str) -> Option<SignalAccuracyStats> {
+    if run_id.is_empty() {
+        return None;
+    }
+    if let Ok(guard) = calibration_cache().lock() {
+        if let Some(cached) = guard.get(run_id) {
+            return Some(cached.clone());
+        }
+    }
+    let stats = match crate::signal_accuracy::compute_signal_accuracy() {
+        Ok(s) => s,
+        Err(e) => {
+            crate::debug_log(&format!("[llm] calibration compute failed: {e}"));
+            return None;
+        }
+    };
+    if let Ok(mut guard) = calibration_cache().lock() {
+        guard.insert(run_id.to_string(), stats.clone());
+    }
+    Some(stats)
+}
 
 // ── Mode resolution ────────────────────────────────────────────────
 
@@ -85,12 +131,19 @@ pub fn generate_line_analysis(
     let enriched_context = enrich_line_context_with_sector(line_context, run_id);
     let ctx = &enriched_context;
 
+    // P1-59 follow-up — codex MCP / live shim parity with native.
+    // `calibration_for_run` memoizes the result per run_id so the disk
+    // read + JSON aggregation only happens once per run (matches the
+    // once-per-batch contract the native path enforces in `flush_batch`).
+    let calibration = calibration_for_run(run_id);
+    let calibration_ref = calibration.as_ref();
+
     let mode = resolve_generation_mode();
     match mode.as_str() {
-        "live" => generate_line_live(ctx, run_state, agent_guidelines, validation_context),
-        "codex_proxy" => generate_line_codex(ctx, run_state, agent_guidelines, validation_context),
+        "live" => generate_line_live(ctx, run_state, agent_guidelines, validation_context, calibration_ref),
+        "codex_proxy" => generate_line_codex(ctx, run_state, agent_guidelines, validation_context, calibration_ref),
         "mock_cache" | "mock_past" => generate_line_from_cache(ctx),
-        _ => generate_line_codex(ctx, run_state, agent_guidelines, validation_context),
+        _ => generate_line_codex(ctx, run_state, agent_guidelines, validation_context, calibration_ref),
     }
 }
 
@@ -218,14 +271,15 @@ fn generate_line_live(
     run_state: &Value,
     agent_guidelines: Option<&str>,
     validation_context: Option<&Value>,
+    calibration_stats: Option<&SignalAccuracyStats>,
 ) -> Result<Value> {
     let model = resolve_model();
     let run_id = run_state.get("run_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
     let ticker = line_context.get("ticker").and_then(|v| v.as_str()).unwrap_or_default().to_string();
     let prompt = if is_repair_pass(validation_context) {
-        build_repair_prompt(line_context, run_state, agent_guidelines, validation_context.unwrap())
+        build_repair_prompt(line_context, run_state, agent_guidelines, validation_context.unwrap(), calibration_stats)
     } else {
-        build_line_analysis_prompt(line_context, run_state, agent_guidelines)
+        build_line_analysis_prompt(line_context, run_state, agent_guidelines, calibration_stats)
     };
 
     let progress_fn: Option<Box<dyn Fn(usize, usize) + Send>> =
@@ -425,11 +479,12 @@ fn generate_line_codex(
     run_state: &Value,
     agent_guidelines: Option<&str>,
     validation_context: Option<&Value>,
+    calibration_stats: Option<&SignalAccuracyStats>,
 ) -> Result<Value> {
     let prompt = if is_repair_pass(validation_context) {
-        build_repair_prompt(line_context, run_state, agent_guidelines, validation_context.unwrap())
+        build_repair_prompt(line_context, run_state, agent_guidelines, validation_context.unwrap(), calibration_stats)
     } else {
-        build_line_analysis_prompt(line_context, run_state, agent_guidelines)
+        build_line_analysis_prompt(line_context, run_state, agent_guidelines, calibration_stats)
     };
     let timeout_ms: u64 = env::var("CODEX_PROXY_TIMEOUT_MS")
         .ok()

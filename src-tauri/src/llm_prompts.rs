@@ -216,6 +216,7 @@ pub(crate) fn build_line_analysis_prompt(
     line_context: &Value,
     run_state: &Value,
     agent_guidelines: Option<&str>,
+    calibration_stats: Option<&crate::signal_accuracy::SignalAccuracyStats>,
 ) -> String {
     let portfolio = run_state.get("portfolio").cloned().unwrap_or_else(|| json!({}));
     let guidelines = agent_guidelines.unwrap_or_default();
@@ -240,6 +241,23 @@ pub(crate) fn build_line_analysis_prompt(
     let section_activity = build_activity_section(line_context.get("activity"));
     let section_data_quality = build_data_quality_section(line_context.get("market"));
 
+    // P1-59 follow-up: cross-portfolio conviction calibration block. The
+    // shared `build_conviction_calibration_section` helper renders the
+    // block (`""` under 5 signals or all-empty tiers — see cold-start
+    // cutoff). When the block is empty, we also skip the INSTRUCTIONS
+    // reference sentence to avoid pointing the LLM at a missing section.
+    // Re-uses the same helper as `build_native_line_prompt` to satisfy
+    // BINDING `product_llm_mode_parity_2026_04` — all 3 LLM modes must
+    // see identical calibration rendering.
+    let section_calibration: String = calibration_stats
+        .map(build_conviction_calibration_section)
+        .unwrap_or_default();
+    let calibration_instruction: &str = if section_calibration.is_empty() {
+        ""
+    } else {
+        "\n- Considere la section CALIBRATION CONVICTION ci-dessus quand tu fixes ta conviction (tu ne peux pas etre \"forte\" si ta tier \"forte\" est durablement <50 %)."
+    };
+
     let guidelines_section = if guidelines.is_empty() {
         String::new()
     } else {
@@ -262,6 +280,9 @@ VALEUR ANALYSEE: {nom} ({ticker})
 {section_sector_cot}
 {section_activity}
 {section_memory}
+
+{section_calibration}
+
 {section_technical}
 
 CONTEXTE PORTEFEUILLE:
@@ -329,7 +350,7 @@ DEEP NEWS — process:
 
 - Si donnees marche incompletes, donne plus de poids aux actualites et evenements
 - Si tu changes de signal par rapport au precedent (memoire), explique pourquoi
-- Si donnees insuffisantes: signal = SURVEILLANCE avec explication
+- Si donnees insuffisantes: signal = SURVEILLANCE avec explication{calibration_instruction}
 {mcp_suffix}
 Reponds uniquement en JSON valide."#,
         nom = as_text(line_context.get("row").and_then(|r| r.get("nom")).or(Some(&json!(ticker)))),
@@ -342,6 +363,7 @@ Reponds uniquement en JSON valide."#,
         section_news = section_news,
         section_shared = section_shared,
         section_memory = section_memory,
+        section_calibration = section_calibration,
         section_technical = section_technical,
         total_value = portfolio.get("valeur_totale").and_then(|v| v.as_f64()).unwrap_or(0.0),
         total_gain = portfolio.get("plus_value_totale").and_then(|v| v.as_f64()).unwrap_or(0.0),
@@ -353,6 +375,7 @@ Reponds uniquement en JSON valide."#,
             ""
         },
         mcp_suffix = mcp_suffix,
+        calibration_instruction = calibration_instruction,
     )
 }
 
@@ -887,6 +910,57 @@ pub(crate) fn build_memory_section(memory: Option<&Value>) -> String {
     lines.join("\n")
 }
 
+// ── P1-59: conviction calibration section ────────────────────────
+//
+// Cross-portfolio aggregation of Alfred's own track record, broken
+// down by conviction tier (forte / moderee / faible). Injected into
+// the per-line analysis prompt so the LLM can calibrate the
+// conviction it assigns to new recos against its historical
+// accuracy on each tier.
+//
+// Cold-start cutoff: `total_signals < 5` returns "" — the home
+// retrospective UI uses the same 5-signal threshold (`app.js`
+// section 8) because a sub-5 sample is statistically meaningless.
+//
+// Tiers with `n == 0` are NOT rendered (we don't want
+// "forte: 0/0 correctes (0 %)" cluttering the prompt). All three
+// tiers may still be present in the underlying stats; we filter at
+// render time.
+pub(crate) fn build_conviction_calibration_section(
+    stats: &crate::signal_accuracy::SignalAccuracyStats,
+) -> String {
+    if stats.total_signals < 5 {
+        return String::new();
+    }
+
+    let mut tier_lines: Vec<String> = Vec::new();
+    let mut push_tier = |name: &str, t: &crate::signal_accuracy::ConvictionStats| {
+        if t.n == 0 {
+            return; // skip empty tiers — no "0/0 correctes"
+        }
+        let pct = (t.correct as f64) * 100.0 / (t.n as f64);
+        tier_lines.push(format!(
+            "- {name}: {}/{} correctes ({:.0} %)",
+            t.correct, t.n, pct
+        ));
+    };
+    push_tier("forte", &stats.by_conviction.forte);
+    push_tier("moderee", &stats.by_conviction.moderee);
+    push_tier("faible", &stats.by_conviction.faible);
+
+    if tier_lines.is_empty() {
+        // total_signals >= 5 but no entry carried a valid tiered
+        // conviction (all "high" / empty / typo) — nothing useful to
+        // calibrate against. Render nothing.
+        return String::new();
+    }
+
+    let mut out = String::from("CALIBRATION CONVICTION (ton historique):\n");
+    out.push_str(&tier_lines.join("\n"));
+    out.push_str("\nSi une tier est durablement <50 %, sois plus humble sur ce niveau. Si une tier est >70 %, tu peux la maintenir.");
+    out
+}
+
 // ── Watchlist generation ─────────────────────────────────────────
 //
 // NOTE: `build_watchlist_prompt` is intentionally NOT extended with
@@ -979,6 +1053,7 @@ pub(crate) fn build_repair_prompt(
     run_state: &Value,
     agent_guidelines: Option<&str>,
     validation_context: &Value,
+    calibration_stats: Option<&crate::signal_accuracy::SignalAccuracyStats>,
 ) -> String {
     let portfolio = run_state.get("portfolio").cloned().unwrap_or_else(|| json!({}));
     let guidelines = agent_guidelines.unwrap_or_default();
@@ -989,6 +1064,18 @@ pub(crate) fn build_repair_prompt(
     let section_news = build_news_section(line_context.get("news"));
     let section_memory = build_memory_section(line_context.get("line_memory"));
     let section_technical = build_technical_section(line_context.get("technical_snapshot"));
+
+    // P1-59 follow-up: repair runs after a first-pass validation failure
+    // — calibration matters just as much here, the LLM is re-deciding
+    // conviction. Same helper, same gating (empty under 5 signals).
+    let section_calibration: String = calibration_stats
+        .map(build_conviction_calibration_section)
+        .unwrap_or_default();
+    let calibration_instruction: &str = if section_calibration.is_empty() {
+        ""
+    } else {
+        "\n- Tiens compte de la section CALIBRATION CONVICTION ci-dessus quand tu corriges la conviction (pas \"forte\" si ta tier \"forte\" est durablement <50 %)."
+    };
 
     let issues = validation_context
         .get("validation_issues")
@@ -1018,6 +1105,9 @@ PROBLEMES A CORRIGER: {issues}
 {section_market}
 {section_news}
 {section_memory}
+
+{section_calibration}
+
 {section_technical}
 
 CONTEXTE PORTEFEUILLE:
@@ -1031,7 +1121,7 @@ RECOMMANDATION PRECEDENTE (a ameliorer):
 Regles:
 - Corrige les champs identifies comme defaillants
 - Garde les champs corrects de la recommandation precedente
-- Utilise les donnees fournies (pas de recherche web)
+- Utilise les donnees fournies (pas de recherche web){calibration_instruction}
 
 JSON valide uniquement, cle "recommendation"."#,
         ticker = ticker,
@@ -1040,11 +1130,13 @@ JSON valide uniquement, cle "recommendation"."#,
         section_market = section_market,
         section_news = section_news,
         section_memory = section_memory,
+        section_calibration = section_calibration,
         section_technical = section_technical,
         rec_to_fix = rec_to_fix,
         total_value = portfolio.get("valeur_totale").and_then(|v| v.as_f64()).unwrap_or(0.0),
         total_gain = portfolio.get("plus_value_totale").and_then(|v| v.as_f64()).unwrap_or(0.0),
         cash = portfolio.get("liquidites").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        calibration_instruction = calibration_instruction,
     )
 }
 
@@ -1488,13 +1580,13 @@ mod tests {
         });
 
         // 1. build_line_analysis_prompt (codex MCP)
-        let p_codex = build_line_analysis_prompt(&line_context, &run_state, None);
+        let p_codex = build_line_analysis_prompt(&line_context, &run_state, None, None);
         // 2. build_repair_prompt
         let validation_context = json!({
             "validation_issues": ["synthese_too_short"],
             "recommendation_to_fix": {"ticker": "AAPL", "signal": "ACHAT"}
         });
-        let p_repair = build_repair_prompt(&line_context, &run_state, None, &validation_context);
+        let p_repair = build_repair_prompt(&line_context, &run_state, None, &validation_context, None);
 
         // Every non-empty line of the expected TECHNIQUE section must appear
         // verbatim in each prompt. This is a stricter contract than substring
@@ -1534,6 +1626,367 @@ mod tests {
             assert!(
                 p_native.contains(line),
                 "native prompt missing TECHNIQUE line: {line:?}\n--- prompt ---\n{p_native}"
+            );
+        }
+    }
+
+    // ── P1-59: conviction calibration section ──────────────────
+
+    use crate::signal_accuracy::{
+        ConvictionBreakdown, ConvictionStats, SignalAccuracyStats,
+    };
+
+    fn calibration_fixture(
+        total: usize,
+        forte: (usize, usize),
+        moderee: (usize, usize),
+        faible: (usize, usize),
+    ) -> SignalAccuracyStats {
+        let tier = |c: usize, i: usize| ConvictionStats { correct: c, incorrect: i, n: c + i };
+        SignalAccuracyStats {
+            total_signals: total,
+            correct: forte.0 + moderee.0 + faible.0,
+            incorrect: forte.1 + moderee.1 + faible.1,
+            best_pick: None,
+            worst_pick: None,
+            by_conviction: ConvictionBreakdown {
+                forte: tier(forte.0, forte.1),
+                moderee: tier(moderee.0, moderee.1),
+                faible: tier(faible.0, faible.1),
+            },
+        }
+    }
+
+    #[test]
+    fn build_conviction_calibration_section_renders_fr_block() {
+        // 20 forte (14 correct), 12 moderee (5 correct), 8 faible (2 correct)
+        let stats = calibration_fixture(40, (14, 6), (5, 7), (2, 6));
+        let block = build_conviction_calibration_section(&stats);
+        assert!(block.starts_with("CALIBRATION CONVICTION (ton historique):"));
+        // 14/20 = 70 %, 5/12 ≈ 42 %, 2/8 = 25 %
+        assert!(block.contains("- forte: 14/20 correctes (70 %)"));
+        assert!(block.contains("- moderee: 5/12 correctes (42 %)"));
+        assert!(block.contains("- faible: 2/8 correctes (25 %)"));
+        // FR-tutoiement closing guidance
+        assert!(block.contains("Si une tier est durablement <50 %"));
+        assert!(block.contains(">70 %"));
+    }
+
+    #[test]
+    fn build_conviction_calibration_section_hidden_under_5_signals() {
+        // Cold-start cutoff mirrors the home retrospective UI gate.
+        let stats = calibration_fixture(3, (2, 0), (1, 0), (0, 0));
+        assert_eq!(build_conviction_calibration_section(&stats), "");
+    }
+
+    #[test]
+    fn build_conviction_calibration_section_skips_empty_tiers() {
+        // total=10 (>=5 so block renders), but only `forte` has any
+        // signals. We must NOT render "moderee: 0/0 correctes (0 %)".
+        let stats = calibration_fixture(10, (7, 3), (0, 0), (0, 0));
+        let block = build_conviction_calibration_section(&stats);
+        assert!(block.contains("- forte: 7/10 correctes (70 %)"));
+        assert!(!block.contains("moderee"), "empty moderee tier must not render: {block}");
+        assert!(!block.contains("faible"), "empty faible tier must not render: {block}");
+        // Closing guidance still rendered (block is non-empty).
+        assert!(block.contains("durablement <50 %"));
+    }
+
+    #[test]
+    fn build_conviction_calibration_section_only_invalid_convictions_renders_nothing() {
+        // total >= 5 but no entries carried a valid tier — defensive.
+        let stats = calibration_fixture(8, (0, 0), (0, 0), (0, 0));
+        assert_eq!(
+            build_conviction_calibration_section(&stats),
+            "",
+            "no tiered conviction data => render nothing"
+        );
+    }
+
+    #[test]
+    fn prompt_includes_calibration_block_when_stats_available() {
+        // Confirms the calibration block is wired into
+        // build_native_line_prompt through the line_data envelope.
+        let calibration_envelope = json!({
+            "total_signals": 10,
+            "correct": 7,
+            "incorrect": 3,
+            "accuracy_pct": 70.0,
+            "best_pick": null,
+            "worst_pick": null,
+            "by_conviction": {
+                "forte": {"correct": 5, "incorrect": 1, "n": 6},
+                "moderee": {"correct": 2, "incorrect": 1, "n": 3},
+                "faible": {"correct": 0, "incorrect": 1, "n": 1},
+            }
+        });
+        let line_data = json!({
+            "position": {"nom": "Apple", "ticker": "AAPL", "quantite": 10},
+            "market_data": {"prix_actuel": 150.0},
+            "news": [],
+            "shared_insights": {},
+            "line_memory": {},
+            "quality": {},
+            "technical_snapshot": null,
+            "calibration_stats": calibration_envelope,
+        });
+        let prompt = crate::native_mcp_analysis::build_native_line_prompt(
+            "run_test", "AAPL", "Apple", "position", &line_data,
+        );
+        assert!(
+            prompt.contains("CALIBRATION CONVICTION (ton historique):"),
+            "prompt must include the calibration header.\n--- prompt ---\n{prompt}"
+        );
+        assert!(
+            prompt.contains("- forte: 5/6 correctes (83 %)"),
+            "prompt must include forte tier line.\n--- prompt ---\n{prompt}"
+        );
+        assert!(
+            prompt.contains("- moderee: 2/3 correctes (67 %)"),
+            "prompt must include moderee tier line.\n--- prompt ---\n{prompt}"
+        );
+        assert!(
+            prompt.contains("- faible: 0/1 correctes (0 %)"),
+            "prompt must include faible tier line.\n--- prompt ---\n{prompt}"
+        );
+        // Instruction line wired into === INSTRUCTIONS ===
+        assert!(
+            prompt.contains("Considere la section CALIBRATION CONVICTION"),
+            "INSTRUCTIONS block must reference the calibration section.\n--- prompt ---\n{prompt}"
+        );
+    }
+
+    #[test]
+    fn prompt_omits_calibration_block_when_stats_absent() {
+        // Legacy callers / tests without calibration_stats: builder must
+        // not inject any calibration content.
+        let line_data = json!({
+            "position": {"nom": "Apple", "ticker": "AAPL"},
+            "market_data": {},
+            "news": [],
+            "shared_insights": {},
+            "line_memory": {},
+            "quality": {},
+            "technical_snapshot": null,
+            // no `calibration_stats` key
+        });
+        let prompt = crate::native_mcp_analysis::build_native_line_prompt(
+            "run_test", "AAPL", "Apple", "position", &line_data,
+        );
+        assert!(
+            !prompt.contains("CALIBRATION CONVICTION"),
+            "prompt must NOT include calibration block when stats are absent.\n--- prompt ---\n{prompt}"
+        );
+        // Calibration instruction in === INSTRUCTIONS === is also gated
+        // on data presence — pointing the LLM at a section that does
+        // not exist would be noise.
+        assert!(
+            !prompt.contains("Considere la section CALIBRATION CONVICTION"),
+            "INSTRUCTIONS must not reference calibration when block is empty.\n--- prompt ---\n{prompt}"
+        );
+    }
+
+    // ── P1-59 follow-up: parity for the 2 OTHER line-prompt builders ──
+    //
+    // BINDING `product_llm_mode_parity_2026_04` — all 3 LLM modes must
+    // see identical calibration content. The native builder was wired
+    // in the first P1-59 pass; these tests pin the codex (`build_line_analysis_prompt`)
+    // and repair (`build_repair_prompt`) paths against the same helper.
+
+    fn calibration_line_context() -> Value {
+        json!({
+            "ticker": "AAPL",
+            "row": {"nom": "Apple", "ticker": "AAPL", "quantite": 10},
+            "type": "position",
+            "market": {"prix_actuel": 150.0, "pe_ratio": 25.0, "source": "alphavantage"},
+            "news": {"items": []},
+            "shared_insights": null,
+            "line_memory": {},
+            "sector_cot": null,
+            "activity": null,
+            "technical_snapshot": null,
+        })
+    }
+
+    fn calibration_run_state() -> Value {
+        json!({
+            "portfolio": {"valeur_totale": 100000.0, "liquidites": 5000.0, "plus_value_totale": 1000.0},
+            "run_id": "test-run-p159",
+            "account": "PEA"
+        })
+    }
+
+    #[test]
+    fn line_analysis_prompt_includes_calibration_block_when_stats_available() {
+        // 20 forte (14 correct), 12 moderee (5 correct), 8 faible (2 correct)
+        let stats = calibration_fixture(40, (14, 6), (5, 7), (2, 6));
+        let prompt = build_line_analysis_prompt(
+            &calibration_line_context(),
+            &calibration_run_state(),
+            None,
+            Some(&stats),
+        );
+        assert!(
+            prompt.contains("CALIBRATION CONVICTION (ton historique):"),
+            "codex prompt must include the calibration header.\n--- prompt ---\n{prompt}"
+        );
+        assert!(
+            prompt.contains("- forte: 14/20 correctes (70 %)"),
+            "codex prompt must include forte tier line.\n--- prompt ---\n{prompt}"
+        );
+        assert!(
+            prompt.contains("- moderee: 5/12 correctes (42 %)"),
+            "codex prompt must include moderee tier line.\n--- prompt ---\n{prompt}"
+        );
+        assert!(
+            prompt.contains("- faible: 2/8 correctes (25 %)"),
+            "codex prompt must include faible tier line.\n--- prompt ---\n{prompt}"
+        );
+        // INSTRUCTIONS reference sentence rendered when block is non-empty.
+        assert!(
+            prompt.contains("Considere la section CALIBRATION CONVICTION"),
+            "codex prompt INSTRUCTIONS must reference the calibration section.\n--- prompt ---\n{prompt}"
+        );
+    }
+
+    #[test]
+    fn line_analysis_prompt_omits_calibration_block_when_stats_absent() {
+        // Cold-start / legacy: None must produce no calibration content.
+        let prompt = build_line_analysis_prompt(
+            &calibration_line_context(),
+            &calibration_run_state(),
+            None,
+            None,
+        );
+        assert!(
+            !prompt.contains("CALIBRATION CONVICTION"),
+            "codex prompt must NOT include calibration block when stats are absent.\n--- prompt ---\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("Considere la section CALIBRATION CONVICTION"),
+            "codex prompt INSTRUCTIONS must not reference calibration when block is empty.\n--- prompt ---\n{prompt}"
+        );
+    }
+
+    #[test]
+    fn repair_prompt_includes_calibration_block_when_stats_available() {
+        let stats = calibration_fixture(40, (14, 6), (5, 7), (2, 6));
+        let validation_context = json!({
+            "validation_issues": ["synthese_too_short"],
+            "recommendation_to_fix": {"ticker": "AAPL", "signal": "ACHAT"}
+        });
+        let prompt = build_repair_prompt(
+            &calibration_line_context(),
+            &calibration_run_state(),
+            None,
+            &validation_context,
+            Some(&stats),
+        );
+        assert!(
+            prompt.contains("CALIBRATION CONVICTION (ton historique):"),
+            "repair prompt must include the calibration header.\n--- prompt ---\n{prompt}"
+        );
+        assert!(
+            prompt.contains("- forte: 14/20 correctes (70 %)"),
+            "repair prompt must include forte tier line.\n--- prompt ---\n{prompt}"
+        );
+        // Repair uses a slightly different wording ("Tiens compte"),
+        // mirroring the imperative tone of the repair flow.
+        assert!(
+            prompt.contains("Tiens compte de la section CALIBRATION CONVICTION"),
+            "repair prompt rules must reference the calibration section.\n--- prompt ---\n{prompt}"
+        );
+    }
+
+    #[test]
+    fn repair_prompt_omits_calibration_block_when_stats_absent() {
+        let validation_context = json!({
+            "validation_issues": ["synthese_too_short"],
+            "recommendation_to_fix": {"ticker": "AAPL", "signal": "ACHAT"}
+        });
+        let prompt = build_repair_prompt(
+            &calibration_line_context(),
+            &calibration_run_state(),
+            None,
+            &validation_context,
+            None,
+        );
+        assert!(
+            !prompt.contains("CALIBRATION CONVICTION"),
+            "repair prompt must NOT include calibration block when stats are absent.\n--- prompt ---\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("Tiens compte de la section CALIBRATION CONVICTION"),
+            "repair prompt rules must not reference calibration when block is empty.\n--- prompt ---\n{prompt}"
+        );
+    }
+
+    // ── Cross-builder calibration parity ─────────────────────────
+    //
+    // BINDING `product_llm_mode_parity_2026_04` extension. Pins the
+    // contract that the same SignalAccuracyStats produces the same
+    // CALIBRATION CONVICTION block in all 3 line builders (codex,
+    // native, repair). Catches future regressions where one builder
+    // drifts ahead of the others.
+
+    #[test]
+    fn calibration_block_parity_across_three_builders() {
+        let stats = calibration_fixture(40, (14, 6), (5, 7), (2, 6));
+        let expected_block = build_conviction_calibration_section(&stats);
+        assert!(!expected_block.is_empty(), "fixture must render a non-empty calibration block");
+
+        // 1. codex line prompt
+        let p_codex = build_line_analysis_prompt(
+            &calibration_line_context(),
+            &calibration_run_state(),
+            None,
+            Some(&stats),
+        );
+
+        // 2. repair prompt
+        let validation_context = json!({
+            "validation_issues": ["synthese_too_short"],
+            "recommendation_to_fix": {"ticker": "AAPL", "signal": "ACHAT"}
+        });
+        let p_repair = build_repair_prompt(
+            &calibration_line_context(),
+            &calibration_run_state(),
+            None,
+            &validation_context,
+            Some(&stats),
+        );
+
+        // 3. native line prompt (envelope shape — calibration_stats is
+        // injected as serialized JSON, matching `flush_batch` behavior)
+        let native_line_data = json!({
+            "position": {"nom": "Apple", "ticker": "AAPL", "quantite": 10},
+            "market_data": {"prix_actuel": 150.0},
+            "news": [],
+            "shared_insights": {},
+            "line_memory": {},
+            "quality": {},
+            "technical_snapshot": null,
+            "calibration_stats": crate::signal_accuracy::stats_to_json(&stats),
+        });
+        let p_native = crate::native_mcp_analysis::build_native_line_prompt(
+            "test-run-p159", "AAPL", "Apple", "position", &native_line_data,
+        );
+
+        // Every non-empty line of the expected block must appear verbatim
+        // in each prompt — same contract used by the TECHNIQUE parity test.
+        for line in expected_block.lines() {
+            if line.trim().is_empty() { continue; }
+            assert!(
+                p_codex.contains(line),
+                "codex prompt missing CALIBRATION line: {line:?}\n--- prompt ---\n{p_codex}"
+            );
+            assert!(
+                p_repair.contains(line),
+                "repair prompt missing CALIBRATION line: {line:?}\n--- prompt ---\n{p_repair}"
+            );
+            assert!(
+                p_native.contains(line),
+                "native prompt missing CALIBRATION line: {line:?}\n--- prompt ---\n{p_native}"
             );
         }
     }

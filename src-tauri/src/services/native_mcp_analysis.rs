@@ -311,6 +311,35 @@ pub(crate) fn build_native_line_prompt(_run_id: &str, ticker: &str, nom: &str, l
         line_data.get("technical_snapshot"),
     );
 
+    // P1-59: optional cross-portfolio conviction calibration block,
+    // computed ONCE per run by the dispatcher and threaded through the
+    // line envelope. When absent (legacy callers, tests with empty
+    // history, sub-5 cold start) we render an empty string — the
+    // prompt format string normalises that into a blank line that the
+    // LLM ignores. See `llm_prompts::build_conviction_calibration_section`
+    // for the rendering rules + the cold-start cutoff.
+    let calibration_block: String = line_data
+        .get("calibration_stats")
+        .and_then(|v| v.as_object())
+        .map(|_obj| {
+            // Deserialize the envelope shape back to SignalAccuracyStats
+            // for the renderer. We only need the fields the renderer
+            // reads (total_signals + by_conviction), which keeps this
+            // deserialization cheap and robust to extra keys.
+            let stats = parse_calibration_stats(line_data.get("calibration_stats"));
+            crate::llm_prompts::build_conviction_calibration_section(&stats)
+        })
+        .unwrap_or_default();
+
+    // P1-59 — only reference the calibration block in INSTRUCTIONS
+    // when it actually rendered, otherwise we'd point the LLM at a
+    // section that does not exist in the prompt.
+    let calibration_instruction: &str = if calibration_block.is_empty() {
+        ""
+    } else {
+        "\nConsidere la section CALIBRATION CONVICTION ci-dessus quand tu fixes ta conviction (tu ne peux pas etre \"forte\" si ta tier \"forte\" est durablement <50 %)."
+    };
+
     // Build activity section (recent transactions/orders for this ticker)
     let activity_section = {
         let items = line_data.get("activity").and_then(|v| v.as_array());
@@ -382,6 +411,8 @@ Insights partages:
 
 {memory_block}
 
+{calibration_block}
+
 {section_technical}
 
 Qualite des donnees:
@@ -410,7 +441,7 @@ Reponds UNIQUEMENT avec un objet JSON (pas de texte avant ou apres) contenant :
 - reanalyse_after: date ISO, reanalyse_reason
 
 Si les donnees sont insuffisantes, tu peux faire UNE recherche web (pas plus) pour completer.
-Sois concret: chiffres, montants, dates. Pas de generalites.
+Sois concret: chiffres, montants, dates. Pas de generalites.{calibration_instruction}
 Les articles "RESUME APPROFONDI (cache)" sont deja resumes — utilise-les directement."#,
         ticker = ticker,
         nom = nom,
@@ -420,9 +451,44 @@ Les articles "RESUME APPROFONDI (cache)" sont deja resumes — utilise-les direc
         news = news,
         insights = insights,
         memory_block = memory_block,
+        calibration_block = calibration_block,
+        calibration_instruction = calibration_instruction,
         section_technical = section_technical,
         quality = quality,
     )
+}
+
+/// P1-59 — deserialize the JSON envelope shape produced by
+/// `signal_accuracy::stats_to_json` back into a `SignalAccuracyStats`
+/// for the calibration renderer. We only populate the fields the
+/// renderer reads (`total_signals` + `by_conviction`), leaving the rest
+/// at default — this keeps the parsing trivial and robust to extra
+/// fields the caller may inject for future features.
+fn parse_calibration_stats(
+    value: Option<&Value>,
+) -> crate::signal_accuracy::SignalAccuracyStats {
+    use crate::signal_accuracy::{
+        ConvictionBreakdown, ConvictionStats, SignalAccuracyStats,
+    };
+    let mut stats = SignalAccuracyStats::default();
+    let Some(obj) = value.and_then(|v| v.as_object()) else { return stats; };
+    stats.total_signals = obj.get("total_signals").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+    let read_tier = |tier: &Value| -> ConvictionStats {
+        ConvictionStats {
+            correct: tier.get("correct").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+            incorrect: tier.get("incorrect").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+            n: tier.get("n").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+        }
+    };
+    if let Some(bc) = obj.get("by_conviction").and_then(|v| v.as_object()) {
+        let mut bd = ConvictionBreakdown::default();
+        if let Some(f) = bc.get("forte") { bd.forte = read_tier(f); }
+        if let Some(m) = bc.get("moderee") { bd.moderee = read_tier(m); }
+        if let Some(w) = bc.get("faible") { bd.faible = read_tier(w); }
+        stats.by_conviction = bd;
+    }
+    stats
 }
 
 /// Run a single line analysis with native backend: LLM returns JSON, we validate+persist.
@@ -2279,13 +2345,38 @@ impl McpBatchDispatchQueue {
                 // Native backend: parallel per-line — LLM returns JSON, we validate+persist
                 let dd = std::path::PathBuf::from(&progress_data_dir);
 
-                // Pre-fetch all line data (fast, from cache/disk)
+                // P1-59: compute the cross-portfolio conviction calibration
+                // ONCE per batch. Reading line-memory.json is cheap and only
+                // happens here, not per-line. The serialized envelope is
+                // then injected into each line_data so the per-line prompt
+                // builder can render the CALIBRATION CONVICTION block. A
+                // read failure (fresh install, missing file) is treated as
+                // "no calibration data yet" — `compute_signal_accuracy`
+                // already swallows that as `SignalAccuracyStats::default()`.
+                let calibration_envelope: Value = match crate::signal_accuracy::compute_signal_accuracy() {
+                    Ok(stats) => crate::signal_accuracy::stats_to_json(&stats),
+                    Err(e) => {
+                        crate::debug_log(&format!("[mcp-native] calibration compute failed: {e}"));
+                        Value::Null
+                    }
+                };
+
+                // Pre-fetch all line data (fast, from cache/disk).
+                // P1-59: inject the calibration envelope into each
+                // line_data — the per-line prompt builder reads
+                // `line_data["calibration_stats"]` to render the
+                // CALIBRATION CONVICTION block.
                 let line_data_vec: Vec<(String, String, String, Value)> = tickers.iter().map(|(ticker, nom, line_type)| {
-                    let line_data = crate::mcp_server::dispatch_tool_direct(
+                    let mut line_data = crate::mcp_server::dispatch_tool_direct(
                         &dd,
                         "get_line_data",
                         &serde_json::json!({"run_id": progress_run_id, "line_id": format!("{line_type}:{ticker}")}),
                     );
+                    if !calibration_envelope.is_null() {
+                        if let Some(obj) = line_data.as_object_mut() {
+                            obj.insert("calibration_stats".to_string(), calibration_envelope.clone());
+                        }
+                    }
                     (ticker.clone(), nom.clone(), line_type.clone(), line_data)
                 }).collect();
 

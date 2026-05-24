@@ -40,6 +40,7 @@ import {
   truncate
 } from "/desktop-shell/ui-display-utils.js";
 import { resolveShellRefreshPlan } from "/desktop-shell/refresh-policy.js";
+import { shouldRunRefresh, forceRefreshDebounce } from "/desktop-shell/refresh-debounce.js";
 import { buildGlobalPortfolioSynthesis } from "/desktop-shell/global-portfolio-synthesis.js";
 // P0-20 (2026-05-23) — home backbone v0.4.1
 import { buildCrossAccountThemeView, findConcentrationThemeToTrigger, shouldNotifyConcentration } from "/desktop-shell/report-view-model.js";
@@ -1171,7 +1172,23 @@ function computeHomeSnapshotKey(snapshot) {
 // P2-24 (2026-05-23) — load the retrospective accuracy stats for the
 // home Section 8 ("Rétro-précision Alfred"). Reads line-memory in the
 // Rust side, no network. Section is hidden when total_signals < 5.
+// P2-62 (2026-05-24) — both refresh functions are fired on every
+// `refreshDashboardInner()` call. During a live run, SSE events make
+// that fire repeatedly; without the per-slot debounce guard below, the
+// underlying Tauri commands (`computeSignalAccuracy`, `licenseStatus`,
+// `runsCountLast7d`) thrash. The guard is reset on user-initiated
+// events that must surface fresh data immediately (see the
+// `alfred://upgrade-activated` listener — it busts `home_header`).
+//
+// Intervals are intentionally asymmetric:
+//   - `home_header` (5s): tier + 7d quota count are time-sensitive
+//     (license activations, quota increments) — 5s keeps the strip
+//     responsive without thrashing.
+//   - `signal_accuracy` (30s): portfolio-wide line-memory aggregate
+//     that only changes on run completion ; 30s absorbs SSE bursts
+//     comfortably while still picking up the post-run delta promptly.
 async function refreshSignalAccuracy() {
+  if (!shouldRunRefresh("signal_accuracy", 30000)) return;
   signalAccuracy = { status: "loading", data: null, error: null };
   try {
     const data = await bridge.computeSignalAccuracy();
@@ -1187,6 +1204,7 @@ async function refreshSignalAccuracy() {
 }
 
 async function refreshHomeHeader() {
+  if (!shouldRunRefresh("home_header", 5000)) return;
   homeHeader = { status: "loading", data: null, error: null };
   renderWelcome();
 
@@ -1280,10 +1298,14 @@ async function refreshDashboardInner() {
   scheduleGlobalHomeSynthesis(snapshot);
   // P0-20 — refresh the tier+quota header strip on every dashboard
   // refresh. Reuses the 60s memoisation in quota-local-counter to
-  // avoid extra Tauri calls when the snapshot churns.
+  // avoid extra Tauri calls when the snapshot churns. P2-62 added a
+  // per-slot 5s debounce inside the function itself, so SSE-driven
+  // dashboard churn no longer thrashes `licenseStatus` / `runsCountLast7d`.
   refreshHomeHeader();
   // P2-24 — fire-and-forget refresh of the retrospective accuracy
-  // stats. Loaded once at mount time, fast enough not to debounce.
+  // stats. P2-62 (2026-05-24): the inner function debounces itself to
+  // ≥5s so live-run SSE churn doesn't re-run `computeSignalAccuracy`
+  // on every event.
   refreshSignalAccuracy();
 
   // Keep live run context up to date with positions (for enriching done rows)
@@ -1753,6 +1775,12 @@ if (typeof window !== "undefined") {
     // one-shot modal guard also resets here (cleared automatically
     // when status flips back to healthy).
     refreshHealthPill().catch(() => { /* health refresh is best-effort */ });
+    // P2-62 (2026-05-24) — bypass the home-header debounce so the
+    // tier flips from "free" to "premium" on the next dashboard
+    // refresh instead of waiting up to 5s. Also reset the quota cache
+    // since the rolling-7d gate no longer applies.
+    forceRefreshDebounce("home_header");
+    resetLocalQuotaCache();
   });
 }
 

@@ -41,6 +41,11 @@ move directly to v0.4.2.
   Now it also force-triggers on price drift > 5 %, fresh material news,
   and cold tickers (no signal in last 90 d).
 
+- **Macro context visible on the home page.** A one-liner tile —
+  10-year US yield, VIX with regime label, EUR/USD, Brent — sits between
+  your sector allocation and the upcoming catalysts. Refreshed every
+  5 minutes locally on top of the 30-minute server cache.
+
 ### Robustness
 
 - The home page's signal accuracy section is now backed by a 5-min Rust
@@ -48,6 +53,12 @@ move directly to v0.4.2.
   longer re-read on every render.
 - `refreshHomeHeader` and `refreshSignalAccuracy` are debounced (5 s and
   30 s respectively) so live SSE bursts don't thrash the Tauri layer.
+- Five home / admin features that were silently swallowing
+  `bridge_payload_invalid` errors in v0.4.1 — the quota counter, the
+  retrospective accuracy section, the Admin tab visibility probe, and
+  the Admin tab usage / VPS-stats panels — now render correctly. The
+  action-name whitelist on the JS bridge had drifted from the Rust
+  emitter side ; both are pinned by a new contract test suite.
 
 ### What's new in v0.4.1 (home redesign — never tagged separately)
 

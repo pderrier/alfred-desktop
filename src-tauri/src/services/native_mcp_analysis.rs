@@ -2333,7 +2333,46 @@ impl McpBatchDispatchQueue {
         for flag in &self.relay_stop_flags {
             flag.store(true, Ordering::Relaxed);
         }
+
+        // P2-63 (2026-05-24) — invalidate the home Section 8 signal-accuracy
+        // TTL cache. All `sync_line_memory` writes for this run originate from
+        // per-line threads dispatched by `flush_batch`; by the time `join_all`
+        // returns, every successful ticker has rewritten `line-memory.json`
+        // (synchronously, before the worker thread send() back on `result_rx`).
+        // This is the single deterministic moment when the file has stabilised
+        // for the entire portfolio — so home reads issued in the next 5 min
+        // (cache TTL) will now see fresh stats instead of the pre-run snapshot.
+        //
+        // Gated on `!completed_tickers.is_empty()`: if every batch failed,
+        // line-memory.json was not mutated and the cached value is still
+        // accurate — invalidating would force a pointless re-read.
+        if !self.completed_tickers.is_empty() {
+            crate::signal_accuracy::invalidate_signal_accuracy_cache();
+        }
+
         Ok(self.completed_tickers.clone())
+    }
+
+    /// Test-only constructor that bypasses `Self::new` (which would touch
+    /// codex MCP config when the codex backend is active) and lets a unit
+    /// test seed `completed_tickers` directly. Used by the P2-63 wiring
+    /// test in this file's `#[cfg(test)] mod tests` block.
+    #[cfg(test)]
+    fn for_test(seed_completed: Vec<String>) -> Self {
+        let (result_tx, result_rx) = mpsc::channel();
+        Self {
+            run_id: "test-run".to_string(),
+            data_dir: std::env::temp_dir()
+                .to_string_lossy()
+                .to_string(),
+            batch_size: 1,
+            pending: Vec::new(),
+            result_tx,
+            result_rx,
+            active_batches: 0,
+            completed_tickers: seed_completed,
+            relay_stop_flags: Vec::new(),
+        }
     }
 
     fn flush_batch(&mut self) -> Result<()> {
@@ -3092,5 +3131,150 @@ pub fn maybe_run_zero_price_repair_at_startup() {
                 "maybe_run_zero_price_repair_at_startup: failed, will retry on next launch: {e}"
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── P2-63 (2026-05-24) — Pin the wiring between `join_all` returning
+    // with at least one completed ticker and the signal-accuracy TTL cache
+    // being invalidated.
+    //
+    // The full path under test:
+    //   1. Seed `compute_signal_accuracy()` cache with a known
+    //      `SignalAccuracyStats` (1 signal).
+    //   2. Write a different `line-memory.json` to disk (5 signals).
+    //   3. Call `McpBatchDispatchQueue::join_all` — the unit under test.
+    //      With `active_batches=0` and `completed_tickers=["X"]` seeded,
+    //      the function short-circuits the recv loop and goes straight to
+    //      the tail (final merge + relay-flag flip + invalidation hook).
+    //   4. Assert the NEXT `compute_signal_accuracy()` call returns the
+    //      NEW 5-signal stats (i.e. the cache was actually dropped).
+    //
+    // Pairs with `services/signal_accuracy.rs::cache_recomputes_after_invalidate`
+    // which pins the same property at the cache layer; this test pins the
+    // CALL SITE.
+
+    fn unique_state_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "alfred-p2-63-wiring-{tag}-{}-{}",
+            crate::now_epoch_ms(),
+            std::process::id()
+        ))
+    }
+
+    fn write_line_memory_with_n_correct(dir: &std::path::Path, n: usize) {
+        std::fs::create_dir_all(dir).expect("create state dir");
+        let mut by_ticker = serde_json::Map::new();
+        // Shape mirrors `signal_accuracy::tests::entry`: the aggregator
+        // counts a ticker as "scored" iff `price_tracking.signal_accuracy`
+        // is exactly `"correct"` or `"incorrect"`.
+        for i in 0..n {
+            by_ticker.insert(
+                format!("WIRE_T{i}"),
+                json!({
+                    "price_tracking": {
+                        "last_signal": "ACHAT",
+                        "signal_accuracy": "correct",
+                        "return_since_signal_pct": 5.0,
+                        "current_price": 100.0,
+                        "price_at_signal": 100.0,
+                    }
+                }),
+            );
+        }
+        let store = json!({ "by_ticker": by_ticker });
+        std::fs::write(
+            dir.join("line-memory.json"),
+            serde_json::to_string(&store).unwrap(),
+        )
+        .expect("write line-memory.json");
+    }
+
+    #[test]
+    fn join_all_invalidates_signal_accuracy_cache_when_tickers_completed() {
+        let _guard = crate::helpers::test_env_lock();
+        crate::signal_accuracy::invalidate_signal_accuracy_cache();
+
+        let base = unique_state_dir("invalidate");
+        std::env::set_var("ALFRED_STATE_DIR", base.as_os_str());
+
+        // 1. Seed cache with 1 signal.
+        write_line_memory_with_n_correct(&base, 1);
+        let before = crate::signal_accuracy::compute_signal_accuracy()
+            .expect("populate cache");
+        assert_eq!(before.total_signals, 1, "preconditions: cache holds 1");
+
+        // 2. Rewrite the file to 5 signals (no invalidate yet).
+        write_line_memory_with_n_correct(&base, 5);
+        let cached = crate::signal_accuracy::compute_signal_accuracy()
+            .expect("read still-cached value");
+        assert_eq!(
+            cached.total_signals, 1,
+            "preconditions: cache still serves the OLD value before join_all"
+        );
+
+        // 3. Run the unit under test — `join_all` with one completed
+        //    ticker. `active_batches` is 0 so it falls straight to the
+        //    tail block (where the invalidation lives).
+        let mut q = McpBatchDispatchQueue::for_test(vec!["WIRE_T0".to_string()]);
+        let completed = q.join_all().expect("join_all ok");
+        assert_eq!(completed, vec!["WIRE_T0".to_string()]);
+
+        // 4. Cache must now reflect the on-disk 5-signal state.
+        let after = crate::signal_accuracy::compute_signal_accuracy()
+            .expect("read after join_all");
+        assert_eq!(
+            after.total_signals, 5,
+            "join_all must invalidate the signal-accuracy cache when \
+             completed_tickers is non-empty"
+        );
+
+        // Cleanup
+        crate::signal_accuracy::invalidate_signal_accuracy_cache();
+        std::env::remove_var("ALFRED_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn join_all_preserves_cache_when_no_tickers_completed() {
+        // Symmetric guard: a run where every batch failed (no completed
+        // tickers) MUST NOT invalidate — the on-disk file wasn't touched
+        // and invalidating would just force a pointless re-read.
+        let _guard = crate::helpers::test_env_lock();
+        crate::signal_accuracy::invalidate_signal_accuracy_cache();
+
+        let base = unique_state_dir("preserve");
+        std::env::set_var("ALFRED_STATE_DIR", base.as_os_str());
+
+        write_line_memory_with_n_correct(&base, 2);
+        let before = crate::signal_accuracy::compute_signal_accuracy()
+            .expect("populate cache");
+        assert_eq!(before.total_signals, 2);
+
+        // Rewrite file to 9 signals — cache still serves OLD (2) because
+        // no invalidate happened yet.
+        write_line_memory_with_n_correct(&base, 9);
+
+        // join_all with EMPTY completed_tickers — the invalidation branch
+        // must NOT fire.
+        let mut q = McpBatchDispatchQueue::for_test(Vec::new());
+        let completed = q.join_all().expect("join_all ok");
+        assert!(completed.is_empty(), "no completed tickers expected");
+
+        // Cache should still hold the OLD value.
+        let after = crate::signal_accuracy::compute_signal_accuracy()
+            .expect("read after empty join_all");
+        assert_eq!(
+            after.total_signals, 2,
+            "join_all with zero completed tickers must NOT invalidate the cache"
+        );
+
+        // Cleanup
+        crate::signal_accuracy::invalidate_signal_accuracy_cache();
+        std::env::remove_var("ALFRED_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

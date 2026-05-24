@@ -19,8 +19,54 @@
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::fs;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::paths::resolve_runtime_state_dir;
+
+// ── P2-63 (2026-05-24) — time-based cache for `compute_signal_accuracy` ─
+//
+// The aggregator reads + parses `line-memory.json` (~1MB in production)
+// every time it's called. Three call sites hit it (`command_handlers.rs`
+// `run_compute_signal_accuracy` on home render, `llm.rs` per-run
+// calibration, `native_mcp_analysis.rs` `flush_batch` per LLM batch) and
+// the underlying file is only mutated at the end of a run — so a short
+// TTL memo trades zero correctness for a guaranteed disk-read cap.
+//
+// Pattern mirrors `llm.rs:38-65` (OnceLock<Mutex<…>>) but the cache key
+// is TIME, not run_id — the stat is portfolio-level and rolls over
+// implicitly when the next run rewrites the file (combined with the
+// explicit `invalidate_signal_accuracy_cache()` hook for callers that
+// know the file just changed).
+const SIGNAL_ACCURACY_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+static SIGNAL_ACCURACY_CACHE: OnceLock<Mutex<Option<(Instant, SignalAccuracyStats)>>> =
+    OnceLock::new();
+
+fn signal_accuracy_cache() -> &'static Mutex<Option<(Instant, SignalAccuracyStats)>> {
+    SIGNAL_ACCURACY_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// Invalidate the in-process cache. Safe to call from any thread.
+/// Called at the end of `McpBatchDispatchQueue::join_all` (the single
+/// deterministic moment when a run has finished writing
+/// `line-memory.json` for the whole portfolio — see
+/// `services/native_mcp_analysis.rs::McpBatchDispatchQueue::join_all`)
+/// and exercised by tests.
+pub fn invalidate_signal_accuracy_cache() {
+    if let Ok(mut guard) = signal_accuracy_cache().lock() {
+        *guard = None;
+    }
+}
+
+/// Test-only helper to poke the cache slot with an arbitrary `Instant`.
+/// Used to simulate TTL expiry deterministically without `thread::sleep`.
+#[cfg(test)]
+pub(crate) fn set_cache_slot_for_test(at: Instant, stats: SignalAccuracyStats) {
+    if let Ok(mut guard) = signal_accuracy_cache().lock() {
+        *guard = Some((at, stats));
+    }
+}
 
 #[derive(Debug, Clone)]
 struct Pick {
@@ -85,7 +131,33 @@ fn normalize_conviction(raw: &str) -> Option<&'static str> {
 }
 
 /// Read the line-memory file and aggregate accuracy across all tickers.
+///
+/// Cached for `SIGNAL_ACCURACY_CACHE_TTL` (5 min). The cache is purely
+/// in-process; the returned `SignalAccuracyStats` is cloned per call so
+/// callers may freely mutate it. Use `invalidate_signal_accuracy_cache()`
+/// to force a re-read (e.g. after a run completes and rewrites the file).
 pub fn compute_signal_accuracy() -> Result<SignalAccuracyStats> {
+    // Fast path — return cached value if fresh.
+    if let Ok(guard) = signal_accuracy_cache().lock() {
+        if let Some((computed_at, ref stats)) = *guard {
+            if computed_at.elapsed() < SIGNAL_ACCURACY_CACHE_TTL {
+                return Ok(stats.clone());
+            }
+        }
+    }
+
+    // Cold path — recompute, cache, return.
+    let stats = compute_signal_accuracy_uncached()?;
+    if let Ok(mut guard) = signal_accuracy_cache().lock() {
+        *guard = Some((Instant::now(), stats.clone()));
+    }
+    Ok(stats)
+}
+
+/// Uncached aggregator — exposed for tests and any caller that
+/// explicitly does not want to populate or read the TTL cache. Performs
+/// the disk read + JSON parse + aggregation unconditionally.
+pub(crate) fn compute_signal_accuracy_uncached() -> Result<SignalAccuracyStats> {
     let path = resolve_runtime_state_dir().join("line-memory.json");
     if !path.exists() {
         return Ok(SignalAccuracyStats::default());
@@ -427,6 +499,187 @@ mod tests {
         assert_eq!(by_conv["moderee"]["correct"], 0);
         assert_eq!(by_conv["moderee"]["incorrect"], 0);
         assert_eq!(by_conv["faible"]["n"], 0);
+    }
+
+    // ── P2-63: TTL cache layer ─────────────────────────────────────
+    //
+    // All tests below mutate `ALFRED_STATE_DIR` AND the process-global
+    // cache slot. Env vars are process-wide and the cache is a static
+    // `OnceLock`, so we must serialize against ALL other env-mutating
+    // tests in the crate. We reuse the canonical `helpers::test_env_lock`
+    // for that (same lock other modules use — see `tests.rs::env_lock`,
+    // `llm_prompts.rs` test calls).
+
+    fn unique_state_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "alfred-signal-accuracy-cache-{tag}-{}-{}",
+            crate::now_epoch_ms(),
+            std::process::id()
+        ))
+    }
+
+    /// Write a minimal `line-memory.json` with N correct entries.
+    fn write_line_memory(dir: &std::path::Path, correct_n: usize) {
+        std::fs::create_dir_all(dir).expect("create state dir");
+        let mut by_ticker = serde_json::Map::new();
+        for i in 0..correct_n {
+            by_ticker.insert(format!("T{i}"), entry("ACHAT", "correct", 5.0));
+        }
+        let store = json!({ "by_ticker": by_ticker });
+        std::fs::write(
+            dir.join("line-memory.json"),
+            serde_json::to_string(&store).unwrap(),
+        )
+        .expect("write line-memory.json");
+    }
+
+    #[test]
+    fn cache_returns_first_call_fresh_within_ttl() {
+        let _guard = crate::helpers::test_env_lock();
+        invalidate_signal_accuracy_cache();
+        let base = unique_state_dir("fresh");
+        std::env::set_var("ALFRED_STATE_DIR", base.as_os_str());
+
+        write_line_memory(&base, 3);
+
+        // First call: cold path — populates cache from the file.
+        let first = compute_signal_accuracy().expect("first call ok");
+        assert_eq!(first.total_signals, 3);
+        assert_eq!(first.correct, 3);
+
+        // Delete the file. If the cache is honored, the second call
+        // must STILL return the cached value (no disk read).
+        std::fs::remove_file(base.join("line-memory.json")).expect("delete file");
+        let second = compute_signal_accuracy().expect("second call ok");
+        assert_eq!(second.total_signals, 3, "cached value must be returned");
+        assert_eq!(second.correct, 3);
+
+        // Cleanup
+        invalidate_signal_accuracy_cache();
+        std::env::remove_var("ALFRED_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cache_recomputes_after_invalidate() {
+        let _guard = crate::helpers::test_env_lock();
+        invalidate_signal_accuracy_cache();
+        let base = unique_state_dir("invalidate");
+        std::env::set_var("ALFRED_STATE_DIR", base.as_os_str());
+
+        write_line_memory(&base, 2);
+        let first = compute_signal_accuracy().expect("first call ok");
+        assert_eq!(first.total_signals, 2);
+
+        // Mutate the underlying file and invalidate — next call must
+        // observe the new value (uncached read).
+        write_line_memory(&base, 5);
+        invalidate_signal_accuracy_cache();
+        let after = compute_signal_accuracy().expect("after invalidate ok");
+        assert_eq!(after.total_signals, 5, "invalidate must force re-read");
+
+        // Cleanup
+        invalidate_signal_accuracy_cache();
+        std::env::remove_var("ALFRED_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cache_recomputes_after_ttl_expiry() {
+        let _guard = crate::helpers::test_env_lock();
+        invalidate_signal_accuracy_cache();
+        let base = unique_state_dir("ttl");
+        std::env::set_var("ALFRED_STATE_DIR", base.as_os_str());
+
+        // File holds 7 signals, but we poke the cache with a STALE entry
+        // (10 minutes old, total_signals=1). The TTL is 5min so the
+        // cached value must be treated as expired and the file re-read.
+        write_line_memory(&base, 7);
+        let stale_stats = SignalAccuracyStats {
+            total_signals: 1,
+            correct: 1,
+            ..Default::default()
+        };
+        let stale_at = Instant::now()
+            .checked_sub(Duration::from_secs(10 * 60))
+            .expect("instant minus 10min");
+        set_cache_slot_for_test(stale_at, stale_stats);
+
+        let stats = compute_signal_accuracy().expect("ok");
+        assert_eq!(
+            stats.total_signals, 7,
+            "stale cache (>TTL) must be discarded and recomputed from disk"
+        );
+
+        // Cleanup
+        invalidate_signal_accuracy_cache();
+        std::env::remove_var("ALFRED_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cache_within_ttl_short_age_is_honored() {
+        // Complement to `recomputes_after_ttl_expiry`: a cache slot with
+        // an Instant that's WITHIN the TTL window must be honored even if
+        // the file would yield a different value. Anchors the boundary.
+        let _guard = crate::helpers::test_env_lock();
+        invalidate_signal_accuracy_cache();
+        let base = unique_state_dir("ttl-fresh");
+        std::env::set_var("ALFRED_STATE_DIR", base.as_os_str());
+
+        write_line_memory(&base, 99);
+        let cached_stats = SignalAccuracyStats {
+            total_signals: 42,
+            correct: 42,
+            ..Default::default()
+        };
+        // 1 second old — well within the 5-minute TTL.
+        set_cache_slot_for_test(Instant::now(), cached_stats);
+
+        let stats = compute_signal_accuracy().expect("ok");
+        assert_eq!(
+            stats.total_signals, 42,
+            "fresh cache (< TTL) must be returned, NOT re-read from disk"
+        );
+
+        // Cleanup
+        invalidate_signal_accuracy_cache();
+        std::env::remove_var("ALFRED_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn concurrent_callers_serialize_no_deadlock() {
+        let _guard = crate::helpers::test_env_lock();
+        invalidate_signal_accuracy_cache();
+        let base = unique_state_dir("concurrent");
+        std::env::set_var("ALFRED_STATE_DIR", base.as_os_str());
+        write_line_memory(&base, 4);
+
+        let start = Instant::now();
+        let h1 = std::thread::spawn(|| compute_signal_accuracy());
+        let h2 = std::thread::spawn(|| compute_signal_accuracy());
+        let r1 = h1.join().expect("thread 1 panic").expect("thread 1 ok");
+        let r2 = h2.join().expect("thread 2 panic").expect("thread 2 ok");
+        let elapsed = start.elapsed();
+
+        assert_eq!(r1.total_signals, 4);
+        assert_eq!(r2.total_signals, 4);
+        assert!(
+            elapsed < Duration::from_millis(2_000),
+            "two concurrent callers must not deadlock; took {:?}",
+            elapsed
+        );
+
+        // Cleanup
+        invalidate_signal_accuracy_cache();
+        std::env::remove_var("ALFRED_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn default_ttl_is_5_minutes() {
+        assert_eq!(SIGNAL_ACCURACY_CACHE_TTL, Duration::from_secs(300));
     }
 
     #[test]

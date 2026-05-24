@@ -10,6 +10,7 @@ import {
 import { buildRunAnalysisOptions } from "/desktop-shell/report-view-model.js";
 import { formatBridgeError, isErrorCritical, extractErrorCode } from "/shared/run-operations-controller.js";
 import { openCashMatchingWizard, openChatWizard } from "/desktop-shell/app-chat-wizard.js";
+import { openCsvConfirmModal } from "/desktop-shell/app-csv-confirm-modal.js";
 import { openDiscussionHistoryModal, buildDiscussionGuidance } from "/desktop-shell/discussion-memory.js";
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -447,10 +448,20 @@ ${insight}` : insight;
       const mergedGuidelines = [guidelines, discussionGuidance].filter(Boolean).join("\n\n");
       const analysisMode = wizardAnalysisModeNode?.value || "full_run";
 
-      // ── CSV preview + chat confirmation flow ─────────────────────
-      // For CSV text imports, preview the parsing before committing.
-      // If transaction history is detected with warnings or unknown format,
-      // open the chat wizard for user confirmation.
+      // ── CSV preview + confirm-modal flow (P0-77b v0.4.4) ───────────
+      //
+      // For CSV text imports, preview the parsing first. The wizard then
+      // splits on two paths:
+      //   - `format === "unknown"`: the parser couldn't identify the
+      //     CSV at all. Free-text help is the right tool here, so we
+      //     keep the chat-wizard for this case.
+      //   - any other path: open the structured confirm modal. The
+      //     modal lets the user accept historical suggestions, mark
+      //     parts-sociales as cash-equivalent, supply a manual ISIN or
+      //     skip enrichment for individual lines. Confirmed corrections
+      //     are funnelled through `csv_import_apply_corrections_local`
+      //     to produce the `uploaded_snapshot` passed to the run.
+      let csvUploadedSnapshot = null;
       if (source === "csv" && (wizardCsvTextNode?.value || "").trim()) {
         try {
           const tauriInvoke = window?.__TAURI__?.core?.invoke;
@@ -463,50 +474,15 @@ ${insight}` : insight;
             if (preview && preview.preview) {
               const format = preview.detected_format || "unknown";
               const previewSource = preview.source || "llm";
-              const confidence = preview.confidence || "high";
-              const warnings = Array.isArray(preview.warnings) ? preview.warnings : [];
               const positions = Array.isArray(preview.positions) ? preview.positions : [];
               const stats = preview.stats || {};
               const posCount = positions.length;
-              // P1-56 visibility — surface parser-level findings (price
-              // outliers, malformed ISINs) and generic tickers at risk for
-              // the P0-55 enrichment-skip guard. Both signals come from
-              // the Rust preview pipeline; we promote them into the
-              // wizard's `warnings` array and trigger the chat wizard
-              // even on high-confidence parses so the user can review
-              // BEFORE the LLM analysis burns through tokens.
-              const parsingIssues = Array.isArray(preview.csv_parsing_issues)
-                ? preview.csv_parsing_issues : [];
-              const genericAtRisk = Array.isArray(preview.generic_tickers_at_risk)
-                ? preview.generic_tickers_at_risk : [];
-              for (const issue of parsingIssues) {
-                const reason = issue?.reason || "issue";
-                const nom = issue?.nom || issue?.ticker || "?";
-                const isinFmt = issue?.isin ? ` (ISIN ${issue.isin})` : "";
-                if (reason === "price_outlier_suspect") {
-                  const unit = issue?.implied_unit_price;
-                  warnings.push(`Prix unitaire suspect sur ${nom}${isinFmt} — ${unit?.toFixed(2) || "?"} €/unité`);
-                } else if (reason === "malformed_isin") {
-                  warnings.push(`ISIN mal formé pour ${nom}${isinFmt}`);
-                } else {
-                  warnings.push(`Anomalie CSV (${reason}) sur ${nom}${isinFmt}`);
-                }
-              }
-              if (genericAtRisk.length > 0) {
-                const names = genericAtRisk.slice(0, 5).map(g => g?.nom || g?.ticker).join(", ");
-                const more = genericAtRisk.length > 5 ? ` (+${genericAtRisk.length - 5} autres)` : "";
-                warnings.push(`${genericAtRisk.length} ticker(s) génériques sans résolution ISIN (enrichissement désactivé pour ces lignes) : ${names}${more}`);
-              }
-              const hasParsingFindings = parsingIssues.length > 0 || genericAtRisk.length > 0;
-              const needsChat = preview.needs_chat_confirmation
-                || confidence === "low"
-                || hasParsingFindings;
+              const reviewItems = Array.isArray(preview.positions_needing_review)
+                ? preview.positions_needing_review : [];
 
-              // Show source-aware status message
+              // Status banner — same shape as before, kept consistent.
               if (previewSource === "cache" && posCount > 0) {
-                const label = format === "transaction_history"
-                  ? `Recognized format -- ${posCount} position(s)`
-                  : `Recognized format -- ${posCount} position(s)`;
+                const label = `Recognized format -- ${posCount} position(s)`;
                 setWizardStatus(label, "status-success");
                 showToast(label, "success");
               } else if (previewSource === "llm" && posCount > 0) {
@@ -514,88 +490,51 @@ ${insight}` : insight;
                   ? `Format analyzed by AI -- ${posCount} position(s) from ${stats.total_trades || "?"} trades`
                   : `Format analyzed by AI -- ${posCount} position(s)`;
                 setWizardStatus(label, "status-success");
-                showToast(label, warnings.length > 0 ? "warning" : "success");
+                showToast(label, reviewItems.length > 0 ? "warning" : "success");
               }
 
-              // Low confidence, unknown format, or any parsing finding →
-              // open chat wizard for confirmation. We always show BOTH
-              // the green-light items (what went well) and the warnings
-              // so Alfred doesn't feel like he only complains. The
-              // chat-wizard message is the primary visibility surface
-              // until the dedicated modal lands (P1-56 v2).
-              if (needsChat) {
-                setWizardStatus("Waiting for CSV confirmation...", "status-loading");
-                const posTable = positions.map(p => {
-                  const t = p.ticker || "?";
-                  const q = (p.quantite || 0).toFixed(2);
-                  const c = (p.prix_revient || 0).toFixed(2);
-                  return `  ${t}: ${q} shares @ ${c} EUR avg cost`;
-                }).join("\n");
-
-                // P1-56 "balanced view" — collect the green-light items
-                // (broker recognised, format parsed cleanly, ISIN OK,
-                // etc.) so the user sees what's working alongside any
-                // warnings. Pierre's directive: never look like Alfred
-                // only complains.
-                const goodNews = [];
-                if (preview.detected_broker && preview.detected_broker !== "AI-detected") {
-                  goodNews.push(`Format reconnu : ${preview.detected_broker} (${format})`);
-                } else if (previewSource === "cache") {
-                  goodNews.push(`Format ${format} reconnu depuis le cache (parser stable)`);
-                } else if (previewSource === "llm" && confidence === "high") {
-                  goodNews.push(`Format ${format} analysé par l'IA avec confiance élevée`);
-                }
-                if (posCount > 0) {
-                  goodNews.push(`${posCount} position(s) parsée(s) avec succès`);
-                }
-                const cleanRows = posCount - parsingIssues.length - genericAtRisk.length;
-                if (cleanRows > 0 && (parsingIssues.length > 0 || genericAtRisk.length > 0)) {
-                  goodNews.push(`${cleanRows} ligne(s) sans anomalie — l'analyse complète portera dessus`);
-                }
-                if (parsingIssues.length === 0) {
-                  goodNews.push("Aucun outlier de prix ni ISIN mal formé détecté");
-                }
-                if (genericAtRisk.length === 0 && posCount > 0) {
-                  goodNews.push("Tous les tickers sont assez spécifiques pour la résolution ISIN");
-                }
-                if (typeof stats.valeur_totale === "number" && stats.valeur_totale > 0) {
-                  goodNews.push(`Valeur totale lue : ${stats.valeur_totale.toFixed(2)} €`);
-                }
-
-                const goodText = goodNews.length > 0
-                  ? "\n\nCe qui va bien :\n" + goodNews.map(g => `  ✓ ${g}`).join("\n")
-                  : "";
-                const warnText = warnings.length > 0
-                  ? "\n\nCe qui mérite ton attention :\n" + warnings.map(w => `  ⚠ ${w}`).join("\n")
-                  : "";
+              if (format === "unknown") {
+                // Unknown format — free-text help is the right tool. Keep
+                // the chat wizard for this narrow case.
+                setWizardStatus("Waiting for CSV format identification...", "status-loading");
                 const headerList = (preview.headers || []).map((h, i) => `  [${i}] ${h}`).join("\n");
-
-                const systemContext = format === "unknown"
-                  ? `You are helping the user import a CSV file into their portfolio tracker. The format could not be automatically detected. Here are the headers and first rows:\n\nHeaders:\n${headerList}\n\nSample data:\n${(preview.sample_rows || []).slice(0, 3).map((row, i) => "  Row " + (i + 1) + ": " + row.join(" | ")).join("\n")}\n\nHelp the user understand what format this is. If they confirm, the import will proceed.`
-                  : `You are helping the user validate a CSV import. The CSV was detected as a ${format}. AI confidence: ${confidence}. Here is the parsed preview:\n\nPositions (${posCount}):\n${posTable}${goodText}${warnText}\n\nStats: ${JSON.stringify(stats)}\n\nHeaders: ${JSON.stringify(preview.headers || [])}\nSample rows: ${JSON.stringify((preview.sample_rows || []).slice(0, 3))}\n\nIf the user confirms, the import proceeds. If they point out issues, suggest they re-export or correct the CSV.`;
-                const initialMessage = format === "unknown"
-                  ? `I could not automatically detect the format of your CSV. Here are the columns I found:\n\n${headerList}\n\nDoes this look like a **position snapshot** (current holdings) or a **transaction history** (buy/sell orders)?`
-                  : `J'ai parsé ton CSV comme **${format}**.\n\n**${posCount} position(s) ouverte(s)**${stats.total_trades ? ` à partir de **${stats.total_trades} trades**` : ""}.${stats.date_range ? `\nPériode : ${stats.date_range}` : ""}${goodText}${warnText}\n\nÇa te paraît correct ? Dis **oui** pour lancer l'analyse.`;
-
                 const chatResult = await openChatWizard({
-                  title: format === "unknown" ? "Identify CSV Format" : "Confirm CSV Import",
-                  systemContext,
-                  initialMessage,
+                  title: "Identify CSV Format",
+                  systemContext: `You are helping the user import a CSV file into their portfolio tracker. The format could not be automatically detected. Here are the headers and first rows:\n\nHeaders:\n${headerList}\n\nSample data:\n${(preview.sample_rows || []).slice(0, 3).map((row, i) => "  Row " + (i + 1) + ": " + row.join(" | ")).join("\n")}\n\nHelp the user understand what format this is. If they confirm, the import will proceed.`,
+                  initialMessage: `I could not automatically detect the format of your CSV. Here are the columns I found:\n\n${headerList}\n\nDoes this look like a **position snapshot** (current holdings) or a **transaction history** (buy/sell orders)?`,
                   discussionScope: "wizard:csv_confirmation",
                   discussionMetadata: { format, account },
                   extractResult: (history) => {
                     const lastUserMsg = [...history].reverse().find(m => m.role === "user");
                     const text = (lastUserMsg?.content || "").toLowerCase().trim();
-                    const confirmed = /^(yes|ok|confirm|correct|proceed|looks?\s*good|go\s*ahead|lgtm)/i.test(text);
+                    const confirmed = /^(yes|ok|confirm|correct|proceed|looks?\s*good|go\s*ahead|lgtm|oui|ouais|confirme|c'?est\s+bon|vas[-\s]?y|d'?accord)/i.test(text);
                     return confirmed ? { confirmed: true } : null;
                   }
                 });
-
                 if (!chatResult || !chatResult.confirmed) {
                   setWizardStatus("CSV import cancelled.", "status-idle");
                   return;
                 }
                 setWizardStatus("CSV confirmed. Starting analysis...", "status-success");
+              } else {
+                // Known format — open the structured confirm modal.
+                setWizardStatus("Waiting for CSV confirmation...", "status-loading");
+                const modalResult = await openCsvConfirmModal({
+                  previewPayload: preview,
+                  account: account || "",
+                });
+                if (!modalResult || !modalResult.confirmed) {
+                  setWizardStatus("Import annulé.", "status-idle");
+                  return;
+                }
+                // Apply corrections backend-side and stash the resulting
+                // snapshot for use as `uploaded_snapshot` below.
+                csvUploadedSnapshot = await tauriInvoke("csv_import_apply_corrections_local", {
+                  csvText: wizardCsvTextNode.value,
+                  account: account || "",
+                  corrections: modalResult.corrections || [],
+                });
+                setWizardStatus("Import confirmé. Lancement de l'analyse...", "status-success");
               }
             }
           }
@@ -618,6 +557,12 @@ ${insight}` : insight;
         agentGuidelines: mergedGuidelines,
         runMode: analysisMode
       });
+      // P0-77b — when the confirm modal produced a corrected snapshot,
+      // attach it as `uploaded_snapshot` so the backend uses our already
+      // parsed + arbitrated positions instead of re-parsing the raw CSV.
+      if (csvUploadedSnapshot) {
+        options.uploaded_snapshot = csvUploadedSnapshot;
+      }
       if (account && guidelines) saveGuidelinesForAccount(account, guidelines);
 
       // Bug 3 fix: Check for unresolved ambiguous cash groups BEFORE starting the run.

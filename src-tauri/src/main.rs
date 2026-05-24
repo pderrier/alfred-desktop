@@ -562,6 +562,43 @@ async fn preview_csv_import_local(
     .map_err(|e| e.to_string())
 }
 
+/// P0-77b — validate an ISIN client-side via the strict ISO-6166 + Luhn
+/// helper. Used by the CSV confirm modal to live-validate the manual ISIN
+/// input as the user types.
+#[tauri::command]
+fn validate_isin_local(isin: String) -> bool {
+    native_collection_helpers::validate_isin(&isin)
+}
+
+/// P0-77b — apply per-line corrections from the CSV confirm modal and
+/// return the snapshot that should be passed to `analysis_run_start_local`
+/// as `uploaded_snapshot`.
+///
+/// Corrections are a sparse list keyed by `position_index` from the
+/// preview's `positions_needing_review`. Recognised actions:
+///   - `accept_suggestion` — set the position's ticker+ISIN from the
+///     historical_suggestion fields (modal validates suggestion exists).
+///   - `manual_isin`       — set `isin` from the user input; ticker stays.
+///   - `cash_equivalent`   — mark the position as `category: cash_equivalent`
+///     so the enrichment pipeline skips market lookups for it.
+///   - `skip`              — leave ticker/ISIN as-is; the existing P0-55
+///     guard will skip enrichment on these rows.
+#[tauri::command]
+async fn csv_import_apply_corrections_local(
+    csv_text: String,
+    account: String,
+    corrections: Vec<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<serde_json::Value, anyhow::Error> {
+        let preview = native_collection::preview_csv_import(&csv_text, &account)?;
+        let snapshot = native_collection::apply_csv_corrections(preview, &corrections)?;
+        Ok(snapshot)
+    })
+    .await
+    .map_err(|e| format!("csv_import_apply_corrections_local_failed:join:{e}"))?
+    .map_err(|e| e.to_string())
+}
+
 // ── LLM backend commands ─────────────────────────────────────────────────
 
 #[tauri::command]
@@ -1116,6 +1153,8 @@ fn run_tauri_app() -> anyhow::Result<()> {
             finary_sync_snapshot_local,
             finary_invalidate_snapshot_local,
             preview_csv_import_local,
+            validate_isin_local,
+            csv_import_apply_corrections_local,
             check_openai_api_key_local,
             check_for_update_local,
             download_update_local,

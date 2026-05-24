@@ -1,5 +1,59 @@
 # Changelog
 
+## v0.4.4
+
+### What changed
+
+- **L'import CSV passe d'un chat libre à une modale d'arbitrage.** Quand
+  une ligne du CSV ne résout pas (ticker générique, ISIN mal formé,
+  parts sociales bancaires), Alfred ouvre maintenant une modale dédiée
+  Cancel/Confirm avec un choix structuré par ligne :
+  - **Accepter la suggestion historique** quand Alfred a déjà analysé
+    cette même position sur le même compte dans un run précédent (ex.
+    « AXA → CS / FR0000120628 depuis le run du 2026-05-16 »). Le cas le
+    plus fréquent : Pierre relance un CSV Boursorama après le précédent,
+    la modale propose en un clic les bons identifiants.
+  - **Saisir un ISIN manuellement** avec validation live (ISO-6166 +
+    Luhn). Le bouton Confirmer reste désactivé tant que l'ISIN tapé est
+    invalide — pas de risque d'envoyer du garbage au pipeline.
+  - **Marquer comme cash-equivalent** pour les parts sociales bancaires
+    (pattern « PARTS SOC… » + ISIN mal formé). L'enrichissement marché
+    est désactivé pour ces lignes, qui restent dans le portefeuille sans
+    bruit de recommandation.
+  - **Skip — analyser sans enrichissement** quand on veut laisser la
+    ligne passer telle quelle.
+
+  Le chat libre reste utilisé pour les imports Finary et pour les CSV
+  dont Alfred ne reconnaît pas du tout le format (où une conversation a
+  du sens). La régression « Pierre répond *oui*, Alfred répond *d'accord
+  c'est bon*, import annulé après clic Confirmer » de v0.4.3 est fixée :
+  le regex anglais-only `^(yes|ok|confirm…)` qui rejetait *oui* est
+  remplacé par une modale qui ne repose plus sur du free-text.
+
+### Under the hood
+
+- Nouvelle commande Tauri `csv_import_apply_corrections_local` qui prend
+  les corrections de la modale et produit le `uploaded_snapshot` passé
+  au pipeline d'analyse — pas de re-parse côté backend.
+- Nouvelle commande Tauri `validate_isin_local` qui expose le validateur
+  ISO-6166 + Luhn à la modale pour la validation live.
+- Backend : `lookup_historical_for_position()` scanne les 10 derniers
+  fichiers `runtime-state/*.json`, filtre par nom normalisé + compte, et
+  retourne la dernière paire (ticker, ISIN) connue pour cette position.
+- Backend : `compute_positions_needing_review()` produit le payload qui
+  pilote la modale, additif au preview existant (`positions_needing_review`).
+- Pipeline : nouveau drapeau position `enrichment_disabled` qui court-
+  circuite la collecte marché/news/LLM tout en gardant la ligne dans le
+  snapshot — utilisé pour les actions `skip` et `cash_equivalent`.
+- 17 tests Rust + 12 tests JS pinent la table de vérité (lookup,
+  filtrage compte, suggestion historique, validation manuelle,
+  cas parts sociales, action inconnue → no-op).
+
+### Compatibility
+
+- No mandatory upgrade. v0.4.3 desktops continuent de marcher mais le
+  bug « réponds oui mais import annulé » est fixé dès v0.4.4 installée.
+
 ## v0.4.3 (hotfix)
 
 ### Bug fixed

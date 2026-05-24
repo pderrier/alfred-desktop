@@ -1189,6 +1189,8 @@ fn reconcile_transactions(transactions: &[CsvTransaction], account: &str) -> Val
 pub fn preview_csv_import(raw: &str, account: &str) -> Result<Value> {
     let (text, boursorama_meta) = prepare_csv_text(raw);
     let acct = if account.is_empty() { "CSV_import" } else { account };
+    // P0-77b — historical lookup scans runtime-state/*.json
+    let data_dir = crate::resolve_runtime_state_dir();
 
     // ── Boursorama special case ───────────────────────────────────
     if boursorama_meta.is_some() {
@@ -1210,6 +1212,12 @@ pub fn preview_csv_import(raw: &str, account: &str) -> Result<Value> {
                 let parsing_issues = snap.get("csv_parsing_issues").cloned()
                     .unwrap_or_else(|| json!([]));
                 let generic_at_risk = compute_generic_tickers_at_risk(&positions_value);
+                // P0-77b — needs-review payload feeds the CSV confirm modal
+                // (per-line arbitration: accept history / manual ISIN / skip
+                // / cash-equivalent for parts sociales).
+                let needs_review = compute_positions_needing_review(
+                    &positions_value, acct, &data_dir,
+                );
                 return Ok(json!({
                     "preview": true,
                     "source": "cache",
@@ -1219,6 +1227,7 @@ pub fn preview_csv_import(raw: &str, account: &str) -> Result<Value> {
                     "warnings": [],
                     "csv_parsing_issues": parsing_issues,
                     "generic_tickers_at_risk": generic_at_risk,
+                    "positions_needing_review": needs_review,
                     "stats": {
                         "position_count": count,
                         "valeur_totale": snap.get("valeur_totale").cloned().unwrap_or_else(|| json!(0.0)),
@@ -1252,6 +1261,7 @@ pub fn preview_csv_import(raw: &str, account: &str) -> Result<Value> {
                 touch_cached_spec(&fingerprint);
                 return Ok(build_preview_response(
                     &cached_spec, &positions, &snapshot, &headers, &data_rows, "cache",
+                    acct, &data_dir,
                 ));
             }
             crate::debug_log("[csv-preview] cached spec produced 0 positions, invalidating");
@@ -1271,7 +1281,10 @@ pub fn preview_csv_import(raw: &str, account: &str) -> Result<Value> {
             if pos_count > 0 {
                 cache_spec(&fingerprint, &spec, &headers);
             }
-            Ok(build_preview_response(&spec, &positions, &snapshot, &headers, &data_rows, "llm"))
+            Ok(build_preview_response(
+                &spec, &positions, &snapshot, &headers, &data_rows, "llm",
+                acct, &data_dir,
+            ))
         }
         Err(_) => {
             // LLM spec also failed — return unknown format for chat confirmation
@@ -1301,6 +1314,8 @@ fn build_preview_response(
     headers: &[String],
     data_rows: &[Vec<String>],
     source: &str,
+    account: &str,
+    data_dir: &std::path::Path,
 ) -> Value {
     let pos_array = positions.as_array();
     let pos_count = pos_array.map(|a| a.len()).unwrap_or(0);
@@ -1312,6 +1327,8 @@ fn build_preview_response(
     // both BEFORE the LLM analysis runs.
     let parsing_issues = snapshot.get("csv_parsing_issues").cloned().unwrap_or_else(|| json!([]));
     let generic_at_risk = compute_generic_tickers_at_risk(positions);
+    // P0-77b — needs-review payload for the CSV confirm modal.
+    let needs_review = compute_positions_needing_review(positions, account, data_dir);
     let mut result = json!({
         "preview": true,
         "source": source,
@@ -1322,6 +1339,7 @@ fn build_preview_response(
         "warnings": [],
         "csv_parsing_issues": parsing_issues,
         "generic_tickers_at_risk": generic_at_risk,
+        "positions_needing_review": needs_review,
         "ready": !needs_chat,
         "needs_chat_confirmation": needs_chat,
         "headers": headers,
@@ -2173,6 +2191,350 @@ pub(crate) fn compute_generic_tickers_at_risk(positions: &Value) -> Value {
             "nom": p.get("nom").and_then(|v| v.as_str()).unwrap_or(""),
             "isin": p.get("isin").and_then(|v| v.as_str()).unwrap_or(""),
         }));
+    }
+    Value::Array(out)
+}
+
+// ── P0-77b — CSV confirm modal: historical lookup + review payload ──────
+//
+// The CSV confirm modal needs to propose corrections for positions whose
+// ticker/ISIN combo cannot be resolved. The two failure modes are:
+//   - generic ticker without a valid ISIN (e.g. "THE" / "PARTS"),
+//   - explicit malformed ISIN (fails ISO-6166 + Luhn, e.g. country code "FY"
+//     on PARTS SOCIALES).
+//
+// For each, we scan the user's past run-state files (`<data_dir>/*.json`)
+// to see if they previously analysed the same security under a known
+// ticker + ISIN combo on the same account. When the modal renders, the
+// user can accept that historical suggestion in one click.
+
+/// A historical match for a position whose CSV ticker/ISIN doesn't resolve.
+/// Surfaced into the wizard payload as a one-click "accept" option.
+#[derive(Debug, Clone)]
+pub struct HistoricalMatch {
+    pub ticker: String,
+    pub isin: String,
+    pub run_date: String, // ISO yyyy-mm-dd
+    pub source: &'static str, // always "history"
+}
+
+impl HistoricalMatch {
+    fn to_json(&self) -> Value {
+        json!({
+            "ticker": self.ticker,
+            "isin": self.isin,
+            "run_date": self.run_date,
+            "source": self.source,
+        })
+    }
+}
+
+/// Normalize a position name for historical matching: uppercase, strip
+/// accents, collapse whitespace. Match is purely heuristic — the modal
+/// asks the user to confirm before persisting.
+pub(crate) fn normalize_name_for_history(name: &str) -> String {
+    let lower = name.trim().to_uppercase();
+    // Strip the most common accents seen on Boursorama CSV exports.
+    let stripped: String = lower
+        .chars()
+        .map(|c| match c {
+            'À' | 'Á' | 'Â' | 'Ã' | 'Ä' | 'Å' => 'A',
+            'Ç' => 'C',
+            'È' | 'É' | 'Ê' | 'Ë' => 'E',
+            'Ì' | 'Í' | 'Î' | 'Ï' => 'I',
+            'Ñ' => 'N',
+            'Ò' | 'Ó' | 'Ô' | 'Õ' | 'Ö' => 'O',
+            'Ù' | 'Ú' | 'Û' | 'Ü' => 'U',
+            'Ý' | 'Ÿ' => 'Y',
+            _ => c,
+        })
+        .collect();
+    stripped.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Reserved filenames inside `<data_dir>/runtime-state/` that are NOT
+/// run-state files. Filtered out by `lookup_historical_for_position`.
+const NON_RUN_STATE_FILES: &[&str] = &[
+    "run-index.json",
+    "line-memory.json",
+    "alfred-session.json",
+];
+
+/// Scan past run-state files in `data_dir` looking for the most recent
+/// position whose normalized name matches `name`. When `compte` is
+/// provided, only positions on that same account are considered.
+///
+/// Returns the most recent `HistoricalMatch` if any, else None. Both
+/// `ticker` and `isin` must be non-empty in the historical record (a
+/// position with an empty ticker is not a useful suggestion).
+pub(crate) fn lookup_historical_for_position(
+    name: &str,
+    compte: Option<&str>,
+    data_dir: &std::path::Path,
+) -> Option<HistoricalMatch> {
+    if name.trim().is_empty() {
+        return None;
+    }
+    if !data_dir.exists() || !data_dir.is_dir() {
+        return None;
+    }
+    let target = normalize_name_for_history(name);
+
+    // Enumerate top-level *.json files in data_dir and sort by mtime desc.
+    let mut candidates: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
+    let read = match fs::read_dir(data_dir) {
+        Ok(r) => r,
+        Err(_) => return None,
+    };
+    for entry in read.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(fname) = path.file_name().and_then(|s| s.to_str()) else { continue };
+        if !fname.ends_with(".json") {
+            continue;
+        }
+        if NON_RUN_STATE_FILES.contains(&fname) {
+            continue;
+        }
+        let mtime = entry.metadata().and_then(|m| m.modified()).ok()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        candidates.push((mtime, path));
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    // Limit to top 10 most recent files — older history is unlikely to
+    // help and we want the modal preview to feel snappy.
+    candidates.truncate(10);
+
+    for (_mtime, path) in candidates {
+        let Ok(content) = fs::read_to_string(&path) else { continue };
+        let Ok(doc) = serde_json::from_str::<Value>(&content) else { continue };
+        let Some(positions) = doc.pointer("/portfolio/positions").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for pos in positions {
+            let pos_name = pos.get("nom").and_then(|v| v.as_str()).unwrap_or("");
+            if normalize_name_for_history(pos_name) != target {
+                continue;
+            }
+            if let Some(want) = compte {
+                let pos_compte = pos.get("compte").and_then(|v| v.as_str()).unwrap_or("");
+                if !pos_compte.is_empty() && pos_compte != want {
+                    continue;
+                }
+            }
+            let ticker = pos.get("ticker").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let isin = pos.get("isin").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if ticker.is_empty() || isin.is_empty() {
+                continue;
+            }
+            if !validate_isin(isin) {
+                continue;
+            }
+            // Run date: prefer top-level created_at / started_at, else
+            // derive from filename mtime (already used for sort order).
+            let run_date = doc.get("created_at")
+                .or_else(|| doc.get("started_at"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.chars().take(10).collect::<String>())
+                .unwrap_or_else(String::new);
+            return Some(HistoricalMatch {
+                ticker: ticker.to_string(),
+                isin: isin.to_string(),
+                run_date,
+                source: "history",
+            });
+        }
+    }
+    None
+}
+
+/// P0-77b — apply per-line corrections from the CSV confirm modal to a
+/// preview payload, returning a normalized snapshot ready to be passed as
+/// `uploaded_snapshot` to `analysis_run_start_local`.
+///
+/// Each correction is a JSON object:
+///   `{ position_index: u, action: String, isin?: String }`
+///
+/// Actions:
+///   - `accept_suggestion`: copies ticker+isin from the position's
+///     `historical_suggestion` (the modal validated it exists upstream).
+///   - `manual_isin`: writes the user-typed ISIN. The modal validates it
+///     via `validate_isin_local` before submit, but we re-validate here.
+///   - `cash_equivalent`: marks the position with `category=cash_equivalent`
+///     and `enrichment_disabled=true` so the pipeline skips market lookups.
+///   - `skip`: marks `enrichment_disabled=true` only, leaving identifiers
+///     as-is. The existing P0-55 guard handles enrichment skipping.
+///
+/// Unknown actions are silently ignored so future client versions don't
+/// break older backends; the modal also lists which actions it sends.
+pub fn apply_csv_corrections(mut preview: Value, corrections: &[Value]) -> Result<Value> {
+    // Map needs_review entries by position_index so we can look up the
+    // historical suggestion attached at preview time.
+    let mut review_by_idx: HashMap<u64, Value> = HashMap::new();
+    if let Some(arr) = preview.get("positions_needing_review").and_then(|v| v.as_array()) {
+        for entry in arr {
+            if let Some(idx) = entry.get("position_index").and_then(|v| v.as_u64()) {
+                review_by_idx.insert(idx, entry.clone());
+            }
+        }
+    }
+
+    let Some(positions) = preview.get_mut("positions").and_then(|v| v.as_array_mut()) else {
+        return Err(anyhow!("csv_corrections_missing_positions"));
+    };
+
+    for correction in corrections {
+        let Some(idx) = correction.get("position_index").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        let action = correction.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        let idx_usize = idx as usize;
+        let Some(pos) = positions.get_mut(idx_usize).and_then(|v| v.as_object_mut()) else {
+            continue;
+        };
+        match action {
+            "accept_suggestion" => {
+                let suggestion = review_by_idx
+                    .get(&idx)
+                    .and_then(|e| e.get("historical_suggestion"))
+                    .cloned();
+                if let Some(s) = suggestion.as_ref().and_then(|v| v.as_object()) {
+                    if let Some(t) = s.get("ticker").and_then(|v| v.as_str()) {
+                        pos.insert("ticker".into(), json!(t));
+                    }
+                    if let Some(i) = s.get("isin").and_then(|v| v.as_str()) {
+                        pos.insert("isin".into(), json!(i));
+                    }
+                }
+            }
+            "manual_isin" => {
+                let new_isin = correction
+                    .get("isin")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_uppercase())
+                    .unwrap_or_default();
+                if !new_isin.is_empty() && validate_isin(&new_isin) {
+                    pos.insert("isin".into(), json!(new_isin));
+                }
+            }
+            "cash_equivalent" => {
+                pos.insert("category".into(), json!("cash_equivalent"));
+                pos.insert("enrichment_disabled".into(), json!(true));
+            }
+            "skip" => {
+                pos.insert("enrichment_disabled".into(), json!(true));
+            }
+            _ => { /* unknown action — leave row untouched */ }
+        }
+    }
+
+    // Drop wizard-only fields before handing the payload off to the
+    // analysis pipeline. The snapshot contract for `uploaded_snapshot` is
+    // pure portfolio data; review/preview metadata stays in the wizard.
+    if let Some(obj) = preview.as_object_mut() {
+        obj.remove("positions_needing_review");
+        obj.remove("generic_tickers_at_risk");
+        obj.remove("csv_parsing_issues");
+        obj.remove("headers");
+        obj.remove("sample_rows");
+        obj.remove("needs_chat_confirmation");
+        obj.remove("preview");
+    }
+    Ok(preview)
+}
+
+/// P0-77b — classify each parsed CSV position into a "needs review" list.
+///
+/// Each entry tells the wizard:
+///   - which position index in the original parse it references,
+///   - what issue is blocking enrichment (`generic` / `malformed_isin`),
+///   - whether the name+ISIN looks like a banking "parts sociales" instrument
+///     (cash-equivalent fallback offered in the modal),
+///   - the most recent historical suggestion from past runs (if any).
+///
+/// Positions with a valid ISIN AND a non-generic ticker do NOT appear here —
+/// they don't need user arbitration.
+pub(crate) fn compute_positions_needing_review(
+    positions: &Value,
+    account: &str,
+    data_dir: &std::path::Path,
+) -> Value {
+    let Some(arr) = positions.as_array() else { return json!([]); };
+    let mut out: Vec<Value> = Vec::new();
+    let account_opt = if account.trim().is_empty() { None } else { Some(account) };
+
+    for (idx, p) in arr.iter().enumerate() {
+        let ticker = p.get("ticker").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let nom = p.get("nom").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let isin = p.get("isin").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let ticker_upper = ticker.to_uppercase();
+
+        let isin_valid = !isin.is_empty() && validate_isin(isin);
+        let isin_empty = isin.is_empty();
+        let isin_malformed = !isin.is_empty() && !isin_valid;
+
+        let has_resolution = p.get("resolved_symbol")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if has_resolution {
+            continue;
+        }
+
+        // Skip rows that are already canonical (valid ISIN). They don't
+        // need user arbitration — the resolver will handle them.
+        if isin_valid {
+            continue;
+        }
+
+        // Classify ticker as generic for the same reasons as the at-risk list.
+        let is_generic_ticker = !ticker_upper.is_empty()
+            && (GENERIC_TICKER_RISK_LIST.iter().any(|g| *g == ticker_upper)
+                || ticker_upper.len() <= 3);
+
+        // The user must arbitrate when:
+        //   - ISIN is malformed (resolver will fail no matter how good the ticker), or
+        //   - ISIN is missing AND the ticker is generic (no canonical anchor at all).
+        // A missing ISIN + a specific multi-char ticker is fine — the resolver
+        // can still try Google/Yahoo with the ticker.
+        let issue = if isin_malformed {
+            "malformed_isin"
+        } else if isin_empty && is_generic_ticker {
+            "generic"
+        } else if isin_empty && ticker.is_empty() {
+            "missing_ticker"
+        } else {
+            continue;
+        };
+
+        // Banking "parts sociales" pattern — name contains PARTS SOC* AND
+        // the ISIN (if any) is malformed. These are not tradeable securities
+        // and the modal offers a cash-equivalent fallback.
+        let upper_name = nom.to_uppercase();
+        let is_parts_pattern = (upper_name.contains("PARTS SOC")
+            || upper_name.contains("PART SOC"))
+            && (isin_empty || isin_malformed);
+
+        let historical = lookup_historical_for_position(nom, account_opt, data_dir);
+
+        let mut entry = json!({
+            "position_index": idx,
+            "ticker": ticker_upper,
+            "nom": nom,
+            "isin": isin,
+            "issue": issue,
+            "is_parts_pattern": is_parts_pattern,
+            "historical_suggestion": Value::Null,
+        });
+        if let Some(hist) = historical {
+            entry["historical_suggestion"] = hist.to_json();
+        }
+        out.push(entry);
     }
     Value::Array(out)
 }
@@ -3110,6 +3472,39 @@ pub(crate) fn execute_native_local_analysis_workflow_with(
             return Err(anyhow!("run_aborted:analysis stopped by user"));
         }
         let ticker = as_text(row.get("ticker"));
+        // P0-77b — honour the CSV confirm modal's `enrichment_disabled`
+        // flag. Rows marked "skip" or "cash_equivalent" by the user must
+        // bypass collection (no market lookup, no news, no LLM analysis)
+        // and stay in the snapshot with their CSV-parsed numbers intact.
+        // We record a `data_quality_weak` issue with a distinct reason so
+        // the run report surfaces the manual skip transparently.
+        let enrichment_disabled = row
+            .get("enrichment_disabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if enrichment_disabled {
+            if !ticker.is_empty() {
+                let _ = crate::update_line_status(&run_id, &ticker, "completed");
+            }
+            positions_by_index[index] = Some(row.clone());
+            incremental_positions.push(row.clone());
+            let category = row.get("category").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let reason = if category == "cash_equivalent" {
+                "user_marked_cash_equivalent"
+            } else {
+                "user_skipped_enrichment"
+            };
+            collection_issues.push(json!({
+                "type": "data_quality_weak",
+                "ticker": ticker.clone(),
+                "nom": as_text(row.get("nom")),
+                "isin": as_text(row.get("isin")),
+                "reasons": [reason],
+                "at": now_iso_string(),
+            }));
+            collection_completed += 1;
+            continue;
+        }
         if !ticker.is_empty() {
             let _ = crate::update_line_status(&run_id, &ticker, "collecting");
         }
@@ -3743,5 +4138,419 @@ mod tests {
             arr.is_empty(),
             "ticker with resolved_symbol must NOT be flagged (got {arr:?})",
         );
+    }
+
+    // ── P0-77b — historical lookup + needs-review payload ─────────────
+    //
+    // Pins the rule "when the CSV ticker/ISIN does not resolve, propose
+    // the last known canonical (ticker, ISIN) Alfred has seen for the
+    // same position name on the same account". This is the substance
+    // that lets the CSV confirm modal show "Accept AXA/FR0000120628
+    // (from run 2026-05-16)" instead of asking the user to type.
+
+    /// Write a minimal run-state file to `dir/<name>.json` that exposes
+    /// a single position under `portfolio.positions[]`. The file's mtime
+    /// is set via OS write order; for ordering tests rely on creation
+    /// order between calls.
+    fn write_runstate(dir: &std::path::Path, name: &str, positions: Value) {
+        let doc = json!({
+            "run_id": name.trim_end_matches(".json"),
+            "created_at": "2026-05-16T08:00:00Z",
+            "portfolio": { "positions": positions },
+        });
+        std::fs::write(
+            dir.join(name),
+            serde_json::to_string_pretty(&doc).expect("serialize"),
+        ).expect("write");
+    }
+
+    #[test]
+    fn lookup_historical_for_position_finds_unique_match() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_runstate(dir.path(), "run1.json", json!([
+            { "nom": "AXA", "ticker": "CS", "isin": "FR0000120628",
+              "compte": "Plan Epargne en Action" }
+        ]));
+        let hit = lookup_historical_for_position("AXA", Some("Plan Epargne en Action"), dir.path())
+            .expect("expected match");
+        assert_eq!(hit.ticker, "CS");
+        assert_eq!(hit.isin, "FR0000120628");
+        assert_eq!(hit.source, "history");
+    }
+
+    #[test]
+    fn lookup_historical_for_position_filters_by_compte() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_runstate(dir.path(), "run1.json", json!([
+            { "nom": "AXA", "ticker": "CS", "isin": "FR0000120628", "compte": "PEA" },
+            { "nom": "AXA", "ticker": "CS_CTO", "isin": "FR0000120628", "compte": "CTO" },
+        ]));
+        let pea_hit = lookup_historical_for_position("AXA", Some("PEA"), dir.path())
+            .expect("expected PEA match");
+        assert_eq!(pea_hit.ticker, "CS");
+        let cto_hit = lookup_historical_for_position("AXA", Some("CTO"), dir.path())
+            .expect("expected CTO match");
+        assert_eq!(cto_hit.ticker, "CS_CTO");
+    }
+
+    #[test]
+    fn lookup_historical_for_position_returns_most_recent_when_multiple() {
+        // We write two files; the second one wins because file ordering
+        // sorts by mtime desc. Sleep a tiny bit between writes so the
+        // mtime resolution doesn't collapse the two timestamps into one.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_runstate(dir.path(), "run_old.json", json!([
+            { "nom": "OVH GROUPE", "ticker": "OVH_OLD", "isin": "FR0014005HJ9",
+              "compte": "PEA" }
+        ]));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        write_runstate(dir.path(), "run_new.json", json!([
+            { "nom": "OVH GROUPE", "ticker": "OVH_NEW", "isin": "FR0014005HJ9",
+              "compte": "PEA" }
+        ]));
+        let hit = lookup_historical_for_position("OVH GROUPE", Some("PEA"), dir.path())
+            .expect("expected match");
+        assert_eq!(hit.ticker, "OVH_NEW", "must pick most recent run");
+    }
+
+    #[test]
+    fn lookup_historical_for_position_handles_no_match() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_runstate(dir.path(), "run1.json", json!([
+            { "nom": "AXA", "ticker": "CS", "isin": "FR0000120628", "compte": "PEA" }
+        ]));
+        let hit = lookup_historical_for_position("UNKNOWN_TICKER_NAME", None, dir.path());
+        assert!(hit.is_none(), "unmatched name must return None");
+    }
+
+    #[test]
+    fn lookup_historical_for_position_ignores_reserved_files() {
+        // run-index.json / line-memory.json / alfred-session.json must
+        // NOT be scanned — they don't expose `portfolio.positions[]`
+        // and reading them as runs would yield false matches.
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Plant a poison value in a reserved file under a key that mirrors
+        // the run-state schema. lookup must skip the file entirely.
+        std::fs::write(
+            dir.path().join("line-memory.json"),
+            serde_json::to_string(&json!({
+                "portfolio": { "positions": [
+                    { "nom": "AXA", "ticker": "POISON", "isin": "FR0000120628" }
+                ] }
+            })).unwrap()
+        ).unwrap();
+        let hit = lookup_historical_for_position("AXA", None, dir.path());
+        assert!(hit.is_none(), "reserved files must be ignored");
+    }
+
+    #[test]
+    fn lookup_historical_for_position_rejects_invalid_isin_in_history() {
+        // If the only historical match has a malformed ISIN, the result is
+        // not useful as a suggestion — return None instead of proposing
+        // garbage back to the user.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_runstate(dir.path(), "run1.json", json!([
+            { "nom": "PARTS SOCIALES", "ticker": "PARTS",
+              "isin": "FY0007684180", "compte": "PEA" }
+        ]));
+        let hit = lookup_historical_for_position("PARTS SOCIALES", Some("PEA"), dir.path());
+        assert!(hit.is_none(), "historical match with malformed ISIN must be rejected");
+    }
+
+    #[test]
+    fn compute_positions_needing_review_skips_valid_isin_rows() {
+        // The four entries Pierre had in his Boursorama CSV under
+        // valid ISINs (post P0-77 fix) must NOT appear in the
+        // needs-review list — the resolver will handle them.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let positions = json!([
+            { "ticker": "CS",  "nom": "AXA",        "isin": "FR0000120628" },
+            { "ticker": "OVH", "nom": "OVH Groupe", "isin": "FR0014005HJ9" },
+        ]);
+        let out = compute_positions_needing_review(&positions, "PEA", dir.path());
+        let arr = out.as_array().expect("array");
+        assert!(arr.is_empty(), "valid ISINs must not appear in review list");
+    }
+
+    #[test]
+    fn compute_positions_needing_review_flags_parts_pattern() {
+        // "PARTS SOCIALES CROZON" with malformed ISIN must be flagged
+        // with `is_parts_pattern=true` so the modal proposes the
+        // cash-equivalent option.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let positions = json!([
+            { "ticker": "PARTS", "nom": "PARTS SOC CROZON", "isin": "FY0007684180" }
+        ]);
+        let out = compute_positions_needing_review(&positions, "PEA", dir.path());
+        let arr = out.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["issue"].as_str(), Some("malformed_isin"));
+        assert_eq!(arr[0]["is_parts_pattern"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn compute_positions_needing_review_attaches_historical_suggestion() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Plant a known good history for OVH Groupe.
+        write_runstate(dir.path(), "history.json", json!([
+            { "nom": "OVH Groupe", "ticker": "OVH", "isin": "FR0014005HJ9",
+              "compte": "PEA" }
+        ]));
+        // Now the CSV row is missing the ISIN — modal should propose the
+        // historical suggestion.
+        let positions = json!([
+            { "ticker": "THE", "nom": "OVH Groupe", "isin": "" }
+        ]);
+        let out = compute_positions_needing_review(&positions, "PEA", dir.path());
+        let arr = out.as_array().expect("array");
+        assert_eq!(arr.len(), 1, "missing ISIN + generic ticker must be flagged");
+        let entry = &arr[0];
+        assert_eq!(entry["issue"].as_str(), Some("generic"));
+        let suggestion = entry.get("historical_suggestion").expect("must have suggestion");
+        assert_eq!(suggestion["ticker"].as_str(), Some("OVH"));
+        assert_eq!(suggestion["isin"].as_str(), Some("FR0014005HJ9"));
+    }
+
+    #[test]
+    fn apply_csv_corrections_accept_suggestion_writes_ticker_and_isin() {
+        // Build a preview-shaped payload by hand (avoids depending on
+        // the full Boursorama prepare/parse stack).
+        let preview = json!({
+            "preview": true,
+            "positions": [
+                { "ticker": "THE", "nom": "OVH Groupe", "isin": "" }
+            ],
+            "positions_needing_review": [
+                { "position_index": 0, "ticker": "THE", "nom": "OVH Groupe", "isin": "",
+                  "issue": "generic", "is_parts_pattern": false,
+                  "historical_suggestion": {
+                      "ticker": "OVH", "isin": "FR0014005HJ9",
+                      "run_date": "2026-05-16", "source": "history"
+                  } }
+            ]
+        });
+        let corrections = vec![json!({
+            "position_index": 0, "action": "accept_suggestion"
+        })];
+        let out = apply_csv_corrections(preview, &corrections).expect("apply ok");
+        let pos = &out["positions"][0];
+        assert_eq!(pos["ticker"].as_str(), Some("OVH"));
+        assert_eq!(pos["isin"].as_str(), Some("FR0014005HJ9"));
+        // Wizard-only fields must be stripped.
+        assert!(out.get("positions_needing_review").is_none());
+        assert!(out.get("preview").is_none());
+    }
+
+    #[test]
+    fn apply_csv_corrections_manual_isin_validates() {
+        // A valid ISIN is written; an invalid one is rejected silently
+        // (defence in depth — the modal validates upstream, but garbage
+        // must never reach the analysis pipeline).
+        let preview = json!({
+            "positions": [
+                { "ticker": "THE", "nom": "OVH Groupe", "isin": "" },
+                { "ticker": "X",   "nom": "Bad",        "isin": "" }
+            ],
+            "positions_needing_review": []
+        });
+        let corrections = vec![
+            json!({ "position_index": 0, "action": "manual_isin", "isin": "FR0014005HJ9" }),
+            json!({ "position_index": 1, "action": "manual_isin", "isin": "NOTVALID" }),
+        ];
+        let out = apply_csv_corrections(preview, &corrections).expect("apply ok");
+        assert_eq!(out["positions"][0]["isin"].as_str(), Some("FR0014005HJ9"));
+        assert_eq!(out["positions"][1]["isin"].as_str(), Some(""),
+            "invalid ISIN must be rejected, original kept");
+    }
+
+    #[test]
+    fn apply_csv_corrections_cash_equivalent_marks_position() {
+        let preview = json!({
+            "positions": [
+                { "ticker": "PARTS", "nom": "PARTS SOC", "isin": "FY0007684180" }
+            ],
+            "positions_needing_review": []
+        });
+        let corrections = vec![json!({
+            "position_index": 0, "action": "cash_equivalent"
+        })];
+        let out = apply_csv_corrections(preview, &corrections).expect("apply ok");
+        let pos = &out["positions"][0];
+        assert_eq!(pos["category"].as_str(), Some("cash_equivalent"));
+        assert_eq!(pos["enrichment_disabled"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn apply_csv_corrections_skip_disables_enrichment() {
+        let preview = json!({
+            "positions": [
+                { "ticker": "FOO", "nom": "Foo", "isin": "" }
+            ],
+            "positions_needing_review": []
+        });
+        let corrections = vec![json!({
+            "position_index": 0, "action": "skip"
+        })];
+        let out = apply_csv_corrections(preview, &corrections).expect("apply ok");
+        let pos = &out["positions"][0];
+        assert_eq!(pos["enrichment_disabled"].as_bool(), Some(true));
+        // skip leaves ticker/ISIN as-is
+        assert_eq!(pos["ticker"].as_str(), Some("FOO"));
+    }
+
+    #[test]
+    fn apply_csv_corrections_unknown_action_is_noop() {
+        let preview = json!({
+            "positions": [
+                { "ticker": "FOO", "nom": "Foo", "isin": "" }
+            ],
+            "positions_needing_review": []
+        });
+        let corrections = vec![json!({
+            "position_index": 0, "action": "future_unknown_action"
+        })];
+        let out = apply_csv_corrections(preview, &corrections).expect("apply ok");
+        let pos = &out["positions"][0];
+        assert_eq!(pos["ticker"].as_str(), Some("FOO"));
+        assert_eq!(pos["isin"].as_str(), Some(""));
+        // No enrichment_disabled was set.
+        assert!(pos.get("enrichment_disabled").is_none());
+    }
+
+    // ── P0-77b QA BLOCK-1 ──────────────────────────────────────────
+    //
+    // Pin the contract that `apply_csv_corrections` produces positions
+    // carrying `enrichment_disabled: true` for both the `skip` and the
+    // `cash_equivalent` actions, AND that those positions emerge intact
+    // from the wizard-strip step (the field downstream collection reads
+    // to bypass market lookup / news / LLM analysis at line 3481-3506 of
+    // run_native_collection_and_analysis_internal).
+    //
+    // The dispatch loop itself spawns background threads and is hard to
+    // unit-test in isolation, so this test pins the data-shape contract
+    // at the boundary the loop relies on. If a future change drops the
+    // flag, the downstream `if enrichment_disabled` branch becomes dead
+    // and disabled rows would silently route through market lookups —
+    // exactly the bug P0-77b prevented.
+    #[test]
+    fn enrichment_disabled_rows_round_trip_through_collection_state() {
+        let preview = json!({
+            "preview": true,
+            "positions": [
+                { "ticker": "PARTS", "nom": "PARTS SOC CROZON", "isin": "FY0007684180" },
+                { "ticker": "FOO",   "nom": "Foo Holdings",     "isin": "" },
+                { "ticker": "CS",    "nom": "AXA",              "isin": "FR0000120628" }
+            ],
+            "positions_needing_review": [
+                { "position_index": 0, "ticker": "PARTS", "nom": "PARTS SOC CROZON",
+                  "isin": "FY0007684180", "issue": "malformed_isin",
+                  "is_parts_pattern": true, "historical_suggestion": null },
+                { "position_index": 1, "ticker": "FOO", "nom": "Foo Holdings",
+                  "isin": "", "issue": "generic",
+                  "is_parts_pattern": false, "historical_suggestion": null }
+            ]
+        });
+        let corrections = vec![
+            // User marks PARTS as cash-equivalent.
+            json!({ "position_index": 0, "action": "cash_equivalent" }),
+            // User skips Foo Holdings (no enrichment, leave numbers as-is).
+            json!({ "position_index": 1, "action": "skip" }),
+            // Row 2 is clean — no correction needed.
+        ];
+        let out = apply_csv_corrections(preview, &corrections).expect("apply ok");
+
+        let positions = out["positions"].as_array().expect("positions array");
+        assert_eq!(positions.len(), 3, "round-trip must preserve all rows");
+
+        // Row 0: cash_equivalent → enrichment_disabled + category.
+        assert_eq!(positions[0]["enrichment_disabled"].as_bool(), Some(true),
+            "cash_equivalent row must carry enrichment_disabled=true downstream");
+        assert_eq!(positions[0]["category"].as_str(), Some("cash_equivalent"),
+            "cash_equivalent row must carry category for issue-reason classification");
+        // The collection loop at line 3492 reads `category` to pick the
+        // `user_marked_cash_equivalent` reason — pin that contract.
+        assert_eq!(positions[0]["ticker"].as_str(), Some("PARTS"),
+            "ticker preserved so the user can still recognise the row in the run report");
+
+        // Row 1: skip → enrichment_disabled only, identifiers untouched.
+        assert_eq!(positions[1]["enrichment_disabled"].as_bool(), Some(true),
+            "skip row must carry enrichment_disabled=true downstream");
+        assert!(positions[1].get("category").is_none()
+            || positions[1]["category"].as_str() != Some("cash_equivalent"),
+            "skip must not promote the row to cash_equivalent category");
+        assert_eq!(positions[1]["ticker"].as_str(), Some("FOO"));
+
+        // Row 2: untouched — must NOT have enrichment_disabled (would
+        // silently bypass collection for a clean row).
+        assert!(positions[2].get("enrichment_disabled").is_none(),
+            "clean rows must never sprout enrichment_disabled by accident");
+        assert_eq!(positions[2]["isin"].as_str(), Some("FR0000120628"));
+
+        // Wizard-only fields must be stripped — the downstream pipeline
+        // consumes a clean snapshot, not the review metadata.
+        assert!(out.get("positions_needing_review").is_none(),
+            "positions_needing_review must be stripped before analysis");
+        assert!(out.get("preview").is_none());
+    }
+
+    // ── P0-77b QA BLOCK-3 ──────────────────────────────────────────
+    //
+    // Pierre's regression: 27 positions with valid ISINs plus one
+    // "PARTS SOCIALES" row with a malformed ISIN. The needs-review list
+    // must contain EXACTLY 1 entry — the PARTS row. Any other count
+    // means we either flagged a clean row (false positive — the original
+    // P0-77 bug) or dropped the PARTS row (would let it through to a
+    // failed market lookup).
+    #[test]
+    fn positions_needing_review_pierre_repro_27_valid_isins_plus_parts_yields_exactly_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Representative subset of Pierre's portfolio: FR/NL ISINs with
+        // tickers of varying lengths (2-5 chars). All have valid checksums.
+        // The pattern is repeated to reach 27 valid rows.
+        let valid_template: &[(&str, &str, &str)] = &[
+            ("CS",    "AXA",                 "FR0000120628"),
+            ("OVH",   "OVH Groupe",          "FR0014005HJ9"),
+            ("ENX",   "EURONEXT",            "NL0006294274"),
+            ("MC",    "LVMH",                "FR0000121014"),
+            ("CA",    "CARREFOUR",           "FR0000120172"),
+            ("TTE",   "TOTALENERGIES",       "FR0000120271"),
+        ];
+
+        let mut positions_vec: Vec<Value> = Vec::with_capacity(28);
+        for i in 0..27 {
+            let (ticker, nom, isin) = valid_template[i % valid_template.len()];
+            // Make the name unique per row so historical-suggestion
+            // lookups don't collapse multiple rows into one.
+            positions_vec.push(json!({
+                "ticker": ticker,
+                "nom": format!("{} #{:02}", nom, i),
+                "isin": isin,
+            }));
+        }
+        // The one row that MUST be flagged: PARTS SOCIALES with the
+        // malformed ISIN Pierre actually had in his Boursorama export.
+        positions_vec.push(json!({
+            "ticker": "PARTS",
+            "nom":    "PARTS SOCIALES CROZON",
+            "isin":   "000007764440",
+        }));
+
+        let positions = Value::Array(positions_vec);
+        let out = compute_positions_needing_review(&positions, "PEA", dir.path());
+        let arr = out.as_array().expect("array");
+
+        assert_eq!(arr.len(), 1,
+            "EXACTLY 1 row must need review — the PARTS SOCIALES one. \
+             More means a false positive (the P0-77 bug); fewer means \
+             the PARTS row is leaking through unflagged.");
+        let entry = &arr[0];
+        assert_eq!(entry["is_parts_pattern"].as_bool(), Some(true),
+            "PARTS SOCIALES name + malformed ISIN must trigger is_parts_pattern");
+        assert_eq!(entry["issue"].as_str(), Some("malformed_isin"),
+            "issue must classify the row as malformed_isin (not generic / missing)");
+        // Sanity: it's the row we put in last.
+        assert_eq!(entry["position_index"].as_u64(), Some(27),
+            "the flagged row must be position 27 (the PARTS row), not any of the 27 valid ones");
     }
 }

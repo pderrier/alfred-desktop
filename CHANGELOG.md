@@ -2,93 +2,40 @@
 
 ## v0.4.5
 
-**Mise à jour obligatoire.** Cette version corrige une analyse de cash erronée et durcit le flux de mise à jour.
+**Mandatory upgrade.** Fixes a cash-analysis error on CSV imports and hardens the update flow.
 
-### What changed
+### What's new
 
-- **Le cash de tes imports CSV est enfin lu correctement.** Quand ton relevé Boursorama indique un solde espèces (« Solde espèces = 5 105 € »), Alfred le prenait à tort pour 0 € et concluait « aucune liquidité disponible » — une analyse fausse. Désormais le solde du CSV est lu et utilisé. Et surtout, Alfred distingue maintenant trois cas : un cash confirmé (« 5 105 € »), un cash réellement nul (« 0 € »), et un cash **inconnu** (non exporté par ton courtier). Dans ce dernier cas il affiche « liquidités inconnues » et ne raisonne PAS sur ta capacité d'achat, au lieu de supposer zéro.
+- **CSV imports now read your cash balance correctly.** When a Boursorama statement lists a cash balance ("Solde espèces = 5 105 €"), Alfred used to treat it as 0 € and conclude "no liquidity available" — a materially wrong analysis. The balance is now read and used. More importantly, Alfred now distinguishes three cases: a confirmed balance, a genuine zero, and an **unknown** balance (not exported by your broker). In the unknown case it shows "cash unknown" and does not reason about your buying power, instead of silently assuming zero.
 
-- **Supprimer un run d'analyse foireux.** Une icône de suppression apparaît sur chaque run dans la liste de gauche. Supprimer un run purge les signaux erronés qu'il a produits et l'exclut des prochaines analyses — la synthèse narrative se nettoie au run suivant. Utile quand un import s'est mal passé et a pollué l'historique.
+- **Delete a botched analysis run.** A delete control now appears on each run in the left-hand list. Deleting a run purges the erroneous signals it produced and excludes it from future analyses — the narrative synthesis cleans up on the next run. Useful when an import went wrong and polluted your history.
 
-- **Mises à jour mieux gérées.** Les nouvelles versions sont désormais obligatoires par défaut, et la fenêtre de mise à jour s'affiche dès le début du chargement (plus besoin d'attendre la fin du splash pour découvrir qu'une mise à jour est requise). Interface en français.
+- **Updates land sooner.** Releases are mandatory by default now, and the update prompt appears at the very start of loading rather than after the full splash — you no longer wait through startup only to be told an update is required.
 
 ### Compatibility
 
-- **Mise à jour obligatoire** : les versions antérieures afficheront l'écran de mise à jour au prochain lancement.
-- Confidentialité et authentification inchangées depuis v0.4.0.
+- **Breaking / mandatory**: earlier versions will show the update screen on next launch.
+- Privacy and authentication unchanged from v0.4.0.
 
 ## v0.4.4
 
-### What changed
+### What's new
 
-- **L'import CSV passe d'un chat libre à une modale d'arbitrage.** Quand
-  une ligne du CSV ne résout pas (ticker générique, ISIN mal formé,
-  parts sociales bancaires), Alfred ouvre maintenant une modale dédiée
-  Cancel/Confirm avec un choix structuré par ligne :
-  - **Accepter la suggestion historique** quand Alfred a déjà analysé
-    cette même position sur le même compte dans un run précédent (ex.
-    « AXA → CS / FR0000120628 depuis le run du 2026-05-16 »). Le cas le
-    plus fréquent : Pierre relance un CSV Boursorama après le précédent,
-    la modale propose en un clic les bons identifiants.
-  - **Saisir un ISIN manuellement** avec validation live (ISO-6166 +
-    Luhn). Le bouton Confirmer reste désactivé tant que l'ISIN tapé est
-    invalide — pas de risque d'envoyer du garbage au pipeline.
-  - **Marquer comme cash-equivalent** pour les parts sociales bancaires
-    (pattern « PARTS SOC… » + ISIN mal formé). L'enrichissement marché
-    est désactivé pour ces lignes, qui restent dans le portefeuille sans
-    bruit de recommandation.
-  - **Skip — analyser sans enrichissement** quand on veut laisser la
-    ligne passer telle quelle.
-
-  Le chat libre reste utilisé pour les imports Finary et pour les CSV
-  dont Alfred ne reconnaît pas du tout le format (où une conversation a
-  du sens). La régression « Pierre répond *oui*, Alfred répond *d'accord
-  c'est bon*, import annulé après clic Confirmer » de v0.4.3 est fixée :
-  le regex anglais-only `^(yes|ok|confirm…)` qui rejetait *oui* est
-  remplacé par une modale qui ne repose plus sur du free-text.
-
-### Under the hood
-
-- Nouvelle commande Tauri `csv_import_apply_corrections_local` qui prend
-  les corrections de la modale et produit le `uploaded_snapshot` passé
-  au pipeline d'analyse — pas de re-parse côté backend.
-- Nouvelle commande Tauri `validate_isin_local` qui expose le validateur
-  ISO-6166 + Luhn à la modale pour la validation live.
-- Backend : `lookup_historical_for_position()` scanne les 10 derniers
-  fichiers `runtime-state/*.json`, filtre par nom normalisé + compte, et
-  retourne la dernière paire (ticker, ISIN) connue pour cette position.
-- Backend : `compute_positions_needing_review()` produit le payload qui
-  pilote la modale, additif au preview existant (`positions_needing_review`).
-- Pipeline : nouveau drapeau position `enrichment_disabled` qui court-
-  circuite la collecte marché/news/LLM tout en gardant la ligne dans le
-  snapshot — utilisé pour les actions `skip` et `cash_equivalent`.
-- 17 tests Rust + 12 tests JS pinent la table de vérité (lookup,
-  filtrage compte, suggestion historique, validation manuelle,
-  cas parts sociales, action inconnue → no-op).
+- **CSV imports use a structured confirmation dialog instead of a free-text chat.** When a row doesn't resolve cleanly (generic ticker, malformed ISIN, bank share certificates), Alfred opens a Cancel/Confirm dialog with a per-row choice: accept the identifier Alfred already used for that position in a past analysis, enter an ISIN manually (validated as you type), mark the line as a cash-equivalent, or skip enrichment for it. The free-text chat is kept for Finary imports and for CSV formats Alfred doesn't recognise. This also fixes a v0.4.3 regression where confirming the import could cancel it.
 
 ### Compatibility
 
-- No mandatory upgrade. v0.4.3 desktops continuent de marcher mais le
-  bug « réponds oui mais import annulé » est fixé dès v0.4.4 installée.
+- No mandatory upgrade. v0.4.3 desktops keep working; the import-confirmation fix applies once v0.4.4 is installed.
 
-## v0.4.3 (hotfix)
+## v0.4.3
 
 ### Bug fixed
 
-- **CSV import wizard plus précis.** Le pré-flight check considérait les
-  tickers de 2-3 caractères (AXA, M6, OVH, THE…) comme « génériques sans
-  résolution » même quand l'ISIN était valide dans le CSV. Résultat sur
-  un portfolio Boursorama typique : ~5 positions sur 28 voyaient leur
-  enrichissement (cours, fondamentaux, news, secteur) silencieusement
-  désactivé. Le check vérifie maintenant si l'ISIN est valide
-  (ISO-6166 + Luhn) en premier — un ticker court avec un bon ISIN est
-  un cas légitime, pas un risque. Les ISINs vraiment malformés
-  (ex. parts sociales bancaires) restent correctement signalés.
+- **More accurate CSV import checks.** Short tickers (2-3 letters, e.g. AXA, M6, OVH) were flagged as "generic, unresolved" even when the CSV carried a valid ISIN — silently disabling enrichment (price, fundamentals, news, sector) on those lines. The check now trusts a valid ISIN (ISO-6166 + checksum) first, so a short ticker with a good ISIN is treated as legitimate. Genuinely malformed ISINs are still flagged.
 
 ### Compatibility
 
-- No mandatory upgrade. v0.4.2 desktops continuent de fonctionner mais
-  bénéficient du fix dès v0.4.3 installée.
+- No mandatory upgrade. v0.4.2 desktops keep working; the fix applies once v0.4.3 is installed.
 
 ## v0.4.2
 

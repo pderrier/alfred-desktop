@@ -7694,3 +7694,226 @@ use crate::storage::read_json_file;
             "parser must read PARTS SOCIALES valeur_actuelle = 922.0 from CSV"
         );
     }
+
+    // ── P0-81: CSV cash balance — read it, and distinguish 0 from unknown ──
+
+    #[test]
+    fn csv_boursorama_extracts_cash_balance() {
+        // Pierre's real Boursorama POSITIONS header carries the cash balance
+        // ("Solde espèces"). It must be parsed into `liquidites` AND flagged
+        // `liquidites_known = true` so the LLM trusts it.
+        let _guard = env_lock();
+        let csv = "Valo total = 29 211,49 €;;;+/- value latente = 1 787,10 €;;;Valo titres = 24 106,49 €;;;Solde espèces = 5 105,00 €\n\
+                   Nom;Code ISIN;Quantité;PRU;Valeur actuelle;ignored;Cours actuel;ignored;Plus/Moins value EUR;ignored;Plus/Moins value %\n\
+                   LVMH;FR0000121014;3, ;472,6 €;1417,80 €;--;479,83 €;--;-21,69 €;--;-1,51 %\n";
+
+        let snap = crate::native_collection::parse_positions_text_for_test(csv, "PEA")
+            .expect("parse must succeed");
+        assert_eq!(
+            snap.get("liquidites").and_then(|v| v.as_f64()),
+            Some(5105.0),
+            "Solde espèces = 5 105,00 € must parse to liquidites = 5105"
+        );
+        assert_eq!(
+            snap.get("liquidites_known").and_then(|v| v.as_bool()),
+            Some(true),
+            "a parsed cash balance must set liquidites_known = true"
+        );
+    }
+
+    #[test]
+    fn csv_without_cash_balance_marks_unknown() {
+        // A CSV whose header has no "Solde espèces" segment: the balance is
+        // UNKNOWN, not zero. The Boursorama parser only fires when both
+        // "Valo total" and "Solde espèces" are present, so a header without
+        // the cash segment produces no totals_line → liquidites_known = false.
+        let _guard = env_lock();
+        let csv = "Nom;Code ISIN;Quantité;PRU;Valeur actuelle;ignored;Cours actuel;ignored;Plus/Moins value EUR;ignored;Plus/Moins value %\n\
+                   LVMH;FR0000121014;3, ;472,6 €;1417,80 €;--;479,83 €;--;-21,69 €;--;-1,51 %\n";
+
+        let snap = crate::native_collection::parse_positions_text_for_test(csv, "PEA")
+            .expect("parse must succeed");
+        assert_eq!(
+            snap.get("liquidites_known").and_then(|v| v.as_bool()),
+            Some(false),
+            "no Solde espèces in header → liquidites_known must be false (unknown)"
+        );
+        // The legacy numeric field still defaults to 0.0 for the UI contract.
+        assert_eq!(
+            snap.get("liquidites").and_then(|v| v.as_f64()),
+            Some(0.0),
+            "liquidites stays 0.0 numerically for the UI contract even when unknown"
+        );
+    }
+
+    #[test]
+    fn cash_mapping_does_not_overwrite_parsed_csv_balance() {
+        // The orchestrator hypothesis was that cash-mapping reconciliation
+        // flattens the parsed CSV balance to 0. It does NOT — a CSV snapshot
+        // has no `accounts[]` array, so per-account scoping falls back to the
+        // snapshot-level liquidites. This test pins the contract at the
+        // assembly point (build_collection_state) that feeds the LLM prompt:
+        // a CSV snapshot carrying liquidites=5105/known=true must survive
+        // verbatim into run_state.portfolio.
+        let _guard = env_lock();
+        let csv_snapshot = json!({
+            "portfolio_source": "csv",
+            "positions": [{"ticker": "MC", "valeur_actuelle": 1417.80, "plus_moins_value": -21.69}],
+            "valeur_totale": 24106.49,
+            "plus_value_totale": 1787.10,
+            "liquidites": 5105.0,
+            "liquidites_known": true
+        });
+        // normalize_csv_snapshot is the first hop after parsing — must preserve.
+        let normalized = crate::native_collection_helpers::normalize_csv_snapshot(&csv_snapshot);
+        assert_eq!(normalized.get("liquidites").and_then(|v| v.as_f64()), Some(5105.0));
+        assert_eq!(normalized.get("liquidites_known").and_then(|v| v.as_bool()), Some(true));
+
+        // build_collection_state is the assembly point that writes
+        // run_state.portfolio — the exact object every prompt builder reads.
+        let empty = serde_json::Map::new();
+        let state = crate::native_collection_helpers::build_collection_state(
+            &normalized,
+            &[],
+            &empty, &empty, &empty,
+            &serde_json::Value::Null,
+            &[], &[],
+            "csv", "success",
+            &serde_json::Value::Null,
+            &serde_json::Value::Null,
+            None,
+        );
+        let portfolio = state.get("portfolio").expect("portfolio object");
+        assert_eq!(
+            portfolio.get("liquidites").and_then(|v| v.as_f64()),
+            Some(5105.0),
+            "build_collection_state must not flatten the parsed CSV cash to 0"
+        );
+        assert_eq!(
+            portfolio.get("liquidites_known").and_then(|v| v.as_bool()),
+            Some(true),
+            "build_collection_state must forward liquidites_known into the portfolio"
+        );
+    }
+
+    #[test]
+    fn finary_snapshot_unmapped_account_marks_cash_unknown() {
+        // P0-81 parity for Finary: an investment account with no cash mapping
+        // must surface cash_known=false in accounts[], so the per-account
+        // scoping tells the LLM "inconnu" rather than "0€".
+        let _guard = env_lock();
+        // Finary snapshot with an investment account that has positions but no
+        // matching cash account anywhere → no mapping entry → cash_known=false.
+        // normalize_finary_snapshot must forward the global liquidites_known.
+        let finary_snapshot = json!({
+            "positions": [{"symbol": "MC", "name": "LVMH", "account": "PEA Bourse",
+                           "market_value": 1000.0, "gain_loss": 50.0}],
+            "accounts": [{"name": "PEA Bourse", "total_value": 1000.0, "total_gain": 50.0,
+                          "cash": 0.0, "cash_known": false}],
+            "cash": 0.0,
+            "liquidites_known": false,
+            "total_value": 1000.0,
+            "total_gain": 50.0
+        });
+        let normalized = crate::native_collection_helpers::normalize_finary_snapshot(&finary_snapshot);
+        assert_eq!(
+            normalized.get("liquidites_known").and_then(|v| v.as_bool()),
+            Some(false),
+            "normalize_finary_snapshot must forward an unknown global cash flag"
+        );
+        // The per-account cash_known marker must survive on accounts[].
+        let account_cash_known = normalized.get("accounts")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|a| a.get("cash_known"))
+            .and_then(|v| v.as_bool());
+        assert_eq!(
+            account_cash_known, Some(false),
+            "accounts[].cash_known must survive normalization for the scoping logic"
+        );
+    }
+
+    #[test]
+    fn csv_pierre_repro_boursorama_solde_especes_reaches_portfolio() {
+        // THE decisive P0-81 repro. iter 1 tested parse_positions_text on a CSV
+        // whose totals line was still present, so it never exercised the bug:
+        // the REAL upload path runs prepare_csv_text first, which STRIPS the
+        // "Solde espèces" line and extracts the balance into boursorama_meta.
+        // parse_positions_text then sees no balance (liquidites=0/unknown) and
+        // the extracted value used to be discarded — exactly Pierre's prod run
+        // 019e5ba08eb8 where portfolio.liquidites=0 despite "Solde espèces =
+        // 5 105,00 €" in the file, making the LLM declare "plus aucune liquidité".
+        //
+        // This asserts the full upload pipeline (parse_csv_upload_text) now lets
+        // the 5105 balance reach the snapshot the analysis worker consumes.
+        let _guard = env_lock();
+        let csv = "Valorisation détaillée d'un contrat\n\
+                   Edition du 26/05/2026\n\
+                   Contrat numéro : 43605682287;;;DERRIER PIERRE (COMPTE PEA)\n\
+                   Valo total = 29 211,49 €;;;+/- value latente = 1 787,10 €;;;Valo titres = 24 106,49 €;;;Solde espèces = 5 105,00 €\n\
+                   Nom;Code ISIN;Quantité;PRU;Valeur actuelle;ignored;Cours actuel;ignored;Plus/Moins value EUR;ignored;Plus/Moins value %\n\
+                   AXA;FR0000120628;18, ;38,00 €;722,16 €;--;40,12 €;--;38,16 €;--;5,58 %\n\
+                   LVMH;FR0000121014;3, ;472,6 €;1417,80 €;--;479,83 €;--;-21,69 €;--;-1,51 %\n";
+
+        let snapshot = crate::native_collection::parse_csv_upload_text_for_test(csv, "PEA")
+            .expect("parse_csv_upload_text must succeed on Pierre's Boursorama CSV");
+
+        assert_eq!(
+            snapshot.get("liquidites").and_then(|v| v.as_f64()),
+            Some(5105.0),
+            "Solde espèces = 5 105,00 € must reach snapshot.liquidites through the \
+             real upload path (prepare_csv_text strips the line, apply_boursorama_totals \
+             re-attaches it). Got: {:?}",
+            snapshot.get("liquidites")
+        );
+        assert_eq!(
+            snapshot.get("liquidites_known").and_then(|v| v.as_bool()),
+            Some(true),
+            "a CSV that explicitly carried the cash balance must set liquidites_known = true"
+        );
+        // The authoritative Boursorama "Valo total" must also survive the strip,
+        // so the preview/stats show the broker figure rather than 0.
+        assert_eq!(
+            snapshot.get("valeur_totale").and_then(|v| v.as_f64()),
+            Some(29211.49),
+            "Valo total must survive the totals-line strip via apply_boursorama_totals"
+        );
+        assert_eq!(
+            snapshot.get("plus_value_totale").and_then(|v| v.as_f64()),
+            Some(1787.10),
+            "+/- value latente must survive the totals-line strip"
+        );
+
+        // End-to-end propagation: parse → normalize → build_collection_state.
+        // This is the exact chain the analysis worker runs (resolve_native_snapshot
+        // calls normalize_csv_snapshot; the per-account scoping copies
+        // snapshot.liquidites into account_cash because a CSV snapshot has no
+        // accounts[]; build_collection_state writes run_state.portfolio). Pins
+        // that 5105 reaches portfolio.liquidites, not just the parse output.
+        let normalized = crate::native_collection_helpers::normalize_csv_snapshot(&snapshot);
+        let positions: Vec<serde_json::Value> = normalized.get("positions")
+            .and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let empty = serde_json::Map::new();
+        let state = crate::native_collection_helpers::build_collection_state(
+            &normalized,
+            &positions,
+            &empty, &empty, &empty,
+            &serde_json::Value::Null,
+            &[], &[],
+            "csv", "success",
+            &serde_json::Value::Null,
+            &serde_json::Value::Null,
+            None,
+        );
+        let portfolio = state.get("portfolio").expect("portfolio object");
+        assert_eq!(
+            portfolio.get("liquidites").and_then(|v| v.as_f64()),
+            Some(5105.0),
+            "the parsed CSV balance must reach run_state.portfolio.liquidites end-to-end"
+        );
+        assert_eq!(
+            portfolio.get("liquidites_known").and_then(|v| v.as_bool()),
+            Some(true),
+            "liquidites_known=true must reach run_state.portfolio end-to-end"
+        );
+    }

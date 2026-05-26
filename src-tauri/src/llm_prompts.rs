@@ -18,6 +18,37 @@ use serde_json::{json, Value};
 pub(crate) const TARGET_WEIGHT_PCT_SCHEMA_LINE: &str =
     "target_weight_pct: float 0-100 ou null (taille cible de cette ligne dans le portefeuille apres execution de tes recos). Mets null si signal=CONSERVER ou SURVEILLANCE. Plafond : 30 % par ligne sauf justification explicite dans synthese.";
 
+/// P0-81 — single source of truth for how the cash balance is described to the
+/// LLM, across every prompt builder (parity contract). The three states must be
+/// rendered distinctly:
+///
+///   * `known && cash > 0`  → `"5105€"`
+///   * `known && cash == 0`  → `"0€ (aucune liquidite disponible)"`
+///   * `!known`              → `"inconnu ..."` with an explicit instruction NOT
+///                             to assume 0 and NOT to reason about buying power.
+///
+/// The `liquidites_known` flag is the parallel field added by the collection
+/// pipeline (see `native_collection.rs` / `docs/finary-snapshot-schema.md`).
+/// When it is absent we render "inconnu" — the safe stance — so an older
+/// run_state never makes the LLM believe the portfolio holds 0€.
+pub(crate) fn render_cash_for_prompt(portfolio: &Value) -> String {
+    let known = portfolio
+        .get("liquidites_known")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !known {
+        return "inconnu (non disponible dans les donnees — NE PAS supposer 0, \
+ne raisonne PAS sur la capacite d'achat ni la liquidite disponible)"
+            .to_string();
+    }
+    let cash = portfolio.get("liquidites").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    if cash <= 0.0 {
+        "0€ (aucune liquidite disponible)".to_string()
+    } else {
+        format!("{cash:.0}€")
+    }
+}
+
 // ── Previous syntheses loader ───────────────────────────────────
 
 /// Load the last N global syntheses from report history for narrative continuity.
@@ -165,7 +196,7 @@ les resume et les met en perspective — elle ne reinvente pas l'analyse.
 RESUME DU PORTEFEUILLE:
 - Valeur totale: {total_value:.0}€
 - Plus/moins-value: {total_gain:+.0}€
-- Liquidites: {cash:.0}€
+- Liquidites: {cash_display}
 - {nb_achat} signaux achat/renforcement | {nb_conserver} a conserver/surveiller | {nb_vente} a alleger/vendre
 
 RECOMMANDATIONS PAR LIGNE (signaux definitifs — ne pas contredire):
@@ -206,7 +237,9 @@ Regles strictes:
 - Chaque action DOIT etre chiffree (quantity > 0, estimated_amount_eur > 0)
 - Maximum 5 actions, priorites 1-5 uniques
 - Pour LIMIT: limit_price > 0. Pour MARKET: limit_price = null
-- Si liquidites = 0: uniquement VENTE/ALLEGEMENT (ou 0 action)
+- Si liquidites = 0 (montant connu): uniquement VENTE/ALLEGEMENT (ou 0 action).
+  Si liquidites inconnu: ne fais AUCUNE supposition sur la capacite d'achat —
+  raisonne sur les merites de chaque ligne sans contrainte de cash.
 - Ne presente PAS les watchlist comme deja detenues
 - Si ecart strategie, le dire clairement dans synthese_marche
 
@@ -220,7 +253,7 @@ OBLIGATIONS de remplissage (P2-7) — non negociable:
 Reponds uniquement en JSON valide."#,
         total_value = portfolio.get("valeur_totale").and_then(|v| v.as_f64()).unwrap_or(0.0),
         total_gain = portfolio.get("plus_value_totale").and_then(|v| v.as_f64()).unwrap_or(0.0),
-        cash = portfolio.get("liquidites").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        cash_display = render_cash_for_prompt(&portfolio),
         nb_achat = nb_achat,
         nb_conserver = nb_conserver,
         nb_vente = nb_vente,
@@ -309,7 +342,7 @@ VALEUR ANALYSEE: {nom} ({ticker})
 
 CONTEXTE PORTEFEUILLE:
 - Valeur totale: {total_value:.0}€
-- Liquidites: {cash:.0}€
+- Liquidites: {cash_display}
 - Plus/moins-value totale: {total_gain:+.0}€
 {guidelines_section}
 ---
@@ -391,7 +424,7 @@ Reponds uniquement en JSON valide."#,
         section_technical = section_technical,
         total_value = portfolio.get("valeur_totale").and_then(|v| v.as_f64()).unwrap_or(0.0),
         total_gain = portfolio.get("plus_value_totale").and_then(|v| v.as_f64()).unwrap_or(0.0),
-        cash = portfolio.get("liquidites").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        cash_display = render_cash_for_prompt(&portfolio),
         guidelines_section = guidelines_section,
         extracted_fundamentals_field = if has_missing_market_fundamentals(line_context.get("market")) {
             ",\n    \"extracted_fundamentals\": {\"pe_ratio\": null, \"revenue_growth\": null, \"profit_margin\": null, \"debt_to_equity\": null}"
@@ -1011,7 +1044,7 @@ pub(crate) fn build_watchlist_prompt(positions: &[Value], portfolio: &Value, gui
         })
         .collect();
     let total_value = portfolio.get("valeur_totale").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let cash = portfolio.get("liquidites").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let cash_display = render_cash_for_prompt(&portfolio);
 
     let guidelines_section = if guidelines.is_empty() {
         String::new()
@@ -1041,7 +1074,7 @@ COMPTE: {account}
 POSITIONS ACTUELLES:
 {positions}
 
-PORTEFEUILLE: {total_value:.0}€ total, {cash:.0}€ cash
+PORTEFEUILLE: {total_value:.0}€ total, liquidites: {cash_display}
 {guidelines_section}
 Suggere exactement 5 tickers complementaires (non detenus) en te basant sur:
 - Diversification sectorielle (quels secteurs sont sous-representes?)
@@ -1064,7 +1097,7 @@ Reponds en JSON strict:
         account = account,
         positions = position_tickers.join("\n"),
         total_value = total_value,
-        cash = cash,
+        cash_display = cash_display,
         guidelines_section = guidelines_section,
         universe_constraint = universe_constraint,
         ticker_example = ticker_example,
@@ -1137,7 +1170,7 @@ PROBLEMES A CORRIGER: {issues}
 
 CONTEXTE PORTEFEUILLE:
 - Valeur totale: {total_value:.0}€
-- Liquidites: {cash:.0}€
+- Liquidites: {cash_display}
 - Plus/moins-value: {total_gain:+.0}€
 {guidelines_section}
 RECOMMANDATION PRECEDENTE (a ameliorer):
@@ -1162,7 +1195,7 @@ JSON valide uniquement, cle "recommendation"."#,
         rec_to_fix = rec_to_fix,
         total_value = portfolio.get("valeur_totale").and_then(|v| v.as_f64()).unwrap_or(0.0),
         total_gain = portfolio.get("plus_value_totale").and_then(|v| v.as_f64()).unwrap_or(0.0),
-        cash = portfolio.get("liquidites").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        cash_display = render_cash_for_prompt(&portfolio),
         calibration_instruction = calibration_instruction,
     )
 }
@@ -2016,5 +2049,182 @@ mod tests {
                 "native prompt missing CALIBRATION line: {line:?}\n--- prompt ---\n{p_native}"
             );
         }
+    }
+
+    // ── P0-81: cash known / unknown rendering ──────────────────────
+    //
+    // The three states must be rendered distinctly in every prompt so the
+    // LLM never confuses "0€ disponible" (known, blocks buys) with "inconnu"
+    // (don't reason about liquidity at all). render_cash_for_prompt is the
+    // single source — assert it directly, then prove every builder routes
+    // through it (parity contract).
+
+    #[test]
+    fn render_cash_for_prompt_known_positive() {
+        let portfolio = json!({ "liquidites": 5105.0, "liquidites_known": true });
+        assert_eq!(render_cash_for_prompt(&portfolio), "5105€");
+    }
+
+    #[test]
+    fn render_cash_for_prompt_known_zero_mentions_no_liquidity() {
+        let portfolio = json!({ "liquidites": 0.0, "liquidites_known": true });
+        let rendered = render_cash_for_prompt(&portfolio);
+        assert!(
+            rendered.contains("0€") && rendered.contains("aucune liquidite"),
+            "known-zero must mention 'aucune liquidite'; got {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn render_cash_for_prompt_unknown_forbids_assuming_zero() {
+        let portfolio = json!({ "liquidites": 0.0, "liquidites_known": false });
+        let rendered = render_cash_for_prompt(&portfolio);
+        assert!(
+            rendered.contains("inconnu"),
+            "unknown must render 'inconnu'; got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("NE PAS supposer 0"),
+            "unknown must instruct NOT to assume 0; got {rendered:?}"
+        );
+        // Never leak a misleading "0€" for the unknown state.
+        assert!(
+            !rendered.contains("0€"),
+            "unknown must not render a numeric 0€; got {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn render_cash_for_prompt_missing_flag_defaults_to_unknown() {
+        // No liquidites_known field at all (legacy run_state) → unknown, the
+        // safe stance, never "0€".
+        let portfolio = json!({ "liquidites": 0.0 });
+        let rendered = render_cash_for_prompt(&portfolio);
+        assert!(
+            rendered.contains("inconnu"),
+            "missing flag must default to 'inconnu'; got {rendered:?}"
+        );
+    }
+
+    fn run_state_with_cash(cash: f64, known: bool) -> Value {
+        json!({
+            "portfolio": {
+                "valeur_totale": 100000.0,
+                "liquidites": cash,
+                "liquidites_known": known,
+                "plus_value_totale": 1000.0
+            },
+            "run_id": "test-run-cash",
+            "account": "PEA"
+        })
+    }
+
+    fn line_context_minimal() -> Value {
+        json!({
+            "ticker": "MC",
+            "row": {"nom": "LVMH", "ticker": "MC", "quantite": 3},
+            "type": "position",
+            "market": {"price": 480.0},
+            "news": {"items": []},
+            "line_memory": {},
+        })
+    }
+
+    #[test]
+    fn prompt_renders_cash_known_positive_across_builders() {
+        let run_state = run_state_with_cash(5105.0, true);
+        let line_context = line_context_minimal();
+
+        let report = build_report_prompt(&run_state);
+        let line = build_line_analysis_prompt(&line_context, &run_state, None, None);
+        let validation = json!({ "validation_issues": ["x"], "recommendation_to_fix": {} });
+        let repair = build_repair_prompt(&line_context, &run_state, None, &validation, None);
+        let positions = vec![json!({"ticker": "MC", "nom": "LVMH", "isin": "FR0000121014"})];
+        let watchlist = build_watchlist_prompt(
+            &positions,
+            run_state.get("portfolio").unwrap(),
+            "",
+            "PEA",
+        );
+
+        for (name, prompt) in [
+            ("report", &report),
+            ("line", &line),
+            ("repair", &repair),
+            ("watchlist", &watchlist),
+        ] {
+            assert!(
+                prompt.contains("5105€"),
+                "{name} prompt must render the actual cash amount '5105€'; got:\n{prompt}"
+            );
+            // The rendered cash descriptor must not be the "inconnu" sentence —
+            // the static actions rule text legitimately mentions "inconnu" in
+            // both branches, so we assert on the descriptor string itself.
+            assert!(
+                !prompt.contains("non disponible dans les donnees"),
+                "{name} prompt must not render the unknown descriptor when cash is known; got:\n{prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_renders_cash_known_zero_across_builders() {
+        let run_state = run_state_with_cash(0.0, true);
+        let line_context = line_context_minimal();
+
+        let report = build_report_prompt(&run_state);
+        let line = build_line_analysis_prompt(&line_context, &run_state, None, None);
+        let validation = json!({ "validation_issues": ["x"], "recommendation_to_fix": {} });
+        let repair = build_repair_prompt(&line_context, &run_state, None, &validation, None);
+
+        for (name, prompt) in [("report", &report), ("line", &line), ("repair", &repair)] {
+            assert!(
+                prompt.contains("aucune liquidite"),
+                "{name} prompt must mention 'aucune liquidite' for known-zero; got:\n{prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_renders_cash_unknown_across_builders() {
+        let run_state = run_state_with_cash(0.0, false);
+        let line_context = line_context_minimal();
+
+        let report = build_report_prompt(&run_state);
+        let line = build_line_analysis_prompt(&line_context, &run_state, None, None);
+        let validation = json!({ "validation_issues": ["x"], "recommendation_to_fix": {} });
+        let repair = build_repair_prompt(&line_context, &run_state, None, &validation, None);
+        let positions = vec![json!({"ticker": "MC", "nom": "LVMH", "isin": "FR0000121014"})];
+        let watchlist = build_watchlist_prompt(
+            &positions,
+            run_state.get("portfolio").unwrap(),
+            "",
+            "PEA",
+        );
+
+        for (name, prompt) in [
+            ("report", &report),
+            ("line", &line),
+            ("repair", &repair),
+            ("watchlist", &watchlist),
+        ] {
+            // The cash DESCRIPTOR (not just the static rule) must be the
+            // unknown sentence — assert on the unique descriptor text.
+            assert!(
+                prompt.contains("non disponible dans les donnees"),
+                "{name} prompt must render the unknown cash descriptor; got:\n{prompt}"
+            );
+            assert!(
+                prompt.contains("NE PAS supposer 0"),
+                "{name} prompt must instruct NOT to assume 0; got:\n{prompt}"
+            );
+        }
+
+        // The synthesis builder additionally carries the actions rule: it must
+        // spell out the unknown-cash branch so the LLM doesn't gate buys.
+        assert!(
+            report.contains("liquidites inconnu"),
+            "report actions rule must address 'liquidites inconnu'; got:\n{report}"
+        );
     }
 }

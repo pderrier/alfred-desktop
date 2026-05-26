@@ -2106,7 +2106,10 @@ WORKFLOW STRICT — suis ces etapes dans l'ordre :
    }}
    Regles: quantity > 0, estimated_amount_eur > 0, priorities 1-5 uniques,
    LIMIT => limit_price > 0, MARKET => limit_price = null.
-   Si liquidites = 0: uniquement VENTE/ALLEGEMENT (ou 0 action).
+   Si liquidites = 0 (montant connu): uniquement VENTE/ALLEGEMENT (ou 0 action).
+   Si liquidites inconnu (portfolio_summary.liquidites_known = false): ne fais
+   AUCUNE supposition sur la capacite d'achat — raisonne sur les merites de
+   chaque ligne sans contrainte de cash.
 
    OBLIGATIONS de remplissage (P2-7):
    - TU DOIS peupler `limit_price` pour TOUTE action VENTE / ALLEGEMENT /

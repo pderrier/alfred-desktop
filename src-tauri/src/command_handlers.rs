@@ -138,6 +138,18 @@ pub fn run_by_id(run_id: String) -> Result<serde_json::Value> {
     }))
 }
 
+/// P1-82 — delete/ban a poisoned analysis run. Bans the run_id (guaranteed
+/// safety net) then surgically purges its line-memory signal_history +
+/// recomputes derived fields + removes the run's files and index entry.
+pub fn run_delete_run(run_id: String) -> Result<serde_json::Value> {
+    let outcome = crate::run_deletion::delete_run(&run_id)?;
+    Ok(json!({
+        "ok": true,
+        "action": "run:delete-local",
+        "result": outcome.to_summary()
+    }))
+}
+
 pub fn run_stack_health() -> Result<serde_json::Value> {
     Ok(json!({
         "ok": true,

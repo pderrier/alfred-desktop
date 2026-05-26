@@ -202,6 +202,40 @@ test("bridge.getAdminVpsStats rejects the legacy underscore action (regression g
   await assertRejectsPayloadInvalid(bridge.getAdminVpsStats());
 });
 
+// ── deleteRun (P1-82) ──────────────────────────────────────────────────
+
+test("bridge.deleteRun accepts the canonical Rust action 'run:delete-local' and unwraps the summary", async () => {
+  // Matches the action string emitted by `run_delete_run` in
+  // command_handlers.rs. app.js reads the unwrapped summary directly
+  // (signal_entries_purged / tickers_affected). A regression on the
+  // action string silently breaks the delete toast + counts.
+  const bridge = bridgeReturning({
+    ok: true,
+    action: "run:delete-local",
+    result: { deleted: true, banned: true, signal_entries_purged: 3, tickers_affected: 2 },
+  });
+  const result = await bridge.deleteRun("run_bad");
+  assert.deepEqual(result, {
+    deleted: true,
+    banned: true,
+    signal_entries_purged: 3,
+    tickers_affected: 2,
+  });
+});
+
+test("bridge.deleteRun rejects an empty run id without invoking", async () => {
+  let invoked = false;
+  const bridge = createDesktopBridgeClient({
+    invoke: async () => { invoked = true; return {}; },
+    globalObject: { fetch: null },
+  });
+  await assert.rejects(bridge.deleteRun("   "), (err) => {
+    assert.equal(err.code, "run_id_required");
+    return true;
+  });
+  assert.equal(invoked, false, "must not hit the backend with a blank run id");
+});
+
 // ── Validator-contract negative case ───────────────────────────────────
 
 test("normalizeTauriPayload rejects a deliberate-mismatch action (validator stays strict)", async () => {

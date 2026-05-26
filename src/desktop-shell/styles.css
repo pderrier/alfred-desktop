@@ -675,6 +675,53 @@ body:has(.splash-screen:not(.fade-out)) .app-layout {
   color: var(--text-strong);
 }
 
+/* P1-82 — run row wraps the selectable run button + an additive delete
+   control. The run button still flex-grows to fill the row. */
+.run-entry-wrap {
+  display: flex;
+  align-items: center;
+  gap: 0.2rem;
+}
+
+.run-entry-wrap .run-entry {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.run-delete-btn {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.4rem;
+  height: 1.4rem;
+  padding: 0;
+  font-size: 0.72rem;
+  line-height: 1;
+  color: var(--sea-muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+  opacity: 0.4;
+  transition: opacity 0.12s ease, color 0.12s ease, background 0.12s ease;
+}
+
+/* CR-2 (P1-82): the delete control is always visible but quiet
+   (opacity 0.4) so it's a discoverable affordance for the frustrated user
+   who needs it, then comes fully forward on row hover/focus. */
+.run-entry-wrap:hover .run-delete-btn,
+.run-delete-btn:hover,
+.run-delete-btn:focus-visible {
+  opacity: 1;
+}
+
+.run-delete-btn:hover {
+  color: #ba4b3a;
+  background: rgba(186, 75, 58, 0.12);
+  border-color: rgba(186, 75, 58, 0.4);
+}
+
 .run-dot {
   width: 0.5rem;
   height: 0.5rem;

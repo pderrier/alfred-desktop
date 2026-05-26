@@ -9,6 +9,7 @@ import {
   buildReportViewModel
 } from "/desktop-shell/report-view-model.js";
 import { resolveShellIntentRoute } from "/desktop-shell/shell-intent-router.js";
+import { buildDeleteRunToast } from "/desktop-shell/app-delete-run-modal.js";
 import { initWizard } from "/desktop-shell/app-wizard.js";
 import { initLineModal, buildPositionContext, showSaveToMemoryPanel, synthesizeChatForMemoryWithUI } from "/desktop-shell/app-line-modal.js";
 import {
@@ -1978,6 +1979,30 @@ initShellLayout({
         const select = document.getElementById("wizard-account-select");
         if (select) select.value = accountName;
       };
+    }
+  },
+  // P1-82 — delete/ban a poisoned run. The shell-layout confirm modal has
+  // already resolved before this runs. Purges signal accumulation + drains
+  // the LLM synthesis poison server-side, then refreshes the sidebar.
+  deleteRun: async (runId) => {
+    try {
+      // bridge.deleteRun unwraps the Tauri envelope and returns the summary
+      // object directly (deleted / signal_entries_purged / tickers_affected /
+      // residual_narrative_warning …).
+      const summary = (await bridge.deleteRun(runId)) || {};
+      // If the deleted run was the one on screen, drop back to the welcome
+      // view so we never display a run whose state file is gone.
+      if (activeRunId === runId) {
+        activeRunId = null;
+        setLiveRunActiveId(null);
+      }
+      await refreshDashboard();
+      // Post-delete toast: surface what just happened. Signals purge
+      // synchronously; the narrative synthesis can only drain on the NEXT run,
+      // so we tell the user when that residual exists (CR-1, P1-82).
+      showToast(buildDeleteRunToast(summary), "success");
+    } catch (err) {
+      showToast(`Échec de la suppression : ${formatBridgeError(err)}`, "error");
     }
   }
 });

@@ -7,6 +7,7 @@
 
 import { formatCurrency, escapeHtml, truncate } from "/desktop-shell/ui-display-utils.js";
 import { renderPositionsTable } from "/desktop-shell/shell-positions.js";
+import { openDeleteRunModal, buildDeleteRunButton } from "/desktop-shell/app-delete-run-modal.js";
 import {
   renderLivePositions,
   updateSingleLineProgress,
@@ -89,10 +90,11 @@ let onSyncFinary = null;
 let onEditGuidelines = null;
 let onStopAnalysis = null;
 let onRetrySynthesis = null;
+let onDeleteRun = null;
 
 // ── Public API ────────────────────────────────────────────────────
 
-export function initShellLayout({ openWizard, connectOpenai, syncFinary, stopAnalysis, retrySynthesis, selectRun, selectAccount, editGuidelines }) {
+export function initShellLayout({ openWizard, connectOpenai, syncFinary, stopAnalysis, retrySynthesis, selectRun, selectAccount, editGuidelines, deleteRun }) {
   onOpenWizard = openWizard;
   onConnectOpenai = connectOpenai;
   onSyncFinary = syncFinary;
@@ -101,6 +103,7 @@ export function initShellLayout({ openWizard, connectOpenai, syncFinary, stopAna
   onRetrySynthesis = retrySynthesis;
   onAccountSelected = selectAccount;
   onRunSelected = selectRun;
+  onDeleteRun = deleteRun;
 
   cmdRunAnalysis?.addEventListener("click", () => onOpenWizard?.());
   sidebarNewRunBtn?.addEventListener("click", () => onOpenWizard?.());
@@ -780,6 +783,15 @@ function selectRun(runId, account) {
   onRunSelected?.(runId);
 }
 
+// P1-82 — open the confirm modal, then delegate the actual delete + sidebar
+// refresh to app.js via the onDeleteRun callback (which owns the bridge and
+// dashboard payload). Kept thin here so shell-layout stays presentation-only.
+async function handleDeleteRunClick(runId, label) {
+  const decision = await openDeleteRunModal({ runId, label });
+  if (!decision?.confirmed) return;
+  await onDeleteRun?.(runId);
+}
+
 function highlightSelectedRun() {
   document.querySelectorAll(".run-entry.is-selected").forEach((el) => el.classList.remove("is-selected"));
   document.querySelectorAll(".account-folder.is-selected").forEach((el) => el.classList.remove("is-selected"));
@@ -856,15 +868,24 @@ function renderAccountFolder(acct) {
     const runsList = document.createElement("div");
     runsList.className = "account-runs";
     for (const run of acct.runs.slice(0, 10)) {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.dataset.runId = run.run_id;
       const status = run.status || "unknown";
       const isActiveRun = isActiveRunInProgress() && run.status === "running";
-      btn.className = isActiveRun ? "run-entry run-entry-active" : "run-entry";
       const dotClass = isActiveRun ? "s-running" : status === "completed" ? "s-completed" : status === "running" ? "s-running" : (status === "failed" || status === "aborted") ? "s-failed" : "s-unknown";
       const ts = run.updated_at ? new Date(run.updated_at).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "?";
       const srcIcon = run.portfolio_source === "finary" ? "F" : "C";
+
+      // P1-82: a run row is a flex wrapper holding the (selectable) run
+      // button + an additive delete control. The run button keeps the
+      // `.run-entry` class + `data-run-id` so highlightSelectedRun and live
+      // push events still target it. The delete icon is purely additive \u2014
+      // it never removes or replaces the existing run-entry affordance.
+      const wrap = document.createElement("div");
+      wrap.className = "run-entry-wrap";
+
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.dataset.runId = run.run_id;
+      btn.className = isActiveRun ? "run-entry run-entry-active" : "run-entry";
       btn.innerHTML = isActiveRun
         ? `<span class="pipeline-spinner" style="width:0.5rem;height:0.5rem;border-width:1.5px"></span>
            <span class="run-ts" style="color:#8ecae6;font-weight:700">Running\u2026</span>`
@@ -872,7 +893,18 @@ function renderAccountFolder(acct) {
            <span class="run-ts">${escapeHtml(ts)}</span>
            <span class="run-source-icon">${srcIcon}</span>`;
       btn.addEventListener("click", () => selectRun(run.run_id, acct.name));
-      runsList.appendChild(btn);
+      wrap.appendChild(btn);
+
+      // Don't offer deletion of the run currently being analysed \u2014 purging
+      // its (incomplete) signals mid-flight would race the writer.
+      if (!isActiveRun) {
+        const delBtn = buildDeleteRunButton(run.run_id, (runId) => {
+          handleDeleteRunClick(runId, `${acct.name} \u00b7 ${ts}`);
+        });
+        wrap.appendChild(delBtn);
+      }
+
+      runsList.appendChild(wrap);
     }
     folder.appendChild(runsList);
   }

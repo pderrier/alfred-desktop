@@ -7917,3 +7917,269 @@ use crate::storage::read_json_file;
             "liquidites_known=true must reach run_state.portfolio end-to-end"
         );
     }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // P1-82 — delete/ban a poisoned analysis run
+    //
+    // Two layers under test:
+    //   Layer 1 (ban):    build_memory_section / sanitize skip banned runs.
+    //   Layer 2 (surgical): apply_run_deletion_to_store purges signal_history
+    //                       by run_id, recomputes derived fields from the new
+    //                       head, resets a ticker whose only history was the
+    //                       deleted run, and prunes run_history by date.
+    // Plus the file/index removal + summary counters.
+    // ═════════════════════════════════════════════════════════════════════
+
+    /// Layer 2 — purge: only the deleted run's signal_history entries leave;
+    /// the others survive untouched.
+    #[test]
+    fn delete_run_purges_signal_history_by_run_id() {
+        let _guard = env_lock();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempdir.path().join("runtime-state");
+        std::env::set_var("ALFRED_STATE_DIR", state_dir.as_os_str());
+
+        seed_line_memory_fixture(&state_dir, json!({
+            "by_ticker": {
+                "MC.PA": {
+                    "schema_version": 2,
+                    "ticker": "MC",
+                    "signal": "ACHAT",
+                    "conviction": "forte",
+                    "signal_history": [
+                        { "date": "2026-05-25", "signal": "ACHAT", "conviction": "forte", "price_at_signal": 700.0, "run_id": "run_bad" },
+                        { "date": "2026-05-10", "signal": "CONSERVER", "conviction": "moderee", "price_at_signal": 690.0, "run_id": "run_good" }
+                    ],
+                    "price_tracking": { "current_price": 710.0, "stale": false },
+                    "memory_narrative": "LVMH thesis."
+                }
+            }
+        }));
+
+        let outcome = crate::run_deletion::apply_run_deletion_for_test("run_bad", "");
+        std::env::remove_var("ALFRED_STATE_DIR");
+
+        assert_eq!(outcome.signal_entries_purged, 1);
+        assert_eq!(outcome.tickers_affected, 1);
+        assert_eq!(outcome.tickers_reset, 0);
+
+        let store = crate::native_mcp_analysis::line_memory_read_for_test();
+        let hist = store["by_ticker"]["MC.PA"]["signal_history"].as_array().expect("history");
+        assert_eq!(hist.len(), 1, "only the surviving run_good entry remains");
+        assert_eq!(hist[0]["run_id"], "run_good");
+    }
+
+    /// Layer 2 — recompute: after purging the banned head, the entry's
+    /// top-level signal/conviction/run_id_last_update reflect the NEW head.
+    #[test]
+    fn delete_run_recomputes_derived_from_new_last() {
+        let _guard = env_lock();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempdir.path().join("runtime-state");
+        std::env::set_var("ALFRED_STATE_DIR", state_dir.as_os_str());
+
+        seed_line_memory_fixture(&state_dir, json!({
+            "by_ticker": {
+                "MC.PA": {
+                    "schema_version": 2,
+                    "ticker": "MC",
+                    "signal": "ACHAT",
+                    "conviction": "forte",
+                    "run_id_last_update": "run_bad",
+                    "trend": "upgrading",
+                    "signal_history": [
+                        { "date": "2026-05-25", "signal": "ACHAT", "conviction": "forte", "price_at_signal": 700.0, "run_id": "run_bad" },
+                        { "date": "2026-05-10", "signal": "VENTE", "conviction": "moderee", "price_at_signal": 690.0, "run_id": "run_good" }
+                    ],
+                    "price_tracking": { "last_signal": "ACHAT", "current_price": 621.0, "stale": false }
+                }
+            }
+        }));
+
+        crate::run_deletion::apply_run_deletion_for_test("run_bad", "");
+        std::env::remove_var("ALFRED_STATE_DIR");
+
+        let store = crate::native_mcp_analysis::line_memory_read_for_test();
+        let entry = &store["by_ticker"]["MC.PA"];
+        assert_eq!(entry["signal"], "VENTE", "top-level signal = new head");
+        assert_eq!(entry["conviction"], "moderee");
+        assert_eq!(entry["run_id_last_update"], "run_good");
+        // price_tracking rebuilt from the surviving VENTE head: anchor 690,
+        // current 621 → −10% → a VENTE (bearish) call that fell is "correct".
+        let pt = &entry["price_tracking"];
+        assert_eq!(pt["last_signal"], "VENTE");
+        assert_eq!(pt["price_at_signal"], 690.0);
+        assert_eq!(pt["signal_accuracy"], "correct");
+    }
+
+    /// Layer 2 — empty result: a ticker whose only analysis was the deleted
+    /// run resets to first-analysis state (history cleared, derived neutral).
+    #[test]
+    fn delete_run_empty_signal_history_resets_entry() {
+        let _guard = env_lock();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempdir.path().join("runtime-state");
+        std::env::set_var("ALFRED_STATE_DIR", state_dir.as_os_str());
+
+        seed_line_memory_fixture(&state_dir, json!({
+            "by_ticker": {
+                "ONLY.PA": {
+                    "schema_version": 2,
+                    "ticker": "ONLY",
+                    "signal": "ACHAT_FORT",
+                    "conviction": "forte",
+                    "trend": "upgrading",
+                    "signal_history": [
+                        { "date": "2026-05-25", "signal": "ACHAT_FORT", "conviction": "forte", "price_at_signal": 10.0, "run_id": "run_bad" }
+                    ],
+                    "price_tracking": { "last_signal": "ACHAT_FORT", "current_price": 9.0 },
+                    "deep_news_seen_urls": ["https://keep-me"]
+                }
+            }
+        }));
+
+        let outcome = crate::run_deletion::apply_run_deletion_for_test("run_bad", "");
+        std::env::remove_var("ALFRED_STATE_DIR");
+
+        assert_eq!(outcome.tickers_reset, 1);
+        let store = crate::native_mcp_analysis::line_memory_read_for_test();
+        let entry = &store["by_ticker"]["ONLY.PA"];
+        assert!(entry["signal_history"].as_array().expect("array").is_empty());
+        assert_eq!(entry["signal"], "");
+        assert_eq!(entry["trend"], "stable");
+        assert!(entry["price_tracking"].is_null());
+        // Identity + deep-news cache preserved (entry not dropped).
+        assert_eq!(entry["ticker"], "ONLY");
+        assert_eq!(entry["deep_news_seen_urls"][0], "https://keep-me");
+    }
+
+    /// Layer 1 — ban safety net: sanitize_entry_for_banned_runs strips a
+    /// banned run's signal_history before any prompt reader sees it.
+    #[test]
+    fn banned_run_id_skipped_in_memory_section() {
+        let banned: std::collections::HashSet<String> =
+            std::iter::once("run_bad".to_string()).collect();
+        let entry = json!({
+            "schema_version": 2,
+            "ticker": "MC",
+            "signal": "ACHAT",
+            "conviction": "forte",
+            "signal_history": [
+                { "date": "2026-05-25", "signal": "ACHAT", "conviction": "forte", "price_at_signal": 700.0, "run_id": "run_bad" },
+                { "date": "2026-05-10", "signal": "CONSERVER", "conviction": "moderee", "price_at_signal": 690.0, "run_id": "run_good" }
+            ],
+            "price_tracking": { "last_signal": "ACHAT", "current_price": 710.0 }
+        });
+
+        let sanitized = crate::native_mcp_analysis::sanitize_entry_for_banned_runs(&entry, &banned);
+        let hist = sanitized["signal_history"].as_array().expect("history");
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0]["run_id"], "run_good");
+        // Derived signal recomputed from the surviving head.
+        assert_eq!(sanitized["signal"], "CONSERVER");
+
+        // And the rendered MEMOIRE LIGNE section must reflect the survivor,
+        // never the banned ACHAT.
+        let memory_for_prompt = json!({
+            "schema_version": 2,
+            "conviction": sanitized["conviction"].clone(),
+            "trend": sanitized["trend"].clone(),
+            "price_tracking": sanitized["price_tracking"].clone(),
+            "signal_history": sanitized["signal_history"].clone(),
+        });
+        let rendered = crate::llm_prompts::build_memory_section(Some(&memory_for_prompt));
+        assert!(rendered.contains("CONSERVER"), "rendered section keeps the survivor signal");
+        assert!(!rendered.contains("| prix: 700"), "banned ACHAT anchor never rendered");
+    }
+
+    /// File + index removal: the run's state file leaves disk and the
+    /// run-index entry is dropped.
+    #[test]
+    fn delete_run_removes_files_and_index_entry() {
+        let _guard = env_lock();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempdir.path().join("runtime-state");
+        std::fs::create_dir_all(&state_dir).expect("mkdir");
+        std::env::set_var("ALFRED_STATE_DIR", state_dir.as_os_str());
+        crate::native_mcp_analysis::line_memory_reset_for_tests();
+
+        let run_id = "run_to_delete";
+        let run_path = state_dir.join(format!("{run_id}.json"));
+        std::fs::write(&run_path, serde_json::to_string(&json!({
+            "run_id": run_id,
+            "created_at": "2026-05-25T10:00:00.000Z",
+            "updated_at": "2026-05-25T10:05:00.000Z",
+            "orchestration": { "status": "completed" },
+            "portfolio": { "positions": [] }
+        })).unwrap()).expect("write run state");
+        let progress_path = state_dir.join(format!("{run_id}_mcp_progress.jsonl"));
+        std::fs::write(&progress_path, "{}\n").expect("write progress");
+
+        // Seed the run-index so removal has something to drop.
+        crate::run_index::upsert(run_id, &json!({ "run_id": run_id, "updated_at": "2026-05-25T10:05:00.000Z" }));
+
+        let outcome = crate::run_deletion::delete_run(run_id).expect("delete_run");
+
+        // Assert the ban set BEFORE clearing ALFRED_STATE_DIR — load reads
+        // banned-runs.json from the (temp) state dir.
+        let banned = crate::run_deletion::load_banned_run_ids();
+        std::env::remove_var("ALFRED_STATE_DIR");
+
+        assert!(!run_path.exists(), "run state file removed");
+        assert!(!progress_path.exists(), "mcp progress sidecar removed");
+        assert!(outcome.files_removed >= 2, "state + progress counted, got {}", outcome.files_removed);
+        assert!(outcome.index_entry_removed, "index entry dropped");
+        assert!(outcome.banned, "run_id banned");
+        assert!(banned.contains(run_id), "ban set persists the run_id");
+    }
+
+    /// Summary counters: the returned outcome reports purge / affected /
+    /// run_history / residual-narrative correctly across multiple tickers.
+    #[test]
+    fn delete_run_summary_reports_counts() {
+        let _guard = env_lock();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempdir.path().join("runtime-state");
+        std::env::set_var("ALFRED_STATE_DIR", state_dir.as_os_str());
+
+        seed_line_memory_fixture(&state_dir, json!({
+            "by_ticker": {
+                "MC.PA": {
+                    "schema_version": 2, "ticker": "MC",
+                    "signal_history": [
+                        { "date": "2026-05-25", "signal": "ACHAT", "price_at_signal": 700.0, "run_id": "run_bad" },
+                        { "date": "2026-05-10", "signal": "CONSERVER", "price_at_signal": 690.0, "run_id": "run_good" }
+                    ],
+                    "memory_narrative": "Cumulative LVMH narrative that cannot be un-written.",
+                    "run_history": [
+                        { "date": "2026-05-25T09:00:00.000Z", "signal": "ACHAT", "synthese": "bad run" },
+                        { "date": "2026-05-10T09:00:00.000Z", "signal": "CONSERVER", "synthese": "good run" }
+                    ]
+                },
+                "CA.PA": {
+                    "schema_version": 2, "ticker": "CA",
+                    "signal_history": [
+                        { "date": "2026-05-25", "signal": "VENTE", "price_at_signal": 12.0, "run_id": "run_bad" }
+                    ]
+                },
+                "TTE.PA": {
+                    "schema_version": 2, "ticker": "TTE",
+                    "signal_history": [
+                        { "date": "2026-05-01", "signal": "ACHAT", "price_at_signal": 55.0, "run_id": "run_other" }
+                    ]
+                }
+            }
+        }));
+
+        // Pass the deleted run's created-at day so run_history date-match fires.
+        let outcome = crate::run_deletion::apply_run_deletion_for_test("run_bad", "2026-05-25");
+        std::env::remove_var("ALFRED_STATE_DIR");
+
+        let summary = outcome.to_summary();
+        assert_eq!(summary["deleted"], true);
+        assert_eq!(summary["signal_entries_purged"], 2, "MC + CA each lost one entry");
+        assert_eq!(summary["tickers_affected"], 2, "MC + CA touched, TTE untouched");
+        assert_eq!(summary["tickers_reset"], 1, "CA had only the banned run → reset");
+        assert_eq!(summary["run_history_entries_pruned"], 1, "MC's 2026-05-25 run_history row pruned");
+        assert_eq!(summary["residual_narrative_warning"], true, "MC still carries a narrative");
+    }

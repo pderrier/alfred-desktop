@@ -60,6 +60,8 @@ mod macro_briefing;
 mod native_mcp_analysis;
 #[path = "services/llm_post_processing.rs"]
 mod llm_post_processing;
+#[path = "services/run_deletion.rs"]
+mod run_deletion;
 mod openai_client;
 mod paths;
 mod report;
@@ -726,6 +728,14 @@ async fn get_run_diff_local() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
+async fn delete_run_local(run_id: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || command_handlers::run_delete_run(run_id))
+        .await
+        .map_err(|e| format!("delete_run_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn save_alfred_state_local(state: serde_json::Value) -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(move || command_handlers::run_save_alfred_state(state))
         .await
@@ -1166,6 +1176,7 @@ fn run_tauri_app() -> anyhow::Result<()> {
             get_stale_positions_local,
             get_signal_scorecard_local,
             get_run_diff_local,
+            delete_run_local,
             save_alfred_state_local,
             load_alfred_state_local,
             export_report_markdown_local,

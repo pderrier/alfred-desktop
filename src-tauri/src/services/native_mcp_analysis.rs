@@ -82,7 +82,7 @@ pub fn line_memory_read() -> Value {
 }
 
 /// Mutate the cached line-memory store in memory. No disk I/O.
-fn line_memory_patch<F>(mutator: F)
+pub(crate) fn line_memory_patch<F>(mutator: F)
 where
     F: FnOnce(&mut Value),
 {
@@ -889,7 +889,15 @@ fn sync_line_memory(
     let current = {
         let store = line_memory_read();
         let entry = read_line_memory_entry(&store, &ticker, resolved_symbol);
-        if entry.is_null() { json!({}) } else { entry }
+        if entry.is_null() {
+            json!({})
+        } else {
+            // P1-82 Layer-1: never carry a banned run's signal_history forward
+            // into a fresh write. If the surgical purge missed this entry, the
+            // ban set still keeps the poisoned signal out of the new history.
+            let banned = crate::run_deletion::load_banned_run_ids();
+            sanitize_entry_for_banned_runs(&entry, &banned)
+        }
     };
 
     // Extract fields from recommendation
@@ -1600,8 +1608,34 @@ fn signal_strength(signal: &str) -> i8 {
 }
 
 /// Returns true if this signal expects a positive price move.
-fn is_bullish_signal(signal: &str) -> bool {
+pub(crate) fn is_bullish_signal(signal: &str) -> bool {
     matches!(signal, "ACHAT_FORT" | "ACHAT" | "RENFORCEMENT")
+}
+
+/// Score a signal's outcome: the 1-decimal return percentage from `anchor`
+/// to `current` and the accuracy verdict (`correct` when the price moved in
+/// the signal's expected direction). Returns `(0.0, "unknown")` when either
+/// price is missing or non-positive — the scorecard gates on a real anchor.
+/// Single source of truth for the return/accuracy formula shared by
+/// `compute_price_tracking` (prev-vs-current model) and
+/// `recompute_price_tracking_from_head` (head-as-anchor model).
+fn score_return_and_accuracy(
+    anchor: Option<f64>,
+    current: Option<f64>,
+    signal: &str,
+) -> (f64, &'static str) {
+    match (anchor, current) {
+        (Some(a), Some(c)) if a > 0.0 && c > 0.0 => {
+            let r = ((c - a) / a * 100.0 * 10.0).round() / 10.0;
+            let acc = if is_bullish_signal(signal) == (r > 0.0) {
+                "correct"
+            } else {
+                "incorrect"
+            };
+            (r, acc)
+        }
+        _ => (0.0, "unknown"),
+    }
 }
 
 /// Compute price_tracking from previous signal data and current price.
@@ -1632,19 +1666,8 @@ fn compute_price_tracking(
         let prev_date = prev.get("date").and_then(|v| v.as_str()).unwrap_or("");
         let prev_anchor = prev.get("price_at_signal").and_then(|v| v.as_f64()).unwrap_or(0.0);
 
-        let (return_pct, accuracy) = match current_price {
-            Some(p) if p > 0.0 && prev_anchor > 0.0 => {
-                let r = ((p - prev_anchor) / prev_anchor * 100.0 * 10.0).round() / 10.0;
-                let positive_return = r > 0.0;
-                let acc = if is_bullish_signal(prev_signal) == positive_return {
-                    "correct"
-                } else {
-                    "incorrect"
-                };
-                (r, acc)
-            }
-            _ => (0.0, "unknown"),
-        };
+        let (return_pct, accuracy) =
+            score_return_and_accuracy(Some(prev_anchor), current_price, prev_signal);
 
         json!({
             "last_signal": prev_signal,
@@ -1667,6 +1690,184 @@ fn compute_price_tracking(
             "signal_accuracy": "first_analysis",
         })
     }
+}
+
+// ── P1-82: run deletion / ban — purge + recompute ───────────────
+//
+// When a run is deleted or banned, every `signal_history[]` entry tagged
+// with the offending `run_id` must disappear and the entry's derived
+// fields (`signal`, `conviction`, `trend`, `price_tracking`,
+// `run_id_last_update`) must be recomputed from the NEW most-recent
+// surviving signal — otherwise a deleted ACHAT keeps driving the next
+// prompt's "previous call" narrative. These helpers are pure transforms
+// on a single `by_ticker` entry so both the surgical-cleanup path
+// (`run_deletion::delete_run`) and the read-time ban safety net
+// (`build_memory_for_prompt`, codex `get_line_data`) share one funnel —
+// satisfying the parity contract (uniform skip across all line-memory
+// readers).
+
+/// Remove every `signal_history[]` entry whose `run_id` is in `banned`.
+/// Returns the filtered history and the number of entries removed. Pure.
+/// Entries with no `run_id` (legacy / migrated) are preserved — a ban
+/// targets a specific run, never untagged history.
+pub(crate) fn filter_signal_history_by_banned_runs(
+    history: &[Value],
+    banned: &std::collections::HashSet<String>,
+) -> (Vec<Value>, usize) {
+    if banned.is_empty() {
+        return (history.to_vec(), 0);
+    }
+    let mut removed = 0usize;
+    let kept: Vec<Value> = history
+        .iter()
+        .filter(|entry| {
+            let is_banned = entry
+                .get("run_id")
+                .and_then(|v| v.as_str())
+                .map(|rid| banned.contains(rid))
+                .unwrap_or(false);
+            if is_banned {
+                removed += 1;
+            }
+            !is_banned
+        })
+        .cloned()
+        .collect();
+    (kept, removed)
+}
+
+/// Recompute the `price_tracking` block for a post-purge entry directly
+/// from its NEW head signal. Unlike `compute_price_tracking` (which models
+/// "previous signal vs a fresh market price at run start"), this models
+/// "the surviving head signal as the current anchor": the head's
+/// `price_at_signal` is both the anchor and the reference, `current_price`
+/// is carried over from the entry's prior `price_tracking` (best-effort —
+/// no fresh market fetch happens at deletion time), and accuracy is
+/// recomputed against the head's direction.
+fn recompute_price_tracking_from_head(entry: &Value, head: &Value) -> Value {
+    let head_signal = head.get("signal").and_then(|v| v.as_str()).unwrap_or("");
+    let head_date = head.get("date").and_then(|v| v.as_str()).unwrap_or("");
+    let head_anchor = head
+        .get("price_at_signal")
+        .and_then(|v| v.as_f64())
+        .filter(|p| p.is_finite() && *p > 0.0);
+
+    // Carry over the last known current_price (and its staleness flag) from
+    // the entry's prior price_tracking — we have no fresh quote at delete time.
+    let prior_pt = entry.get("price_tracking");
+    let current_price = prior_pt
+        .and_then(|pt| pt.get("current_price"))
+        .and_then(|v| v.as_f64())
+        .filter(|p| p.is_finite() && *p > 0.0);
+    let stale = prior_pt
+        .and_then(|pt| pt.get("stale"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let current_price_value: Value = current_price.map(|p| json!(p)).unwrap_or(Value::Null);
+
+    let (return_pct, accuracy) =
+        score_return_and_accuracy(head_anchor, current_price, head_signal);
+
+    json!({
+        "last_signal": head_signal,
+        "last_signal_date": head_date,
+        "price_at_signal": head_anchor.map(|p| json!(p)).unwrap_or(Value::Null),
+        "current_price": current_price_value,
+        "stale": stale,
+        "return_since_signal_pct": return_pct,
+        "signal_accuracy": accuracy,
+    })
+}
+
+/// Recompute a `by_ticker` entry's derived fields from a freshly purged
+/// `signal_history`. Mutates `entry` in place:
+///  - `signal` / `conviction` / `run_id_last_update` ← new head entry,
+///  - `trend` ← `compute_trend(history)`,
+///  - `price_tracking` ← `recompute_price_tracking_from_head`.
+///
+/// When `history` is empty (the run was the ticker's only analysis) the
+/// caller decides whether to reset-to-first-analysis or drop the entry;
+/// this helper only handles the non-empty case and returns `false` for an
+/// empty history so the caller can branch.
+pub(crate) fn recompute_entry_derived_from_history(entry: &mut Value, history: &[Value]) -> bool {
+    let obj = match entry.as_object_mut() {
+        Some(o) => o,
+        None => return false,
+    };
+    obj.insert("signal_history".to_string(), json!(history));
+
+    let head = match history.first() {
+        Some(h) => h.clone(),
+        None => return false,
+    };
+
+    let head_signal = head.get("signal").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let head_conviction = head.get("conviction").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let head_run_id = head.get("run_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    obj.insert("signal".to_string(), Value::String(head_signal));
+    obj.insert("conviction".to_string(), Value::String(head_conviction));
+    if !head_run_id.is_empty() {
+        obj.insert("run_id_last_update".to_string(), Value::String(head_run_id));
+    }
+    obj.insert("trend".to_string(), Value::String(compute_trend(history).to_string()));
+
+    let pt = recompute_price_tracking_from_head(entry, &head);
+    if let Some(o) = entry.as_object_mut() {
+        o.insert("price_tracking".to_string(), pt);
+    }
+    true
+}
+
+/// Clear an entry's signal-derived state back to a first-analysis baseline:
+/// empty `signal_history`, blank `signal`/`conviction`, `stable` trend, null
+/// `price_tracking`. Leaves identity (`ticker`) and deep-news caches intact.
+/// Shared by the read-time ban sanitizer and the surgical delete reset so
+/// the "what does first-analysis look like" contract has one definition.
+pub(crate) fn reset_entry_signal_state(entry: &mut Value) {
+    if let Some(obj) = entry.as_object_mut() {
+        obj.insert("signal_history".to_string(), json!([]));
+        obj.insert("signal".to_string(), Value::String(String::new()));
+        obj.insert("conviction".to_string(), Value::String(String::new()));
+        obj.insert("trend".to_string(), Value::String("stable".to_string()));
+        obj.insert("price_tracking".to_string(), Value::Null);
+    }
+}
+
+/// Read-time ban safety net (Layer 1, P1-82): return a sanitized clone of a
+/// `by_ticker` entry with every banned `signal_history` entry removed and
+/// derived fields recomputed from the surviving head. When nothing is banned
+/// (the common path) the entry is returned unchanged — zero allocation churn
+/// on the hot path. This is the SINGLE funnel both line-memory readers use
+/// (`build_memory_for_prompt` for native/oauth, `get_line_data` for codex),
+/// so the skip is uniform across all 3 LLM modes (parity contract).
+pub(crate) fn sanitize_entry_for_banned_runs(
+    entry: &Value,
+    banned: &std::collections::HashSet<String>,
+) -> Value {
+    if banned.is_empty() || !entry.is_object() {
+        return entry.clone();
+    }
+    let history: Vec<Value> = entry
+        .get("signal_history")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let (filtered, removed) = filter_signal_history_by_banned_runs(&history, banned);
+    if removed == 0 {
+        return entry.clone();
+    }
+    let mut sanitized = entry.clone();
+    if filtered.is_empty() {
+        // The entire visible history belonged to banned runs — present the
+        // ticker as a first analysis so the prompt doesn't reference a
+        // poisoned signal.
+        reset_entry_signal_state(&mut sanitized);
+    } else {
+        recompute_entry_derived_from_history(&mut sanitized, &filtered);
+    }
+    sanitized
 }
 
 // ── Line memory helpers ─────────────────────────────────────────

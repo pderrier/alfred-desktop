@@ -458,6 +458,30 @@ export function createDesktopBridgeClient({
       const payload = await parseHttpResponse(response, "bridge_run_detail_http_failed");
       return payload.run || null;
     },
+    async deleteRun(runId) {
+      const safeRunId = String(runId || "").trim();
+      if (!safeRunId) {
+        throw createBridgeError("run_id_required", "run_id_required");
+      }
+      const commandNames = ["delete_run_local", "run:delete-local"];
+      if (invoke) {
+        return invokeWithFallback(
+          invoke,
+          commandNames,
+          ["delete_run_local", "run:delete-local"],
+          { runId: safeRunId },
+          { timeoutMs: invokeTimeoutMs }
+        );
+      }
+      if (!fetchFn) {
+        throw createBridgeError("bridge_transport_unavailable", "bridge_transport_unavailable");
+      }
+      const response = await fetchFn(`/api/runs/${encodeURIComponent(safeRunId)}`, {
+        method: "DELETE",
+        headers: { "content-type": "application/json" },
+      });
+      return parseHttpResponse(response, "bridge_delete_run_http_failed");
+    },
     async retryGlobalSynthesis(runId) {
       const safeRunId = String(runId || "").trim();
       if (!safeRunId) {

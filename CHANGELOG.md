@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.4.5
+
+**Mise à jour obligatoire.** Cette version corrige une analyse de cash erronée et durcit le flux de mise à jour.
+
+### What changed
+
+- **Le cash de tes imports CSV est enfin lu correctement.** Quand ton relevé Boursorama indique un solde espèces (« Solde espèces = 5 105 € »), Alfred le prenait à tort pour 0 € et concluait « aucune liquidité disponible » — une analyse fausse. Désormais le solde du CSV est lu et utilisé. Et surtout, Alfred distingue maintenant trois cas : un cash confirmé (« 5 105 € »), un cash réellement nul (« 0 € »), et un cash **inconnu** (non exporté par ton courtier). Dans ce dernier cas il affiche « liquidités inconnues » et ne raisonne PAS sur ta capacité d'achat, au lieu de supposer zéro.
+
+- **Supprimer un run d'analyse foireux.** Une icône de suppression apparaît sur chaque run dans la liste de gauche. Supprimer un run purge les signaux erronés qu'il a produits et l'exclut des prochaines analyses — la synthèse narrative se nettoie au run suivant. Utile quand un import s'est mal passé et a pollué l'historique.
+
+- **Mises à jour mieux gérées.** Les nouvelles versions sont désormais obligatoires par défaut, et la fenêtre de mise à jour s'affiche dès le début du chargement (plus besoin d'attendre la fin du splash pour découvrir qu'une mise à jour est requise). Interface en français.
+
+### Compatibility
+
+- **Mise à jour obligatoire** : les versions antérieures afficheront l'écran de mise à jour au prochain lancement.
+- Confidentialité et authentification inchangées depuis v0.4.0.
+
 ## v0.4.4
 
 ### What changed

@@ -588,6 +588,11 @@ fn tool_get_run_context(data_dir: &Path, params: &Value) -> Result<Value> {
             "valeur_totale": portfolio.get("valeur_totale").cloned().unwrap_or(Value::Null),
             "plus_value_totale": portfolio.get("plus_value_totale").cloned().unwrap_or(Value::Null),
             "liquidites": portfolio.get("liquidites").cloned().unwrap_or(Value::Null),
+            // P0-81: parity — the codex MCP agent must see the same known/unknown
+            // distinction the native prompt builders render. false → the agent
+            // must not treat liquidites as 0 (the tool description spells out the
+            // rule). Defaults to false (unknown) when absent from run_state.
+            "liquidites_known": portfolio.get("liquidites_known").and_then(|v| v.as_bool()).unwrap_or(false),
             "position_count": positions.len(),
         },
         "lines": all_lines,

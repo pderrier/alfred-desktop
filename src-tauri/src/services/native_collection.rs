@@ -365,7 +365,10 @@ fn execute_spec(spec: &CsvParsingSpec, rows: &[Vec<String>], _headers: &[String]
                 "positions": positions,
                 "valeur_totale": positions.iter().filter_map(|p| p.get("valeur_actuelle").and_then(|v| v.as_f64())).sum::<f64>(),
                 "plus_value_totale": positions.iter().filter_map(|p| p.get("plus_moins_value").and_then(|v| v.as_f64())).sum::<f64>(),
+                // P0-81: the generic LLM CsvParsingSpec extracts positions only,
+                // never a cash balance — cash is UNKNOWN, not zero.
                 "liquidites": 0.0,
+                "liquidites_known": false,
                 "csv_parsing_issues": csv_parsing_issues,
             }))
         }
@@ -529,32 +532,25 @@ fn parse_positions_file(path: &PathBuf, account_name: &str) -> Result<Value> {
 /// Parse CSV positions text (Boursorama semicolon format) into a portfolio snapshot.
 fn parse_positions_text(text: &str, account_name: &str) -> Result<Value> {
     let lines = text.lines().filter(|line| !line.trim().is_empty()).collect::<Vec<_>>();
-    let totals_line = lines
+    // P0-81: the totals line carries "Valo total / +/- value latente /
+    // Solde espèces". On the export path the line is still present here; on the
+    // upload path `prepare_csv_text` has already stripped it (and re-attaches
+    // the values via `apply_boursorama_totals`). `liquidites_known` distinguishes
+    // a parsed 0 balance from an absent "Solde espèces" segment (UNKNOWN).
+    let totals = lines
         .iter()
         .find(|line| line.contains("Valo total") && line.contains("Solde espèces"))
-        .copied()
-        .unwrap_or_default();
-    let valeur_totale = totals_line
-        .split("Valo total")
-        .nth(1)
-        .and_then(|part| part.split('=').nth(1))
-        .and_then(|part| part.split(';').next())
-        .map(parse_fr_number)
-        .unwrap_or(0.0);
-    let plus_value_totale = totals_line
-        .split("+/- value latente")
-        .nth(1)
-        .and_then(|part| part.split('=').nth(1))
-        .and_then(|part| part.split(';').next())
-        .map(parse_fr_number)
-        .unwrap_or(0.0);
-    let liquidites = totals_line
-        .split("Solde espèces")
-        .nth(1)
-        .and_then(|part| part.split('=').nth(1))
-        .and_then(|part| part.split(';').next())
-        .map(parse_fr_number)
-        .unwrap_or(0.0);
+        .map(|line| parse_boursorama_totals(line))
+        .unwrap_or_else(|| json!({
+            "valeur_totale": 0.0,
+            "plus_value_totale": 0.0,
+            "liquidites": 0.0,
+            "liquidites_known": false,
+        }));
+    let valeur_totale = totals.get("valeur_totale").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let plus_value_totale = totals.get("plus_value_totale").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let liquidites = totals.get("liquidites").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let liquidites_known = totals.get("liquidites_known").and_then(|v| v.as_bool()).unwrap_or(false);
     let header_index = lines.iter().position(|line| {
         let cols = split_semicolon(line);
         cols.first().map(|value| normalize_header(value)).unwrap_or_default() == "nom"
@@ -606,6 +602,7 @@ fn parse_positions_text(text: &str, account_name: &str) -> Result<Value> {
         "valeur_totale": valeur_totale,
         "plus_value_totale": plus_value_totale,
         "liquidites": liquidites,
+        "liquidites_known": liquidites_known,
         "csv_parsing_issues": csv_parsing_issues,
     }))
 }
@@ -665,6 +662,54 @@ fn parse_orders_file(path: Option<PathBuf>) -> Result<Value> {
     Ok(Value::Array(out))
 }
 
+/// Parse a single value out of the Boursorama totals line by label.
+/// The line shape is `Label = 1 234,56 €;;;Other label = ...`, so we split on
+/// the label, then on `=`, then on `;` to isolate the number for that field.
+fn parse_boursorama_total_field(totals_line: &str, label: &str) -> Option<f64> {
+    totals_line
+        .split(label)
+        .nth(1)
+        .and_then(|p| p.split('=').nth(1))
+        .and_then(|p| p.split(';').next())
+        .map(parse_fr_number)
+}
+
+/// Parse the Boursorama "Valo total … Solde espèces" totals line into the
+/// canonical `{valeur_totale, plus_value_totale, liquidites, liquidites_known}`
+/// object. Single source of truth for these four fields, shared by
+/// `prepare_csv_text` (upload path, line later stripped) and
+/// `parse_positions_text` (export path, line still present). `liquidites_known`
+/// distinguishes a parsed `0` cash balance from an absent "Solde espèces"
+/// segment (UNKNOWN) — see P0-81.
+fn parse_boursorama_totals(totals_line: &str) -> Value {
+    let parsed_cash = parse_boursorama_total_field(totals_line, "Solde espèces");
+    json!({
+        "valeur_totale": parse_boursorama_total_field(totals_line, "Valo total").unwrap_or(0.0),
+        "plus_value_totale": parse_boursorama_total_field(totals_line, "+/- value latente").unwrap_or(0.0),
+        "liquidites": parsed_cash.unwrap_or(0.0),
+        "liquidites_known": parsed_cash.is_some(),
+    })
+}
+
+/// Merge the authoritative Boursorama totals (extracted by `prepare_csv_text`
+/// before the totals line was stripped from the body) into a parsed snapshot.
+///
+/// P0-81 root cause: `prepare_csv_text` strips the "Valo total … Solde espèces"
+/// line from the body AND extracts its values into `boursorama_meta`. The body
+/// fed to `parse_positions_text` no longer carries that line, so the parser's
+/// own totals lookup returns nothing and `liquidites` collapses to 0. The
+/// extracted balance was simply discarded. This helper re-attaches it: when the
+/// CSV explicitly carried these values they are the source of truth and
+/// override the parser's body-derived zeros.
+fn apply_boursorama_totals(snapshot: &mut Value, boursorama_meta: &Value) {
+    let Some(obj) = snapshot.as_object_mut() else { return };
+    for key in ["valeur_totale", "plus_value_totale", "liquidites", "liquidites_known"] {
+        if let Some(value) = boursorama_meta.get(key) {
+            obj.insert(key.to_string(), value.clone());
+        }
+    }
+}
+
 /// Prepare CSV text for parsing: strip file separators and Boursorama metadata.
 /// Returns (cleaned_text, boursorama_metadata_if_any).
 fn prepare_csv_text(raw: &str) -> (String, Option<Value>) {
@@ -675,25 +720,9 @@ fn prepare_csv_text(raw: &str) -> (String, Option<Value>) {
         .join("\n");
 
     // Extract Boursorama metadata (Valo total line) and strip it from text
-    let metadata_line = text.lines()
+    let metadata = text.lines()
         .find(|line| line.contains("Valo total") && line.contains("Solde espèces"))
-        .map(|s| s.to_string());
-
-    let metadata = metadata_line.as_deref().map(|totals_line| {
-        let valeur_totale = totals_line.split("Valo total").nth(1)
-            .and_then(|p| p.split('=').nth(1))
-            .and_then(|p| p.split(';').next())
-            .map(parse_fr_number).unwrap_or(0.0);
-        let plus_value_totale = totals_line.split("+/- value latente").nth(1)
-            .and_then(|p| p.split('=').nth(1))
-            .and_then(|p| p.split(';').next())
-            .map(parse_fr_number).unwrap_or(0.0);
-        let liquidites = totals_line.split("Solde espèces").nth(1)
-            .and_then(|p| p.split('=').nth(1))
-            .and_then(|p| p.split(';').next())
-            .map(parse_fr_number).unwrap_or(0.0);
-        json!({ "valeur_totale": valeur_totale, "plus_value_totale": plus_value_totale, "liquidites": liquidites })
-    });
+        .map(parse_boursorama_totals);
 
     // Strip metadata lines (Valo total, Meta;ignored) from the text so they don't become data rows
     let clean_text = if metadata.is_some() {
@@ -724,10 +753,15 @@ fn parse_csv_upload_text(raw: &str, account: &str) -> Result<Value> {
     let acct = if account.is_empty() { "CSV_import" } else { account };
 
     // ── Boursorama special case (semicolon metadata format) ─────────
-    if boursorama_meta.is_some() {
-        if let Ok(snap) = parse_positions_text(&text, acct) {
+    if let Some(meta) = boursorama_meta.as_ref() {
+        if let Ok(mut snap) = parse_positions_text(&text, acct) {
             let pos = snap.get("positions").and_then(|v| v.as_array());
             if pos.map(|a| !a.is_empty()).unwrap_or(false) {
+                // P0-81: `text` had the totals line stripped by prepare_csv_text,
+                // so parse_positions_text saw no "Solde espèces" and produced
+                // liquidites=0/unknown. The real balance lives in `meta` — merge
+                // it back as the authoritative source before wrapping.
+                apply_boursorama_totals(&mut snap, meta);
                 crate::debug_log("[csv-parse] Boursorama metadata format detected");
                 return wrap_snapshot(snap);
             }
@@ -798,7 +832,10 @@ fn wrap_snapshot(portfolio: Value) -> Result<Value> {
         "orders": [],
         "valeur_totale": portfolio.get("valeur_totale").cloned().unwrap_or_else(|| json!(0.0)),
         "plus_value_totale": portfolio.get("plus_value_totale").cloned().unwrap_or_else(|| json!(0.0)),
-        "liquidites": portfolio.get("liquidites").cloned().unwrap_or_else(|| json!(0.0))
+        "liquidites": portfolio.get("liquidites").cloned().unwrap_or_else(|| json!(0.0)),
+        // P0-81: parallel known flag. Absent in older parse paths → treat as
+        // unknown (the safe default for the LLM: don't reason on liquidity).
+        "liquidites_known": portfolio.get("liquidites_known").cloned().unwrap_or_else(|| json!(false))
     });
     // Preserve transaction history metadata (source, reconciliation) through normalization
     if let Some(source) = portfolio.get("source") {
@@ -1179,7 +1216,10 @@ fn reconcile_transactions(transactions: &[CsvTransaction], account: &str) -> Val
         },
         "valeur_totale": valeur_totale,
         "plus_value_totale": plus_value_totale,
-        "liquidites": 0.0
+        // P0-81: reconstructed from trade history — no statement of the
+        // current cash balance, so it is UNKNOWN rather than zero.
+        "liquidites": 0.0,
+        "liquidites_known": false
     })
 }
 
@@ -1193,10 +1233,15 @@ pub fn preview_csv_import(raw: &str, account: &str) -> Result<Value> {
     let data_dir = crate::resolve_runtime_state_dir();
 
     // ── Boursorama special case ───────────────────────────────────
-    if boursorama_meta.is_some() {
-        if let Ok(snap) = parse_positions_text(&text, acct) {
+    if let Some(meta) = boursorama_meta.as_ref() {
+        if let Ok(mut snap) = parse_positions_text(&text, acct) {
             let pos = snap.get("positions").and_then(|v| v.as_array());
             if pos.map(|a| !a.is_empty()).unwrap_or(false) {
+                // P0-81: re-attach the authoritative totals stripped by
+                // prepare_csv_text so the preview surfaces the real Valo total
+                // and cash balance instead of the body-derived zeros.
+                apply_boursorama_totals(&mut snap, meta);
+                let pos = snap.get("positions").and_then(|v| v.as_array());
                 let count = pos.map(|a| a.len()).unwrap_or(0);
                 let positions_value = snap.get("positions").cloned().unwrap_or_else(|| json!([]));
                 // P1-56 visibility — forward the parser's own findings so the
@@ -1375,7 +1420,9 @@ fn load_csv_export_snapshot(export_path: &str, account_name: &str) -> Result<Val
         "orders": parse_orders_file(orders_file)?,
         "valeur_totale": portfolio.get("valeur_totale").cloned().unwrap_or_else(|| json!(0.0)),
         "plus_value_totale": portfolio.get("plus_value_totale").cloned().unwrap_or_else(|| json!(0.0)),
-        "liquidites": portfolio.get("liquidites").cloned().unwrap_or_else(|| json!(0.0))
+        "liquidites": portfolio.get("liquidites").cloned().unwrap_or_else(|| json!(0.0)),
+        // P0-81: propagate the parsed-balance known flag (see parse_positions_text).
+        "liquidites_known": portfolio.get("liquidites_known").cloned().unwrap_or_else(|| json!(false))
     }))
 }
 
@@ -1614,8 +1661,18 @@ fn fetch_finary_snapshot(run_id: &str, _request_fn: HttpRequestFn) -> Result<Val
     }).sum();
 
     let snapshot_accounts: Vec<Value> = account_map.iter().map(|(name, (value, gain))| {
-        let acct_cash = investment_name_to_cash.get(name).copied().unwrap_or(0.0);
-        json!({ "name": name, "total_value": value, "total_gain": gain, "cash": acct_cash })
+        // P0-81: `cash_known` distinguishes a mapped cash balance (even 0€) from
+        // an investment account with no cash mapping at all. The per-account
+        // scoping in execute_native_local_analysis_workflow_with reads this to
+        // decide whether to tell the LLM "0€" or "inconnu".
+        let mapped_cash = investment_name_to_cash.get(name).copied();
+        json!({
+            "name": name,
+            "total_value": value,
+            "total_gain": gain,
+            "cash": mapped_cash.unwrap_or(0.0),
+            "cash_known": mapped_cash.is_some(),
+        })
     }).collect();
 
     // Phase 1 cross-account context: enrich snapshot with full holdings_accounts
@@ -1635,6 +1692,11 @@ fn fetch_finary_snapshot(run_id: &str, _request_fn: HttpRequestFn) -> Result<Val
         "total_value": total_value,
         "total_gain": total_gain,
         "cash": cash,
+        // P0-81: the global Finary cash picture is known whenever holdings
+        // accounts were returned (every EUR fiat is summed above). An empty
+        // holdings payload (API degraded) leaves cash=0 with no source of
+        // truth → unknown, so the synthesis prompt must not read it as "0€".
+        "liquidites_known": !holdings_accounts.is_empty(),
         "cash_by_currency": cash_by_currency,
         "holdings_accounts": holdings_metadata,
         "portfolio_summary": portfolio_summary
@@ -3220,9 +3282,24 @@ pub(crate) fn execute_native_local_analysis_workflow_with(
         .and_then(|v| v.as_array())
         .and_then(|accounts| accounts.iter().find(|a| as_text(a.get("name")) == target_account))
         .cloned();
-    let account_cash = account_entry.as_ref()
-        .and_then(|a| a.get("cash")).and_then(|v| v.as_f64())
-        .unwrap_or_else(|| snapshot.get("liquidites").and_then(|v| v.as_f64()).unwrap_or(0.0));
+    // P0-81: resolve both the cash amount AND whether it is actually known.
+    //  - Finary scoped run: read accounts[].cash + accounts[].cash_known (set
+    //    by fetch_finary_snapshot from the mapping). An unmapped investment
+    //    account → cash_known=false → LLM told "inconnu", not "0€".
+    //  - CSV run: there is no accounts[] array, so we fall back to the
+    //    snapshot-level liquidites parsed from the Boursorama "Solde espèces"
+    //    line, preserving both its value AND its liquidites_known flag. This
+    //    is the source of truth in CSV mode and must never be flattened to 0.
+    let (account_cash, account_cash_known) = match account_entry.as_ref() {
+        Some(account) => (
+            account.get("cash").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            account.get("cash_known").and_then(|v| v.as_bool()).unwrap_or(false),
+        ),
+        None => (
+            snapshot.get("liquidites").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            snapshot.get("liquidites_known").and_then(|v| v.as_bool()).unwrap_or(false),
+        ),
+    };
     let account_value: f64 = positions.iter()
         .map(|p| p.get("valeur_actuelle").and_then(|v| v.as_f64()).unwrap_or(0.0))
         .sum::<f64>() + account_cash;
@@ -3273,6 +3350,10 @@ pub(crate) fn execute_native_local_analysis_workflow_with(
     let mut snapshot = snapshot;
     if let Some(obj) = snapshot.as_object_mut() {
         obj.insert("liquidites".to_string(), json!(account_cash));
+        // P0-81: persist the resolved known flag onto the scoped snapshot so
+        // build_collection_state forwards it into run_state.portfolio for every
+        // downstream prompt builder.
+        obj.insert("liquidites_known".to_string(), json!(account_cash_known));
         obj.insert("valeur_totale".to_string(), json!(account_value));
         obj.insert("plus_value_totale".to_string(), json!(account_gain));
     }
@@ -3432,6 +3513,9 @@ pub(crate) fn execute_native_local_analysis_workflow_with(
         let portfolio_summary = json!({
             "valeur_totale": wl_snapshot.get("valeur_totale").cloned().unwrap_or_else(|| json!(0.0)),
             "liquidites": wl_snapshot.get("liquidites").cloned().unwrap_or_else(|| json!(0.0)),
+            // P0-81: forward the known flag so the watchlist prompt renders
+            // "inconnu" instead of "0€" when the cash balance is unavailable.
+            "liquidites_known": wl_snapshot.get("liquidites_known").cloned().unwrap_or_else(|| json!(false)),
             "plus_value_totale": wl_snapshot.get("plus_value_totale").cloned().unwrap_or_else(|| json!(0.0)),
         });
         match crate::llm::generate_watchlist_suggestions(&wl_positions, &portfolio_summary, &wl_guidelines, &wl_account) {
@@ -3842,6 +3926,17 @@ pub fn resolve_canonical_symbols_for_test(positions: Vec<Value>) -> Vec<Value> {
 #[allow(dead_code)]
 pub fn parse_positions_text_for_test(text: &str, account_name: &str) -> Result<Value> {
     parse_positions_text(text, account_name)
+}
+
+// P0-81 — the REAL analysis path. Unlike parse_positions_text (which sees the
+// raw, totals-line-present text on the export path), this seam exercises the
+// upload pipeline: prepare_csv_text strips the totals line, then
+// apply_boursorama_totals re-attaches the extracted balance. This is the only
+// seam that reproduces Pierre's "solde espèces jeté" bug end-to-end.
+#[cfg(test)]
+#[allow(dead_code)]
+pub fn parse_csv_upload_text_for_test(raw: &str, account: &str) -> Result<Value> {
+    parse_csv_upload_text(raw, account)
 }
 
 #[cfg(test)]

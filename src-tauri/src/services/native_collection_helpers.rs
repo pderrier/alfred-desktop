@@ -283,7 +283,11 @@ pub(crate) fn normalize_finary_snapshot(snapshot: &Value) -> Value {
         "orders": snapshot.get("orders").cloned().unwrap_or_else(|| json!([])),
         "valeur_totale": to_number(snapshot.get("total_value").or_else(|| snapshot.get("valeur_totale"))),
         "plus_value_totale": to_number(snapshot.get("total_gain").or_else(|| snapshot.get("plus_value_totale"))),
-        "liquidites": to_number(snapshot.get("cash").or_else(|| snapshot.get("liquidites")))
+        "liquidites": to_number(snapshot.get("cash").or_else(|| snapshot.get("liquidites"))),
+        // P0-81: forward the global known flag set by fetch_finary_snapshot.
+        // Absent (e.g. a finary_snapshot pushed from JS) → assume known, since
+        // the legacy Finary path has always reported its full cash picture.
+        "liquidites_known": snapshot.get("liquidites_known").and_then(|v| v.as_bool()).unwrap_or(true)
     });
     // Preserve ambiguous cash groups through normalization so the wizard can trigger
     if let Some(groups) = snapshot.get("ambiguous_cash_groups") {
@@ -311,7 +315,10 @@ pub(crate) fn normalize_csv_snapshot(snapshot: &Value) -> Value {
         "orders": snapshot.get("orders").cloned().unwrap_or_else(|| json!([])),
         "valeur_totale": to_number(snapshot.get("valeur_totale")),
         "plus_value_totale": to_number(snapshot.get("plus_value_totale")),
-        "liquidites": to_number(snapshot.get("liquidites"))
+        "liquidites": to_number(snapshot.get("liquidites")),
+        // P0-81: forward the parsed-balance known flag. Absent → false
+        // (unknown), so an old/foreign CSV snapshot never reads as "0€".
+        "liquidites_known": snapshot.get("liquidites_known").and_then(|v| v.as_bool()).unwrap_or(false)
     });
     // Preserve transaction history reconciliation metadata through normalization
     if let Some(csv_source) = snapshot.get("csv_source") {
@@ -1271,7 +1278,10 @@ pub(crate) fn build_collection_state(
             "accounts": snapshot.get("accounts").cloned().unwrap_or_else(|| json!([])),
             "valeur_totale": snapshot.get("valeur_totale").cloned().unwrap_or_else(|| json!(0.0)),
             "plus_value_totale": snapshot.get("plus_value_totale").cloned().unwrap_or_else(|| json!(0.0)),
-            "liquidites": snapshot.get("liquidites").cloned().unwrap_or_else(|| json!(0.0))
+            "liquidites": snapshot.get("liquidites").cloned().unwrap_or_else(|| json!(0.0)),
+            // P0-81: parallel known flag (see parse_positions_text). Defaults to
+            // false (unknown) when absent — the safe stance for the LLM.
+            "liquidites_known": snapshot.get("liquidites_known").cloned().unwrap_or_else(|| json!(false))
         },
         "transactions": snapshot.get("transactions").cloned().unwrap_or_else(|| json!([])),
         "orders": snapshot.get("orders").cloned().unwrap_or_else(|| json!([])),

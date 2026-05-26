@@ -570,6 +570,12 @@ pub(crate) fn normalize_deep_news_enum(value: Option<&Value>, accepted: &[&str])
 
 pub(crate) fn build_memory_for_prompt(entry: Option<&Value>, global_banned_urls: Option<&Value>) -> Option<Value> {
     let entry = entry?;
+    // P1-82 Layer-1 ban safety net: strip any signal_history entry tagged with
+    // a banned run_id and recompute derived fields, so a deleted run never
+    // feeds the next prompt — even if the surgical purge missed this entry.
+    let banned = crate::run_deletion::load_banned_run_ids();
+    let sanitized = crate::native_mcp_analysis::sanitize_entry_for_banned_runs(entry, &banned);
+    let entry = &sanitized;
     let deep_news_banned_urls = as_string_list(entry.get("deep_news_banned_urls"), 200, 700)
         .into_iter()
         .filter_map(|value| value.as_str().map(normalize_url))

@@ -901,6 +901,13 @@ fn tool_get_line_data(data_dir: &Path, params: &Value) -> Result<Value> {
             Value::Null
         }
     };
+    // P1-82 Layer-1 ban safety net (parity with native/oauth's
+    // build_memory_for_prompt): strip banned-run signal_history entries and
+    // recompute derived fields before the codex agent sees them.
+    let line_memory = {
+        let banned = crate::run_deletion::load_banned_run_ids();
+        crate::native_mcp_analysis::sanitize_entry_for_banned_runs(&line_memory, &banned)
+    };
 
     // Quality indicators — per-run `run_state.quality.by_ticker` map, NOT
     // line-memory. Ticker key is the raw broker ticker (no canonical dedup

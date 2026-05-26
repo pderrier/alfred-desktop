@@ -56,6 +56,20 @@ pub fn upsert(run_id: &str, summary: &Value) {
     flush_to_disk(&entries);
 }
 
+/// Remove a run summary by `run_id` from both the in-memory index and disk.
+/// Returns true when an entry was actually removed. Used by run deletion
+/// (P1-82) so a deleted run vanishes from the sidebar without a full rebuild.
+pub fn remove(run_id: &str) -> bool {
+    let mut entries = get_index().lock().unwrap_or_else(|e| e.into_inner());
+    let before = entries.len();
+    entries.retain(|e| e.get("run_id").and_then(|v| v.as_str()) != Some(run_id));
+    let removed = entries.len() != before;
+    if removed {
+        flush_to_disk(&entries);
+    }
+    removed
+}
+
 /// Build a compact summary from a run_state Value.
 pub fn summary_from_run_state(run_state: &Value) -> Value {
     let run_id = run_state.get("run_id").and_then(|v| v.as_str()).unwrap_or_default();

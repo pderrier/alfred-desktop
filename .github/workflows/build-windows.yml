@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       mandatory:
-        description: 'Mark this release as a mandatory update'
+        description: 'Mark this release as a mandatory update (default true since 2026-05-25; uncheck for an additive/non-blocking release)'
         type: boolean
-        default: false
+        default: true
 
 jobs:
   build:
@@ -162,7 +162,10 @@ jobs:
           # Extract version from tag (strip leading 'v')
           TAG="${GITHUB_REF_NAME:-v0.1.0}"
           VERSION="${TAG#v}"
-          MANDATORY="${{ github.event.inputs.mandatory || 'false' }}"
+          # Releases are mandatory by default (Pierre 2026-05-25). Override
+          # to a non-blocking/additive release by passing mandatory=false on
+          # the workflow_dispatch input.
+          MANDATORY="${{ github.event.inputs.mandatory || 'true' }}"
           BASE_URL="https://vps-c5793aab.vps.ovh.net/alfred/release/windows"
 
           # Find the NSIS exe and compute SHA-256

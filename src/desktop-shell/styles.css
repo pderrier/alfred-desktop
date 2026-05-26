@@ -2640,11 +2640,13 @@ main {
 /* Legacy banner — kept for backward compat but no longer generated */
 .update-banner { display: none; }
 
-/* ── Mandatory update overlay (inside splash) ──────────────────── */
-.update-mandatory {
-  text-align: center;
-  max-width: 340px;
-  margin: 0 auto;
+/* ── Mandatory update overlay (top-level, P0-80) ───────────────── */
+/* Rendered as a full-screen overlay above the splash (z-index 10000)
+   so a mandatory upgrade is the first thing the user sees. Reuses the
+   .update-modal-overlay/.update-modal styling; the accent border + the
+   absence of a "Not Now" button distinguish it from the optional banner. */
+.update-modal-overlay-mandatory .update-modal {
+  border-color: rgba(240, 138, 119, 0.6);
 }
 
 /* ── Alfred Overlay (Phase A) ──────────────────────────────────── */

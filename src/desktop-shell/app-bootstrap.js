@@ -9,6 +9,10 @@ import { formatBridgeError } from "/shared/run-operations-controller.js";
 import { isFinarySessionRunnable } from "/desktop-shell/run-wizard-policy.js";
 import { showToast, clearErrorToasts } from "/desktop-shell/shell-layout.js";
 import { decideFallback, decideOauthProposal } from "/desktop-shell/codex-fallback-policy.js";
+import {
+  shouldHaltForMandatoryUpdate,
+  buildMandatoryUpdateStrings,
+} from "/desktop-shell/update-gate-policy.js";
 
 export { decideFallback, decideOauthProposal };
 
@@ -136,44 +140,79 @@ export function initBootstrap(deps) {
   // ── Update state (shared between startup and post-splash) ────────
   let pendingUpdate = null; // { mandatory, latest_version, release_notes, installer_url }
 
+  /**
+   * Render the mandatory-update overlay as a TOP-LEVEL element (P0-80).
+   *
+   * Previously this injected into the splash `splash-status` node, which
+   * meant the full splash (loader bar + status text) flashed before the
+   * update prompt appeared. We now render a dedicated full-screen overlay
+   * (reusing the `.update-modal-overlay` style, z-index 10000, above the
+   * splash) so the prompt is the FIRST and ONLY thing the user sees when an
+   * update is mandatory — nothing heavy loads behind it. Unlike the optional
+   * banner there is no "Not Now" dismiss: the user must upgrade.
+   *
+   * Copy is FR-tutoiement (see `buildMandatoryUpdateStrings`). Dynamic text
+   * (version, release notes) is set via `textContent` rather than
+   * interpolated into `innerHTML`, so server-supplied `release_notes` can't
+   * inject markup.
+   */
   function showMandatoryUpdateUI(update) {
-    const splash = document.getElementById("splash-screen");
-    if (!splash) return;
-    const loaderNode = document.getElementById("splash-loader");
-    const connectNode = document.getElementById("splash-connect");
-    if (loaderNode) loaderNode.classList.add("hidden");
-    if (connectNode) connectNode.classList.add("hidden");
+    const strings = buildMandatoryUpdateStrings(update);
 
-    setSplashStatus("");
-    const statusNode = document.getElementById("splash-status");
-    if (!statusNode) return;
+    const existing = document.getElementById("update-modal-overlay");
+    if (existing) existing.remove();
 
-    statusNode.innerHTML = "";
-    const wrap = document.createElement("div");
-    wrap.className = "update-mandatory";
-    wrap.innerHTML = `
-      <h3 style="margin:0 0 0.4rem;color:#fff">Update Required</h3>
-      <p style="margin:0 0 0.6rem;color:rgba(255,255,255,0.7);font-size:0.8rem">
-        Version ${update.latest_version} is available (you have ${update.current_version}).
-      </p>
-      ${update.release_notes ? `<p style="margin:0 0 0.8rem;color:rgba(255,255,255,0.5);font-size:0.72rem">${update.release_notes}</p>` : ""}
-      <div class="update-progress hidden" style="margin:0 0 0.6rem">
-        <div class="splash-loader" style="display:block"><div class="splash-loader-bar" style="width:0%;animation:none"></div></div>
-        <span class="update-progress-text" style="font-size:0.7rem;color:rgba(255,255,255,0.5)"></span>
-      </div>
-      <button class="cmd-btn update-download-btn">Download &amp; Install</button>
-      <p class="update-error hidden" style="margin:0.5rem 0 0;color:#f08a77;font-size:0.72rem"></p>
+    const overlay = document.createElement("div");
+    overlay.id = "update-modal-overlay";
+    overlay.className = "update-modal-overlay update-modal-overlay-mandatory";
+
+    const modal = document.createElement("div");
+    modal.className = "update-modal";
+
+    const title = document.createElement("h2");
+    title.className = "update-modal-title";
+    title.textContent = strings.title;
+    modal.appendChild(title);
+
+    const body = document.createElement("p");
+    body.className = "update-modal-version";
+    body.textContent = strings.body;
+    modal.appendChild(body);
+
+    if (strings.releaseNotes) {
+      const notes = document.createElement("p");
+      notes.className = "update-modal-notes";
+      notes.textContent = strings.releaseNotes;
+      modal.appendChild(notes);
+    }
+
+    const progressWrap = document.createElement("div");
+    progressWrap.className = "update-progress hidden";
+    progressWrap.innerHTML = `
+      <div class="splash-loader" style="display:block;margin:0.5rem 0"><div class="splash-loader-bar" style="width:0%;animation:none"></div></div>
+      <span class="update-progress-text"></span>
+      <p class="update-error hidden"></p>
     `;
-    statusNode.appendChild(wrap);
+    modal.appendChild(progressWrap);
 
-    const downloadBtn = wrap.querySelector(".update-download-btn");
-    const progressWrap = wrap.querySelector(".update-progress");
-    const progressBar = wrap.querySelector(".splash-loader-bar");
-    const progressText = wrap.querySelector(".update-progress-text");
-    const errorText = wrap.querySelector(".update-error");
+    const actions = document.createElement("div");
+    actions.className = "update-modal-actions";
+    const downloadBtn = document.createElement("button");
+    downloadBtn.type = "button";
+    downloadBtn.className = "cmd-btn update-download-btn";
+    downloadBtn.textContent = strings.downloadBtn;
+    actions.appendChild(downloadBtn);
+    modal.appendChild(actions);
+
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+
+    const progressBar = progressWrap.querySelector(".splash-loader-bar");
+    const progressText = progressWrap.querySelector(".update-progress-text");
+    const errorText = progressWrap.querySelector(".update-error");
 
     downloadBtn.addEventListener("click", () =>
-      runDownloadAndInstall(update, downloadBtn, progressWrap, progressBar, progressText, errorText)
+      runDownloadAndInstall(update, downloadBtn, progressWrap, progressBar, progressText, errorText, strings)
     );
   }
 
@@ -227,12 +266,19 @@ export function initBootstrap(deps) {
     });
   }
 
-  async function runDownloadAndInstall(update, btn, progressWrap, progressBar, progressText, errorText) {
+  async function runDownloadAndInstall(update, btn, progressWrap, progressBar, progressText, errorText, strings) {
     const tauriInvoke = window?.__TAURI__?.core?.invoke;
     if (!tauriInvoke) return;
 
+    // `strings` is supplied by the mandatory overlay (FR-tutoiement); the
+    // optional banner calls without it and keeps its own labels.
+    const downloadingLabel = "Downloading\u2026";
+    const installingLabel = strings?.installingBtn || "Installing\u2026";
+    const retryLabel = strings?.retryBtn || "Retry";
+    const failedLabel = strings?.downloadFailed || "Download failed";
+
     btn.disabled = true;
-    btn.textContent = "Downloading\u2026";
+    btn.textContent = downloadingLabel;
     progressWrap.classList.remove("hidden");
     errorText.classList.add("hidden");
 
@@ -254,14 +300,14 @@ export function initBootstrap(deps) {
       const result = await tauriInvoke("download_update_local", {
         url: update.installer_url, sha256: null
       });
-      btn.textContent = "Installing\u2026";
+      btn.textContent = installingLabel;
       await tauriInvoke("install_update_local", { path: result.path });
       // App exits after this — if we're still here, something went wrong
     } catch (err) {
       btn.disabled = false;
-      btn.textContent = "Retry";
+      btn.textContent = retryLabel;
       errorText.classList.remove("hidden");
-      errorText.textContent = typeof err === "string" ? err : (err?.message || "Download failed");
+      errorText.textContent = typeof err === "string" ? err : (err?.message || failedLabel);
     } finally {
       if (unlisten) unlisten();
     }
@@ -270,17 +316,30 @@ export function initBootstrap(deps) {
   async function runStartupSessionCheck() {
     const tauriInvoke = window?.__TAURI__?.core?.invoke;
     const loaderNode = document.getElementById("splash-loader");
+    const connectNode = document.getElementById("splash-connect");
 
-    // 0. Check for updates (non-blocking on failure)
+    // 0. Check for updates FIRST, before any heavy/visible startup work.
+    //
+    // P0-80: a mandatory update must be surfaced as early as possible. The
+    // splash HTML mounts with the loader bar + "Starting up..." visible and
+    // the connect card hidden; if we let those render and only swapped to
+    // the update prompt after the (heavy) bootstrap, the user would watch
+    // the whole splash run just to be told "upgrade or quit". Instead we
+    // collapse the splash to a minimal "checking updates" state, await the
+    // check, and only reveal the loader + continue when no mandatory update
+    // is pending. A mandatory update halts here behind a top-level overlay.
+    if (loaderNode) loaderNode.classList.add("hidden");
+    if (connectNode) connectNode.classList.add("hidden");
+    setSplashStatus("V\u00e9rification des mises \u00e0 jour\u2026");
+
     if (tauriInvoke) {
       try {
-        setSplashStatus("Checking for updates\u2026");
         const update = await tauriInvoke("check_for_update_local");
+        if (shouldHaltForMandatoryUpdate(update)) {
+          showMandatoryUpdateUI(update);
+          return; // Block — user must update (overlay stays, nothing loads)
+        }
         if (update?.update_available) {
-          if (update.mandatory) {
-            showMandatoryUpdateUI(update);
-            return; // Block — user must update
-          }
           // Optional — check if user already dismissed this version
           try {
             const prefs = await tauriInvoke("get_user_preferences_local");
@@ -291,6 +350,9 @@ export function initBootstrap(deps) {
         }
       } catch { /* update check failed — continue normally */ }
     }
+
+    // No mandatory update \u2014 reveal the loader and resume normal bootstrap.
+    if (loaderNode) loaderNode.classList.remove("hidden");
 
     // 1. Load cached dashboard (fast, local)
     setSplashStatus("Loading cached dashboard\u2026");
@@ -648,10 +710,9 @@ export function initBootstrap(deps) {
       return;
     }
 
-    // 4. Show unified connection card
+    // 4. Show unified connection card (connectNode declared at fn top — P0-80)
     if (loaderNode) loaderNode.classList.add("hidden");
     setSplashStatus("Connect your accounts to get started");
-    const connectNode = document.getElementById("splash-connect");
     if (connectNode) connectNode.classList.remove("hidden");
 
     // Show backend selector when OpenAI is not connected

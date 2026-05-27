@@ -130,19 +130,25 @@ fn apply_auth(req: ureq::Request, path: &str) -> ureq::Request {
 ///     observability endpoints, gated by `require_admin` server-side)
 ///   - `/license` or anything under `/license/` (v0.4.0 P0-15 — LS
 ///     activation/validation/status, gated by `require_auth` only)
+///   - `/quota` or anything under `/quota/` (v0.4.7 P3-31 — read-only
+///     home-strip quota probe, mounted at root alongside `/run/start`,
+///     gated by `require_auth` only — see `handlers::quota_routes`)
 ///
 /// Anything else returns false — there is no fuzzy / partial /
 /// case-insensitive match because the server-side routes are
 /// case-sensitive too.
 ///
 /// Renamed from `is_admin_path` in v0.4.0 P0-15 (P3-40 follow-up) when
-/// `/license/*` joined the exemption set. The behavioural contract is
-/// pinned by `session_exempt_endpoints_skip_run_session_header`.
+/// `/license/*` joined the exemption set. `/quota/*` joined in v0.4.7
+/// (P3-31). The behavioural contract is pinned by
+/// `session_exempt_endpoints_skip_run_session_header`.
 fn is_session_exempt_path(path: &str) -> bool {
     path == "/admin"
         || path.starts_with("/admin/")
         || path == "/license"
         || path.starts_with("/license/")
+        || path == "/quota"
+        || path.starts_with("/quota/")
 }
 
 // ── Run-session context (v0.4.0 P0-11) ──────────────────────────────
@@ -913,6 +919,31 @@ pub fn get_license_status() -> Result<LicenseStatusResponse> {
         .map_err(|e| anyhow!("alfred_api_parse_failed:license_status:{e}"))
 }
 
+/// Fetch the authoritative rolling-7d quota for the current user.
+///
+/// `GET /quota/status` (v0.4.7 P3-31). READ-ONLY — the server reuses
+/// `quota::get_quota_info`, whose only Redis write is the expired-entry
+/// prune; it NEVER consumes a run. This is the primary source for the
+/// home strip count, replacing the local `run-index.json` count that
+/// drifts ±1 vs the server ZSET (`docs/monetization-architecture.md`
+/// § "Quota exposure to UI").
+///
+/// Returns the raw server envelope `{count, limit, period, reset_at}`
+/// unparsed: `limit` is a NUMBER for free tier but the STRING
+/// `"unlimited"` for paid tier, so a typed `u32` mirror would fail on
+/// paid users. The JS layer (`quota-local-counter.js`) does the
+/// numeric coercion and treats a non-numeric `limit` as the desktop
+/// default of 3 — paid tier is rendered from `licenseStatus().tier`,
+/// not from this `limit`.
+///
+/// `/quota/status` is auth-gated (HMAC + `X-Client-Hash`) but NOT under
+/// `require_run_session` — `is_session_exempt_path` skips injecting the
+/// `X-Run-Session` header so a cold-start home render works before any
+/// run session exists.
+pub fn get_quota_status() -> Result<Value> {
+    api_get("/quota/status", TIMEOUT_SECS)
+}
+
 /// Authenticated POST request with a JSON body that parses and returns
 /// the response envelope. Used by `/license/*` calls where the server
 /// returns a structured response we want to consume (unlike `api_post`
@@ -1451,6 +1482,21 @@ mod tests {
     }
 
     #[test]
+    fn is_session_exempt_path_matches_quota_root_and_subroutes() {
+        // v0.4.7 P3-31: /quota/* added to the exempt set. The home strip
+        // probes `GET /quota/status` at cold start AND during an active
+        // run (when the X-Run-Session slot is populated). The endpoint is
+        // NOT under `require_run_session` server-side (mounted at root via
+        // `handlers::quota_routes`), so the header must be suppressed —
+        // otherwise an active-run home re-render would leak a session
+        // header into a non-session endpoint.
+        assert!(is_session_exempt_path("/quota"));
+        assert!(is_session_exempt_path("/quota/status"));
+        // Future quota routes must inherit the rule.
+        assert!(is_session_exempt_path("/quota/anything/nested"));
+    }
+
+    #[test]
     fn is_session_exempt_path_rejects_non_exempt_paths() {
         // Make sure we don't accidentally over-match. Every gated
         // analysis endpoint must continue to receive X-Run-Session.
@@ -1458,6 +1504,7 @@ mod tests {
         assert!(!is_session_exempt_path("/api/news"));
         assert!(!is_session_exempt_path("/api/admin"));        // suffix, not prefix
         assert!(!is_session_exempt_path("/api/license"));      // suffix, not prefix
+        assert!(!is_session_exempt_path("/api/quota"));        // suffix, not prefix
         assert!(!is_session_exempt_path("/run/start"));
         assert!(!is_session_exempt_path("/healthz"));
         assert!(!is_session_exempt_path(""));

@@ -1391,9 +1391,14 @@ pub fn run_current_user_hash() -> Result<serde_json::Value> {
 /// helper `quota-local-counter.js`. Returns
 /// `{count: <integer>, limit: 3, period: "rolling_7d"}` so the JS can
 /// render `Gratuit · X/3 cette semaine` without further math. The
-/// `limit` is reported by the desktop for now (matches the server
-/// default `FREE_TIER_RUNS_PER_WEEK = 3`); P3-31 will replace this with
-/// a server-side `/quota/status` once that endpoint lands.
+/// `limit` is reported by the desktop (matches the server default
+/// `FREE_TIER_RUNS_PER_WEEK = 3`).
+///
+/// v0.4.7 P3-31: this is now the FALLBACK source — the home strip reads
+/// the authoritative `run_quota_status` (`GET /quota/status`) first and
+/// only falls back to this local count on network failure. The local
+/// count can drift ±1 vs the server ZSET, so it's a degraded-mode
+/// approximation, not the primary.
 pub fn run_runs_count_last_7d() -> Result<serde_json::Value> {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now_ms = SystemTime::now()
@@ -1409,6 +1414,23 @@ pub fn run_runs_count_last_7d() -> Result<serde_json::Value> {
             "period": "rolling_7d",
         }),
     ))
+}
+
+/// P3-31 (v0.4.7) — authoritative rolling-7d quota for the home strip.
+/// Proxies `GET /quota/status`, which returns the SAME count the
+/// enforcement gate (`quota::start_run`) sees, killing the ±1 drift of
+/// the local `run-index.json` count (`run_runs_count_last_7d`). The JS
+/// helper `quota-local-counter.js` uses this as the PRIMARY source and
+/// falls back to the local count on network failure.
+///
+/// Returns the server envelope `{count, limit, period, reset_at}`
+/// verbatim. `reset_at` (epoch secs, or null for an empty window) lets
+/// the home strip render "réinitialisation le JJ/MM". Read-only — never
+/// consumes quota. Errors propagate so the JS layer can fall back to the
+/// local count rather than rendering a stale/empty strip.
+pub fn run_quota_status() -> Result<serde_json::Value> {
+    let payload = crate::alfred_api_client::get_quota_status()?;
+    Ok(bridge_envelope("home:quota-status-local", payload))
 }
 
 /// P2-24 (2026-05-23) — cross-portfolio signal accuracy. Aggregates

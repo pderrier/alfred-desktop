@@ -830,12 +830,27 @@ async fn macro_briefing_local() -> Result<serde_json::Value, String> {
 /// `runs_count_last_7d_local` — P0-20 (2026-05-23) home tier+quota
 /// header strip. Returns the number of runs in the rolling 7-day
 /// window plus the desktop-side limit. Read-only against the in-memory
-/// run-index, no network round-trip.
+/// run-index, no network round-trip. v0.4.7 P3-31: this is the FALLBACK
+/// source for the home strip — see `quota_status_local`.
 #[tauri::command]
 async fn runs_count_last_7d_local() -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(command_handlers::run_runs_count_last_7d)
         .await
         .map_err(|e| format!("runs_count_last_7d_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+/// `quota_status_local` — P3-31 (v0.4.7) authoritative rolling-7d quota
+/// for the home strip. Proxies `GET /quota/status` (read-only, never
+/// consumes quota). Returns `{count, limit, period, reset_at}` from the
+/// server ZSET — the same count the enforcement gate sees, killing the
+/// ±1 drift of the local `runs_count_last_7d_local`. The JS layer uses
+/// this as PRIMARY and falls back to the local count on network failure.
+#[tauri::command]
+async fn quota_status_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_quota_status)
+        .await
+        .map_err(|e| format!("quota_status_local_failed:join:{e}"))?
         .map_err(|e| e.to_string())
 }
 
@@ -1185,6 +1200,7 @@ fn run_tauri_app() -> anyhow::Result<()> {
             current_user_hash_local,
             admin_check_local,
             runs_count_last_7d_local,
+            quota_status_local,
             compute_signal_accuracy_local,
             macro_briefing_local,
             license_activate_local,

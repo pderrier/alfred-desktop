@@ -876,14 +876,28 @@ export function createDesktopBridgeClient({
     },
     /**
      * P0-20 (2026-05-23) — count of runs whose `updated_at` falls in
-     * the rolling 7-day window. Used by the home tier+quota header.
+     * the rolling 7-day window. Used by the home tier+quota header as
+     * the FALLBACK source (v0.4.7 P3-31: `quotaStatus` is primary).
      * Returns `{count, limit, period}` (limit hardcoded to 3 desktop-
-     * side until P3-31 ships `/quota/status` server-side). Read-only,
-     * no quota consumption — safe to call repeatedly.
+     * side). Read-only, no quota consumption — safe to call repeatedly.
      */
     async runsCountLast7d() {
       const payload = await invoke("runs_count_last_7d_local");
       return normalizeTauriPayload(payload, ["home:runs-count-last-7d-local"]);
+    },
+    /**
+     * P3-31 (v0.4.7) — authoritative rolling-7d quota for the home strip.
+     * Proxies `GET /quota/status` server-side, returning the SAME count
+     * the enforcement gate sees (no ±1 local drift). Returns
+     * `{count, limit, period, reset_at}` where `reset_at` is epoch secs
+     * (or null for an empty window). `limit` is a number for free tier
+     * and the string `"unlimited"` for paid. Read-only — never consumes
+     * quota. This is the PRIMARY source for `getLocalQuotaState`, which
+     * falls back to `runsCountLast7d` on network failure.
+     */
+    async quotaStatus() {
+      const payload = await invoke("quota_status_local");
+      return normalizeTauriPayload(payload, ["home:quota-status-local"]);
     },
     /**
      * P2-24 (2026-05-23) — cross-portfolio signal accuracy. Aggregates

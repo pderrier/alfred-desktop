@@ -9,6 +9,8 @@ import {
 } from "/desktop-shell/run-wizard-policy.js";
 import { buildRunAnalysisOptions } from "/desktop-shell/report-view-model.js";
 import { formatBridgeError, isErrorCritical, extractErrorCode } from "/shared/run-operations-controller.js";
+import { parseStructuredErrorCode } from "/shared/bridge-client.js";
+import { buildFreeTierExhaustedModalCopy } from "/desktop-shell/quota-copy.js";
 import { openCashMatchingWizard, openChatWizard } from "/desktop-shell/app-chat-wizard.js";
 import { openCsvConfirmModal } from "/desktop-shell/app-csv-confirm-modal.js";
 import { openDiscussionHistoryModal, buildDiscussionGuidance } from "/desktop-shell/discussion-memory.js";
@@ -328,6 +330,20 @@ export function initWizard(deps) {
   }
 
   function displayError(error, context) {
+    // P3-31: route free-tier exhaustion to the friendly "Quota atteint"
+    // modal instead of surfacing the raw code
+    // (`alfred_free_tier_exhausted:342616:3:rolling_7d`). The structured
+    // fields (retry_after / limit / period) are NOT preserved on the
+    // bridge error object — only the bare code — so we re-parse the raw
+    // message to recover them for the reset-date copy.
+    const rawText = String(error?.message || error || "");
+    const structured = parseStructuredErrorCode(rawText);
+    if (structured?.code === "alfred_free_tier_exhausted") {
+      const copy = buildFreeTierExhaustedModalCopy(structured);
+      showErrorModal(copy.title, copy.message, copy.hint, copy.cta);
+      return;
+    }
+
     const formatted = formatBridgeError(error);
     if (isErrorCritical(error)) {
       const code = extractErrorCode(error);

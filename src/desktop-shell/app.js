@@ -47,6 +47,7 @@ import { buildGlobalPortfolioSynthesis } from "/desktop-shell/global-portfolio-s
 import { buildCrossAccountThemeView, findConcentrationThemeToTrigger, shouldNotifyConcentration } from "/desktop-shell/report-view-model.js";
 import { getThemeLabel } from "/desktop-shell/theme-labels.js";
 import { getLocalQuotaState, resetLocalQuotaCache } from "/desktop-shell/quota-local-counter.js";
+import { buildFreeTierExhaustedModalCopy, buildQuotaStripResetClause } from "/desktop-shell/quota-copy.js";
 import { extractFirstSentence, countPendingRecos } from "/desktop-shell/home-last-synthesis.js";
 import { extractTradeMoves, formatTradeRow } from "/desktop-shell/home-recent-trades.js";
 import { extractDatedCatalysts, formatCatalystRow } from "/desktop-shell/catalyst-calendar.js";
@@ -1257,6 +1258,9 @@ async function refreshHomeHeader() {
         pending_notice: license?.pending_notice || null,
         count: quota?.count ?? 0,
         limit: quota?.limit ?? 3,
+        // P3-31: epoch secs at which the oldest run slides out of the
+        // rolling window (or null for an empty window / fallback path).
+        reset_at: quota?.reset_at ?? null,
       },
       error: null,
     };
@@ -1694,42 +1698,6 @@ function extractFreeTierExhaustion(payload) {
   return null;
 }
 
-/**
- * Build the user-facing copy for the free-tier-exhausted upgrade modal.
- * Returns `{title, message, hint, cta}` ready to pass to `showErrorModal`.
- *
- * The countdown ("reset in Xj") is computed from the `retry_after`
- * seconds the server sent. When absent we fall back to a generic
- * message — the modal still renders, never a `NaN`.
- *
- * Pure function — no DOM dependencies — so the test suite can pin the
- * copy contract without a jsdom canvas.
- */
-function buildFreeTierExhaustedModalCopy(envelope) {
-  const limit = envelope?.limit && envelope.limit > 0 ? envelope.limit : 3;
-  const retryAfter = envelope?.retryAfter && envelope.retryAfter > 0 ? envelope.retryAfter : null;
-  let resetClause = "Une nouvelle analyse sera disponible plus tard cette semaine.";
-  if (retryAfter !== null) {
-    const days = Math.ceil(retryAfter / 86400);
-    const hours = Math.ceil(retryAfter / 3600);
-    if (days >= 2) {
-      resetClause = `Prochaine analyse disponible dans ${days} jours.`;
-    } else if (hours >= 2) {
-      resetClause = `Prochaine analyse disponible dans ${hours} heures.`;
-    } else {
-      resetClause = "Prochaine analyse disponible sous peu.";
-    }
-  }
-  return {
-    title: "Quota atteint",
-    message: `Vous avez utilisé vos ${limit} analyses gratuites pour les 7 derniers jours. ${resetClause}`,
-    hint: "Mode illimité bientôt disponible — contactez l'auteur !",
-    cta: {
-      label: "Contacter l'auteur",
-      detail: envelope || {}
-    }
-  };
-}
 
 // One-shot guard so we don't re-trigger the modal on every health
 // poll (the splash hits this every 30s in dev mode). Reset when the
@@ -2665,9 +2633,12 @@ function renderWelcome() {
     }
     const count = Number.isFinite(data.count) ? data.count : 0;
     const limit = Number.isFinite(data.limit) ? data.limit : 3;
+    // P3-31: append the reset date when the server gave us one. Empty
+    // string when unknown (fresh user / fallback path) — never "NaN".
+    const resetClause = buildQuotaStripResetClause(data.reset_at);
     return `
       <div class="welcome-step welcome-home-header" style="padding:0.55rem 0.8rem;background:var(--surface-2);border-radius:6px;margin-bottom:0.6rem;display:flex;justify-content:space-between;align-items:center;gap:0.6rem;flex-wrap:wrap">
-        <span><strong>Gratuit</strong> · ${count}/${limit} cette semaine</span>
+        <span><strong>Gratuit</strong> · ${count}/${limit} cette semaine${escapeHtml(resetClause)}</span>
         <a href="#" class="welcome-upgrade-link" onclick="event.preventDefault(); window.dispatchEvent(new CustomEvent('alfred://upgrade-requested'));" style="color:var(--accent);text-decoration:none">Mode illimité bientôt disponible — contactez l'auteur ! →</a>
         ${pendingNotice}
       </div>

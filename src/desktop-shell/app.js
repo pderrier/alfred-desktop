@@ -1723,9 +1723,9 @@ function buildFreeTierExhaustedModalCopy(envelope) {
   return {
     title: "Quota atteint",
     message: `Vous avez utilisé vos ${limit} analyses gratuites pour les 7 derniers jours. ${resetClause}`,
-    hint: "Passez en Premium (9 €/an) pour des analyses illimitées.",
+    hint: "Mode illimité bientôt disponible — contactez l'auteur !",
     cta: {
-      label: "Upgrade — 9€/an",
+      label: "Contacter l'auteur",
       detail: envelope || {}
     }
   };
@@ -1802,7 +1802,18 @@ if (typeof window !== "undefined") {
     showToast,
   });
   window.addEventListener("alfred://upgrade-requested", () => {
-    upgradeFlow.open();
+    // v0.4.6 — Premium pas encore dispo : on ouvre un email pré-rempli vers
+    // l'auteur au lieu de l'overlay de paiement Lemon Squeezy.
+    const subject = encodeURIComponent(
+      "Je suis intéressé par un plus grand quota d'analyses"
+    );
+    const mailto = `mailto:pierre.derrier@gmail.com?subject=${subject}`;
+    bridge.openExternalUrl(mailto).catch(() => {
+      showToast(
+        "Impossible d'ouvrir le client mail — écris à pierre.derrier@gmail.com",
+        "info"
+      );
+    });
   });
   window.addEventListener("alfred://upgrade-activated", () => {
     showToast(
@@ -2657,7 +2668,7 @@ function renderWelcome() {
     return `
       <div class="welcome-step welcome-home-header" style="padding:0.55rem 0.8rem;background:var(--surface-2);border-radius:6px;margin-bottom:0.6rem;display:flex;justify-content:space-between;align-items:center;gap:0.6rem;flex-wrap:wrap">
         <span><strong>Gratuit</strong> · ${count}/${limit} cette semaine</span>
-        <a href="#" class="welcome-upgrade-link" onclick="event.preventDefault(); window.dispatchEvent(new CustomEvent('alfred://upgrade-requested'));" style="color:var(--accent);text-decoration:none">Passe en illimité · 9 €/an →</a>
+        <a href="#" class="welcome-upgrade-link" onclick="event.preventDefault(); window.dispatchEvent(new CustomEvent('alfred://upgrade-requested'));" style="color:var(--accent);text-decoration:none">Mode illimité bientôt disponible — contactez l'auteur ! →</a>
         ${pendingNotice}
       </div>
     `;

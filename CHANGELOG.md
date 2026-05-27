@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.4.6
+
+### What's new
+
+- **Unlimited mode — a clearer path while it's being built.** When you reach the free weekly limit, the old "Premium · 9 €/year" prompts now read "Unlimited mode coming soon — contact the author!" and open a pre-filled email instead of a checkout. Paid unlimited access isn't live yet; this lets interested users reach out directly in the meantime.
+
+### Compatibility
+
+- No mandatory upgrade. Existing desktops keep working; the new prompt applies once v0.4.6 is installed.
+
 ## v0.4.5
 
 **Mandatory upgrade.** Fixes a cash-analysis error on CSV imports and hardens the update flow.

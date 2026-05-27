@@ -255,7 +255,10 @@ pub(crate) fn validate_external_url(url: &str) -> Result<String> {
         return Err(anyhow!("external_url_invalid"));
     }
     let lower = trimmed.to_ascii_lowercase();
-    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+    if !(lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("mailto:"))
+    {
         return Err(anyhow!("external_url_invalid"));
     }
     // Reject control characters and encoded CR/LF to reduce shell/launcher injection risk.

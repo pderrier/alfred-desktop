@@ -803,7 +803,17 @@ pub(crate) fn fetch_ticker_enrichment(
         });
     (
         json!({
-            "prix_actuel": market.get("price").cloned().unwrap_or(Value::Null),
+            // The API now emits the spot price under the canonical
+            // `prix_actuel` key (de-duplicated from the legacy dual
+            // `price`/`prix_actuel` shape — see alfred-api
+            // `enrichment::canonicalize_spot_field`). The `price` fallback is
+            // kept for transition safety so a freshly-built desktop talking to
+            // a not-yet-redeployed API still reads the spot value.
+            "prix_actuel": market
+                .get("prix_actuel")
+                .or_else(|| market.get("price"))
+                .cloned()
+                .unwrap_or(Value::Null),
             "pe_ratio": market.get("pe_ratio").cloned().unwrap_or(Value::Null),
             "revenue_growth": market.get("revenue_growth").cloned().unwrap_or(Value::Null),
             "profit_margin": market.get("profit_margin").cloned().unwrap_or(Value::Null),
@@ -1355,5 +1365,83 @@ mod tests {
     fn compute_weight_pct_clamps_value_zero() {
         // value = 0 → 0 regardless of total.
         assert_eq!(compute_weight_pct(0.0, 100_000.0), 0.0);
+    }
+
+    // ── Market-row spot key: consume the canonical `prix_actuel` ──────
+    //
+    // The alfred-api now emits the spot price under the single canonical
+    // `prix_actuel` key (de-duplicated from the legacy `price`/`prix_actuel`
+    // pair — see alfred-api `enrichment::canonicalize_spot_field`). The
+    // desktop's market_row builder must read that key, with a `price`
+    // fallback retained for transition safety (fresh desktop ↔ older API).
+
+    /// Stub `request_fn` for `fetch_ticker_enrichment`: returns a market
+    /// payload keyed on `path`. The market_row spot price is driven by the
+    /// `MARKET_STUB` thread-local so each test can vary the API shape
+    /// (canonical `prix_actuel`, legacy `price`, or both).
+    fn stub_request(
+        _method: &str,
+        _host: &str,
+        _port: u16,
+        path: &str,
+        _body: Option<&str>,
+        _timeout: Option<u64>,
+    ) -> Result<Value> {
+        if path.starts_with("/market/spot") {
+            Ok(json!({ "market": MARKET_STUB.with(|m| m.borrow().clone()) }))
+        } else {
+            // /news — empty, irrelevant to the spot-key contract.
+            Ok(json!({ "news": { "items": [] } }))
+        }
+    }
+
+    thread_local! {
+        static MARKET_STUB: std::cell::RefCell<Value> = std::cell::RefCell::new(Value::Null);
+    }
+
+    fn run_enrichment_with_market(market: Value) -> Value {
+        MARKET_STUB.with(|m| *m.borrow_mut() = market);
+        let (market_row, _news, _issues) =
+            fetch_ticker_enrichment("MC", Some("LVMH"), Some("FR0000121014"), None, stub_request);
+        market_row
+    }
+
+    #[test]
+    fn market_row_reads_canonical_prix_actuel_from_api() {
+        // API emits the canonical key → desktop surfaces it verbatim.
+        let row = run_enrichment_with_market(json!({
+            "symbol": "1rPMC",
+            "prix_actuel": 712.4,
+            "pe_ratio": 24.0,
+            "source": "boursorama:spot"
+        }));
+        assert_eq!(row.get("prix_actuel").and_then(|v| v.as_f64()), Some(712.4));
+        assert_eq!(row.get("source").and_then(|v| v.as_str()), Some("boursorama:spot"));
+    }
+
+    #[test]
+    fn market_row_falls_back_to_legacy_price_key() {
+        // Transition safety: a not-yet-redeployed API still emitting `price`
+        // must still populate the desktop's `prix_actuel`.
+        let row = run_enrichment_with_market(json!({
+            "symbol": "1rPMC",
+            "price": 712.4,
+            "pe_ratio": 24.0,
+            "source": "boursorama:spot"
+        }));
+        assert_eq!(row.get("prix_actuel").and_then(|v| v.as_f64()), Some(712.4));
+    }
+
+    #[test]
+    fn market_row_prefers_canonical_when_both_keys_present() {
+        // A legacy dual-key entry (should not happen post-fix, but defend):
+        // the canonical `prix_actuel` wins over the stale `price`.
+        let row = run_enrichment_with_market(json!({
+            "symbol": "ASML",
+            "price": 0.19,
+            "prix_actuel": 179.08,
+            "source": "yahoo:spot"
+        }));
+        assert_eq!(row.get("prix_actuel").and_then(|v| v.as_f64()), Some(179.08));
     }
 }

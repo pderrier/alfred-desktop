@@ -2019,37 +2019,44 @@ fn persist_line_extras(data_dir: &std::path::Path, run_id: &str, ticker: &str, l
 
     // Persist shared insights (with optional sector analysis).
     //
-    // PARITY FIX (2026-05-17): `run_id` is now forwarded to every
-    // `dispatch_tool_direct` call so the MCP tool can emit a `line_progress`
-    // event with the matching `"sharing insights"` / `"persisting
-    // fundamentals"` / `"caching deep news"` string. Without `run_id` the
-    // event is silently skipped (see `mcp_server::tool_persist_*` —
-    // `if !run_id.is_empty()` gate) and the `run_stats` aggregator counts
-    // `insights_persisted=0`, `fundamentals_persisted=0`,
-    // `deep_news_persisted=0` for every native / native-oauth run even
-    // though the writes actually happened. This was the root cause of the
-    // `collective_memory=0` artifact observed in the 2026-05-17 cache audit
-    // — H2 confirmed (audit: docs/audits/collective-memory-zero-2026-05-17.md).
-    if let Some(insights) = rec.get("shared_insights") {
-        if !insights.is_null() {
-            let mut params = json!({
-                "ticker": ticker,
-                "isin": isin,
-                "run_id": run_id,
-                "insights": serde_json::to_string(insights).unwrap_or_default(),
-            });
-            if let Some(sector) = rec.get("sector").and_then(|v| v.as_str()) {
-                params["sector"] = json!(sector);
-            }
-            if let Some(sa) = rec.get("sector_analysis").and_then(|v| v.as_str()) {
-                params["sector_analysis"] = json!(sa);
-            }
-            crate::mcp_server::dispatch_tool_direct(
-                data_dir,
-                "persist_shared_insights",
-                &params,
-            );
+    // ROOT-CAUSE FIX (2026-05-28): build the insights object from the
+    // TOP-LEVEL recommendation fields the LLM actually emits — see the
+    // schema in `llm_prompts::build_line_analysis_prompt` (lines 350-376).
+    // The prior gate `rec.get("shared_insights")` looked for a nested
+    // wrapper that the LLM never produces, so the dispatch was silently
+    // skipped on every native / native-oauth run and `insights:<ISIN>`
+    // stopped accumulating in the API cache once codex stopped being the
+    // default backend (around 2026-05-16). Codex mode is unaffected: it
+    // bypasses this code path entirely because the LLM emits
+    // `tools/call persist_shared_insights` directly via JSON-RPC (see
+    // `build_batch_prompt` step 8). The pure helper
+    // `extract_shared_insights` is unit-tested in `tests.rs` and shares
+    // the field vocabulary with the legacy `llm_parsing` path
+    // (handlers.rs:1035 + 1053 on the API side).
+    //
+    // PARITY FIX (2026-05-17): `run_id` is forwarded so the MCP tool can
+    // emit the `"sharing insights"` `line_progress` event picked up by
+    // `run_stats::aggregate_from_progress_file`. Without it the
+    // aggregator counts `insights_persisted=0` even when the writes
+    // succeed (audit: docs/audits/collective-memory-zero-2026-05-17.md).
+    if let Some(insights) = extract_shared_insights(rec) {
+        let mut params = json!({
+            "ticker": ticker,
+            "isin": isin,
+            "run_id": run_id,
+            "insights": serde_json::to_string(&insights).unwrap_or_default(),
+        });
+        if let Some(sector) = rec.get("sector").and_then(|v| v.as_str()) {
+            params["sector"] = json!(sector);
         }
+        if let Some(sa) = rec.get("sector_analysis").and_then(|v| v.as_str()) {
+            params["sector_analysis"] = json!(sa);
+        }
+        crate::mcp_server::dispatch_tool_direct(
+            data_dir,
+            "persist_shared_insights",
+            &params,
+        );
     }
 
     // Persist extracted fundamentals
@@ -2108,6 +2115,60 @@ fn persist_line_extras(data_dir: &std::path::Path, run_id: &str, ticker: &str, l
             );
         }
     }
+}
+
+/// Field set the LLM emits at the TOP LEVEL of `recommendation` that
+/// makes up a shareable, ticker-generic insight contribution. Mirrors
+/// the legacy `llm_parsing::persist_shared_insights_if_present` field
+/// list AND the API handler's `generic_fields` + `array_fields` (see
+/// `apps/alfred-api/src/handlers.rs::insights_post_handler`). Any new
+/// field added to the schema must land here — pinned by
+/// `extract_shared_insights_matches_legacy_llm_parsing_helper` in
+/// `tests.rs`.
+const SHARED_INSIGHT_FIELDS: &[&str] = &[
+    "analyse_technique",
+    "analyse_fondamentale",
+    "analyse_sentiment",
+    "deep_news_summary",
+    "badges_keywords",
+    "risques",
+    "catalyseurs",
+];
+
+/// Build the `insights` object posted to `/api/insights` from a per-line
+/// LLM recommendation.
+///
+/// The LLM emits these fields at the top level of `recommendation` (see
+/// the JSON schema in `llm_prompts::build_line_analysis_prompt` lines
+/// 350-376). There is NO nested `shared_insights` wrapper — that was the
+/// 2026-03-24 → 2026-05-28 bug, root-caused in commit
+/// `bc76bd3` and surfaced when the default backend switched away from
+/// codex around 2026-05-16. This helper restores the contribution flow
+/// for native / native-oauth modes by reading the same field list the
+/// legacy `llm_parsing` path always read.
+///
+/// Returns `None` when the recommendation carries no populated generic
+/// field — the API rejects empty insight objects, so skipping the
+/// round-trip is cleaner. Empty strings / empty arrays are treated as
+/// "no content" and not forwarded — preserves the API guarantee that a
+/// contribution never overwrites richer prior content with noise.
+pub(crate) fn extract_shared_insights(rec: &Value) -> Option<Value> {
+    let mut insights = serde_json::Map::new();
+    for field in SHARED_INSIGHT_FIELDS {
+        let Some(val) = rec.get(*field) else { continue };
+        let has_content = match val {
+            Value::String(s) => !s.is_empty(),
+            Value::Array(a) => !a.is_empty(),
+            _ => false,
+        };
+        if has_content {
+            insights.insert((*field).to_string(), val.clone());
+        }
+    }
+    if insights.is_empty() {
+        return None;
+    }
+    Some(Value::Object(insights))
 }
 
 /// Pick the article URL to associate a fresh deep_news_summary with.

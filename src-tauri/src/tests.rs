@@ -8183,3 +8183,273 @@ use crate::storage::read_json_file;
         assert_eq!(summary["run_history_entries_pruned"], 1, "MC's 2026-05-25 run_history row pruned");
         assert_eq!(summary["residual_narrative_warning"], true, "MC still carries a narrative");
     }
+
+    // ── Insights persistence — root-cause fix 2026-05-28 ─────────────
+    //
+    // Production audit (2026-05-28) showed `insights:<ISIN>` total = 41
+    // entries, all `last_updated` between 2026-05-15 and 2026-05-16 —
+    // frozen for 12 days across 11+ runs and 6 client hashes. The
+    // collaborative-analysis feature was silently dead in native /
+    // native-oauth mode.
+    //
+    // Root cause: `services/native_mcp_analysis::persist_line_extras`
+    // gated the `dispatch_tool_direct("persist_shared_insights", …)`
+    // call on `rec.get("shared_insights")` — but the LLM recommendation
+    // schema (see `llm_prompts::build_line_analysis_prompt` line 350-376)
+    // emits the fields TOP-LEVEL inside `recommendation`:
+    //   { "analyse_technique": "...", "risques": [...],
+    //     "catalyseurs": [...], "deep_news_summary": "...", ... }
+    // There is no wrapper `shared_insights` object. The gate was therefore
+    // ALWAYS None and the persist call was NEVER dispatched in
+    // native/native-oauth modes. Codex mode masked the bug because the
+    // LLM in tool-use loop emitted `tools/call persist_shared_insights`
+    // directly — the codex prompt (`build_batch_prompt`, step 8)
+    // instructs the model to call the tool itself. When the default
+    // backend shifted away from codex around 2026-05-16 the bug surfaced.
+    //
+    // Bug introduced 2026-03-24 by commit `bc76bd3` ("native backend calls
+    // tools directly, model just returns JSON"), latent until the mode
+    // switch.
+    //
+    // Fix (this commit): extract a pure helper
+    // `native_mcp_analysis::extract_shared_insights(rec)` that reads the
+    // top-level recommendation fields the LLM actually emits — same field
+    // list as the legacy `llm_parsing::persist_shared_insights_if_present`
+    // (which has been correct since v0.1.0). The legacy helper now
+    // delegates to the same extractor, eliminating drift.
+
+    #[test]
+    fn extract_shared_insights_reads_top_level_recommendation_fields() {
+        // Realistic recommendation: matches the schema in
+        // `llm_prompts::build_line_analysis_prompt` (lines 350-376).
+        // No nested `shared_insights` wrapper — fields are top-level.
+        let rec = json!({
+            "line_id": "position:MC",
+            "ticker": "MC",
+            "type": "position",
+            "signal": "CONSERVER",
+            "conviction": "moderee",
+            "synthese": "Position LVMH stable, momentum sectoriel mitige",
+            "analyse_technique": "Tendance laterale, support a 650, resistance 720",
+            "analyse_fondamentale": "PER eleve a 28, croissance CA ralentit",
+            "analyse_sentiment": "Sentiment neutre, news sectorielles mitigees",
+            "raisons_principales": ["valuation tendue", "marche luxe en repli"],
+            "risques": ["recession Chine", "ralentissement consommation europe"],
+            "catalyseurs": ["resultats T2 22 juillet", "guidance reviewee"],
+            "badges_keywords": ["luxe", "PER-eleve", "attendre-T2"],
+            "deep_news_summary": "Le secteur du luxe traverse une phase d'ajustement, LVMH conserve sa premium mais la guidance est revue a la baisse.",
+            "deep_news_quality_score": 78,
+        });
+
+        let insights = crate::native_mcp_analysis::extract_shared_insights(&rec)
+            .expect("non-empty rec with generic fields must produce Some(insights)");
+        let obj = insights.as_object().expect("insights must be an Object");
+
+        // The API handler (handlers.rs insights_post_handler line 1035)
+        // iterates exactly these field names — they must all be in the
+        // emitted insights object when the LLM produces them.
+        assert!(obj.contains_key("analyse_technique"), "analyse_technique missing from extracted insights");
+        assert!(obj.contains_key("analyse_fondamentale"), "analyse_fondamentale missing");
+        assert!(obj.contains_key("analyse_sentiment"), "analyse_sentiment missing");
+        assert!(obj.contains_key("deep_news_summary"), "deep_news_summary missing");
+        assert!(obj.contains_key("badges_keywords"), "badges_keywords missing");
+        assert!(obj.contains_key("risques"), "risques missing");
+        assert!(obj.contains_key("catalyseurs"), "catalyseurs missing");
+
+        // String values pass through verbatim.
+        assert_eq!(
+            obj.get("analyse_technique").and_then(|v| v.as_str()),
+            Some("Tendance laterale, support a 650, resistance 720"),
+        );
+        // Array values pass through verbatim.
+        assert_eq!(
+            obj.get("risques").and_then(|v| v.as_array()).map(|a| a.len()),
+            Some(2),
+        );
+    }
+
+    #[test]
+    fn extract_shared_insights_returns_none_for_recommendation_without_generic_fields() {
+        // A recommendation with only signal/conviction but no analyse_*,
+        // risques, catalyseurs, deep_news_summary, or badges_keywords
+        // should yield None so the persist call is skipped (it would be
+        // a no-op anyway — the API rejects empty insights — but skipping
+        // the round-trip is cleaner).
+        let rec = json!({
+            "line_id": "position:MC",
+            "ticker": "MC",
+            "signal": "SURVEILLANCE",
+            "conviction": "faible",
+            // No generic fields populated.
+        });
+        let insights = crate::native_mcp_analysis::extract_shared_insights(&rec);
+        assert!(insights.is_none(), "rec with no generic fields must yield None");
+    }
+
+    #[test]
+    fn extract_shared_insights_skips_empty_strings_and_empty_arrays() {
+        // Defensive: empty strings/arrays are noise — don't push them
+        // to the API where they would overwrite richer prior insights
+        // contributed by other users.
+        let rec = json!({
+            "analyse_technique": "",
+            "analyse_fondamentale": "real analysis",
+            "risques": [],
+            "catalyseurs": ["concrete catalyst"],
+            "badges_keywords": [],
+            "deep_news_summary": "",
+        });
+        let insights = crate::native_mcp_analysis::extract_shared_insights(&rec)
+            .expect("at least one populated field must yield Some(insights)");
+        let obj = insights.as_object().unwrap();
+
+        assert!(!obj.contains_key("analyse_technique"), "empty string must not be persisted");
+        assert!(obj.contains_key("analyse_fondamentale"), "non-empty string must be persisted");
+        assert!(!obj.contains_key("risques"), "empty array must not be persisted");
+        assert!(obj.contains_key("catalyseurs"), "non-empty array must be persisted");
+        assert!(!obj.contains_key("badges_keywords"), "empty array must not be persisted");
+        assert!(!obj.contains_key("deep_news_summary"), "empty string must not be persisted");
+    }
+
+    #[test]
+    fn extract_shared_insights_matches_legacy_llm_parsing_helper() {
+        // Parity guard: the field set extracted by the native-mode helper
+        // MUST equal the field set extracted by the legacy upstream-LLM
+        // helper. If a contributor adds a new field to one, they must add
+        // it to the other — this test fails until they do.
+        //
+        // The legacy helper persists via `alfred_api_client::persist_shared_insights`
+        // (which we cannot call in tests without network). Instead we
+        // compare the SHAPE of the extracted object — same keys, same
+        // values — between the new pure helper and a local re-impl of
+        // the legacy field list. This pins both implementations to the
+        // same vocabulary.
+        let rec = json!({
+            "analyse_technique": "T",
+            "analyse_fondamentale": "F",
+            "analyse_sentiment": "S",
+            "deep_news_summary": "D",
+            "badges_keywords": ["k1", "k2"],
+            "risques": ["r1"],
+            "catalyseurs": ["c1"],
+        });
+        let new_insights = crate::native_mcp_analysis::extract_shared_insights(&rec)
+            .expect("non-empty rec yields Some");
+
+        // The legacy field set lives in
+        // `llm_parsing::persist_shared_insights_if_present` and the API
+        // handler's `generic_fields` + `array_fields` (handlers.rs:1035 +
+        // 1053). Recreating that list here is the contract: any change
+        // must be made in BOTH places.
+        let legacy_fields = [
+            "analyse_technique", "analyse_fondamentale", "analyse_sentiment",
+            "deep_news_summary", "badges_keywords", "risques", "catalyseurs",
+        ];
+        for f in &legacy_fields {
+            assert!(
+                new_insights.get(*f).is_some(),
+                "field `{f}` missing from native-mode extractor — drift vs legacy",
+            );
+        }
+        // And no NEW keys leaked in.
+        let new_keys: std::collections::HashSet<_> = new_insights
+            .as_object().unwrap().keys().cloned().collect();
+        let legacy_keys: std::collections::HashSet<_> =
+            legacy_fields.iter().map(|s| s.to_string()).collect();
+        assert_eq!(new_keys, legacy_keys, "extra keys leaked from native-mode extractor");
+    }
+
+    #[test]
+    fn extract_shared_insights_handles_real_prod_recommendation_fixture() {
+        // Real recommendation captured from prod runtime-state on 2026-05-27
+        // (run 019e6b37d3ad, ticker LSS / Lectra, native backend) — see
+        // `src-tauri/tests/fixtures/recommendation_lss_2026_05_27.json`.
+        //
+        // This is the SAME shape that silently slipped through the broken
+        // `rec.get("shared_insights")` gate on every native-mode run since
+        // 2026-05-16. Pinning the extractor against real prod data
+        // prevents another silent-degrade regression: if the LLM schema
+        // drifts (a future prompt edit rewraps the fields), this test
+        // fails loudly instead of dropping contributions on the floor.
+        let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("recommendation_lss_2026_05_27.json");
+        let raw = std::fs::read_to_string(&fixture_path)
+            .unwrap_or_else(|e| panic!("read fixture {fixture_path:?}: {e}"));
+        let rec: serde_json::Value = serde_json::from_str(&raw)
+            .expect("fixture must be valid JSON");
+
+        // Sanity: prod recommendation does NOT carry a `shared_insights`
+        // wrapper. That is the contract that was silently violated.
+        assert!(
+            rec.get("shared_insights").is_none(),
+            "prod fixture must not have a nested shared_insights — schema contract",
+        );
+
+        let insights = crate::native_mcp_analysis::extract_shared_insights(&rec)
+            .expect("real prod recommendation must produce non-empty insights");
+        let obj = insights.as_object().unwrap();
+
+        // The full SHARED_INSIGHT_FIELDS set is populated on a healthy
+        // analysis — all 7 fields make it through.
+        for f in [
+            "analyse_technique", "analyse_fondamentale", "analyse_sentiment",
+            "deep_news_summary", "badges_keywords", "risques", "catalyseurs",
+        ] {
+            assert!(
+                obj.contains_key(f),
+                "prod recommendation field `{f}` missing from extracted insights",
+            );
+        }
+
+        // Spot-check that the actual prod content survives the extraction
+        // verbatim (the API merge logic expects strings as-is and arrays
+        // as-is, no shape transformation).
+        let at = obj.get("analyse_technique").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(at.contains("RSI 58,88"), "analyse_technique content mutated");
+        let risques = obj.get("risques").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(risques.len(), 4, "risques array length preserved");
+        let badges = obj.get("badges_keywords").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(badges.len(), 5, "badges_keywords array length preserved");
+    }
+
+    #[test]
+    fn line_analysis_prompt_schema_has_no_shared_insights_wrapper() {
+        // Contract test: confirm the LLM recommendation schema does NOT
+        // emit a nested `shared_insights` key. If a future refactor
+        // reintroduces it, the extractor design has to change in lockstep
+        // — this test forces that conversation.
+        //
+        // The prompt is built from a minimal line_context; we only look
+        // at the static schema portion ("\"recommendation\": {…}"). The
+        // schema is the JSON shape the LLM is told to return.
+        let line_context = json!({
+            "ticker": "MC",
+            "row": { "nom": "LVMH", "isin": "FR0000121014" },
+            "market": {},
+            "news": [],
+            "line_memory": {},
+            "shared_insights": null,
+        });
+        let run_state = json!({ "portfolio": {} });
+        let prompt = crate::llm_prompts::build_line_analysis_prompt(
+            &line_context,
+            &run_state,
+            None,
+            None,
+        );
+
+        // Read just the "recommendation": { ... } block from the schema.
+        // The prompt sets up: `"recommendation": {\n  "line_id": ...`
+        // We assert the schema NEVER instructs the LLM to emit a nested
+        // `"shared_insights":` wrapper field.
+        //
+        // Match exactly the schema-emit pattern (with a leading quote +
+        // colon) — comments / instructions referencing the WORD
+        // "shared_insights" elsewhere in the prompt are fine.
+        assert!(
+            !prompt.contains("\"shared_insights\":"),
+            "LLM schema must not emit a nested `shared_insights` wrapper — extractor reads top-level fields. Found in prompt:\n{prompt}",
+        );
+    }

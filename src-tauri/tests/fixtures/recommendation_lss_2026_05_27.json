@@ -1,0 +1,32 @@
+{
+  "_source": "captured from prod runtime-state run 019e6b37d3ad (2026-05-27T22:58 local), ticker LSS, native backend. Used by tests::extract_shared_insights_real_prod_recommendation_fixture in src/tests.rs to pin the LLM output shape we extract shared insights from. If this fixture is regenerated, the test still passes as long as the LLM keeps emitting the SHARED_INSIGHT_FIELDS at the top level of recommendation — that is the contract the bug 2026-05-28 broke.",
+  "line_id": "position:LSS",
+  "ticker": "LSS",
+  "type": "position",
+  "nom": "Lectra",
+  "signal": "CONSERVER",
+  "conviction": "moderee",
+  "analyse_technique": "RSI 58,88, MACD redevenu positif et cours au-dessus des SMA 20 et 50, ce qui montre un rebond court terme. Le titre reste toutefois 21,72% sous sa SMA 200 et 36,67% sous son plus haut 52 semaines: la tendance longue n'est pas reparee.",
+  "analyse_fondamentale": "PER 25,39 assez exigeant pour une societe dont le chiffre d'affaires recule de 4%. La marge nette de 6,98% et l'endettement raisonnable soutiennent le dossier, mais la croissance doit revenir pour justifier un achat plus agressif.",
+  "analyse_sentiment": "Le flux recent est plutot constructif grace aux rachats d'actions et a la gouvernance, mais il manque une nouvelle operationnelle forte sur commandes, ARR ou marges. Le sentiment est donc positif mais tactique.",
+  "deep_news_summary": "Les actualites recentes sont dominees par le programme de rachat d'actions, avec des transactions declarees sur la semaine du 18 au 22 mai 2026, et par des mouvements de gouvernance au conseil. Flux positif, mais surtout financier, pas encore une preuve de reprise commerciale.",
+  "risques": [
+    "Croissance du chiffre d'affaires encore negative",
+    "Valorisation elevee au regard du momentum operationnel",
+    "Tendance longue fragile sous SMA 200",
+    "Sensibilite aux investissements industriels des clients"
+  ],
+  "catalyseurs": [
+    "Poursuite du programme de rachat d'actions",
+    "Reprise de l'ARR et des revenus recurrents",
+    "Amelioration des commandes equipements",
+    "Retour au-dessus de la SMA 200"
+  ],
+  "badges_keywords": [
+    "logiciel industriel",
+    "SaaS",
+    "rachat actions",
+    "revenus recurrents",
+    "PEA-PME"
+  ]
+}

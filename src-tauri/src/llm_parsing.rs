@@ -138,27 +138,17 @@ pub(crate) fn is_repair_pass(validation_context: Option<&Value>) -> bool {
 // ── Insights persistence ─────────────────────────────────────────
 
 /// Extract generic insights from a recommendation and persist them to the shared cache.
+///
+/// Delegates field extraction to `native_mcp_analysis::extract_shared_insights`
+/// so the legacy upstream-LLM path (`llm::run_upstream_line_analysis`)
+/// and the MCP / native path (`native_mcp_analysis::persist_line_extras`)
+/// agree on the field vocabulary. Pinned by
+/// `extract_shared_insights_matches_legacy_llm_parsing_helper` in
+/// `tests.rs` — a contributor adding a field touches only the helper.
 pub(crate) fn persist_shared_insights_if_present(recommendation: &Value, line_context: &Value) {
-    let generic_fields = [
-        "analyse_technique", "analyse_fondamentale", "analyse_sentiment",
-        "deep_news_summary", "badges_keywords", "risques", "catalyseurs",
-    ];
-    let mut insights = serde_json::Map::new();
-    for field in &generic_fields {
-        if let Some(val) = recommendation.get(*field) {
-            let is_nonempty = match val {
-                Value::String(s) => !s.is_empty(),
-                Value::Array(a) => !a.is_empty(),
-                _ => false,
-            };
-            if is_nonempty {
-                insights.insert(field.to_string(), val.clone());
-            }
-        }
-    }
-    if insights.is_empty() {
+    let Some(insights) = crate::native_mcp_analysis::extract_shared_insights(recommendation) else {
         return;
-    }
+    };
     let ticker = line_context.get("ticker").and_then(|v| v.as_str()).unwrap_or("");
     let isin = line_context
         .get("row")
@@ -168,7 +158,7 @@ pub(crate) fn persist_shared_insights_if_present(recommendation: &Value, line_co
     // Extract sector from line_context if available (set by get_line_data)
     let sector = line_context.get("sector").and_then(|v| v.as_str());
     let sector_analysis = recommendation.get("sector_analysis").and_then(|v| v.as_str());
-    crate::alfred_api_client::persist_shared_insights(ticker, isin, &Value::Object(insights), sector, sector_analysis);
+    crate::alfred_api_client::persist_shared_insights(ticker, isin, &insights, sector, sector_analysis);
 }
 
 /// Persist the deep news summary to the per-URL API cache.

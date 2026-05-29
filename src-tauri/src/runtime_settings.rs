@@ -122,6 +122,19 @@ pub fn definitions_json() -> serde_json::Value {
             "whyItMatters": "Keeps rollout safe by leaving instrumentation off until explicitly enabled.",
             "resetLabel": "Disable artifacts"
         },
+        "run_narration_enabled": {
+            "type": "integer",
+            "min": 0,
+            "max": 1,
+            "defaultValue": 1,
+            "section": "product",
+            "restartRequired": false,
+            "envName": "ALFRED_RUN_NARRATION_ENABLED",
+            "label": "Run-narration live toast",
+            "description": "Emit short LLM-generated narration toasts during an analysis run (one every ~10s). When 0, the narrator never starts and its dedicated app-server slot is never spawned.",
+            "whyItMatters": "The narration uses a dedicated app-server process; turning it off saves that process and the per-tick LLM calls for users who don't want live commentary.",
+            "resetLabel": "Enable run narration"
+        },
         "line_memory_repaired_v1": {
             "type": "integer",
             "min": 0,
@@ -358,6 +371,7 @@ fn normalize_value(key: &str, value: &serde_json::Value) -> Result<serde_json::V
         }
         "line_analysis_concurrency" => normalize_integer(key, value, 1, 12),
         "agentos_artifacts_enabled" => normalize_integer(key, value, 0, 1),
+        "run_narration_enabled" => normalize_integer(key, value, 0, 1),
         "llm_backend_auto_fallback" => normalize_integer(key, value, 0, 1),
         "codex_auth_auto_fallback" => normalize_integer(key, value, 0, 1),
         "codex_auth_oauth_retry_after_ms" => normalize_integer(key, value, 0, 9007199254740991_i64),
@@ -404,6 +418,9 @@ fn value_from_env(key: &str) -> Option<serde_json::Value> {
             .ok()
             .map(|value| json!(value)),
         "agentos_artifacts_enabled" => env::var("ALFRED_AGENTOS_ARTIFACTS_ENABLED")
+            .ok()
+            .map(|value| json!(value)),
+        "run_narration_enabled" => env::var("ALFRED_RUN_NARRATION_ENABLED")
             .ok()
             .map(|value| json!(value)),
         "line_analysis_throttle_ms" => env::var("ALFRED_LINE_ANALYSIS_THROTTLE_MS")

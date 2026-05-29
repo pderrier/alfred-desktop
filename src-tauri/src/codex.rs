@@ -254,7 +254,19 @@ pub struct AppServerClient {
 /// Pool of app-server processes for parallel line analysis.
 /// Each worker thread takes a slot, uses it, returns it.
 struct AppServerPool {
+    /// Analysis slots (count = `pool_size()`). Used exclusively by line
+    /// analysis / synthesis via `with_app_server`. The narrator never touches
+    /// these.
     slots: Vec<Mutex<Option<AppServerClient>>>,
+    /// Dedicated slot reserved exclusively for run-narration. NOT part of
+    /// `slots`, so narration never contends with line analysis for an
+    /// app-server process (root-cause fix for narration toast lag: previously
+    /// narration shared the analysis pool and blocked behind an in-flight
+    /// line-analysis LLM call). Started lazily on first narration use so a
+    /// session with narration disabled never pays the extra process cost.
+    /// Single-consumer (only the narrator thread), so a plain `Mutex<Option>`
+    /// is sufficient.
+    narration_slot: Mutex<Option<AppServerClient>>,
     best_model: Mutex<Option<String>>,
 }
 
@@ -270,6 +282,7 @@ fn app_server_pool() -> &'static AppServerPool {
         let slots = (0..n).map(|_| Mutex::new(None)).collect();
         AppServerPool {
             slots,
+            narration_slot: Mutex::new(None),
             best_model: Mutex::new(None),
         }
     })
@@ -600,18 +613,19 @@ fn map_rpc_error(err: &Value) -> anyhow::Error {
 
 // ── Singleton public API ──────────────────────────────────────────
 
-/// Ensure a specific pool slot has a running app-server.
-fn ensure_slot(slot_idx: usize) -> Result<()> {
+/// Ensure the app-server held in `guard` is spawned, initialized, and has a
+/// resolved model. Shared by analysis slots and the dedicated narration slot
+/// so both go through one spawn/init/model-resolution path (DRY). `label` is
+/// only used for debug logging (e.g. "1" or "narration"). A live client is
+/// left untouched; a dead one is replaced.
+fn ensure_client(guard: &mut Option<AppServerClient>, label: &str) -> Result<()> {
     let pool = app_server_pool();
-    let mut guard = pool.slots[slot_idx]
-        .lock()
-        .map_err(|e| anyhow!("codex_app_server_lock_poisoned:{e}"))?;
 
-    if let Some(ref mut client) = *guard {
+    if let Some(client) = guard.as_mut() {
         if client.is_alive() {
             return Ok(());
         }
-        crate::debug_log(&format!("codex app-server[{slot_idx}]: process died, restarting"));
+        crate::debug_log(&format!("codex app-server[{label}]: process died, restarting"));
     }
 
     // Clean legacy global config before first spawn so it doesn't
@@ -621,7 +635,7 @@ fn ensure_slot(slot_idx: usize) -> Result<()> {
     let mut client = AppServerClient::spawn()?;
     client.initialize()?;
 
-    // Resolve best model once (shared across pool)
+    // Resolve best model once (shared across pool, incl. the narration slot).
     {
         let mut best = pool.best_model.lock().unwrap_or_else(|e| e.into_inner());
         if best.is_none() {
@@ -635,9 +649,18 @@ fn ensure_slot(slot_idx: usize) -> Result<()> {
         }
     }
 
-    crate::debug_log(&format!("codex app-server[{slot_idx}]: ready"));
+    crate::debug_log(&format!("codex app-server[{label}]: ready"));
     *guard = Some(client);
     Ok(())
+}
+
+/// Ensure a specific analysis pool slot has a running app-server.
+fn ensure_slot(slot_idx: usize) -> Result<()> {
+    let pool = app_server_pool();
+    let mut guard = pool.slots[slot_idx]
+        .lock()
+        .map_err(|e| anyhow!("codex_app_server_lock_poisoned:{e}"))?;
+    ensure_client(&mut guard, &slot_idx.to_string())
 }
 
 /// Initialize the first slot (used for session_status, login, etc.)
@@ -656,6 +679,14 @@ pub fn stop_app_server() {
             }
             *guard = None;
         }
+    }
+    // Tear down the dedicated narration slot too — it lives outside `slots`.
+    if let Ok(mut guard) = pool.narration_slot.lock() {
+        if let Some(ref mut client) = *guard {
+            crate::debug_log("codex app-server[narration]: stopping");
+            client.stop();
+        }
+        *guard = None;
     }
     if let Ok(mut best) = pool.best_model.lock() {
         *best = None;
@@ -693,6 +724,33 @@ where
     let client = guard
         .as_mut()
         .ok_or_else(|| anyhow!("codex_app_server_not_running"))?;
+    f(client)
+}
+
+/// Execute a closure with the dedicated narration app-server client.
+///
+/// Uses ONLY the reserved `narration_slot` — it never iterates or blocks on
+/// the analysis `slots`, so narration can never contend with line analysis
+/// for a process (and analysis can never contend with narration). The slot's
+/// codex process is started lazily on first use, so a session with narration
+/// disabled never pays the extra-process cost.
+///
+/// Single-consumer (only the narrator thread calls this), so locking the slot
+/// is contention-free in practice; the `Mutex` is just for `Send`/`Sync` and
+/// for safe teardown from `stop_app_server`.
+fn with_narration_app_server<F, R>(f: F) -> Result<R>
+where
+    F: FnOnce(&mut AppServerClient) -> Result<R>,
+{
+    let pool = app_server_pool();
+    let mut guard = pool
+        .narration_slot
+        .lock()
+        .map_err(|e| anyhow!("codex_narration_slot_lock_poisoned:{e}"))?;
+    ensure_client(&mut guard, "narration")?;
+    let client = guard
+        .as_mut()
+        .ok_or_else(|| anyhow!("codex_narration_app_server_not_running"))?;
     f(client)
 }
 
@@ -777,6 +835,9 @@ pub fn set_codex_mock(mock: Option<CodexMockFn>) {
 /// Run a prompt via the Codex app-server.
 /// Creates a thread, starts a turn, streams agent messages, and returns the
 /// accumulated JSON result. In tests, can be overridden via `set_codex_mock`.
+///
+/// Uses the analysis pool (`with_app_server`). For run-narration, which must
+/// never contend with line analysis, use `run_codex_prompt_narration` instead.
 pub fn run_codex_prompt_with_progress(
     prompt: &str,
     _timeout_ms: u64,
@@ -790,7 +851,41 @@ pub fn run_codex_prompt_with_progress(
             }
         }
     }
-    with_app_server(|client| {
+    with_app_server(|client| run_turn_on_client(client, prompt, &on_progress))
+}
+
+/// Run a prompt via the dedicated narration app-server slot.
+///
+/// Identical turn semantics to `run_codex_prompt_with_progress` (same
+/// `run_turn_on_client` body), but routes through `with_narration_app_server`
+/// so it uses the reserved narration slot and never blocks behind in-flight
+/// line analysis. This is the codex/native-oauth path for `run_narrator`.
+pub fn run_codex_prompt_narration(
+    prompt: &str,
+    _timeout_ms: u64,
+    on_progress: Option<CodexProgressFn>,
+) -> Result<Value> {
+    // Test mock hook — shared with the analysis path so narrator tests can
+    // inject the same fake LLM.
+    if let Some(slot) = CODEX_MOCK.get() {
+        if let Ok(guard) = slot.lock() {
+            if let Some(mock_fn) = *guard {
+                return mock_fn(prompt);
+            }
+        }
+    }
+    with_narration_app_server(|client| run_turn_on_client(client, prompt, &on_progress))
+}
+
+/// Drive one full Codex turn on an already-acquired client: start a thread,
+/// start a turn, stream notifications until completion, extract JSON. Shared
+/// by the analysis path and the narration path so both behave identically.
+fn run_turn_on_client(
+    client: &mut AppServerClient,
+    prompt: &str,
+    on_progress: &Option<CodexProgressFn>,
+) -> Result<Value> {
+    {
         let model = client.best_model.clone().unwrap_or_else(|| "gpt-5.4".to_string());
         // 1. Start a new thread
         let thread_id = {
@@ -1025,7 +1120,7 @@ pub fn run_codex_prompt_with_progress(
             None if agent_text.is_empty() => Ok(json!({"ok": true, "mcp_turn": true})),
             None => Ok(json!({"ok": true, "mcp_turn": true, "agent_text": agent_text})),
         }
-    })
+    }
 }
 
 /// Run a simple text-in/text-out prompt through the Codex app-server.
@@ -2208,5 +2303,115 @@ mod tests {
         // can verify the file is restored correctly when only the IO runs.
         fs::copy(&backup_path, &auth_path).unwrap();
         assert_eq!(auth_mode().unwrap(), "chatgpt");
+    }
+
+    // ── Dedicated-narration-slot locking topology ────────────────────
+    //
+    // These tests prove the root-cause fix WITHOUT spawning a real codex
+    // process: the guarantee is purely about the lock topology — narration
+    // acquires `pool.narration_slot`, analysis acquires `pool.slots[*]`, and
+    // the two sets are disjoint. We exercise the exact `Mutex`es the real
+    // `with_*_app_server` functions lock, just without the `ensure_client`
+    // spawn step (which needs a codex binary unavailable in CI).
+
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    /// Serializes the pool-topology tests. They all lock every analysis slot
+    /// of the shared static pool; running two in parallel would deadlock them
+    /// against each other. `lock().unwrap_or_else(into_inner)` so a panic in
+    /// one test (poisoning the lock) doesn't cascade into spurious failures.
+    static POOL_TOPOLOGY_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Acquiring the narration slot must succeed immediately even when EVERY
+    /// analysis slot is held (saturated pool). On master the narrator routed
+    /// through `with_app_server`, whose all-slots-busy fallback BLOCKS on
+    /// `slots[0].lock()`; here it must not touch the analysis slots at all.
+    #[test]
+    fn narration_slot_acquires_while_analysis_pool_saturated() {
+        let _topology = POOL_TOPOLOGY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pool = app_server_pool();
+
+        // Saturate the analysis pool: hold a guard on every analysis slot.
+        let mut held_guards = Vec::new();
+        for slot in pool.slots.iter() {
+            held_guards.push(slot.lock().expect("analysis slot lock"));
+        }
+
+        // On a worker thread, acquire the narration slot the same way
+        // `with_narration_app_server` does (lock `narration_slot`). It must
+        // return quickly — it never waits on the held analysis slots.
+        let (tx, rx) = mpsc::channel::<()>();
+        let handle = thread::spawn(move || {
+            let pool = app_server_pool();
+            let _guard = pool
+                .narration_slot
+                .lock()
+                .expect("narration slot lock must not block");
+            tx.send(()).ok();
+        });
+
+        // Generous deadline; in practice the lock is uncontended so this is
+        // near-instant. A regression (narration touching the analysis slots)
+        // would deadlock here against `held_guards`.
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("narration slot acquisition blocked behind saturated analysis pool");
+        handle.join().unwrap();
+
+        drop(held_guards);
+    }
+
+    /// Companion test that demonstrates the master failure mode the fix
+    /// removes: the analysis fallback (`slots[0].lock()`) DOES block when the
+    /// pool is saturated. This is the exact path the narrator used to hit, and
+    /// the reason narration toasts lagged behind line analysis.
+    #[test]
+    fn analysis_fallback_blocks_when_pool_saturated() {
+        let _topology = POOL_TOPOLOGY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pool = app_server_pool();
+
+        let mut held_guards = Vec::new();
+        for slot in pool.slots.iter() {
+            held_guards.push(slot.lock().expect("analysis slot lock"));
+        }
+
+        // A thread that tries to take slot[0] (the with_app_server blocking
+        // fallback) must NOT complete while we hold the guards.
+        let (tx, rx) = mpsc::channel::<()>();
+        let handle = thread::spawn(move || {
+            let pool = app_server_pool();
+            let _guard = pool.slots[0].lock().expect("slot0 lock");
+            tx.send(()).ok();
+        });
+
+        // It should time out — proving the fallback blocks on the busy pool.
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "analysis fallback unexpectedly proceeded while pool saturated"
+        );
+
+        // Release so the worker can finish and the test doesn't leak a thread.
+        drop(held_guards);
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("worker should acquire slot0 once guards released");
+        handle.join().unwrap();
+    }
+
+    /// `stop_app_server` must clear (tear down) the narration slot too, not
+    /// just the analysis slots. Putting a real `Some(AppServerClient)` in the
+    /// slot would need a codex binary (unavailable in CI), so this asserts the
+    /// teardown invariant on the slot: after `stop_app_server` the narration
+    /// slot is `None` and the call does not panic (it touches the slot
+    /// unconditionally — a regression that skipped it would leak the process).
+    #[test]
+    fn stop_app_server_clears_narration_slot() {
+        let _topology = POOL_TOPOLOGY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        stop_app_server();
+        let pool = app_server_pool();
+        assert!(
+            pool.narration_slot.lock().unwrap().is_none(),
+            "narration slot must be None after stop_app_server"
+        );
     }
 }

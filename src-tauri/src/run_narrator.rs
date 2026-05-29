@@ -217,7 +217,10 @@ pub fn stop(run_id: &str) {
 pub type LlmCall = fn(&str, u64) -> Result<String>;
 
 fn llm_call_real(prompt: &str, timeout_ms: u64) -> Result<String> {
-    let value = crate::llm_backend::run_prompt(prompt, timeout_ms, None)?;
+    // Route through the narration-specific entry point so codex / native-oauth
+    // modes use the dedicated narration app-server slot and never block behind
+    // an in-flight line-analysis LLM call (root-cause fix for narration lag).
+    let value = crate::llm_backend::run_prompt_narration(prompt, timeout_ms, None)?;
     Ok(extract_text(&value))
 }
 
@@ -775,6 +778,7 @@ mod tests {
 
     #[test]
     fn test_tick_skips_when_buffer_empty() {
+        let _env = SETTINGS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let run_id = "test_tick_empty";
         install_state(run_id);
         static CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -789,8 +793,66 @@ mod tests {
         remove_state(run_id);
     }
 
+    /// Serializes every test whose outcome depends on `is_enabled()` — i.e.
+    /// any test that drives `tick_once`. One test mutates the process-global
+    /// `ALFRED_RUN_NARRATION_ENABLED` env var that `is_enabled()` reads; if it
+    /// ran concurrently with another `tick_once` test that expects the default
+    /// (enabled), the kill-switch would leak and the other test would see the
+    /// narrator disabled. Holding this lock across each such test makes the
+    /// env-var window exclusive.
+    static SETTINGS_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Kill-switch + lazy-start proof: when `run_narration_enabled` is 0,
+    /// `tick_once` must short-circuit BEFORE the LLM call — which is the only
+    /// path that would lazily spawn the dedicated narration app-server slot.
+    /// So a disabled session never pays the extra-process cost. We flip the
+    /// switch via its env override (`ALFRED_RUN_NARRATION_ENABLED`).
+    #[test]
+    fn test_tick_skips_llm_when_kill_switch_disabled() {
+        let _env = SETTINGS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let prev = std::env::var("ALFRED_RUN_NARRATION_ENABLED").ok();
+        std::env::set_var("ALFRED_RUN_NARRATION_ENABLED", "0");
+
+        // Sanity: the switch is now read as disabled (proves the kill-switch
+        // is actually wired — before this fix the setting key was undefined
+        // and `is_enabled()` was hardwired to true).
+        assert!(!is_enabled(), "kill-switch override should disable narration");
+
+        let run_id = "test_kill_switch";
+        install_state(run_id);
+        // Buffer has events — the ONLY reason a tick wouldn't call the LLM is
+        // the kill-switch (rules out the empty-buffer short-circuit).
+        record_event(
+            run_id,
+            &make_event("line_done", json!({"ticker": "AAPL", "recommendation": {"signal": "BUY"}})),
+        );
+
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        CALLS.store(0, Ordering::SeqCst);
+        fn fake(_p: &str, _t: u64) -> Result<String> {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok("should not be called".to_string())
+        }
+        let fired = tick_once(run_id, &(fake as LlmCall));
+        assert!(!fired, "disabled narrator must not fire the LLM");
+        assert_eq!(
+            CALLS.load(Ordering::SeqCst),
+            0,
+            "kill-switch must prevent the LLM call (and thus the narration-slot spawn)"
+        );
+
+        // Restore env + cleanup.
+        match prev {
+            Some(v) => std::env::set_var("ALFRED_RUN_NARRATION_ENABLED", v),
+            None => std::env::remove_var("ALFRED_RUN_NARRATION_ENABLED"),
+        }
+        remove_state(run_id);
+    }
+
     #[test]
     fn test_tick_fires_when_buffer_has_events() {
+        let _env = SETTINGS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let run_id = "test_tick_fires";
         install_state(run_id);
         record_event(
@@ -820,6 +882,7 @@ mod tests {
 
     #[test]
     fn test_previous_narration_is_passed_to_next_tick() {
+        let _env = SETTINGS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let run_id = "test_continuity";
         install_state(run_id);
 
@@ -868,6 +931,7 @@ mod tests {
         // the threshold from 3 to 10. The test now asserts the contract in
         // terms of the threshold constant itself, so future bumps don't
         // require rewriting the test.
+        let _env = SETTINGS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let run_id = "test_failure_threshold";
         install_state(run_id);
         static CALLS: AtomicUsize = AtomicUsize::new(0);

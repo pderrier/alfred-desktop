@@ -45,7 +45,37 @@ fn resolve_backend() -> String {
 
 /// Execute a prompt through the active backend.
 /// Drop-in replacement for `codex::run_codex_prompt_with_progress`.
+///
+/// This is the single sanctioned entry point for analysis-class LLM calls.
+/// Run-narration must use `run_prompt_narration` instead so it routes to the
+/// dedicated narration app-server slot (codex/native-oauth) and never blocks
+/// behind in-flight line analysis.
 pub fn run_prompt(prompt: &str, timeout_ms: u64, on_progress: Option<ProgressFn>) -> Result<Value> {
+    run_prompt_inner(prompt, timeout_ms, on_progress, false)
+}
+
+/// Execute a run-narration prompt through the active backend.
+///
+/// Behaves exactly like `run_prompt` (same backend resolution, artifacts,
+/// timeout handling) except that for the two app-server-backed modes
+/// (`codex`, `native-oauth`) it routes to the reserved narration slot via
+/// `codex::run_codex_prompt_narration` instead of the shared analysis pool.
+/// `native` mode (direct OpenAI HTTP) does not use the pool, so it is
+/// unaffected either way and shares the same code path.
+pub fn run_prompt_narration(
+    prompt: &str,
+    timeout_ms: u64,
+    on_progress: Option<ProgressFn>,
+) -> Result<Value> {
+    run_prompt_inner(prompt, timeout_ms, on_progress, true)
+}
+
+fn run_prompt_inner(
+    prompt: &str,
+    timeout_ms: u64,
+    on_progress: Option<ProgressFn>,
+    narration: bool,
+) -> Result<Value> {
     let backend = resolve_backend();
     let run_id = format!("llm-{}", crate::helpers::new_run_id());
     let started = Instant::now();
@@ -69,7 +99,14 @@ pub fn run_prompt(prompt: &str, timeout_ms: u64, on_progress: Option<ProgressFn>
 
     let result = match backend.as_str() {
         "native" | "openai" => {
+            // Direct OpenAI HTTP — no app-server pool, so narration and
+            // analysis never contend here regardless of `narration`.
             crate::openai_client::run_prompt(prompt, timeout_ms, on_progress, Some(&artifacts))
+        }
+        "native-oauth" if narration => {
+            // OAuth via the app-server, but on the dedicated narration slot.
+            crate::codex::ensure_mcp_config();
+            crate::codex::run_codex_prompt_narration(prompt, timeout_ms, on_progress)
         }
         "native-oauth" => crate::openai_client::run_prompt_oauth(
             prompt,
@@ -77,8 +114,13 @@ pub fn run_prompt(prompt: &str, timeout_ms: u64, on_progress: Option<ProgressFn>
             on_progress,
             Some(&artifacts),
         ),
+        _ if narration => {
+            // Codex backend, narration: dedicated narration slot.
+            crate::codex::ensure_mcp_config();
+            crate::codex::run_codex_prompt_narration(prompt, timeout_ms, on_progress)
+        }
         _ => {
-            // Codex backend — existing path
+            // Codex backend — analysis pool (existing path).
             crate::codex::ensure_mcp_config();
             crate::codex::run_codex_prompt_with_progress(prompt, timeout_ms, on_progress)
         }

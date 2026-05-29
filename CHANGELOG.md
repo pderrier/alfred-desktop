@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.4.7
+
+**Mandatory upgrade.** Substantial quality-of-analysis improvements (foreign-ISIN spot prices, US holdings, French PEA ETFs), the collaborative-insight feed restored, a clearer free-tier quota UX, and a public diagnostic endpoint.
+
+### What's new
+
+- **Accurate spot prices for foreign holdings.** ASML (NL), SAP (DE), Nestlé (CH), Novo Nordisk (DK) and other non-French European securities now resolve through Yahoo Finance with the canonical exchange-qualified symbol. The previous Boursorama search misresolved many of these to unrelated French-listed instruments — those analyses ran on the wrong price for weeks.
+- **US holdings now covered.** Tickers like AMD, C3.ai, Berkshire Hathaway B and other US securities now get market data, sector classification, and technical snapshots. They used to come back empty, and the LLM reasoned only on news headlines for US lines.
+- **French PEA ETFs (Amundi) priced correctly.** A scraper layer assumed every quote was a stock and rejected the ETF page format, producing phantom prices like 1.80 € for an 85 € ETF. Fixed at the source — no special cases. PEA portfolios holding Amundi PEA Monde, PEA MSCI Emerging or S&P 500 ETFs now reflect real NAVs.
+- **Collaborative-insight feed restored.** A March refactor inadvertently silenced the cross-portfolio insight contribution from native and native-OAuth modes — the shared signal corpus has been frozen since mid-May. Native runs contribute again, and your analyses will benefit from the wider corpus as it rebuilds.
+- **Clearer free-tier quota.** The home strip now reads from the server (no more `2/3` displayed while the server enforces `3/3 exhausted`) and shows the reset date. When the weekly limit is hit, the dialog includes the reset date and a direct "contact the author" email link for the unlimited-mode waitlist.
+- **Worker hardened.** The background refresh loop no longer dies on a single bad ticker (an isolated UTF-8 parsing edge case had silently killed it for three days in May), now isolates panics per ticker, and persists a corrected price even when no new fundamentals were filled in the same cycle.
+- **Public diagnostic endpoint.** `GET /api/stats` exposes a JSON report — uptime, cache footprint, aggregated traffic, data-quality counters, worker status — with no authentication required. Aggregated only; no per-user or per-portfolio data ever leaks.
+
+### Compatibility
+
+- **Mandatory.** Earlier versions show the update screen on next launch.
+- Privacy and authentication unchanged from v0.4.0.
+
 ## v0.4.6
 
 ### What's new

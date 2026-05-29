@@ -96,3 +96,90 @@ export function buildFreeTierExhaustedModalCopy(envelope, nowFn = Date.now) {
     },
   };
 }
+
+/**
+ * v0.4.8 P0 — single routing helper for ALL user-facing error display
+ * sites that can possibly carry a structured quota code.
+ *
+ * Background: v0.4.7 shipped the friendly "Quota atteint" modal only on
+ * the run-wizard `displayError` path. The run-progress event handler
+ * (`run.failed`) was a SECOND display site that bypassed the routing
+ * entirely and rendered the raw code
+ * (`alfred_free_tier_exhausted:179364:3:rolling_7d`) as the modal body.
+ * Two paths, one fix — Pierre saw the raw code on v0.4.7.
+ *
+ * Contract:
+ *   - If `error` stringifies to a recognised `alfred_free_tier_exhausted`
+ *     code → call `deps.showErrorModal` with the friendly copy
+ *     (title / message / hint / cta — including reset date).
+ *   - Otherwise → invoke `fallback(error)` (the caller decides what the
+ *     default display looks like — `showErrorModal("Analysis Failed", …)`
+ *     on the run-progress path, `formatBridgeError`/`showToast` on the
+ *     wizard path).
+ *
+ * `deps` is injected so this module stays DOM-/bridge-free and remains
+ * unit-testable without jsdom. Production callers pass
+ * `{ parseStructuredErrorCode, showErrorModal }`; tests pass spies.
+ *
+ * Returns `true` when the structured-quota branch fired, `false` when
+ * the fallback was invoked. Useful for tests; production callers can
+ * ignore.
+ */
+/**
+ * v0.4.8 P0 — single-source friendly one-liner for any error that may
+ * carry a structured quota code, for NON-modal display surfaces (the
+ * in-page synthesis card, status badges, run-entry labels — anywhere we
+ * render an error into the DOM as a short string rather than a modal).
+ *
+ * Background: v0.4.8 routed the run.failed MODAL through
+ * `displayQuotaAwareError`, but the `run.failed` handler ALSO writes the
+ * raw `errorMsg` into the `#report-synthesis` card
+ * (`✗ alfred_free_tier_exhausted:179364:3:rolling_7d`). That card was a
+ * SECOND raw-code surface. This helper is the ONE place that maps a quota
+ * error to its friendly card line so the card and the modal stay
+ * consistent — no inline re-parse in `app.js`.
+ *
+ * Contract:
+ *   - `error` stringifies to a recognised `alfred_free_tier_exhausted`
+ *     code → returns the short friendly line
+ *     `"Quota gratuit atteint — voir le détail."`.
+ *   - Otherwise → returns `null` so the caller renders its own default
+ *     (typically the raw `errorMsg`, which is fine for generic failures).
+ *
+ * `deps` is injected (`{ parseStructuredErrorCode }`) so this module
+ * stays DOM-/bridge-free and unit-testable without jsdom — same pattern
+ * as `displayQuotaAwareError`. Returns a plain string (the card applies
+ * its own `escapeHtml` before insertion).
+ */
+export function friendlyErrorSummary(error, deps) {
+  const parseStructuredErrorCode = deps?.parseStructuredErrorCode;
+  if (typeof parseStructuredErrorCode !== "function") {
+    return null;
+  }
+  const rawText = String(error?.message || error || "");
+  const structured = parseStructuredErrorCode(rawText);
+  if (structured?.code === "alfred_free_tier_exhausted") {
+    return "Quota gratuit atteint — voir le détail.";
+  }
+  return null;
+}
+
+export function displayQuotaAwareError(error, fallback, deps) {
+  const parseStructuredErrorCode = deps?.parseStructuredErrorCode;
+  const showErrorModal = deps?.showErrorModal;
+  const nowFn = deps?.nowFn || Date.now;
+  const rawText = String(error?.message || error || "");
+  const structured =
+    typeof parseStructuredErrorCode === "function"
+      ? parseStructuredErrorCode(rawText)
+      : null;
+  if (structured?.code === "alfred_free_tier_exhausted" && typeof showErrorModal === "function") {
+    const copy = buildFreeTierExhaustedModalCopy(structured, nowFn);
+    showErrorModal(copy.title, copy.message, copy.hint, copy.cta);
+    return true;
+  }
+  if (typeof fallback === "function") {
+    fallback(error);
+  }
+  return false;
+}

@@ -5,7 +5,10 @@ import {
   resolveResetEpochSecs,
   buildQuotaStripResetClause,
   buildFreeTierExhaustedModalCopy,
+  displayQuotaAwareError,
+  friendlyErrorSummary,
 } from "../src/desktop-shell/quota-copy.js";
+import { parseStructuredErrorCode } from "../src/shared/bridge-client.js";
 
 // ── P3-31: quota copy + reset-date formatting ───────────────────────
 //
@@ -117,4 +120,176 @@ test("buildFreeTierExhaustedModalCopy: passes the envelope through as cta.detail
   const env = { retryAfter: 200, limit: 3, period: "rolling_7d" };
   const copy = buildFreeTierExhaustedModalCopy(env, () => 1_700_000_000_000);
   assert.deepEqual(copy.cta.detail, env);
+});
+
+// ── v0.4.8 P0 — displayQuotaAwareError routing ──────────────────────
+//
+// Background: v0.4.7 shipped quota-aware routing inline only in
+// `app-wizard.js::displayError`. The run-progress error handler in
+// `app.js` (run.failed → showErrorModal) bypassed it, surfacing the raw
+// code (`alfred_free_tier_exhausted:179364:3:rolling_7d`) to the user.
+// The shared helper centralises the routing — both sites delegate.
+
+test("displayQuotaAwareError: routes friendly modal for free_tier_exhausted (raw run.failed message)", () => {
+  // The exact shape the user saw on v0.4.7 — the literal Pierre
+  // reported on 2026-05-29 18:25 UTC.
+  const raw = "alfred_free_tier_exhausted:179364:3:rolling_7d";
+  const calls = [];
+  const fixedNowMs = 1_748_000_000_000; // arbitrary fixed clock
+  const routed = displayQuotaAwareError(
+    { message: raw },
+    () => calls.push({ kind: "fallback" }),
+    {
+      parseStructuredErrorCode,
+      showErrorModal: (title, message, hint, cta) =>
+        calls.push({ kind: "modal", title, message, hint, cta }),
+      nowFn: () => fixedNowMs,
+    }
+  );
+  assert.equal(routed, true, "must return true when the structured branch fires");
+  assert.equal(calls.length, 1, "must invoke showErrorModal exactly once and NOT the fallback");
+  assert.equal(calls[0].kind, "modal");
+  assert.equal(calls[0].title, "Quota atteint");
+  assert.match(calls[0].message, /Vous avez utilisé vos 3 analyses gratuites/);
+  // Reset-date copy derived from retry_after=179364s + fixed clock.
+  const expectedReset = new Intl.DateTimeFormat("fr-FR", { day: "2-digit", month: "2-digit" }).format(
+    new Date(fixedNowMs + 179364 * 1000)
+  );
+  assert.match(calls[0].message, new RegExp(`Prochaine analyse disponible le ${expectedReset}\\.`));
+  assert.equal(calls[0].hint, "Mode illimité bientôt disponible — contactez l'auteur !");
+  assert.equal(calls[0].cta.label, "Contacter l'auteur");
+  // CRITICAL: the raw code must NEVER leak into the modal body.
+  assert.equal(
+    /alfred_free_tier_exhausted/.test(calls[0].message),
+    false,
+    "raw code must not surface in the user-facing message"
+  );
+  assert.equal(
+    /alfred_free_tier_exhausted/.test(calls[0].title),
+    false,
+    "raw code must not surface in the modal title"
+  );
+});
+
+test("displayQuotaAwareError: accepts a bare string error too (defensive)", () => {
+  const calls = [];
+  const routed = displayQuotaAwareError(
+    "alfred_free_tier_exhausted:3600:3:rolling_7d",
+    () => calls.push({ kind: "fallback" }),
+    {
+      parseStructuredErrorCode,
+      showErrorModal: (title) => calls.push({ kind: "modal", title }),
+    }
+  );
+  assert.equal(routed, true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].title, "Quota atteint");
+});
+
+test("displayQuotaAwareError: invokes fallback for non-quota errors", () => {
+  const calls = [];
+  const routed = displayQuotaAwareError(
+    { message: "network_unreachable: ECONNREFUSED" },
+    (err) => calls.push({ kind: "fallback", err }),
+    {
+      parseStructuredErrorCode,
+      showErrorModal: () => calls.push({ kind: "modal" }),
+    }
+  );
+  assert.equal(routed, false);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].kind, "fallback");
+  assert.equal(calls[0].err.message, "network_unreachable: ECONNREFUSED");
+});
+
+test("displayQuotaAwareError: invokes fallback for empty / null / undefined errors", () => {
+  for (const err of [null, undefined, "", { message: "" }]) {
+    const calls = [];
+    const routed = displayQuotaAwareError(
+      err,
+      (e) => calls.push(e),
+      { parseStructuredErrorCode, showErrorModal: () => {} }
+    );
+    assert.equal(routed, false, `must fall back for: ${JSON.stringify(err)}`);
+    assert.equal(calls.length, 1);
+  }
+});
+
+test("displayQuotaAwareError: does not invoke fallback when none provided (defensive no-op)", () => {
+  assert.doesNotThrow(() => {
+    displayQuotaAwareError(
+      { message: "generic_error" },
+      undefined,
+      { parseStructuredErrorCode, showErrorModal: () => {} }
+    );
+  });
+});
+
+test("displayQuotaAwareError: still falls back when deps.showErrorModal is missing (defensive)", () => {
+  const calls = [];
+  const routed = displayQuotaAwareError(
+    { message: "alfred_free_tier_exhausted:60:3:rolling_7d" },
+    (err) => calls.push({ kind: "fallback", err }),
+    { parseStructuredErrorCode }
+  );
+  // Without showErrorModal we cannot route; treat as fallback so the
+  // user still sees SOMETHING.
+  assert.equal(routed, false);
+  assert.equal(calls.length, 1);
+});
+
+// ── v0.4.8 P0 — friendlyErrorSummary (synthesis-card / non-modal) ───
+//
+// The run.failed handler ALSO writes `errorMsg` into the `#report-synthesis`
+// card. v0.4.8's first cut fixed only the modal; the card still rendered
+// `✗ alfred_free_tier_exhausted:179364:3:rolling_7d`. `friendlyErrorSummary`
+// is the single source of truth for the short card line so the card and
+// the modal stay consistent. Same injectable-deps pattern as
+// displayQuotaAwareError (no DOM, no bridge).
+
+test("friendlyErrorSummary: returns friendly line for the raw quota code (run.failed message)", () => {
+  const out = friendlyErrorSummary(
+    { message: "alfred_free_tier_exhausted:179364:3:rolling_7d" },
+    { parseStructuredErrorCode }
+  );
+  assert.equal(out, "Quota gratuit atteint — voir le détail.");
+  // CRITICAL: must NOT leak the raw code into the card line.
+  assert.equal(/alfred_free_tier_exhausted/.test(out), false);
+});
+
+test("friendlyErrorSummary: accepts a bare string error too", () => {
+  const out = friendlyErrorSummary(
+    "alfred_free_tier_exhausted:3600:3:rolling_7d",
+    { parseStructuredErrorCode }
+  );
+  assert.equal(out, "Quota gratuit atteint — voir le détail.");
+});
+
+test("friendlyErrorSummary: returns null for a generic (non-quota) error", () => {
+  const out = friendlyErrorSummary(
+    { message: "network_unreachable: ECONNREFUSED" },
+    { parseStructuredErrorCode }
+  );
+  assert.equal(out, null, "generic errors must fall through to the caller's default (raw errorMsg)");
+});
+
+test("friendlyErrorSummary: returns null for empty / null / undefined errors", () => {
+  for (const err of [null, undefined, "", { message: "" }]) {
+    assert.equal(
+      friendlyErrorSummary(err, { parseStructuredErrorCode }),
+      null,
+      `must be null for: ${JSON.stringify(err)}`
+    );
+  }
+});
+
+test("friendlyErrorSummary: returns null when parseStructuredErrorCode dep is missing (defensive)", () => {
+  assert.equal(
+    friendlyErrorSummary({ message: "alfred_free_tier_exhausted:60:3:rolling_7d" }, {}),
+    null
+  );
+  assert.equal(
+    friendlyErrorSummary("alfred_free_tier_exhausted:60:3:rolling_7d", undefined),
+    null
+  );
 });

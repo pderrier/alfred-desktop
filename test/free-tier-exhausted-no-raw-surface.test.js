@@ -110,6 +110,51 @@ test("anti-regression: app.js run-progress handler delegates to displayQuotaAwar
   );
 });
 
+test("anti-regression: app.js synthesis-card render on run.failed routes through friendlyErrorSummary", () => {
+  // v0.4.8 P0 (second surface): the run.failed handler writes the error
+  // into `#report-synthesis` via innerHTML. v0.4.7→first-cut v0.4.8 fixed
+  // only the MODAL — the card still rendered the raw
+  // `✗ alfred_free_tier_exhausted:179364:3:rolling_7d`. The fix routes the
+  // card text through `friendlyErrorSummary` (single source of truth with
+  // the modal). This guard FAILS if someone reverts the card to raw
+  // `escapeHtml(errorMsg)` without the friendly mapping.
+  const src = readFileSync(resolve(SHELL_DIR, "app.js"), "utf8");
+
+  // 1) The helper must be imported.
+  assert.equal(
+    /import\s*{[^}]*\bfriendlyErrorSummary\b[^}]*}\s*from\s*["'][^"']*quota-copy\.js["']/.test(src),
+    true,
+    "app.js must import friendlyErrorSummary from quota-copy.js"
+  );
+
+  // 2) Isolate the `report-synthesis` innerHTML failure render and assert
+  // it consults friendlyErrorSummary — i.e. it renders `friendly ?? errorMsg`
+  // rather than the bare `errorMsg`.
+  const code = stripComments(src);
+  const synthBlock = code.match(
+    /getElementById\(\s*["']report-synthesis["']\s*\)[\s\S]{0,400}?innerHTML\s*=([\s\S]{0,200}?);/
+  );
+  assert.ok(
+    synthBlock,
+    "could not locate the report-synthesis innerHTML failure render in app.js"
+  );
+  const assignment = synthBlock[1];
+  const windowStart = code.indexOf(synthBlock[0]);
+  const windowText = code.slice(Math.max(0, windowStart - 200), windowStart + synthBlock[0].length);
+  assert.equal(
+    /friendlyErrorSummary\s*\(/.test(windowText) && /\bfriendly\b/.test(assignment),
+    true,
+    "report-synthesis failure render must route through friendlyErrorSummary (friendly ?? errorMsg), not raw errorMsg.\n" +
+      `Render expression: ${assignment.trim()}`
+  );
+  // And it must NEVER render the bare `errorMsg` without the friendly guard.
+  assert.equal(
+    /escapeHtml\(\s*errorMsg\s*\)/.test(assignment),
+    false,
+    "report-synthesis must not render escapeHtml(errorMsg) directly — wrap with friendlyErrorSummary"
+  );
+});
+
 test("anti-regression: app-wizard.js displayError delegates to displayQuotaAwareError", () => {
   const src = readFileSync(resolve(SHELL_DIR, "app-wizard.js"), "utf8");
   // The wizard displayError body must call the shared helper, not the

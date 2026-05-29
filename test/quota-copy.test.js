@@ -6,6 +6,7 @@ import {
   buildQuotaStripResetClause,
   buildFreeTierExhaustedModalCopy,
   displayQuotaAwareError,
+  friendlyErrorSummary,
 } from "../src/desktop-shell/quota-copy.js";
 import { parseStructuredErrorCode } from "../src/shared/bridge-client.js";
 
@@ -235,4 +236,60 @@ test("displayQuotaAwareError: still falls back when deps.showErrorModal is missi
   // user still sees SOMETHING.
   assert.equal(routed, false);
   assert.equal(calls.length, 1);
+});
+
+// ── v0.4.8 P0 — friendlyErrorSummary (synthesis-card / non-modal) ───
+//
+// The run.failed handler ALSO writes `errorMsg` into the `#report-synthesis`
+// card. v0.4.8's first cut fixed only the modal; the card still rendered
+// `✗ alfred_free_tier_exhausted:179364:3:rolling_7d`. `friendlyErrorSummary`
+// is the single source of truth for the short card line so the card and
+// the modal stay consistent. Same injectable-deps pattern as
+// displayQuotaAwareError (no DOM, no bridge).
+
+test("friendlyErrorSummary: returns friendly line for the raw quota code (run.failed message)", () => {
+  const out = friendlyErrorSummary(
+    { message: "alfred_free_tier_exhausted:179364:3:rolling_7d" },
+    { parseStructuredErrorCode }
+  );
+  assert.equal(out, "Quota gratuit atteint — voir le détail.");
+  // CRITICAL: must NOT leak the raw code into the card line.
+  assert.equal(/alfred_free_tier_exhausted/.test(out), false);
+});
+
+test("friendlyErrorSummary: accepts a bare string error too", () => {
+  const out = friendlyErrorSummary(
+    "alfred_free_tier_exhausted:3600:3:rolling_7d",
+    { parseStructuredErrorCode }
+  );
+  assert.equal(out, "Quota gratuit atteint — voir le détail.");
+});
+
+test("friendlyErrorSummary: returns null for a generic (non-quota) error", () => {
+  const out = friendlyErrorSummary(
+    { message: "network_unreachable: ECONNREFUSED" },
+    { parseStructuredErrorCode }
+  );
+  assert.equal(out, null, "generic errors must fall through to the caller's default (raw errorMsg)");
+});
+
+test("friendlyErrorSummary: returns null for empty / null / undefined errors", () => {
+  for (const err of [null, undefined, "", { message: "" }]) {
+    assert.equal(
+      friendlyErrorSummary(err, { parseStructuredErrorCode }),
+      null,
+      `must be null for: ${JSON.stringify(err)}`
+    );
+  }
+});
+
+test("friendlyErrorSummary: returns null when parseStructuredErrorCode dep is missing (defensive)", () => {
+  assert.equal(
+    friendlyErrorSummary({ message: "alfred_free_tier_exhausted:60:3:rolling_7d" }, {}),
+    null
+  );
+  assert.equal(
+    friendlyErrorSummary("alfred_free_tier_exhausted:60:3:rolling_7d", undefined),
+    null
+  );
 });

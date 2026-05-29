@@ -125,6 +125,45 @@ export function buildFreeTierExhaustedModalCopy(envelope, nowFn = Date.now) {
  * the fallback was invoked. Useful for tests; production callers can
  * ignore.
  */
+/**
+ * v0.4.8 P0 — single-source friendly one-liner for any error that may
+ * carry a structured quota code, for NON-modal display surfaces (the
+ * in-page synthesis card, status badges, run-entry labels — anywhere we
+ * render an error into the DOM as a short string rather than a modal).
+ *
+ * Background: v0.4.8 routed the run.failed MODAL through
+ * `displayQuotaAwareError`, but the `run.failed` handler ALSO writes the
+ * raw `errorMsg` into the `#report-synthesis` card
+ * (`✗ alfred_free_tier_exhausted:179364:3:rolling_7d`). That card was a
+ * SECOND raw-code surface. This helper is the ONE place that maps a quota
+ * error to its friendly card line so the card and the modal stay
+ * consistent — no inline re-parse in `app.js`.
+ *
+ * Contract:
+ *   - `error` stringifies to a recognised `alfred_free_tier_exhausted`
+ *     code → returns the short friendly line
+ *     `"Quota gratuit atteint — voir le détail."`.
+ *   - Otherwise → returns `null` so the caller renders its own default
+ *     (typically the raw `errorMsg`, which is fine for generic failures).
+ *
+ * `deps` is injected (`{ parseStructuredErrorCode }`) so this module
+ * stays DOM-/bridge-free and unit-testable without jsdom — same pattern
+ * as `displayQuotaAwareError`. Returns a plain string (the card applies
+ * its own `escapeHtml` before insertion).
+ */
+export function friendlyErrorSummary(error, deps) {
+  const parseStructuredErrorCode = deps?.parseStructuredErrorCode;
+  if (typeof parseStructuredErrorCode !== "function") {
+    return null;
+  }
+  const rawText = String(error?.message || error || "");
+  const structured = parseStructuredErrorCode(rawText);
+  if (structured?.code === "alfred_free_tier_exhausted") {
+    return "Quota gratuit atteint — voir le détail.";
+  }
+  return null;
+}
+
 export function displayQuotaAwareError(error, fallback, deps) {
   const parseStructuredErrorCode = deps?.parseStructuredErrorCode;
   const showErrorModal = deps?.showErrorModal;

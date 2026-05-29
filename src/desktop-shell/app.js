@@ -45,7 +45,7 @@ import { buildGlobalPortfolioSynthesis } from "/desktop-shell/global-portfolio-s
 import { buildCrossAccountThemeView, findConcentrationThemeToTrigger, shouldNotifyConcentration } from "/desktop-shell/report-view-model.js";
 import { getThemeLabel } from "/desktop-shell/theme-labels.js";
 import { getLocalQuotaState, resetLocalQuotaCache } from "/desktop-shell/quota-local-counter.js";
-import { buildFreeTierExhaustedModalCopy, buildQuotaStripResetClause, displayQuotaAwareError } from "/desktop-shell/quota-copy.js";
+import { buildFreeTierExhaustedModalCopy, buildQuotaStripResetClause, displayQuotaAwareError, friendlyErrorSummary } from "/desktop-shell/quota-copy.js";
 import { extractFirstSentence, countPendingRecos } from "/desktop-shell/home-last-synthesis.js";
 import { extractTradeMoves, formatTradeRow } from "/desktop-shell/home-recent-trades.js";
 import { extractDatedCatalysts, formatCatalystRow } from "/desktop-shell/catalyst-calendar.js";
@@ -307,10 +307,15 @@ const runOperations = createRunOperationsController({
         );
         // Notify Alfred overlay — Phase B: reactive triggers auto-fire
         alfredOverlay.notify("run-failed", event);
-        // Show failure in synthesis card
+        // Show failure in synthesis card. For a structured quota code the
+        // card must show the friendly one-liner (consistent with the modal
+        // above), NOT the raw `alfred_free_tier_exhausted:\u2026` string \u2014 same
+        // single source of truth via `friendlyErrorSummary`. Generic
+        // failures fall back to the raw `errorMsg` (already user-readable).
         const synthNode = document.getElementById("report-synthesis");
         if (synthNode) {
-          synthNode.innerHTML = `<span style="color:#ba4b3a">\u2717 ${escapeHtml(errorMsg)}</span>`;
+          const friendly = friendlyErrorSummary(errorMsg, { parseStructuredErrorCode });
+          synthNode.innerHTML = `<span style="color:#ba4b3a">\u2717 ${escapeHtml(friendly ?? errorMsg)}</span>`;
         }
         // Refresh sidebar to show failed status (reads from in-memory index, fast)
         // Use a lightweight dashboard refresh — doesn't overwrite the failure view

@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.4.8
+
+**Mandatory upgrade.** Fixes the free-tier quota message and removes a delay in the live analysis narration.
+
+### What's new
+
+- **A clear message when you hit the free limit.** Reaching the weekly free quota previously showed a raw internal error (`alfred_free_tier_exhausted:…`) both in the failure dialog and in the analysis card. It now shows a proper "Quota atteint" message with the reset date and a direct way to contact the author about unlimited access.
+- **Smoother live narration during analysis.** The running commentary shown while an analysis is in progress used to lag because it competed with the portfolio analysis for the same processing slots. Narration now runs on its own dedicated slot, so the updates appear promptly without slowing the analysis. The narration can also be turned off via configuration if you prefer a quieter run.
+
+### Compatibility
+
+- **Mandatory.** Earlier versions show the update screen on next launch.
+- Privacy and authentication unchanged from v0.4.0.
+
 ## v0.4.7
 
 **Mandatory upgrade.** Substantial quality-of-analysis improvements (foreign-ISIN spot prices, US holdings, French PEA ETFs), the collaborative-insight feed restored, a clearer free-tier quota UX, and a public diagnostic endpoint.

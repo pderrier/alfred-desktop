@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# pre-push hook — guardrail: a vX.Y.Z tag MUST match the bumped version.
+#
+# Blocks pushing a release tag `vX.Y.Z` unless package.json (the version
+# source of truth, kept in sync by scripts/bump-version.sh) is exactly
+# X.Y.Z. Stops the "tagged a release but forgot to bump version" class
+# (which ships a mandatory update whose manifest version lies).
+#
+# Install: scripts/install-git-hooks.sh  (copies this into the repo's
+# git hooks dir + chmod +x). Re-run after a fresh clone / submodule init.
+#
+# stdin lines: <local ref> <local sha> <remote ref> <remote sha>
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+PKG="$REPO_ROOT/package.json"
+
+manifest_version() {
+  sed -nE 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$PKG" | head -1
+}
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  case "$local_ref" in
+    refs/tags/v[0-9]*)
+      tag="${local_ref#refs/tags/}"
+      tag_ver="${tag#v}"
+      pkg_ver="$(manifest_version)"
+      if [ "$tag_ver" != "$pkg_ver" ]; then
+        echo "✗ pre-push BLOCKED: tag $tag does not match package.json version $pkg_ver." >&2
+        echo "  Run ./scripts/bump-version.sh $tag_ver and commit BEFORE tagging." >&2
+        exit 1
+      fi
+      # Cross-check the other manifests stay aligned (bump-version.sh owns them).
+      for f in src-tauri/Cargo.toml src-tauri/tauri.conf.json \
+               src-tauri/tauri.windows.conf.json src-tauri/tauri.macos.conf.json \
+               alfred-cli/Cargo.toml; do
+        if ! grep -qE "(\"version\": \"$tag_ver\"|^version = \"$tag_ver\")" "$REPO_ROOT/$f" 2>/dev/null; then
+          echo "✗ pre-push BLOCKED: $f is not at version $tag_ver (run scripts/bump-version.sh $tag_ver)." >&2
+          exit 1
+        fi
+      done
+      echo "✓ pre-push: tag $tag matches all manifests at $tag_ver." >&2
+      ;;
+  esac
+done
+
+exit 0

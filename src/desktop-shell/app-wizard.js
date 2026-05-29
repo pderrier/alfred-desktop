@@ -10,7 +10,7 @@ import {
 import { buildRunAnalysisOptions } from "/desktop-shell/report-view-model.js";
 import { formatBridgeError, isErrorCritical, extractErrorCode } from "/shared/run-operations-controller.js";
 import { parseStructuredErrorCode } from "/shared/bridge-client.js";
-import { buildFreeTierExhaustedModalCopy } from "/desktop-shell/quota-copy.js";
+import { displayQuotaAwareError } from "/desktop-shell/quota-copy.js";
 import { openCashMatchingWizard, openChatWizard } from "/desktop-shell/app-chat-wizard.js";
 import { openCsvConfirmModal } from "/desktop-shell/app-csv-confirm-modal.js";
 import { openDiscussionHistoryModal, buildDiscussionGuidance } from "/desktop-shell/discussion-memory.js";
@@ -330,29 +330,26 @@ export function initWizard(deps) {
   }
 
   function displayError(error, context) {
-    // P3-31: route free-tier exhaustion to the friendly "Quota atteint"
-    // modal instead of surfacing the raw code
-    // (`alfred_free_tier_exhausted:342616:3:rolling_7d`). The structured
-    // fields (retry_after / limit / period) are NOT preserved on the
-    // bridge error object — only the bare code — so we re-parse the raw
-    // message to recover them for the reset-date copy.
-    const rawText = String(error?.message || error || "");
-    const structured = parseStructuredErrorCode(rawText);
-    if (structured?.code === "alfred_free_tier_exhausted") {
-      const copy = buildFreeTierExhaustedModalCopy(structured);
-      showErrorModal(copy.title, copy.message, copy.hint, copy.cta);
-      return;
-    }
-
-    const formatted = formatBridgeError(error);
-    if (isErrorCritical(error)) {
-      const code = extractErrorCode(error);
-      const title = context ? `${context} failed` : "Error";
-      const hint = formatted.includes("(hint:") ? formatted.split("(hint: ")[1]?.replace(")", "") : "";
-      showErrorModal(title, error?.message || code, hint);
-    } else {
-      showToast(formatted, "error");
-    }
+    // v0.4.8 P0 — route via the shared `displayQuotaAwareError` helper so
+    // structured quota codes (e.g. `alfred_free_tier_exhausted:…`) ALWAYS
+    // surface the friendly "Quota atteint" modal. v0.4.7 had this logic
+    // inline here only; the run-progress error path bypassed it. The
+    // helper now backs both sites — DRY contract.
+    displayQuotaAwareError(
+      error,
+      (fallbackError) => {
+        const formatted = formatBridgeError(fallbackError);
+        if (isErrorCritical(fallbackError)) {
+          const code = extractErrorCode(fallbackError);
+          const title = context ? `${context} failed` : "Error";
+          const hint = formatted.includes("(hint:") ? formatted.split("(hint: ")[1]?.replace(")", "") : "";
+          showErrorModal(title, fallbackError?.message || code, hint);
+        } else {
+          showToast(formatted, "error");
+        }
+      },
+      { parseStructuredErrorCode, showErrorModal }
+    );
   }
 
   function getSelectedWizardAccount() {

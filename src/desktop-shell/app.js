@@ -1,9 +1,7 @@
-import { createDesktopBridgeClient } from "/shared/bridge-client.js";
+import { createDesktopBridgeClient, parseStructuredErrorCode } from "/shared/bridge-client.js";
 import {
   createRunOperationsController,
-  formatBridgeError,
-  isErrorCritical,
-  extractErrorCode
+  formatBridgeError
 } from "/shared/run-operations-controller.js";
 import {
   buildReportViewModel
@@ -47,7 +45,7 @@ import { buildGlobalPortfolioSynthesis } from "/desktop-shell/global-portfolio-s
 import { buildCrossAccountThemeView, findConcentrationThemeToTrigger, shouldNotifyConcentration } from "/desktop-shell/report-view-model.js";
 import { getThemeLabel } from "/desktop-shell/theme-labels.js";
 import { getLocalQuotaState, resetLocalQuotaCache } from "/desktop-shell/quota-local-counter.js";
-import { buildFreeTierExhaustedModalCopy, buildQuotaStripResetClause } from "/desktop-shell/quota-copy.js";
+import { buildFreeTierExhaustedModalCopy, buildQuotaStripResetClause, displayQuotaAwareError } from "/desktop-shell/quota-copy.js";
 import { extractFirstSentence, countPendingRecos } from "/desktop-shell/home-last-synthesis.js";
 import { extractTradeMoves, formatTradeRow } from "/desktop-shell/home-recent-trades.js";
 import { extractDatedCatalysts, formatCatalystRow } from "/desktop-shell/catalyst-calendar.js";
@@ -294,9 +292,19 @@ const runOperations = createRunOperationsController({
         // Refresh to show new results
         refreshDashboard().catch(() => {});
       } else {
-        // Show clear failure state — don't silently fall back to old report
+        // Show clear failure state — don't silently fall back to old report.
+        //
+        // v0.4.8 P0 — route through `displayQuotaAwareError` so structured
+        // quota codes (e.g. `alfred_free_tier_exhausted:179364:3:rolling_7d`)
+        // surface the friendly "Quota atteint" modal instead of the raw
+        // code. v0.4.7 patched only the wizard path; this run-progress
+        // handler bypassed the routing and surfaced the raw string.
         const errorMsg = event?.message || "Analysis failed";
-        showErrorModal("Analysis Failed", errorMsg, "You can retry the analysis from the sidebar.");
+        displayQuotaAwareError(
+          { message: errorMsg },
+          () => showErrorModal("Analysis Failed", errorMsg, "You can retry the analysis from the sidebar."),
+          { parseStructuredErrorCode, showErrorModal }
+        );
         // Notify Alfred overlay — Phase B: reactive triggers auto-fire
         alfredOverlay.notify("run-failed", event);
         // Show failure in synthesis card
@@ -408,19 +416,6 @@ function renderAllocationBar(allocation) {
   ).join("")}</div><div class="alloc-legend">${allocation.filter((a) => a.weight >= 3).map((a) =>
     `<span class="alloc-legend-item"><span class="alloc-legend-dot" style="background:${ALLOC_COLORS[a.tone] || ALLOC_COLORS.neutral}"></span>${a.ticker} ${a.weight.toFixed(0)}%</span>`
   ).join("")}</div>`;
-}
-
-function displayError(error, context = "") {
-  const formatted = formatBridgeError(error);
-  if (isErrorCritical(error)) {
-    const code = extractErrorCode(error);
-    const title = context ? `${context} failed` : "Error";
-    const hint = formatted.includes("(hint:") ? formatted.split("(hint: ")[1]?.replace(")", "") : "";
-    const message = error?.message || code;
-    showErrorModal(title, message, hint);
-  } else {
-    showToast(formatted, "error");
-  }
 }
 
 let latestReportModel = null;

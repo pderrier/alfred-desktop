@@ -96,3 +96,51 @@ export function buildFreeTierExhaustedModalCopy(envelope, nowFn = Date.now) {
     },
   };
 }
+
+/**
+ * v0.4.8 P0 — single routing helper for ALL user-facing error display
+ * sites that can possibly carry a structured quota code.
+ *
+ * Background: v0.4.7 shipped the friendly "Quota atteint" modal only on
+ * the run-wizard `displayError` path. The run-progress event handler
+ * (`run.failed`) was a SECOND display site that bypassed the routing
+ * entirely and rendered the raw code
+ * (`alfred_free_tier_exhausted:179364:3:rolling_7d`) as the modal body.
+ * Two paths, one fix — Pierre saw the raw code on v0.4.7.
+ *
+ * Contract:
+ *   - If `error` stringifies to a recognised `alfred_free_tier_exhausted`
+ *     code → call `deps.showErrorModal` with the friendly copy
+ *     (title / message / hint / cta — including reset date).
+ *   - Otherwise → invoke `fallback(error)` (the caller decides what the
+ *     default display looks like — `showErrorModal("Analysis Failed", …)`
+ *     on the run-progress path, `formatBridgeError`/`showToast` on the
+ *     wizard path).
+ *
+ * `deps` is injected so this module stays DOM-/bridge-free and remains
+ * unit-testable without jsdom. Production callers pass
+ * `{ parseStructuredErrorCode, showErrorModal }`; tests pass spies.
+ *
+ * Returns `true` when the structured-quota branch fired, `false` when
+ * the fallback was invoked. Useful for tests; production callers can
+ * ignore.
+ */
+export function displayQuotaAwareError(error, fallback, deps) {
+  const parseStructuredErrorCode = deps?.parseStructuredErrorCode;
+  const showErrorModal = deps?.showErrorModal;
+  const nowFn = deps?.nowFn || Date.now;
+  const rawText = String(error?.message || error || "");
+  const structured =
+    typeof parseStructuredErrorCode === "function"
+      ? parseStructuredErrorCode(rawText)
+      : null;
+  if (structured?.code === "alfred_free_tier_exhausted" && typeof showErrorModal === "function") {
+    const copy = buildFreeTierExhaustedModalCopy(structured, nowFn);
+    showErrorModal(copy.title, copy.message, copy.hint, copy.cta);
+    return true;
+  }
+  if (typeof fallback === "function") {
+    fallback(error);
+  }
+  return false;
+}

@@ -84,6 +84,17 @@ pub fn derive_expected_line_ids(run_state: &serde_json::Value) -> Vec<String> {
 
 // ── Action enrichment from line recommendations ──
 
+// Held-position signals that warrant a portfolio `actions_immediates` entry.
+//
+// Watchlist Curation v2 (D1): the watchlist verdict vocabulary
+// (ENTRER | ACHAT_SUR_REPLI | SURVEILLER | ECARTER) is DELIBERATELY absent
+// here. A validated watchlist proposal is an *opportunity*, surfaced in the
+// synthesis `opportunites_watchlist` field — never an immediate portfolio
+// move (the user holds no position to act on). `enrich_actions_from_*` also
+// hard-excludes `type == "watchlist"` rows below, so a verdict like
+// ACHAT_SUR_REPLI (which would substring-match "ACHAT") can never leak into
+// actions_immediates. The type guard is the load-bearing exclusion; this
+// list stays held-only by design.
 const ACTIONABLE_SIGNALS: &[&str] = &[
     "ACHAT_FORT", "ACHAT", "RENFORCEMENT", "ALLEGEMENT", "VENTE",
 ];
@@ -109,7 +120,11 @@ fn signal_priority(signal: &str) -> u8 {
 
 /// Enrich LLM-generated actions_immediates with any actionable line recommendations
 /// that the LLM missed. Sorts by conviction (forte first) then signal priority.
-fn enrich_actions_from_recommendations(
+///
+/// `pub(crate)` so the type-guard regression test in `tests.rs` can exercise the
+/// `type == "watchlist"` exclusion directly (the load-bearing exclusion at the
+/// `continue` below), without driving the whole compose pipeline.
+pub(crate) fn enrich_actions_from_recommendations(
     llm_actions: &[serde_json::Value],
     recommendations: &[serde_json::Value],
 ) -> Vec<serde_json::Value> {

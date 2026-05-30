@@ -5,7 +5,7 @@
  * static positions table from report data (not live run updates).
  */
 
-import { formatCurrency, escapeHtml, truncate } from "/desktop-shell/ui-display-utils.js";
+import { formatCurrency, escapeHtml, truncate, signalToneClass } from "/desktop-shell/ui-display-utils.js";
 import { isActiveRunInProgress } from "/desktop-shell/shell-live-run.js";
 
 // ── DOM refs ──────────────────────────────────────────────────────
@@ -159,8 +159,14 @@ export function renderPositionsTable(viewModel, dashboardPayload) {
     positionsTbodyNode.appendChild(sepTr);
 
     for (const rec of watchlistRecs) {
+      // Watchlist Curation v2 (D1): a verdict the LLM ECARTE-d (rejected) is
+      // rendered de-emphasised — Alfred validated the proposal as a
+      // non-opportunity. Driven by signal OR verdict_validation so the row
+      // dims even if only one field is present.
+      const discarded = String(rec.signal || "").toUpperCase() === "ECARTER"
+        || String(rec.verdictValidation || "").toLowerCase() === "ecartee";
       const tr = document.createElement("tr");
-      tr.className = "pos-main-row pos-watchlist-row";
+      tr.className = `pos-main-row pos-watchlist-row${discarded ? " pos-watchlist-discarded" : ""}`;
       tr.dataset.ticker = rec.ticker;
       tr.innerHTML = `
         <td><strong>${escapeHtml(rec.ticker)}</strong> <span class="watchlist-badge">watchlist</span></td>
@@ -177,9 +183,10 @@ export function renderPositionsTable(viewModel, dashboardPayload) {
 
       if (rec.summary) {
         const subTr = document.createElement("tr");
-        subTr.className = "pos-sub-row pos-watchlist-row";
+        subTr.className = `pos-sub-row pos-watchlist-row${discarded ? " pos-watchlist-discarded" : ""}`;
         subTr.dataset.ticker = rec.ticker;
-        subTr.innerHTML = `<td colspan="9" class="pos-rec-row">${escapeHtml(rec.signal || "")} · ${escapeHtml(rec.conviction || "")} · ${escapeHtml(truncate(rec.summary, 120))}</td>`;
+        const discardPrefix = discarded ? "écartée par Alfred — " : "";
+        subTr.innerHTML = `<td colspan="9" class="pos-rec-row">${escapeHtml(discardPrefix)}${escapeHtml(rec.signal || "")} · ${escapeHtml(rec.conviction || "")} · ${escapeHtml(truncate(rec.summary, 120))}</td>`;
         positionsTbodyNode.appendChild(subTr);
       }
     }
@@ -200,11 +207,7 @@ export function renderPositionsTable(viewModel, dashboardPayload) {
 // ── Signal badge ─────────────────────────────────────────────────
 
 export function renderSignalBadge(signal) {
-  const s = (signal || "?").toUpperCase();
-  const tone = s.includes("ACHAT") || s.includes("RENFORC") ? "tone-buy"
-    : s.includes("VENTE") || s.includes("ALLEG") ? "tone-sell"
-    : "tone-neutral";
-  return `<span class="signal-badge ${tone}">${escapeHtml(signal || "?")}</span>`;
+  return `<span class="signal-badge ${signalToneClass(signal)}">${escapeHtml(signal || "?")}</span>`;
 }
 
 function renderSignalCell(rec, isRunning, stage, ticker, collectionProgress, lineProgress, runStatus) {
@@ -231,10 +234,7 @@ function renderSignalCell(rec, isRunning, stage, ticker, collectionProgress, lin
     return "<span class=\"pipeline-chip s-waiting\">Collected</span>";
   }
 
-  const tone = signal.includes("ACHAT") || signal.includes("ACHETER") || signal.includes("BUY") || signal.includes("RENFORC") ? "tone-buy"
-    : signal.includes("VENTE") || signal.includes("VENDR") || signal.includes("SELL") || signal.includes("ALLEG") ? "tone-sell"
-    : "tone-neutral";
-  return `<span class="signal-badge ${tone}">${escapeHtml(rec.signal || "?")}</span>`;
+  return `<span class="signal-badge ${signalToneClass(signal)}">${escapeHtml(rec.signal || "?")}</span>`;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────

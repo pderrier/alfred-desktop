@@ -18,6 +18,104 @@ use serde_json::{json, Value};
 pub(crate) const TARGET_WEIGHT_PCT_SCHEMA_LINE: &str =
     "target_weight_pct: float 0-100 ou null (taille cible de cette ligne dans le portefeuille apres execution de tes recos). Mets null si signal=CONSERVER ou SURVEILLANCE. Plafond : 30 % par ligne sauf justification explicite dans synthese.";
 
+// ── Watchlist line verdict vocabulary (Watchlist Curation v2 — D1) ──────────
+//
+// A watchlist line is NOT a held position: it is an LLM *proposal* of an
+// opportunity that is not necessarily valid. The line analysis must VALIDATE
+// or REJECT that proposal — it does not pretend the ticker is held (no PRU/PV,
+// no "renforcer/alléger"). The verdict vocabulary below is the single source
+// of truth shared by ALL line-prompt builders (codex / native / native-oauth /
+// repair) so the three LLM modes render identically — see
+// `docs/llm-mode-parity-contract.md` and the parity test
+// `watchlist_verdict_schema_parity_across_line_builders`.
+//
+//   * ENTRER          — proposition validée, entrée immédiate justifiée.
+//   * ACHAT_SUR_REPLI — intérêt confirmé mais entrée conditionnée à un repli.
+//   * SURVEILLER      — pas encore le moment, garder sous observation.
+//   * ECARTER         — proposition invalidée : ne PAS entrer.
+
+/// The `signal` enum line injected into a watchlist line prompt schema.
+pub(crate) const WATCHLIST_SIGNAL_ENUM: &str =
+    "ENTRER|ACHAT_SUR_REPLI|SURVEILLER|ECARTER";
+
+/// The `verdict_validation` enum line injected into a watchlist line prompt
+/// schema. Maps 1:1 to the signal: ENTRER/ACHAT_SUR_REPLI => "valide",
+/// SURVEILLER => "a_surveiller", ECARTER => "ecartee".
+pub(crate) const WATCHLIST_VERDICT_VALIDATION_ENUM: &str =
+    "valide|a_surveiller|ecartee";
+
+/// Reframing intro for a watchlist line — replaces the held-position framing.
+/// Single source so all builders open the watchlist task identically.
+pub(crate) const WATCHLIST_FRAMING_INTRO: &str =
+    "Tu VALIDES une proposition d'opportunite NON DETENUE. Elle n'est pas forcement \
+pertinente — confirme l'interet d'une ENTREE (ENTRER / ACHAT_SUR_REPLI), garde-la \
+en observation (SURVEILLER), ou ECARTE-la si la these ne tient pas (ECARTER). \
+Ne raisonne PAS comme sur une ligne detenue : pas de PRU, pas de plus-value, \
+pas de \"renforcer/alleger\".";
+
+/// The `action_recommandee` rule line for a watchlist verdict. For an entry
+/// verdict it is an entry plan; for ECARTER it is an explicit non-entry reason.
+pub(crate) const WATCHLIST_ACTION_RULE_LINE: &str =
+    "action_recommandee: pour ENTRER/ACHAT_SUR_REPLI => plan d'ENTREE chiffre (prix d'entree cible, taille initiale en titres ou en €). Pour SURVEILLER => niveau/condition a surveiller. Pour ECARTER => \"ne pas entrer\" + raison concrete.";
+
+/// Per-line schema fragments that differ between a held position and a
+/// watchlist proposal. Computed once from `is_watchlist` and threaded into
+/// every line-prompt builder so the watchlist verdict frame renders
+/// identically across codex / native / native-oauth / repair.
+///
+/// `held` mirrors the legacy held-position schema verbatim — extending the
+/// frame here must never change what a held line sees (parity guard).
+pub(crate) struct LineSchemaFrame {
+    /// The `signal` enum string for the schema (no key, value list only).
+    pub signal_enum: &'static str,
+    /// The schema line for `verdict_validation` including the leading comma +
+    /// newline + indentation, or `""` for held positions. Inserted directly
+    /// after the `signal` line in the JSON schema block.
+    pub verdict_validation_schema_line: &'static str,
+    /// The `action_recommandee` rule sentence used in the "Regles" list.
+    pub action_rule_line: &'static str,
+    /// A leading paragraph injected at the top of the task framing (watchlist
+    /// reframing), or `""` for held positions.
+    pub framing_intro: &'static str,
+    /// The "insufficient data" fallback rule. Held lines fall back to
+    /// SURVEILLANCE; watchlist proposals fall back to SURVEILLER (or ECARTER
+    /// when the thesis itself is unsupported).
+    pub insufficient_data_rule: &'static str,
+    /// Extra coherence rule pinning the signal<->verdict_validation mapping.
+    /// `""` for held positions.
+    pub verdict_coherence_rule: &'static str,
+}
+
+impl LineSchemaFrame {
+    pub(crate) fn for_line(is_watchlist: bool) -> Self {
+        if is_watchlist {
+            LineSchemaFrame {
+                signal_enum: WATCHLIST_SIGNAL_ENUM,
+                verdict_validation_schema_line:
+                    ",\n    \"verdict_validation\": \"valide|a_surveiller|ecartee\"",
+                action_rule_line: WATCHLIST_ACTION_RULE_LINE,
+                framing_intro: WATCHLIST_FRAMING_INTRO,
+                insufficient_data_rule:
+                    "Si donnees insuffisantes pour confirmer l'opportunite: signal = SURVEILLER (ou ECARTER si la these ne tient pas), avec explication.",
+                verdict_coherence_rule:
+                    "verdict_validation DOIT etre coherent avec signal: ENTRER/ACHAT_SUR_REPLI => \"valide\", SURVEILLER => \"a_surveiller\", ECARTER => \"ecartee\". ECARTER invalide la proposition (ne pas entrer).",
+            }
+        } else {
+            LineSchemaFrame {
+                signal_enum:
+                    "ACHAT_FORT|ACHAT|RENFORCEMENT|CONSERVER|ALLEGEMENT|VENTE|SURVEILLANCE",
+                verdict_validation_schema_line: "",
+                action_rule_line:
+                    "action_recommandee: TOUJOURS chiffree (nb titres, montant €, prix si pertinent)",
+                framing_intro: "",
+                insufficient_data_rule:
+                    "Si donnees insuffisantes: signal = SURVEILLANCE avec explication",
+                verdict_coherence_rule: "",
+            }
+        }
+    }
+}
+
 /// P0-81 — single source of truth for how the cash balance is described to the
 /// LLM, across every prompt builder (parity contract). The three states must be
 /// rendered distinctly:
@@ -132,15 +230,24 @@ pub(crate) fn build_report_prompt(run_state: &Value) -> String {
         .unwrap_or_else(|| json!([]));
 
     let recs_arr = recommendations.as_array().cloned().unwrap_or_default();
-    let nb_achat = recs_arr.iter().filter(|r| {
+    // Watchlist Curation v2 (D1): the buy/hold/sell tallies summarise PORTFOLIO
+    // moves on held lines. Watchlist proposals use a different verdict
+    // vocabulary (ENTRER | ACHAT_SUR_REPLI | SURVEILLER | ECARTER) and are
+    // opportunities, not portfolio moves — so they must NOT inflate these
+    // counts. A watchlist `ACHAT_SUR_REPLI` would otherwise substring-match
+    // "ACHAT" and be miscounted as a portfolio buy.
+    fn is_held_rec(r: &&Value) -> bool {
+        r.get("type").and_then(|v| v.as_str()).unwrap_or("position") != "watchlist"
+    }
+    let nb_achat = recs_arr.iter().filter(is_held_rec).filter(|r| {
         let s = as_text_upper(r.get("signal"));
         s.contains("ACHAT") || s.contains("RENFORC")
     }).count();
-    let nb_vente = recs_arr.iter().filter(|r| {
+    let nb_vente = recs_arr.iter().filter(is_held_rec).filter(|r| {
         let s = as_text_upper(r.get("signal"));
         s.contains("VENTE") || s.contains("ALLEG")
     }).count();
-    let nb_conserver = recs_arr.iter().filter(|r| {
+    let nb_conserver = recs_arr.iter().filter(is_held_rec).filter(|r| {
         let s = as_text_upper(r.get("signal"));
         s.contains("CONSERVER") || s.contains("SURVEILLANCE")
     }).count();
@@ -321,11 +428,21 @@ pub(crate) fn build_line_analysis_prompt(
 
     let mcp_suffix = mcp_validation_suffix(run_state);
 
+    // Watchlist Curation v2 (D1): swap the verdict vocabulary + schema for
+    // watchlist proposals. Single source via `LineSchemaFrame` so codex /
+    // native / native-oauth / repair stay byte-identical for the same line.
+    let frame = LineSchemaFrame::for_line(is_watchlist);
+    let watchlist_framing = if frame.framing_intro.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}\n", frame.framing_intro)
+    };
+
     format!(
         r#"Tu es un analyste financier qui s'adresse a un investisseur particulier non-expert. Sois factuel, concret et base sur les donnees fournies.
 
 MEMOIRE LIGNE = accountability de nos analyses precedentes (signaux et theses Alfred). TECHNIQUE = etat marche actuel calcule sur ~250 jours OHLC (independant des runs). Les deux se completent : la memoire dit ce qu'on a annonce, la technique dit ce que dit le marche.
-
+{watchlist_framing}
 VALEUR ANALYSEE: {nom} ({ticker})
 {section_position}
 {section_market}
@@ -354,7 +471,7 @@ Produis ton analyse en JSON UNIQUEMENT avec cette structure exacte:
     "line_id": "{line_type}:{ticker_lower}",
     "ticker": "{ticker}",
     "type": "{line_type}",
-    "signal": "ACHAT_FORT|ACHAT|RENFORCEMENT|CONSERVER|ALLEGEMENT|VENTE|SURVEILLANCE",
+    "signal": "{signal_enum}"{verdict_validation_schema_line},
     "conviction": "forte|moderee|faible",
     "target_weight_pct": null,
     "synthese": "4-6 phrases: actualite cle, indicateurs determinants, plan court et moyen terme",
@@ -365,7 +482,7 @@ Produis ton analyse en JSON UNIQUEMENT avec cette structure exacte:
     "risques": ["risque concret 1", "risque concret 2"],
     "catalyseurs": ["catalyseur 1", "catalyseur 2"],
     "badges_keywords": ["mot-cle-1", "mot-cle-2", "mot-cle-3"],
-    "action_recommandee": "instruction CHIFFREE: nb titres, montant €, prix entree/sortie",
+    "action_recommandee": "instruction CHIFFREE (voir regle action_recommandee ci-dessous)",
     "reanalyse_after": "YYYY-MM-DD",
     "reanalyse_reason": "prochain catalyseur",
     "deep_news_summary": "synthese 100-500 chars des actualites les plus impactantes pour cet investissement",
@@ -378,7 +495,7 @@ Produis ton analyse en JSON UNIQUEMENT avec cette structure exacte:
 
 Regles strictes:
 - synthese: minimum 150 caracteres, explique comme a un ami
-- action_recommandee: TOUJOURS chiffree (nb titres, montant €, prix si pertinent)
+- {action_rule_line}
 - {target_weight_rule_line}
 - badges_keywords: 3-8 mots courts, specifiques, orientes decision (pas de signal/conviction/secteur seul)
   - au moins 1 badge "fait d'actualite" (ex: "restructuration en cours")
@@ -407,7 +524,7 @@ DEEP NEWS — process:
 
 - Si donnees marche incompletes, donne plus de poids aux actualites et evenements
 - Si tu changes de signal par rapport au precedent (memoire), explique pourquoi
-- Si donnees insuffisantes: signal = SURVEILLANCE avec explication{calibration_instruction}
+- {insufficient_data_rule}{verdict_coherence_rule_line}{calibration_instruction}
 {mcp_suffix}
 Reponds uniquement en JSON valide."#,
         nom = as_text(line_context.get("row").and_then(|r| r.get("nom")).or(Some(&json!(ticker)))),
@@ -434,6 +551,16 @@ Reponds uniquement en JSON valide."#,
         mcp_suffix = mcp_suffix,
         calibration_instruction = calibration_instruction,
         target_weight_rule_line = TARGET_WEIGHT_PCT_SCHEMA_LINE,
+        watchlist_framing = watchlist_framing,
+        signal_enum = frame.signal_enum,
+        verdict_validation_schema_line = frame.verdict_validation_schema_line,
+        action_rule_line = frame.action_rule_line,
+        insufficient_data_rule = frame.insufficient_data_rule,
+        verdict_coherence_rule_line = if frame.verdict_coherence_rule.is_empty() {
+            String::new()
+        } else {
+            format!("\n- {}", frame.verdict_coherence_rule)
+        },
     )
 }
 
@@ -1033,7 +1160,34 @@ pub(crate) fn build_conviction_calibration_section(
 // inject TECHNIQUE; watchlist is a 5th builder operating at a different
 // level and is exempt.
 
-pub(crate) fn build_watchlist_prompt(positions: &[Value], portfolio: &Value, guidelines: &str, account: &str) -> String {
+/// Inputs to the watchlist generation prompt. Watchlist Curation v2 (D3/D4)
+/// turns the generator into a *top-up*: the persisted/kept list is preserved,
+/// the LLM is only asked for `topup_count` additional tickers, and it must
+/// exclude both held tickers and already-kept watchlist tickers.
+pub(crate) struct WatchlistPromptArgs<'a> {
+    pub positions: &'a [Value],
+    pub portfolio: &'a Value,
+    pub guidelines: &'a str,
+    pub account: &'a str,
+    /// How many NEW tickers the LLM should propose (the gap to ~5).
+    pub topup_count: usize,
+    /// Tickers already kept on the watchlist that must NOT be re-proposed.
+    pub kept_tickers: &'a [String],
+    /// Free-text per-account directive (D4), e.g. "ce compte est ETF/fonds".
+    pub account_feedback: &'a str,
+}
+
+pub(crate) fn build_watchlist_prompt(args: &WatchlistPromptArgs) -> String {
+    let WatchlistPromptArgs {
+        positions,
+        portfolio,
+        guidelines,
+        account,
+        topup_count,
+        kept_tickers,
+        account_feedback,
+    } = *args;
+
     let position_tickers: Vec<String> = positions
         .iter()
         .map(|p| {
@@ -1044,12 +1198,33 @@ pub(crate) fn build_watchlist_prompt(positions: &[Value], portfolio: &Value, gui
         })
         .collect();
     let total_value = portfolio.get("valeur_totale").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let cash_display = render_cash_for_prompt(&portfolio);
+    let cash_display = render_cash_for_prompt(portfolio);
 
     let guidelines_section = if guidelines.is_empty() {
         String::new()
     } else {
         format!("\nDIRECTIVES INVESTISSEUR:\n{guidelines}\n")
+    };
+
+    // D4 — free-text per-account directive. When the user says the account is
+    // ETF/fund-oriented, bias the suggestions toward ETFs/funds.
+    let feedback_section = if account_feedback.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nDIRECTIVES WATCHLIST (compte): {}\n(Respecte ces directives en priorite : si elles impliquent une preference ETF/fonds, propose des ETF/fonds et evite le stock-picking d'actions individuelles.)\n",
+            account_feedback.trim()
+        )
+    };
+
+    // D3 — exclude already-kept watchlist tickers in addition to held ones.
+    let kept_section = if kept_tickers.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nDEJA EN WATCHLIST (ne PAS reproposer): {}\n",
+            kept_tickers.join(", ")
+        )
     };
 
     let account_lower = account.to_lowercase();
@@ -1071,15 +1246,15 @@ pub(crate) fn build_watchlist_prompt(positions: &[Value], portfolio: &Value, gui
 
 COMPTE: {account}
 
-POSITIONS ACTUELLES:
+POSITIONS ACTUELLES (deja detenues — ne PAS les reproposer):
 {positions}
-
+{kept_section}{feedback_section}
 PORTEFEUILLE: {total_value:.0}€ total, liquidites: {cash_display}
 {guidelines_section}
-Suggere exactement 5 tickers complementaires (non detenus) en te basant sur:
+Suggere exactement {topup_count} ticker(s) complementaire(s) (non detenus, non deja en watchlist) en te basant sur:
 - Diversification sectorielle (quels secteurs sont sous-representes?)
 {universe_constraint}
-- Complementarite (pas de duplication avec les positions existantes)
+- Complementarite (pas de duplication avec les positions existantes ni la watchlist)
 - Qualite (entreprises etablies avec fondamentaux solides)
 
 Reponds en JSON strict:
@@ -1096,9 +1271,12 @@ Reponds en JSON strict:
 }}"#,
         account = account,
         positions = position_tickers.join("\n"),
+        kept_section = kept_section,
+        feedback_section = feedback_section,
         total_value = total_value,
         cash_display = cash_display,
         guidelines_section = guidelines_section,
+        topup_count = topup_count,
         universe_constraint = universe_constraint,
         ticker_example = ticker_example,
     )
@@ -1116,8 +1294,13 @@ pub(crate) fn build_repair_prompt(
     let portfolio = run_state.get("portfolio").cloned().unwrap_or_else(|| json!({}));
     let guidelines = agent_guidelines.unwrap_or_default();
     let ticker = line_context.get("ticker").and_then(|v| v.as_str()).unwrap_or("UNKNOWN");
+    let is_watchlist = line_context
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("position")
+        == "watchlist";
 
-    let section_position = build_position_section(line_context.get("row"), false);
+    let section_position = build_position_section(line_context.get("row"), is_watchlist);
     let section_market = build_market_section_no_web(line_context.get("market"));
     let section_news = build_news_section(line_context.get("news"));
     let section_memory = build_memory_section(line_context.get("line_memory"));
@@ -1152,6 +1335,19 @@ pub(crate) fn build_repair_prompt(
         format!("\nDIRECTIVES INVESTISSEUR:\n{guidelines}\n")
     };
 
+    // Watchlist Curation v2 (D1): a watchlist repair must keep the entry-verdict
+    // vocabulary — never let the held-position framing leak back in on a fix
+    // pass. Single source via `LineSchemaFrame`.
+    let frame = LineSchemaFrame::for_line(is_watchlist);
+    let watchlist_repair_rules = if is_watchlist {
+        format!(
+            "\n- signal DOIT rester dans {} (proposition NON detenue : pas de PRU/PV, pas de renforcer/alleger).\n- {}\n- {}",
+            frame.signal_enum, frame.verdict_coherence_rule, frame.action_rule_line
+        )
+    } else {
+        String::new()
+    };
+
     format!(
         r#"Repare cette recommandation pour {ticker}.
 
@@ -1180,12 +1376,13 @@ Regles:
 - Corrige les champs identifies comme defaillants
 - Garde les champs corrects de la recommandation precedente
 - Utilise les donnees fournies (pas de recherche web)
-- {target_weight_rule_line}{calibration_instruction}
+- {target_weight_rule_line}{watchlist_repair_rules}{calibration_instruction}
 
 JSON valide uniquement, cle "recommendation"."#,
         ticker = ticker,
         issues = issues,
         target_weight_rule_line = TARGET_WEIGHT_PCT_SCHEMA_LINE,
+        watchlist_repair_rules = watchlist_repair_rules,
         section_position = section_position,
         section_market = section_market,
         section_news = section_news,
@@ -1566,6 +1763,148 @@ mod tests {
         snap["indicators"]["trend_signal"] = json!("sideways");
         let s = build_technical_section(Some(&snap));
         assert!(s.contains("laterale"), "sideways trend → 'laterale':\n{s}");
+    }
+
+    // ── Watchlist Curation v2 (D1): dedicated entry-verdict frame ──────
+
+    fn watchlist_line_context() -> Value {
+        json!({
+            "ticker": "ASML",
+            "row": {"nom": "ASML Holding", "ticker": "ASML"},
+            "type": "watchlist",
+            "market": {"price": 620.0, "pe_ratio": 30.0},
+            "news": {"items": []},
+            "line_memory": {},
+        })
+    }
+
+    #[test]
+    fn watchlist_line_prompt_uses_entry_verdict_vocabulary() {
+        let run_state = run_state_with_cash(5000.0, true);
+        let ctx = watchlist_line_context();
+        let prompt = build_line_analysis_prompt(&ctx, &run_state, None, None);
+
+        // New verdict enum present, held vocabulary absent from the signal line.
+        assert!(prompt.contains("ENTRER|ACHAT_SUR_REPLI|SURVEILLER|ECARTER"),
+            "watchlist signal enum missing:\n{prompt}");
+        assert!(prompt.contains("\"verdict_validation\": \"valide|a_surveiller|ecartee\""),
+            "verdict_validation schema field missing:\n{prompt}");
+        // Reframing intro present.
+        assert!(prompt.contains("VALIDES une proposition"),
+            "watchlist validation framing missing:\n{prompt}");
+        // Held-position framing dropped: no PRU/PV, no held signal enum.
+        assert!(!prompt.contains("ACHAT_FORT|ACHAT|RENFORCEMENT|CONSERVER|ALLEGEMENT|VENTE|SURVEILLANCE"),
+            "held signal enum must NOT appear on a watchlist line:\n{prompt}");
+        assert!(prompt.contains("NON DETENU"),
+            "watchlist position section must say NON DETENU:\n{prompt}");
+        assert!(!prompt.contains("Prix de revient"),
+            "watchlist line must not render a PRU:\n{prompt}");
+    }
+
+    #[test]
+    fn held_line_prompt_keeps_legacy_vocabulary_unchanged() {
+        // The held-position frame must be byte-stable — no verdict_validation,
+        // no watchlist framing leaking into a normal position.
+        let run_state = run_state_with_cash(5000.0, true);
+        let ctx = line_context_minimal();
+        let prompt = build_line_analysis_prompt(&ctx, &run_state, None, None);
+        assert!(prompt.contains("ACHAT_FORT|ACHAT|RENFORCEMENT|CONSERVER|ALLEGEMENT|VENTE|SURVEILLANCE"),
+            "held signal enum must remain on a position line:\n{prompt}");
+        assert!(!prompt.contains("verdict_validation"),
+            "held line must NOT carry verdict_validation:\n{prompt}");
+        assert!(!prompt.contains("VALIDES une proposition"),
+            "held line must NOT carry watchlist framing:\n{prompt}");
+        assert!(!prompt.contains("ENTRER|ACHAT_SUR_REPLI"),
+            "held line must NOT carry the watchlist enum:\n{prompt}");
+    }
+
+    #[test]
+    fn watchlist_verdict_schema_parity_across_line_builders() {
+        // BINDING parity contract: the watchlist verdict frame must render
+        // identically across codex (build_line_analysis_prompt), native
+        // (build_native_line_prompt), and repair (build_repair_prompt). We
+        // assert the verdict enum + the validation field appear in all three.
+        let run_state = run_state_with_cash(5000.0, true);
+        let ctx = watchlist_line_context();
+
+        let codex = build_line_analysis_prompt(&ctx, &run_state, None, None);
+        let validation = json!({
+            "validation_issues": ["synthese_too_short"],
+            "recommendation_to_fix": {"ticker": "ASML", "signal": "SURVEILLER", "type": "watchlist"}
+        });
+        let repair = build_repair_prompt(&ctx, &run_state, None, &validation, None);
+
+        let native_line_data = json!({
+            "position": ctx["row"],
+            "market_data": ctx["market"],
+            "news": ctx["news"],
+            "shared_insights": Value::Null,
+            "line_memory": {},
+            "quality": {},
+            "technical_snapshot": Value::Null,
+        });
+        let native = crate::native_mcp_analysis::build_native_line_prompt(
+            "test-run", "ASML", "ASML Holding", "watchlist", &native_line_data,
+        );
+
+        for (name, p) in [("codex", &codex), ("native", &native), ("repair", &repair)] {
+            assert!(p.contains("ENTRER") && p.contains("ACHAT_SUR_REPLI")
+                && p.contains("SURVEILLER") && p.contains("ECARTER"),
+                "{name} watchlist prompt missing the verdict vocabulary:\n{p}");
+            assert!(p.contains("valide") && p.contains("a_surveiller") && p.contains("ecartee"),
+                "{name} watchlist prompt missing verdict_validation values:\n{p}");
+        }
+        // None of the three may carry the held enum on a watchlist line.
+        for (name, p) in [("codex", &codex), ("native", &native), ("repair", &repair)] {
+            assert!(!p.contains("ACHAT_FORT|ACHAT|RENFORCEMENT|CONSERVER|ALLEGEMENT|VENTE|SURVEILLANCE"),
+                "{name} watchlist prompt must not carry the held enum:\n{p}");
+        }
+    }
+
+    #[test]
+    fn watchlist_topup_prompt_requests_gap_and_excludes_kept() {
+        // D3: build_watchlist_prompt asks for exactly `topup_count` tickers and
+        // lists the kept tickers as "do not re-propose". D4: feedback injected.
+        let positions = vec![json!({"ticker": "MC", "nom": "LVMH", "isin": "FR0000121014"})];
+        let portfolio = json!({"valeur_totale": 100000.0, "liquidites": 5000.0, "liquidites_known": true});
+        let kept = vec!["ASML".to_string(), "SAP".to_string()];
+        let prompt = build_watchlist_prompt(&WatchlistPromptArgs {
+            positions: &positions,
+            portfolio: &portfolio,
+            guidelines: "",
+            account: "PEA",
+            topup_count: 3,
+            kept_tickers: &kept,
+            account_feedback: "ce compte est ETF/fonds, pas de stock-picking",
+        });
+        assert!(prompt.contains("Suggere exactement 3 ticker"),
+            "top-up count must be the gap (3):\n{prompt}");
+        assert!(prompt.contains("DEJA EN WATCHLIST (ne PAS reproposer): ASML, SAP"),
+            "kept tickers must be listed as excluded:\n{prompt}");
+        assert!(prompt.contains("DIRECTIVES WATCHLIST (compte): ce compte est ETF/fonds"),
+            "account feedback must be injected:\n{prompt}");
+        assert!(prompt.contains("ETF/fonds"),
+            "feedback must bias toward ETF/fonds:\n{prompt}");
+    }
+
+    #[test]
+    fn watchlist_prompt_without_feedback_or_kept_is_clean() {
+        let positions = vec![json!({"ticker": "MC", "nom": "LVMH"})];
+        let portfolio = json!({"valeur_totale": 100000.0, "liquidites_known": false});
+        let prompt = build_watchlist_prompt(&WatchlistPromptArgs {
+            positions: &positions,
+            portfolio: &portfolio,
+            guidelines: "",
+            account: "PEA",
+            topup_count: 5,
+            kept_tickers: &[],
+            account_feedback: "",
+        });
+        assert!(prompt.contains("Suggere exactement 5 ticker"));
+        assert!(!prompt.contains("DEJA EN WATCHLIST"),
+            "no kept section when kept is empty:\n{prompt}");
+        assert!(!prompt.contains("DIRECTIVES WATCHLIST (compte)"),
+            "no feedback section when feedback is empty:\n{prompt}");
     }
 
     #[test]
@@ -2140,12 +2479,15 @@ mod tests {
         let validation = json!({ "validation_issues": ["x"], "recommendation_to_fix": {} });
         let repair = build_repair_prompt(&line_context, &run_state, None, &validation, None);
         let positions = vec![json!({"ticker": "MC", "nom": "LVMH", "isin": "FR0000121014"})];
-        let watchlist = build_watchlist_prompt(
-            &positions,
-            run_state.get("portfolio").unwrap(),
-            "",
-            "PEA",
-        );
+        let watchlist = build_watchlist_prompt(&WatchlistPromptArgs {
+            positions: &positions,
+            portfolio: run_state.get("portfolio").unwrap(),
+            guidelines: "",
+            account: "PEA",
+            topup_count: 5,
+            kept_tickers: &[],
+            account_feedback: "",
+        });
 
         for (name, prompt) in [
             ("report", &report),
@@ -2195,12 +2537,15 @@ mod tests {
         let validation = json!({ "validation_issues": ["x"], "recommendation_to_fix": {} });
         let repair = build_repair_prompt(&line_context, &run_state, None, &validation, None);
         let positions = vec![json!({"ticker": "MC", "nom": "LVMH", "isin": "FR0000121014"})];
-        let watchlist = build_watchlist_prompt(
-            &positions,
-            run_state.get("portfolio").unwrap(),
-            "",
-            "PEA",
-        );
+        let watchlist = build_watchlist_prompt(&WatchlistPromptArgs {
+            positions: &positions,
+            portfolio: run_state.get("portfolio").unwrap(),
+            guidelines: "",
+            account: "PEA",
+            topup_count: 5,
+            kept_tickers: &[],
+            account_feedback: "",
+        });
 
         for (name, prompt) in [
             ("report", &report),

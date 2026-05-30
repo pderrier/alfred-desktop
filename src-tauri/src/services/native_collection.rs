@@ -2759,7 +2759,124 @@ fn resolve_canonical_symbols(positions: Vec<Value>) -> Vec<Value> {
 /// useful when it differs (e.g. Yahoo `.PA` suffix on a French entry the
 /// LLM listed as `STMPA`). When equal, we still store it so downstream
 /// enrichment can pass `&canonical=` consistently.
-fn resolve_watchlist_items(items: Vec<Value>) -> Vec<Value> {
+/// Target size of a curated watchlist. Watchlist Curation v2 (D3): the LLM
+/// only tops up to this count — the persisted/kept entries are preserved.
+pub(crate) const WATCHLIST_TARGET_SIZE: usize = 5;
+
+/// Watchlist Curation v2 (D3) — pure planning of the top-up step.
+///
+/// Given the entries kept from `watchlist_by_account[account]` and the set of
+/// currently-held tickers, decide:
+///   * `topup_count` — how many NEW tickers to ask the LLM for (the gap to
+///     `WATCHLIST_TARGET_SIZE`). `0` when the kept list already meets/exceeds
+///     the target → the caller must skip the LLM entirely (cost win).
+///   * `excluded_tickers` — held tickers PLUS kept watchlist tickers, so the
+///     LLM never re-proposes something already covered.
+///
+/// Kept entries are deduped by upper-cased ticker and any kept entry that
+/// duplicates a held ticker is dropped (it is no longer an "opportunity not
+/// held"). Pure + total so it is unit-tested without any I/O.
+pub(crate) struct WatchlistPlan {
+    pub kept: Vec<Value>,
+    pub topup_count: usize,
+    pub excluded_tickers: Vec<String>,
+}
+
+pub(crate) fn plan_watchlist_topup(
+    kept_raw: &[Value],
+    held_tickers: &[String],
+    target: usize,
+) -> WatchlistPlan {
+    let held_upper: std::collections::HashSet<String> = held_tickers
+        .iter()
+        .map(|t| t.trim().to_uppercase())
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut kept: Vec<Value> = Vec::new();
+    let mut excluded: Vec<String> = held_upper.iter().cloned().collect();
+    excluded.sort();
+
+    for item in kept_raw {
+        let ticker = item
+            .get("ticker")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_uppercase();
+        if ticker.is_empty() {
+            continue;
+        }
+        // Drop kept entries that are now held, or duplicated.
+        if held_upper.contains(&ticker) || !seen.insert(ticker.clone()) {
+            continue;
+        }
+        kept.push(item.clone());
+        excluded.push(ticker);
+    }
+
+    let topup_count = target.saturating_sub(kept.len());
+    WatchlistPlan { kept, topup_count, excluded_tickers: excluded }
+}
+
+/// Watchlist Curation v2 (D2) — run the mid-run confirmation gate and return
+/// the watchlist items to analyse this run.
+///
+/// Emits `watchlist_confirmation_needed` with the candidate list + current
+/// per-account feedback, then blocks on the backend gate up to
+/// `WATCHLIST_GATE_TIMEOUT_MS`:
+///   * Confirmed  → use the user's submitted item list (already persisted by
+///     `run_watchlist_confirm`).
+///   * TimedOut   → proceed with the candidate list as-is. We deliberately do
+///     NOT persist it as the curated list — the persisted list is only ever
+///     rewritten by an explicit user confirmation, so a timed-out run never
+///     silently overwrites the user's curation.
+///   * Cancelled  → propagate the run-aborted error so the worker tears down.
+fn resolve_watchlist_confirmation(
+    run_id: &str,
+    account: &str,
+    account_feedback: &str,
+    candidates: Vec<Value>,
+) -> Result<Vec<Value>> {
+    use crate::analysis_ops::WatchlistGateOutcome;
+
+    // Surface the candidates + feedback to the UI so the modal can render.
+    crate::emit_event(
+        "watchlist_confirmation_needed",
+        json!({
+            "run_id": run_id,
+            "account": account,
+            "candidates": candidates,
+            "feedback": account_feedback,
+            "timeout_ms": crate::analysis_ops::WATCHLIST_GATE_TIMEOUT_MS,
+        }),
+    );
+
+    let timeout = std::time::Duration::from_millis(
+        crate::analysis_ops::WATCHLIST_GATE_TIMEOUT_MS,
+    );
+    match crate::analysis_ops::wait_for_watchlist_confirmation(run_id, timeout) {
+        WatchlistGateOutcome::Confirmed(payload) => {
+            let items = payload
+                .get("items")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            eprintln!("[watchlist] confirmation received — {} item(s)", items.len());
+            Ok(items)
+        }
+        WatchlistGateOutcome::TimedOut => {
+            eprintln!("[watchlist] confirmation timed out — using candidates");
+            Ok(candidates)
+        }
+        WatchlistGateOutcome::Cancelled => {
+            Err(anyhow!("run_aborted:analysis stopped by user"))
+        }
+    }
+}
+
+pub(crate) fn resolve_watchlist_items(items: Vec<Value>) -> Vec<Value> {
     use std::collections::HashMap;
     let mut cache: HashMap<String, Option<String>> = HashMap::new();
     items
@@ -3503,12 +3620,36 @@ pub(crate) fn execute_native_local_analysis_workflow_with(
         }
     }
 
-    // Launch watchlist suggestion in background while positions collect
+    // Watchlist Curation v2 (D3) — build the candidate list in background while
+    // positions collect. The persisted curated list is REUSED: we keep the
+    // user-confirmed entries from a prior run and ask the LLM only to top up to
+    // WATCHLIST_TARGET_SIZE, excluding held + already-kept tickers. The
+    // candidate list is NOT persisted here — persistence happens only after the
+    // user confirms via the mid-run modal (D2), so a timed-out/cancelled run
+    // never silently overwrites the curated list.
     let wl_positions = positions.clone();
     let wl_snapshot = snapshot.clone();
-    let wl_run_id = run_id.clone();
     let wl_guidelines = run_state.get("agent_guidelines").and_then(|v| v.as_str()).unwrap_or_default().to_string();
     let wl_account = as_text(run_state.get("account"));
+    // Read the persisted curated list + per-account feedback up front.
+    let wl_prefs = crate::runtime_settings::get_user_preferences();
+    let wl_kept_raw: Vec<Value> = wl_prefs
+        .get("watchlist_by_account")
+        .and_then(|m| m.get(&wl_account))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let wl_feedback = wl_prefs
+        .get("watchlist_feedback_by_account")
+        .and_then(|m| m.get(&wl_account))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let wl_held_tickers: Vec<String> = positions
+        .iter()
+        .map(|p| as_text(p.get("ticker")))
+        .filter(|t| !t.is_empty())
+        .collect();
     let watchlist_handle = std::thread::spawn(move || {
         let portfolio_summary = json!({
             "valeur_totale": wl_snapshot.get("valeur_totale").cloned().unwrap_or_else(|| json!(0.0)),
@@ -3518,35 +3659,53 @@ pub(crate) fn execute_native_local_analysis_workflow_with(
             "liquidites_known": wl_snapshot.get("liquidites_known").cloned().unwrap_or_else(|| json!(false)),
             "plus_value_totale": wl_snapshot.get("plus_value_totale").cloned().unwrap_or_else(|| json!(0.0)),
         });
-        match crate::llm::generate_watchlist_suggestions(&wl_positions, &portfolio_summary, &wl_guidelines, &wl_account) {
-            Ok(items) if !items.is_empty() => {
-                // v0.3 (#23): when an LLM-suggested watchlist item carries an
-                // ISIN, resolve it once via /api/resolve so the saved entry
-                // and the run_state watchlist both carry resolved_symbol.
-                // Downstream enrichment + the line-modal venue hint reuse this
-                // field — keeps the watchlist on the same v0.3 parity contract
-                // as portfolio positions. Fire-and-forget: missing v0.3 server
-                // → items stay unchanged and behave as pre-v0.3.
-                let items = resolve_watchlist_items(items);
-                eprintln!("[watchlist] LLM suggested {} items (background)", items.len());
-                // Save to user preferences
-                let mut prefs = crate::runtime_settings::get_user_preferences();
-                if let Some(obj) = prefs.as_object_mut() {
-                    let wl = obj.entry("watchlist_by_account".to_string()).or_insert_with(|| json!({}));
-                    if let Some(wl_obj) = wl.as_object_mut() {
-                        wl_obj.insert(wl_account.clone(), json!(&items));
-                    }
+
+        let plan = plan_watchlist_topup(&wl_kept_raw, &wl_held_tickers, WATCHLIST_TARGET_SIZE);
+        eprintln!(
+            "[watchlist] kept={} topup_count={} (target {})",
+            plan.kept.len(), plan.topup_count, WATCHLIST_TARGET_SIZE
+        );
+
+        // D3 — skip the LLM entirely when the kept list already meets target.
+        let topup_items = if plan.topup_count == 0 {
+            eprintln!("[watchlist] kept list >= target — skipping LLM generation");
+            Vec::new()
+        } else {
+            match crate::llm::generate_watchlist_suggestions(
+                &wl_positions,
+                &portfolio_summary,
+                &wl_guidelines,
+                &wl_account,
+                plan.topup_count,
+                &plan.excluded_tickers,
+                &wl_feedback,
+            ) {
+                Ok(items) if !items.is_empty() => {
+                    // v0.3 (#23): resolve LLM-suggested ISINs once via
+                    // /api/resolve so candidate entries carry resolved_symbol.
+                    let items = resolve_watchlist_items(items);
+                    eprintln!("[watchlist] LLM topped up {} item(s)", items.len());
+                    items
                 }
-                let _ = crate::runtime_settings::save_user_preferences(&prefs);
-                let _ = patch_run_state_direct_with(&wl_run_id, |rs| {
-                    if let Some(obj) = rs.as_object_mut() {
-                        obj.insert("watchlist".to_string(), json!({ "items": &items }));
-                    }
-                });
-                Some((items, wl_account))
+                Ok(_) => { eprintln!("[watchlist] LLM returned empty top-up"); Vec::new() }
+                Err(e) => { eprintln!("[watchlist] top-up generation failed (non-blocking): {e}"); Vec::new() }
             }
-            Ok(_) => { eprintln!("[watchlist] LLM returned empty watchlist"); None }
-            Err(e) => { eprintln!("[watchlist] generation failed (non-blocking): {e}"); None }
+        };
+
+        // Candidate list = kept + top-up, deduped by upper-cased ticker
+        // (kept first). This is what the user sees in the confirmation modal.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut candidates: Vec<Value> = Vec::new();
+        for item in plan.kept.into_iter().chain(topup_items.into_iter()) {
+            let ticker = as_text(item.get("ticker")).trim().to_uppercase();
+            if ticker.is_empty() || !seen.insert(ticker) { continue; }
+            candidates.push(item);
+        }
+
+        if candidates.is_empty() {
+            None
+        } else {
+            Some((candidates, wl_account, wl_feedback))
         }
     });
 
@@ -3651,9 +3810,35 @@ pub(crate) fn execute_native_local_analysis_workflow_with(
         }
     }
 
-    // Positions done — join watchlist thread and inject items into same pipeline
-    if let Ok(Some((watchlist_items, account))) = watchlist_handle.join() {
+    // Positions done — join watchlist thread, run the mid-run confirmation
+    // gate (D2), then inject the CONFIRMED items into the same pipeline.
+    if let Ok(Some((candidate_items, account, account_feedback))) = watchlist_handle.join() {
+        // Watchlist Curation v2 (D2) — confirmation gate. We are at the natural
+        // pause point: positions are analysed, watchlist line analysis has not
+        // started. Emit the candidate list to the UI, then block up to ~45 s
+        // for the user's confirmed set. On timeout we proceed with the
+        // candidates as-is; on cancel we abort cleanly; on confirmation we use
+        // the submitted set (already persisted by `run_watchlist_confirm`).
+        let watchlist_items = resolve_watchlist_confirmation(
+            &run_id,
+            &account,
+            &account_feedback,
+            candidate_items,
+        )?;
         let wl_count = watchlist_items.len();
+        if wl_count == 0 {
+            // User unchecked everything (or empty after confirmation) — nothing
+            // to analyse. Fall through to synthesis with positions only.
+            eprintln!("[watchlist] confirmed set is empty — no watchlist lines this run");
+        }
+        // Record the confirmed items in run_state so coverage derivation
+        // (`report.rs` reads `watchlist.items`) and the report renderer see the
+        // exact set being analysed this run.
+        let _ = patch_run_state_direct_with(&run_id, |rs| {
+            if let Some(obj) = rs.as_object_mut() {
+                obj.insert("watchlist".to_string(), json!({ "items": &watchlist_items }));
+            }
+        });
         let new_total = (positions.len() + wl_count) as i64;
         // Update total in progress counters
         set_native_run_stage(
@@ -3685,7 +3870,7 @@ pub(crate) fn execute_native_local_analysis_workflow_with(
                 }
             }
             let _ = crate::update_line_status(&run_id, &ticker.to_uppercase(), "collecting");
-            collection_dispatch.push(positions.len() + collection_completed - positions.len(), wl_row)?;
+            collection_dispatch.push(collection_completed, wl_row)?;
             for result in collection_dispatch.drain_ready() {
                 collection_completed += 1;
                 apply_watchlist_collection_result(

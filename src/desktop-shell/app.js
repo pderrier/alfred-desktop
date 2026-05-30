@@ -36,7 +36,8 @@ import {
   formatCurrency,
   mergeEvents,
   escapeHtml,
-  truncate
+  truncate,
+  signalToneClass
 } from "/desktop-shell/ui-display-utils.js";
 import { resolveShellRefreshPlan } from "/desktop-shell/refresh-policy.js";
 import { shouldRunRefresh, forceRefreshDebounce } from "/desktop-shell/refresh-debounce.js";
@@ -385,12 +386,9 @@ function renderAnalysisEvents(events = []) {
 
 // ── Actions rendering ────────────────────────────────────────────
 
-function recommendationActionClass(signal) {
-  const raw = String(signal || "").toUpperCase();
-  if (raw.includes("ACHAT") || raw.includes("ACHETER") || raw.includes("RENFORC") || raw.includes("BUY")) return "tone-buy";
-  if (raw.includes("VENTE") || raw.includes("VENDR") || raw.includes("ALLEG") || raw.includes("SELL")) return "tone-sell";
-  return "tone-neutral";
-}
+// recommendationActionClass removed — tone mapping is single-sourced in
+// `signalToneClass` (ui-display-utils.js) so the action cards, the positions
+// table badge, and the live-run badge all share one signal→tone rule.
 
 function renderKpiDelta(nodeId, delta) {
   const parent = document.getElementById(nodeId)?.parentElement;
@@ -490,7 +488,7 @@ function renderActionsNow(items = [], recommendations = []) {
   }
   for (const action of actionable.slice(0, 5)) {
     const card = document.createElement("article");
-    card.className = `action-card ${recommendationActionClass(action.action)}`;
+    card.className = `action-card ${signalToneClass(action.action)}`;
     const displayName = action.nom || action.ticker || "";
     const tickerLabel = action.ticker ? `<span class="action-ticker">${escapeHtml(action.ticker)}</span>` : "";
     const nameHtml = displayName

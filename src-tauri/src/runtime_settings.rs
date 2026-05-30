@@ -574,6 +574,17 @@ pub fn get_user_preferences() -> serde_json::Value {
     }
 }
 
+/// Preference keys whose value is an `{ account -> value }` map and must
+/// deep-merge by account on save, so persisting one account's entry never
+/// clobbers the others. Setting an inner account value to `null` deletes only
+/// that account's entry (see `save_user_preferences`).
+const PER_ACCOUNT_MERGE_KEYS: &[&str] = &[
+    "guidelines_by_account",
+    // Watchlist Curation v2 (D3 / D4):
+    "watchlist_by_account",
+    "watchlist_feedback_by_account",
+];
+
 pub fn save_user_preferences(prefs: &serde_json::Value) -> Result<()> {
     let path = resolve_preferences_path();
     if let Some(parent) = path.parent() {
@@ -600,14 +611,24 @@ pub fn save_user_preferences(prefs: &serde_json::Value) -> Result<()> {
             if new_val.is_null() {
                 continue; // Already handled above
             }
-            if key == "guidelines_by_account" {
-                let existing_guidelines =
+            // Per-account maps must deep-merge by account so saving one
+            // account never wipes the others. `guidelines_by_account` and the
+            // Watchlist Curation v2 maps (`watchlist_by_account`,
+            // `watchlist_feedback_by_account`) all share this contract.
+            if PER_ACCOUNT_MERGE_KEYS.contains(&key.as_str()) {
+                let existing_map =
                     existing_obj.entry(key.clone()).or_insert_with(|| json!({}));
-                if let (Some(eg), Some(ng)) =
-                    (existing_guidelines.as_object_mut(), new_val.as_object())
+                if let (Some(em), Some(nm)) =
+                    (existing_map.as_object_mut(), new_val.as_object())
                 {
-                    for (acct, guideline) in ng {
-                        eg.insert(acct.clone(), guideline.clone());
+                    for (acct, val) in nm {
+                        // A per-account value set to null deletes that one
+                        // account's entry without touching the siblings.
+                        if val.is_null() {
+                            em.remove(acct);
+                        } else {
+                            em.insert(acct.clone(), val.clone());
+                        }
                     }
                 }
             } else {

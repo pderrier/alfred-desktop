@@ -376,6 +376,78 @@ pub fn run_save_user_preferences(prefs: serde_json::Value) -> Result<serde_json:
     Ok(json!({ "ok": true }))
 }
 
+/// Watchlist Curation v2 (D2/D3/D4) — resume command for the mid-run
+/// confirmation modal. The frontend calls this when the user confirms the
+/// watchlist checklist. It:
+///   1. resolves any user-added tickers carrying an ISIN via `/api/resolve`
+///      (parity with `resolve_watchlist_items`),
+///   2. persists the confirmed set as `watchlist_by_account[account]` and the
+///      free-text directive as `watchlist_feedback_by_account[account]`
+///      (deep-merged so sibling accounts survive),
+///   3. signals the worker's watchlist gate with the confirmed item list so the
+///      run proceeds with exactly what the user kept.
+///
+/// `confirmed_items` is the final checklist (kept candidates the user left
+/// checked). `added_tickers` is a list of `{ticker, nom?, isin?}` objects the
+/// user typed in. They are merged + deduped by upper-cased ticker, kept first.
+pub fn run_watchlist_confirm(
+    run_id: String,
+    account: String,
+    confirmed_items: serde_json::Value,
+    added_tickers: serde_json::Value,
+    feedback: Option<String>,
+) -> Result<serde_json::Value> {
+    let run_id = run_id.trim().to_string();
+    if run_id.is_empty() {
+        return Err(anyhow::anyhow!("watchlist_confirm_run_id_required"));
+    }
+
+    let confirmed = confirmed_items.as_array().cloned().unwrap_or_default();
+    let added = added_tickers.as_array().cloned().unwrap_or_default();
+
+    // Resolve added items (ISIN-keyed; a no-op for bare-ticker entries — the
+    // collection pipeline routes those by ticker as usual).
+    let resolved_added = crate::native_collection::resolve_watchlist_items(added);
+
+    // Merge confirmed + added, dedupe by upper-cased ticker (kept first so a
+    // user re-adding a kept ticker doesn't duplicate it).
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut merged: Vec<serde_json::Value> = Vec::new();
+    for item in confirmed.into_iter().chain(resolved_added.into_iter()) {
+        let ticker = item
+            .get("ticker")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_uppercase();
+        if ticker.is_empty() || !seen.insert(ticker) {
+            continue;
+        }
+        merged.push(item);
+    }
+
+    // Persist the confirmed list + feedback (deep-merged by account).
+    let mut prefs = json!({
+        "watchlist_by_account": { account.clone(): merged.clone() }
+    });
+    if let Some(fb) = feedback.as_ref() {
+        if let Some(obj) = prefs.as_object_mut() {
+            obj.insert(
+                "watchlist_feedback_by_account".to_string(),
+                json!({ account.clone(): fb }),
+            );
+        }
+    }
+    runtime_settings::save_user_preferences(&prefs)?;
+
+    // Signal the gate so the worker proceeds with the confirmed set.
+    let waited = crate::analysis_ops::submit_watchlist_confirmation(
+        &run_id,
+        json!({ "items": merged, "account": account }),
+    );
+    Ok(json!({ "ok": true, "gate_signalled": waited, "count": merged.len() }))
+}
+
 // ── Stale Reanalysis Alerts (Phase 1b) ──
 
 pub fn run_get_stale_positions() -> Result<serde_json::Value> {
@@ -468,18 +540,42 @@ pub enum SignalKind {
     /// Active hold: CONSERVER / MAINTIEN / HOLD — analyst confirmed the
     /// position; thesis is validated by appreciation, invalidated by drop.
     Hold,
-    /// Watch-only: SURVEILLANCE / MONITORING / WATCH — analyst did NOT take
-    /// a position. Never counts toward accuracy; deep drops earn a regret
-    /// flag but not an "incorrect" mark.
+    /// Watch-only: SURVEILLANCE / MONITORING / WATCH / SURVEILLER — analyst
+    /// did NOT take a position. Never counts toward accuracy; deep drops earn
+    /// a regret flag but not an "incorrect" mark.
     Watch,
+    /// Watchlist Curation v2 (D1): ECARTER — the LLM proposal was VALIDATED
+    /// as a non-opportunity and rejected. Like Watch it represents "no
+    /// position taken", but it is an explicit *rejection* of a proposed entry,
+    /// not an ongoing observation. Never scored; never surfaced as an action.
+    Discard,
     /// Unknown / unmapped (or empty).
     Other,
 }
 
+/// Maps an LLM signal string to a coarse semantic kind.
+///
+/// Watchlist Curation v2 (D1): the watchlist verdict vocabulary
+/// (`ENTRER | ACHAT_SUR_REPLI | SURVEILLER | ECARTER`) is folded into the same
+/// kinds so every consumer (scorecard, actions enrichment, synthesis tallies)
+/// reads one mapping. Entry verdicts are Buy-tier; SURVEILLER is Watch; ECARTER
+/// is the dedicated Discard kind (never Sell — there is no held position to
+/// sell). The order matters: ECARTER is checked before the generic SELL match
+/// would ever apply (it shares no substring anyway, but the explicit branch
+/// documents intent).
 pub fn classify_signal(raw: &str) -> SignalKind {
     let upper = raw.trim().to_uppercase();
     if upper.is_empty() {
         return SignalKind::Other;
+    }
+    // Watchlist entry verdicts → Buy-tier. ACHAT_SUR_REPLI already matches the
+    // generic ACHAT branch below; ENTRER needs its own branch.
+    if upper == "ENTRER" {
+        return SignalKind::Buy;
+    }
+    // Watchlist rejection — dedicated kind, never Sell.
+    if upper == "ECARTER" {
+        return SignalKind::Discard;
     }
     if upper.contains("ACHAT") || upper.contains("RENFORC") || upper == "BUY" {
         return SignalKind::Buy;
@@ -494,7 +590,7 @@ pub fn classify_signal(raw: &str) -> SignalKind {
     if upper.contains("CONSERV") || upper.contains("MAINTIEN") || upper == "HOLD" {
         return SignalKind::Hold;
     }
-    if upper.contains("SURVEILLANCE")
+    if upper.contains("SURVEILL")
         || upper.contains("MONITOR")
         || upper == "WATCH"
     {
@@ -648,6 +744,10 @@ pub fn run_get_signal_scorecard(ticker: String) -> Result<serde_json::Value> {
                     }
                     "neutral"
                 }
+                // Watchlist Curation v2: a rejected proposal took no position,
+                // so it never scores — like an un-acted Watch but without the
+                // missed-drop regret flag (we did not propose holding it).
+                SignalKind::Discard => "neutral",
                 SignalKind::Other => "neutral",
             }
         };
@@ -668,6 +768,7 @@ pub fn run_get_signal_scorecard(ticker: String) -> Result<serde_json::Value> {
             SignalKind::Sell => "sell",
             SignalKind::Hold => "hold",
             SignalKind::Watch => "watch",
+            SignalKind::Discard => "discard",
             SignalKind::Other => "other",
         };
 

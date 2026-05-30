@@ -120,7 +120,11 @@ fn signal_priority(signal: &str) -> u8 {
 
 /// Enrich LLM-generated actions_immediates with any actionable line recommendations
 /// that the LLM missed. Sorts by conviction (forte first) then signal priority.
-fn enrich_actions_from_recommendations(
+///
+/// `pub(crate)` so the type-guard regression test in `tests.rs` can exercise the
+/// `type == "watchlist"` exclusion directly (the load-bearing exclusion at the
+/// `continue` below), without driving the whole compose pipeline.
+pub(crate) fn enrich_actions_from_recommendations(
     llm_actions: &[serde_json::Value],
     recommendations: &[serde_json::Value],
 ) -> Vec<serde_json::Value> {

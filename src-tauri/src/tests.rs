@@ -4327,6 +4327,55 @@ use crate::storage::read_json_file;
         std::env::remove_var("ALFRED_STATE_DIR");
     }
 
+    #[test]
+    fn watchlist_achat_sur_repli_does_not_leak_to_actions_immediates() {
+        // Watchlist Curation v2 (D1) load-bearing exclusion (report.rs:138):
+        // a recommendation with type == "watchlist" must NEVER be auto-injected
+        // into actions_immediates — even when its signal substring-matches an
+        // ACTIONABLE_SIGNAL. ACHAT_SUR_REPLI contains "ACHAT", which would
+        // otherwise pass the `ACTIONABLE_SIGNALS.iter().any(|s| signal.contains(s))`
+        // check; the `rec_type == "watchlist"` guard is the only thing keeping a
+        // validated *opportunity* (no held position to act on) out of the
+        // immediate-actions list.
+        let recommendations = vec![
+            // Watchlist opportunity — must be excluded despite the ACHAT substring.
+            json!({
+                "ticker": "NVDA",
+                "type": "watchlist",
+                "signal": "ACHAT_SUR_REPLI",
+                "conviction": "forte",
+                "action_recommandee": "Entrer sur repli"
+            }),
+            // A genuine held-position buy — must still be injected (control).
+            json!({
+                "ticker": "MC",
+                "type": "position",
+                "signal": "ACHAT",
+                "conviction": "forte"
+            }),
+        ];
+
+        let actions =
+            crate::report::enrich_actions_from_recommendations(&[], &recommendations);
+
+        let tickers: std::collections::HashSet<String> = actions
+            .iter()
+            .filter_map(|a| a.get("ticker").and_then(|v| v.as_str()))
+            .map(|t| t.to_uppercase())
+            .collect();
+
+        assert!(
+            !tickers.contains("NVDA"),
+            "watchlist ACHAT_SUR_REPLI leaked into actions_immediates: {:?}",
+            actions
+        );
+        assert!(
+            tickers.contains("MC"),
+            "held-position ACHAT must still be auto-injected (control): {:?}",
+            actions
+        );
+    }
+
     // ── P0-2: run_narrator timeout, threshold, degrade status event ──────
     //
     // These tests pin the bug-fix contract for v0.3.2:

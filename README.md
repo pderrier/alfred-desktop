@@ -20,6 +20,16 @@
 > 2. **System Settings → Privacy & Security → Open Anyway** — after a blocked launch attempt, a button appears at the bottom of the Privacy & Security pane.
 > 3. **Terminal (power users):** `xattr -cr "/Applications/Alfred Desktop.app"` — strips the quarantine attribute entirely; no dialog needed after that.
 
+## ⚠️ Important — please read before downloading
+
+Alfred is a **free, personal application provided "as is"**, with no warranty of any kind. By downloading and using it, you acknowledge the following (you will also be asked to confirm these points inside the app on first launch):
+
+- **Alfred is only a connection tool.** It links your personal accounts to the AI model *you* choose to connect. Any analysis, recommendation, or investment advice comes **exclusively from that third-party AI model — not from Alfred or its author.** You remain the sole judge of the relevance and validity of this information, and you waive any claim against this application or its author in the event of capital loss or any other damage.
+- **Relying on an AI for financial decisions carries specific risks.** An AI can produce inaccurate, incomplete, or misleading information. Investment advice is normally the domain of licensed professionals. Alfred is **not** a financial advisor, broker, or regulated service. Use it as a decision-support aid in full awareness of these risks, and assume full responsibility for your own decisions.
+- **Your financial data is sent to the AI provider.** When you connect an AI provider (e.g. OpenAI / ChatGPT), your personal financial data — positions, amounts, and portfolio composition — is transmitted to that third party to be analyzed, and becomes subject to *their* terms of use and privacy policy, over which Alfred has no control. See [third-party data sharing](#important-note-about-third-party-data-sharing) below for details.
+
+**This is not investment advice. Nothing produced by Alfred constitutes financial, legal, or tax advice.**
+
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md) for the full version history.

@@ -115,13 +115,29 @@ export function openWatchlistConfirmModal(payload = {}) {
     });
 
     // ── Confirm / Cancel / close ──
-    overlay.querySelector(".wl-confirm-btn")?.addEventListener("click", async () => {
+    const confirmBtn = overlay.querySelector(".wl-confirm-btn");
+    confirmBtn?.addEventListener("click", async () => {
       const checklist = collectChecklist(overlay);
       const added = parseAddedTickers(overlay.querySelector(".wl-add-input")?.value || "");
       const fb = String(overlay.querySelector(".wl-feedback-input")?.value || "").trim();
       const submitted = buildConfirmPayload({ runId, account, checklist, added, feedback: fb });
-      await callWatchlistConfirm(submitted);
-      finish({ confirmed: true });
+
+      // Disable the button while the RPC is in flight so a double-click can't
+      // fire two confirms.
+      clearConfirmError(overlay);
+      if (confirmBtn) confirmBtn.disabled = true;
+      const ok = await callWatchlistConfirm(submitted);
+      if (ok) {
+        // Gate signalled + curated list persisted backend-side: safe to close.
+        finish({ confirmed: true });
+        return;
+      }
+      // BLOCK-1 (feedback_failure_visibility): the invoke FAILED (run already
+      // timed out, IPC error, or Tauri unavailable). Surface a truthful inline
+      // error and keep the modal open so the user can retry or dismiss — never
+      // close as if the curation had been saved.
+      if (confirmBtn) confirmBtn.disabled = false;
+      showConfirmError(overlay);
     });
     overlay.querySelector(".wl-cancel-btn")?.addEventListener("click", () => finish({ confirmed: false, reason: "cancel" }));
     overlay.querySelector(".wl-close-btn")?.addEventListener("click", () => finish({ confirmed: false, reason: "cancel" }));
@@ -166,10 +182,11 @@ function buildModalHtml({ account, candidates, feedback }) {
             style="width:100%;padding:0.4rem 0.5rem;background:rgba(10,17,24,0.6);border:1px solid rgba(73,100,126,0.4);border-radius:4px;color:var(--sea-text);font-size:0.82rem;resize:vertical">${escapeHtml(feedback)}</textarea>
         </label>
       </div>
+      <p class="wl-confirm-error hidden" role="alert" style="margin:0;padding:0.55rem 1.2rem 0;font-size:0.78rem;color:var(--sea-danger,#ff6b6b)"></p>
       <div style="display:flex;gap:0.5rem;padding:0.8rem 1.2rem;border-top:1px solid rgba(73,100,126,0.3);align-items:center;justify-content:space-between">
         <span style="font-size:0.75rem;color:var(--sea-muted,#8a9bb0)">Sans action : analyse auto dans <strong class="wl-countdown">45s</strong></span>
         <span style="display:flex;gap:0.5rem">
-          <button class="wl-cancel-btn cmd-btn ghost-btn">Ignorer</button>
+          <button class="wl-cancel-btn cmd-btn ghost-btn">Passer</button>
           <button class="wl-confirm-btn cmd-btn">Confirmer</button>
         </span>
       </div>
@@ -264,6 +281,15 @@ function buildConfirmPayload({ runId, account, checklist, added, feedback }) {
   };
 }
 
+/**
+ * Signal the backend gate + persist the curated list via `watchlist_confirm_local`.
+ * Returns `true` only when the invoke RESOLVED (the backend has accepted the
+ * curated list and released the gate). Returns `false` on any failure —
+ * missing Tauri bridge, IPC error, or a backend error (e.g. the run already
+ * timed out). The caller MUST NOT treat `false` as a successful confirm
+ * (feedback_failure_visibility): a failed confirm means the curation was NOT
+ * recorded, so we surface that to the user rather than closing silently.
+ */
 async function callWatchlistConfirm(args) {
   const inv = tauriInvoke();
   if (!inv) return false;
@@ -275,10 +301,32 @@ async function callWatchlistConfirm(args) {
   }
 }
 
+const CONFIRM_ERROR_MESSAGE =
+  "Échec de la confirmation — tes modifications n’ont pas été enregistrées.";
+
+/** Show the inline failure message inside the modal footer (BLOCK-1). */
+function showConfirmError(overlay) {
+  const node = overlay?.querySelector(".wl-confirm-error");
+  if (!node) return;
+  node.textContent = CONFIRM_ERROR_MESSAGE;
+  node.classList.remove("hidden");
+}
+
+/** Clear any previously-shown inline failure message before a retry. */
+function clearConfirmError(overlay) {
+  const node = overlay?.querySelector(".wl-confirm-error");
+  if (!node) return;
+  node.textContent = "";
+  node.classList.add("hidden");
+}
+
 export const __test = {
   buildModalHtml,
   renderCandidateRow,
   collectChecklist,
   parseAddedTickers,
   buildConfirmPayload,
+  showConfirmError,
+  clearConfirmError,
+  CONFIRM_ERROR_MESSAGE,
 };

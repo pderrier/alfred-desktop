@@ -17,12 +17,16 @@ import {
   updateTickerCollectionStatus,
   resetTickerCollectionStatus
 } from "/desktop-shell/ticker-collection-status.js";
+import { initWatchlistConfirmModal } from "/desktop-shell/app-watchlist-confirm-modal.js";
 
 export function initEvents(deps) {
   const {
     bridge,
     getActiveRunId,
   } = deps;
+
+  // Watchlist Curation v2 (D2): mid-run confirmation modal listener.
+  initWatchlistConfirmModal({ getActiveRunId });
 
   // ── Real-time line progress via Tauri events (no polling delay) ──
   if (window?.__TAURI__?.event?.listen) {

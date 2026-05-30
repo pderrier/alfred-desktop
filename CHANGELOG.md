@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.4.9
+
+**Mandatory upgrade.** Smarter watchlist opportunities and a first-launch consent screen.
+
+### What's new
+
+- **Watchlist opportunities are now validated, not just listed.** Alfred's suggested opportunities (securities you don't hold) used to be analysed with the same wording as your real positions — producing odd "hold / trim" advice on things you don't own and biasing the summary. Each suggestion is now treated as a proposal to *confirm or reject*, with a dedicated verdict: enter now, buy on a dip, keep watching, or discard. A weak idea is explicitly set aside instead of being dressed up as a position.
+- **You choose which opportunities to analyse.** While your real holdings are being analysed, a confirmation window lets you tick the watchlist names you actually want Alfred to dig into, and add your own tickers. Your selection is kept for next time, so the list stops being regenerated from scratch on every run — Alfred only tops it up when you have fewer than five.
+- **Tell Alfred what kind of opportunities you want, per account.** A free-text feedback field per account steers future suggestions — for example, "this is an ETF/fund account, no individual stock picks." No more single-stock proposals on portfolios that are clearly fund-based.
+- **First-launch consent screen.** A one-time legal/liability consent gate is shown on first launch.
+
+### Compatibility
+
+- **Mandatory.** Earlier versions show the update screen on next launch.
+- Privacy and authentication unchanged from v0.4.0.
+
 ## v0.4.8
 
 **Mandatory upgrade.** Fixes the free-tier quota message and removes a delay in the live analysis narration.

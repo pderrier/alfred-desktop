@@ -59,6 +59,7 @@ import { initAlfredOverlay } from "/desktop-shell/app-alfred-overlay.js";
 import { registerDefaultTriggers } from "/desktop-shell/app-alfred-triggers.js";
 import { startIdleTimer } from "/desktop-shell/app-alfred-idle.js";
 import { installUpgradeFlow } from "/desktop-shell/upgrade-view.js";
+import { enforceLegalConsentGate } from "/desktop-shell/app-legal-consent.js";
 import {
   initShellLayout,
   renderSidebar,
@@ -3130,6 +3131,11 @@ document.getElementById("home-btn")?.addEventListener("click", () => {
 wizard.close();
 setLineMemoryModalVisible(false);
 void refreshRuntimeSettings().catch(() => {});
+// First-launch legal/liability consent gate. Blocks the startup session check
+// (and thus all UI reveal — the consent overlay sits at z-index 10001 above the
+// splash) until the user has acknowledged the terms. On refuse, the gate closes
+// the app and runStartupSessionCheck never runs.
+void enforceLegalConsentGate().then(() => {
 bootstrap.runStartupSessionCheck().then(async () => {
   await refreshAccountStatus();
   updateAuthPills();
@@ -3161,5 +3167,9 @@ bootstrap.runStartupSessionCheck().then(async () => {
   }
   alfredOverlay.notify("app-ready", {});
 }).catch((err) => {
+  bootstrap.showStartupError("Startup failed", String(err?.message || err));
+});
+}).catch((err) => {
+  // A consent-gate failure must surface, not silently strand the splash.
   bootstrap.showStartupError("Startup failed", String(err?.message || err));
 });

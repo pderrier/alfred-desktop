@@ -38,11 +38,29 @@ export function mergeEvents(snapshotEvents = [], uiEvents = []) {
   return merged.slice(0, 50);
 }
 
-export function recommendationActionClass(signal) {
-  const normalized = String(signal || "").toUpperCase();
-  if (normalized.includes("ACHAT")) return "positive";
-  if (normalized.includes("VENTE")) return "negative";
-  return "neutral";
+/**
+ * Single source of truth mapping a recommendation signal/verdict string to a
+ * CSS tone class. Used by every signal-display site (action cards, the
+ * positions/recommendations table badge, the live-run badge) so the tone
+ * mapping cannot drift between them.
+ *
+ * Watchlist Curation v2 (D1): the watchlist verdict vocabulary
+ * (ENTRER | ACHAT_SUR_REPLI | SURVEILLER | ECARTER) maps to dedicated tones:
+ *   - ENTRER / ACHAT_SUR_REPLI → "tone-entry"  (validated opportunity)
+ *   - ECARTER                  → "tone-discard" (rejected proposal)
+ *   - SURVEILLER               → "tone-neutral"
+ * These exact-match checks run BEFORE the held-position substring checks so
+ * ACHAT_SUR_REPLI is not swallowed by the generic "ACHAT" → tone-buy rule and
+ * ECARTER never falls through to a buy/sell tone.
+ */
+export function signalToneClass(signal) {
+  const s = String(signal || "").toUpperCase();
+  if (s === "ECARTER") return "tone-discard";
+  if (s === "ENTRER" || s === "ACHAT_SUR_REPLI") return "tone-entry";
+  if (s === "SURVEILLER") return "tone-neutral";
+  if (s.includes("ACHAT") || s.includes("ACHETER") || s.includes("RENFORC") || s.includes("BUY")) return "tone-buy";
+  if (s.includes("VENTE") || s.includes("VENDR") || s.includes("ALLEG") || s.includes("SELL")) return "tone-sell";
+  return "tone-neutral";
 }
 
 export function renderRecommendationDetail(rec) {

@@ -18,6 +18,104 @@ use serde_json::{json, Value};
 pub(crate) const TARGET_WEIGHT_PCT_SCHEMA_LINE: &str =
     "target_weight_pct: float 0-100 ou null (taille cible de cette ligne dans le portefeuille apres execution de tes recos). Mets null si signal=CONSERVER ou SURVEILLANCE. Plafond : 30 % par ligne sauf justification explicite dans synthese.";
 
+// ── Watchlist line verdict vocabulary (Watchlist Curation v2 — D1) ──────────
+//
+// A watchlist line is NOT a held position: it is an LLM *proposal* of an
+// opportunity that is not necessarily valid. The line analysis must VALIDATE
+// or REJECT that proposal — it does not pretend the ticker is held (no PRU/PV,
+// no "renforcer/alléger"). The verdict vocabulary below is the single source
+// of truth shared by ALL line-prompt builders (codex / native / native-oauth /
+// repair) so the three LLM modes render identically — see
+// `docs/llm-mode-parity-contract.md` and the parity test
+// `watchlist_verdict_schema_parity_across_line_builders`.
+//
+//   * ENTRER          — proposition validée, entrée immédiate justifiée.
+//   * ACHAT_SUR_REPLI — intérêt confirmé mais entrée conditionnée à un repli.
+//   * SURVEILLER      — pas encore le moment, garder sous observation.
+//   * ECARTER         — proposition invalidée : ne PAS entrer.
+
+/// The `signal` enum line injected into a watchlist line prompt schema.
+pub(crate) const WATCHLIST_SIGNAL_ENUM: &str =
+    "ENTRER|ACHAT_SUR_REPLI|SURVEILLER|ECARTER";
+
+/// The `verdict_validation` enum line injected into a watchlist line prompt
+/// schema. Maps 1:1 to the signal: ENTRER/ACHAT_SUR_REPLI => "valide",
+/// SURVEILLER => "a_surveiller", ECARTER => "ecartee".
+pub(crate) const WATCHLIST_VERDICT_VALIDATION_ENUM: &str =
+    "valide|a_surveiller|ecartee";
+
+/// Reframing intro for a watchlist line — replaces the held-position framing.
+/// Single source so all builders open the watchlist task identically.
+pub(crate) const WATCHLIST_FRAMING_INTRO: &str =
+    "Tu VALIDES une proposition d'opportunite NON DETENUE. Elle n'est pas forcement \
+pertinente — confirme l'interet d'une ENTREE (ENTRER / ACHAT_SUR_REPLI), garde-la \
+en observation (SURVEILLER), ou ECARTE-la si la these ne tient pas (ECARTER). \
+Ne raisonne PAS comme sur une ligne detenue : pas de PRU, pas de plus-value, \
+pas de \"renforcer/alleger\".";
+
+/// The `action_recommandee` rule line for a watchlist verdict. For an entry
+/// verdict it is an entry plan; for ECARTER it is an explicit non-entry reason.
+pub(crate) const WATCHLIST_ACTION_RULE_LINE: &str =
+    "action_recommandee: pour ENTRER/ACHAT_SUR_REPLI => plan d'ENTREE chiffre (prix d'entree cible, taille initiale en titres ou en €). Pour SURVEILLER => niveau/condition a surveiller. Pour ECARTER => \"ne pas entrer\" + raison concrete.";
+
+/// Per-line schema fragments that differ between a held position and a
+/// watchlist proposal. Computed once from `is_watchlist` and threaded into
+/// every line-prompt builder so the watchlist verdict frame renders
+/// identically across codex / native / native-oauth / repair.
+///
+/// `held` mirrors the legacy held-position schema verbatim — extending the
+/// frame here must never change what a held line sees (parity guard).
+pub(crate) struct LineSchemaFrame {
+    /// The `signal` enum string for the schema (no key, value list only).
+    pub signal_enum: &'static str,
+    /// The schema line for `verdict_validation` including the leading comma +
+    /// newline + indentation, or `""` for held positions. Inserted directly
+    /// after the `signal` line in the JSON schema block.
+    pub verdict_validation_schema_line: &'static str,
+    /// The `action_recommandee` rule sentence used in the "Regles" list.
+    pub action_rule_line: &'static str,
+    /// A leading paragraph injected at the top of the task framing (watchlist
+    /// reframing), or `""` for held positions.
+    pub framing_intro: &'static str,
+    /// The "insufficient data" fallback rule. Held lines fall back to
+    /// SURVEILLANCE; watchlist proposals fall back to SURVEILLER (or ECARTER
+    /// when the thesis itself is unsupported).
+    pub insufficient_data_rule: &'static str,
+    /// Extra coherence rule pinning the signal<->verdict_validation mapping.
+    /// `""` for held positions.
+    pub verdict_coherence_rule: &'static str,
+}
+
+impl LineSchemaFrame {
+    pub(crate) fn for_line(is_watchlist: bool) -> Self {
+        if is_watchlist {
+            LineSchemaFrame {
+                signal_enum: WATCHLIST_SIGNAL_ENUM,
+                verdict_validation_schema_line:
+                    ",\n    \"verdict_validation\": \"valide|a_surveiller|ecartee\"",
+                action_rule_line: WATCHLIST_ACTION_RULE_LINE,
+                framing_intro: WATCHLIST_FRAMING_INTRO,
+                insufficient_data_rule:
+                    "Si donnees insuffisantes pour confirmer l'opportunite: signal = SURVEILLER (ou ECARTER si la these ne tient pas), avec explication.",
+                verdict_coherence_rule:
+                    "verdict_validation DOIT etre coherent avec signal: ENTRER/ACHAT_SUR_REPLI => \"valide\", SURVEILLER => \"a_surveiller\", ECARTER => \"ecartee\". ECARTER invalide la proposition (ne pas entrer).",
+            }
+        } else {
+            LineSchemaFrame {
+                signal_enum:
+                    "ACHAT_FORT|ACHAT|RENFORCEMENT|CONSERVER|ALLEGEMENT|VENTE|SURVEILLANCE",
+                verdict_validation_schema_line: "",
+                action_rule_line:
+                    "action_recommandee: TOUJOURS chiffree (nb titres, montant €, prix si pertinent)",
+                framing_intro: "",
+                insufficient_data_rule:
+                    "Si donnees insuffisantes: signal = SURVEILLANCE avec explication",
+                verdict_coherence_rule: "",
+            }
+        }
+    }
+}
+
 /// P0-81 — single source of truth for how the cash balance is described to the
 /// LLM, across every prompt builder (parity contract). The three states must be
 /// rendered distinctly:
@@ -132,15 +230,24 @@ pub(crate) fn build_report_prompt(run_state: &Value) -> String {
         .unwrap_or_else(|| json!([]));
 
     let recs_arr = recommendations.as_array().cloned().unwrap_or_default();
-    let nb_achat = recs_arr.iter().filter(|r| {
+    // Watchlist Curation v2 (D1): the buy/hold/sell tallies summarise PORTFOLIO
+    // moves on held lines. Watchlist proposals use a different verdict
+    // vocabulary (ENTRER | ACHAT_SUR_REPLI | SURVEILLER | ECARTER) and are
+    // opportunities, not portfolio moves — so they must NOT inflate these
+    // counts. A watchlist `ACHAT_SUR_REPLI` would otherwise substring-match
+    // "ACHAT" and be miscounted as a portfolio buy.
+    fn is_held_rec(r: &&Value) -> bool {
+        r.get("type").and_then(|v| v.as_str()).unwrap_or("position") != "watchlist"
+    }
+    let nb_achat = recs_arr.iter().filter(is_held_rec).filter(|r| {
         let s = as_text_upper(r.get("signal"));
         s.contains("ACHAT") || s.contains("RENFORC")
     }).count();
-    let nb_vente = recs_arr.iter().filter(|r| {
+    let nb_vente = recs_arr.iter().filter(is_held_rec).filter(|r| {
         let s = as_text_upper(r.get("signal"));
         s.contains("VENTE") || s.contains("ALLEG")
     }).count();
-    let nb_conserver = recs_arr.iter().filter(|r| {
+    let nb_conserver = recs_arr.iter().filter(is_held_rec).filter(|r| {
         let s = as_text_upper(r.get("signal"));
         s.contains("CONSERVER") || s.contains("SURVEILLANCE")
     }).count();
@@ -321,11 +428,21 @@ pub(crate) fn build_line_analysis_prompt(
 
     let mcp_suffix = mcp_validation_suffix(run_state);
 
+    // Watchlist Curation v2 (D1): swap the verdict vocabulary + schema for
+    // watchlist proposals. Single source via `LineSchemaFrame` so codex /
+    // native / native-oauth / repair stay byte-identical for the same line.
+    let frame = LineSchemaFrame::for_line(is_watchlist);
+    let watchlist_framing = if frame.framing_intro.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}\n", frame.framing_intro)
+    };
+
     format!(
         r#"Tu es un analyste financier qui s'adresse a un investisseur particulier non-expert. Sois factuel, concret et base sur les donnees fournies.
 
 MEMOIRE LIGNE = accountability de nos analyses precedentes (signaux et theses Alfred). TECHNIQUE = etat marche actuel calcule sur ~250 jours OHLC (independant des runs). Les deux se completent : la memoire dit ce qu'on a annonce, la technique dit ce que dit le marche.
-
+{watchlist_framing}
 VALEUR ANALYSEE: {nom} ({ticker})
 {section_position}
 {section_market}
@@ -354,7 +471,7 @@ Produis ton analyse en JSON UNIQUEMENT avec cette structure exacte:
     "line_id": "{line_type}:{ticker_lower}",
     "ticker": "{ticker}",
     "type": "{line_type}",
-    "signal": "ACHAT_FORT|ACHAT|RENFORCEMENT|CONSERVER|ALLEGEMENT|VENTE|SURVEILLANCE",
+    "signal": "{signal_enum}"{verdict_validation_schema_line},
     "conviction": "forte|moderee|faible",
     "target_weight_pct": null,
     "synthese": "4-6 phrases: actualite cle, indicateurs determinants, plan court et moyen terme",
@@ -365,7 +482,7 @@ Produis ton analyse en JSON UNIQUEMENT avec cette structure exacte:
     "risques": ["risque concret 1", "risque concret 2"],
     "catalyseurs": ["catalyseur 1", "catalyseur 2"],
     "badges_keywords": ["mot-cle-1", "mot-cle-2", "mot-cle-3"],
-    "action_recommandee": "instruction CHIFFREE: nb titres, montant €, prix entree/sortie",
+    "action_recommandee": "instruction CHIFFREE (voir regle action_recommandee ci-dessous)",
     "reanalyse_after": "YYYY-MM-DD",
     "reanalyse_reason": "prochain catalyseur",
     "deep_news_summary": "synthese 100-500 chars des actualites les plus impactantes pour cet investissement",
@@ -378,7 +495,7 @@ Produis ton analyse en JSON UNIQUEMENT avec cette structure exacte:
 
 Regles strictes:
 - synthese: minimum 150 caracteres, explique comme a un ami
-- action_recommandee: TOUJOURS chiffree (nb titres, montant €, prix si pertinent)
+- {action_rule_line}
 - {target_weight_rule_line}
 - badges_keywords: 3-8 mots courts, specifiques, orientes decision (pas de signal/conviction/secteur seul)
   - au moins 1 badge "fait d'actualite" (ex: "restructuration en cours")
@@ -407,7 +524,7 @@ DEEP NEWS — process:
 
 - Si donnees marche incompletes, donne plus de poids aux actualites et evenements
 - Si tu changes de signal par rapport au precedent (memoire), explique pourquoi
-- Si donnees insuffisantes: signal = SURVEILLANCE avec explication{calibration_instruction}
+- {insufficient_data_rule}{verdict_coherence_rule_line}{calibration_instruction}
 {mcp_suffix}
 Reponds uniquement en JSON valide."#,
         nom = as_text(line_context.get("row").and_then(|r| r.get("nom")).or(Some(&json!(ticker)))),
@@ -434,6 +551,16 @@ Reponds uniquement en JSON valide."#,
         mcp_suffix = mcp_suffix,
         calibration_instruction = calibration_instruction,
         target_weight_rule_line = TARGET_WEIGHT_PCT_SCHEMA_LINE,
+        watchlist_framing = watchlist_framing,
+        signal_enum = frame.signal_enum,
+        verdict_validation_schema_line = frame.verdict_validation_schema_line,
+        action_rule_line = frame.action_rule_line,
+        insufficient_data_rule = frame.insufficient_data_rule,
+        verdict_coherence_rule_line = if frame.verdict_coherence_rule.is_empty() {
+            String::new()
+        } else {
+            format!("\n- {}", frame.verdict_coherence_rule)
+        },
     )
 }
 
@@ -1116,8 +1243,13 @@ pub(crate) fn build_repair_prompt(
     let portfolio = run_state.get("portfolio").cloned().unwrap_or_else(|| json!({}));
     let guidelines = agent_guidelines.unwrap_or_default();
     let ticker = line_context.get("ticker").and_then(|v| v.as_str()).unwrap_or("UNKNOWN");
+    let is_watchlist = line_context
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("position")
+        == "watchlist";
 
-    let section_position = build_position_section(line_context.get("row"), false);
+    let section_position = build_position_section(line_context.get("row"), is_watchlist);
     let section_market = build_market_section_no_web(line_context.get("market"));
     let section_news = build_news_section(line_context.get("news"));
     let section_memory = build_memory_section(line_context.get("line_memory"));
@@ -1152,6 +1284,19 @@ pub(crate) fn build_repair_prompt(
         format!("\nDIRECTIVES INVESTISSEUR:\n{guidelines}\n")
     };
 
+    // Watchlist Curation v2 (D1): a watchlist repair must keep the entry-verdict
+    // vocabulary — never let the held-position framing leak back in on a fix
+    // pass. Single source via `LineSchemaFrame`.
+    let frame = LineSchemaFrame::for_line(is_watchlist);
+    let watchlist_repair_rules = if is_watchlist {
+        format!(
+            "\n- signal DOIT rester dans {} (proposition NON detenue : pas de PRU/PV, pas de renforcer/alleger).\n- {}\n- {}",
+            frame.signal_enum, frame.verdict_coherence_rule, frame.action_rule_line
+        )
+    } else {
+        String::new()
+    };
+
     format!(
         r#"Repare cette recommandation pour {ticker}.
 
@@ -1180,12 +1325,13 @@ Regles:
 - Corrige les champs identifies comme defaillants
 - Garde les champs corrects de la recommandation precedente
 - Utilise les donnees fournies (pas de recherche web)
-- {target_weight_rule_line}{calibration_instruction}
+- {target_weight_rule_line}{watchlist_repair_rules}{calibration_instruction}
 
 JSON valide uniquement, cle "recommendation"."#,
         ticker = ticker,
         issues = issues,
         target_weight_rule_line = TARGET_WEIGHT_PCT_SCHEMA_LINE,
+        watchlist_repair_rules = watchlist_repair_rules,
         section_position = section_position,
         section_market = section_market,
         section_news = section_news,

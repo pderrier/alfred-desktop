@@ -340,6 +340,26 @@ pub(crate) fn build_native_line_prompt(_run_id: &str, ticker: &str, nom: &str, l
         "\nConsidere la section CALIBRATION CONVICTION ci-dessus quand tu fixes ta conviction (tu ne peux pas etre \"forte\" si ta tier \"forte\" est durablement <50 %)."
     };
 
+    // Watchlist Curation v2 (D1): swap the verdict vocabulary + schema for
+    // watchlist proposals. Same `LineSchemaFrame` single source as the codex
+    // and repair builders — parity contract.
+    let frame = crate::llm_prompts::LineSchemaFrame::for_line(line_type == "watchlist");
+    let watchlist_framing = if frame.framing_intro.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}\n", frame.framing_intro)
+    };
+    // The native schema is a bullet list, not a JSON block, so the
+    // verdict_validation field is rendered as its own bullet (or omitted).
+    let verdict_validation_bullet = if line_type == "watchlist" {
+        format!(
+            "\n- verdict_validation: {} (coherent avec signal: ENTRER/ACHAT_SUR_REPLI=>valide, SURVEILLER=>a_surveiller, ECARTER=>ecartee)",
+            crate::llm_prompts::WATCHLIST_VERDICT_VALIDATION_ENUM
+        )
+    } else {
+        String::new()
+    };
+
     // Build activity section (recent transactions/orders for this ticker)
     let activity_section = {
         let items = line_data.get("activity").and_then(|v| v.as_array());
@@ -390,7 +410,7 @@ pub(crate) fn build_native_line_prompt(_run_id: &str, ticker: &str, nom: &str, l
         r#"Tu es Alfred, un conseiller financier bienveillant. Analyse cette ligne.
 
 MEMOIRE LIGNE = accountability de nos analyses precedentes (signaux et theses Alfred). TECHNIQUE = etat marche actuel calcule sur ~250 jours OHLC (independant des runs). Les deux se completent : la memoire dit ce qu'on a annonce, la technique dit ce que dit le marche.
-
+{watchlist_framing}
 Ligne: {line_type}:{ticker} ({nom})
 
 === DONNEES ===
@@ -423,7 +443,7 @@ Qualite des donnees:
 Reponds UNIQUEMENT avec un objet JSON (pas de texte avant ou apres) contenant :
 - line_id: "{line_type}:{ticker}"
 - ticker: "{ticker}", type: "{line_type}", nom: "{nom}"
-- signal: ACHAT_FORT | ACHAT | RENFORCEMENT | CONSERVER | ALLEGEMENT | VENTE | SURVEILLANCE
+- signal: {signal_enum}{verdict_validation_bullet}
 - conviction: faible | moderee | forte
 - {target_weight_rule_line}
 - synthese: minimum 150 caracteres (explique comme a un ami)
@@ -431,7 +451,7 @@ Reponds UNIQUEMENT avec un objet JSON (pas de texte avant ou apres) contenant :
 - analyse_technique, analyse_fondamentale, analyse_sentiment
 - raisons_principales: 3-5 raisons (array)
 - risques, catalyseurs, badges_keywords: arrays
-- action_recommandee: instruction CHIFFREE (nb titres, montant EUR, prix). Pour watchlist: prix d'entree ideal + montant suggere.
+- {action_rule_line}
 - deep_news_summary: synthese 100-500 chars des actualites cles (OBLIGATOIRE si news disponibles)
 - deep_news_memory_summary: MEMOIRE EVOLUTIVE 140-700 chars (OBLIGATOIRE) qui fusionne memoire precedente + nouveaux insights; conserve le fil narratif multi-run, elimine les repetitions, et explicite ce qui change vs ce qui reste valide
 - deep_news_quality_score: 0-100
@@ -457,6 +477,10 @@ Les articles "RESUME APPROFONDI (cache)" sont deja resumes — utilise-les direc
         section_technical = section_technical,
         quality = quality,
         target_weight_rule_line = crate::llm_prompts::TARGET_WEIGHT_PCT_SCHEMA_LINE,
+        watchlist_framing = watchlist_framing,
+        signal_enum = frame.signal_enum,
+        verdict_validation_bullet = verdict_validation_bullet,
+        action_rule_line = frame.action_rule_line,
     )
 }
 

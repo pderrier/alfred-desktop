@@ -269,6 +269,10 @@ function normalizeRecommendation(rec, index, latestRun) {
   const name = asText(rec?.nom || rec?.name);
   const signal = asText(rec?.signal, "N/A");
   const conviction = asText(rec?.conviction, "N/A");
+  // Watchlist Curation v2 (D1): verdict_validation lives inside the
+  // recommendation object (valide | a_surveiller | ecartee). Only watchlist
+  // proposals carry it; held positions leave it empty.
+  const verdictValidation = asText(rec?.verdict_validation);
   const summary = asText(rec?.summary || rec?.synthese || rec?.analyse, "No summary.");
   const action = asText(rec?.action_recommandee || rec?.action || rec?.decision, "N/A");
   const type = asText(rec?.type, "position");
@@ -299,6 +303,7 @@ function normalizeRecommendation(rec, index, latestRun) {
     name,
     signal,
     conviction,
+    verdictValidation,
     summary,
     action,
     type,
@@ -335,6 +340,7 @@ function buildCollectedOnlyRecommendation(row, index, latestRun) {
     name: asText(row?.nom || row?.name),
     signal: "COLLECTED",
     conviction: asText(row?.analysis_status || "pending"),
+    verdictValidation: "",
     summary: "Collected data is available for this line, but no LLM recommendation was persisted.",
     action: "Inspect collected data",
     type,

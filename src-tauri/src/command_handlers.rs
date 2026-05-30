@@ -468,18 +468,42 @@ pub enum SignalKind {
     /// Active hold: CONSERVER / MAINTIEN / HOLD — analyst confirmed the
     /// position; thesis is validated by appreciation, invalidated by drop.
     Hold,
-    /// Watch-only: SURVEILLANCE / MONITORING / WATCH — analyst did NOT take
-    /// a position. Never counts toward accuracy; deep drops earn a regret
-    /// flag but not an "incorrect" mark.
+    /// Watch-only: SURVEILLANCE / MONITORING / WATCH / SURVEILLER — analyst
+    /// did NOT take a position. Never counts toward accuracy; deep drops earn
+    /// a regret flag but not an "incorrect" mark.
     Watch,
+    /// Watchlist Curation v2 (D1): ECARTER — the LLM proposal was VALIDATED
+    /// as a non-opportunity and rejected. Like Watch it represents "no
+    /// position taken", but it is an explicit *rejection* of a proposed entry,
+    /// not an ongoing observation. Never scored; never surfaced as an action.
+    Discard,
     /// Unknown / unmapped (or empty).
     Other,
 }
 
+/// Maps an LLM signal string to a coarse semantic kind.
+///
+/// Watchlist Curation v2 (D1): the watchlist verdict vocabulary
+/// (`ENTRER | ACHAT_SUR_REPLI | SURVEILLER | ECARTER`) is folded into the same
+/// kinds so every consumer (scorecard, actions enrichment, synthesis tallies)
+/// reads one mapping. Entry verdicts are Buy-tier; SURVEILLER is Watch; ECARTER
+/// is the dedicated Discard kind (never Sell — there is no held position to
+/// sell). The order matters: ECARTER is checked before the generic SELL match
+/// would ever apply (it shares no substring anyway, but the explicit branch
+/// documents intent).
 pub fn classify_signal(raw: &str) -> SignalKind {
     let upper = raw.trim().to_uppercase();
     if upper.is_empty() {
         return SignalKind::Other;
+    }
+    // Watchlist entry verdicts → Buy-tier. ACHAT_SUR_REPLI already matches the
+    // generic ACHAT branch below; ENTRER needs its own branch.
+    if upper == "ENTRER" {
+        return SignalKind::Buy;
+    }
+    // Watchlist rejection — dedicated kind, never Sell.
+    if upper == "ECARTER" {
+        return SignalKind::Discard;
     }
     if upper.contains("ACHAT") || upper.contains("RENFORC") || upper == "BUY" {
         return SignalKind::Buy;
@@ -494,7 +518,7 @@ pub fn classify_signal(raw: &str) -> SignalKind {
     if upper.contains("CONSERV") || upper.contains("MAINTIEN") || upper == "HOLD" {
         return SignalKind::Hold;
     }
-    if upper.contains("SURVEILLANCE")
+    if upper.contains("SURVEILL")
         || upper.contains("MONITOR")
         || upper == "WATCH"
     {
@@ -648,6 +672,10 @@ pub fn run_get_signal_scorecard(ticker: String) -> Result<serde_json::Value> {
                     }
                     "neutral"
                 }
+                // Watchlist Curation v2: a rejected proposal took no position,
+                // so it never scores — like an un-acted Watch but without the
+                // missed-drop regret flag (we did not propose holding it).
+                SignalKind::Discard => "neutral",
                 SignalKind::Other => "neutral",
             }
         };
@@ -668,6 +696,7 @@ pub fn run_get_signal_scorecard(ticker: String) -> Result<serde_json::Value> {
             SignalKind::Sell => "sell",
             SignalKind::Hold => "hold",
             SignalKind::Watch => "watch",
+            SignalKind::Discard => "discard",
             SignalKind::Other => "other",
         };
 

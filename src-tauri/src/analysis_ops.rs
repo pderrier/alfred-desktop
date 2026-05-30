@@ -109,6 +109,22 @@ fn is_cancelled(flag: &AtomicBool) -> bool {
     flag.load(Ordering::Relaxed)
 }
 
+/// Test seam: register a cancel flag for an operation the same way
+/// `start_analysis` does, then trip it — so tests can exercise the
+/// cancellation-aware paths (e.g. the watchlist gate) without spinning up a
+/// real worker thread. Mirrors `register_cancel_flag` + `request_cancellation`'s
+/// flag-store write, minus the side effects (codex kill, run-state patch).
+#[cfg(test)]
+pub fn test_register_and_trip_cancel_flag(operation_id: &str) {
+    let flag = register_cancel_flag(operation_id);
+    flag.store(true, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub fn test_clear_cancel_flag(operation_id: &str) {
+    unregister_cancel_flag(operation_id);
+}
+
 // ── Global cancel check (callable from worker threads by operation_id) ───
 
 /// Check if any running operation has been cancelled. Used by dispatch workers.

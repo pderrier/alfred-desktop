@@ -1765,6 +1765,148 @@ mod tests {
         assert!(s.contains("laterale"), "sideways trend → 'laterale':\n{s}");
     }
 
+    // ── Watchlist Curation v2 (D1): dedicated entry-verdict frame ──────
+
+    fn watchlist_line_context() -> Value {
+        json!({
+            "ticker": "ASML",
+            "row": {"nom": "ASML Holding", "ticker": "ASML"},
+            "type": "watchlist",
+            "market": {"price": 620.0, "pe_ratio": 30.0},
+            "news": {"items": []},
+            "line_memory": {},
+        })
+    }
+
+    #[test]
+    fn watchlist_line_prompt_uses_entry_verdict_vocabulary() {
+        let run_state = run_state_with_cash(5000.0, true);
+        let ctx = watchlist_line_context();
+        let prompt = build_line_analysis_prompt(&ctx, &run_state, None, None);
+
+        // New verdict enum present, held vocabulary absent from the signal line.
+        assert!(prompt.contains("ENTRER|ACHAT_SUR_REPLI|SURVEILLER|ECARTER"),
+            "watchlist signal enum missing:\n{prompt}");
+        assert!(prompt.contains("\"verdict_validation\": \"valide|a_surveiller|ecartee\""),
+            "verdict_validation schema field missing:\n{prompt}");
+        // Reframing intro present.
+        assert!(prompt.contains("VALIDES une proposition"),
+            "watchlist validation framing missing:\n{prompt}");
+        // Held-position framing dropped: no PRU/PV, no held signal enum.
+        assert!(!prompt.contains("ACHAT_FORT|ACHAT|RENFORCEMENT|CONSERVER|ALLEGEMENT|VENTE|SURVEILLANCE"),
+            "held signal enum must NOT appear on a watchlist line:\n{prompt}");
+        assert!(prompt.contains("NON DETENU"),
+            "watchlist position section must say NON DETENU:\n{prompt}");
+        assert!(!prompt.contains("Prix de revient"),
+            "watchlist line must not render a PRU:\n{prompt}");
+    }
+
+    #[test]
+    fn held_line_prompt_keeps_legacy_vocabulary_unchanged() {
+        // The held-position frame must be byte-stable — no verdict_validation,
+        // no watchlist framing leaking into a normal position.
+        let run_state = run_state_with_cash(5000.0, true);
+        let ctx = line_context_minimal();
+        let prompt = build_line_analysis_prompt(&ctx, &run_state, None, None);
+        assert!(prompt.contains("ACHAT_FORT|ACHAT|RENFORCEMENT|CONSERVER|ALLEGEMENT|VENTE|SURVEILLANCE"),
+            "held signal enum must remain on a position line:\n{prompt}");
+        assert!(!prompt.contains("verdict_validation"),
+            "held line must NOT carry verdict_validation:\n{prompt}");
+        assert!(!prompt.contains("VALIDES une proposition"),
+            "held line must NOT carry watchlist framing:\n{prompt}");
+        assert!(!prompt.contains("ENTRER|ACHAT_SUR_REPLI"),
+            "held line must NOT carry the watchlist enum:\n{prompt}");
+    }
+
+    #[test]
+    fn watchlist_verdict_schema_parity_across_line_builders() {
+        // BINDING parity contract: the watchlist verdict frame must render
+        // identically across codex (build_line_analysis_prompt), native
+        // (build_native_line_prompt), and repair (build_repair_prompt). We
+        // assert the verdict enum + the validation field appear in all three.
+        let run_state = run_state_with_cash(5000.0, true);
+        let ctx = watchlist_line_context();
+
+        let codex = build_line_analysis_prompt(&ctx, &run_state, None, None);
+        let validation = json!({
+            "validation_issues": ["synthese_too_short"],
+            "recommendation_to_fix": {"ticker": "ASML", "signal": "SURVEILLER", "type": "watchlist"}
+        });
+        let repair = build_repair_prompt(&ctx, &run_state, None, &validation, None);
+
+        let native_line_data = json!({
+            "position": ctx["row"],
+            "market_data": ctx["market"],
+            "news": ctx["news"],
+            "shared_insights": Value::Null,
+            "line_memory": {},
+            "quality": {},
+            "technical_snapshot": Value::Null,
+        });
+        let native = crate::native_mcp_analysis::build_native_line_prompt(
+            "test-run", "ASML", "ASML Holding", "watchlist", &native_line_data,
+        );
+
+        for (name, p) in [("codex", &codex), ("native", &native), ("repair", &repair)] {
+            assert!(p.contains("ENTRER") && p.contains("ACHAT_SUR_REPLI")
+                && p.contains("SURVEILLER") && p.contains("ECARTER"),
+                "{name} watchlist prompt missing the verdict vocabulary:\n{p}");
+            assert!(p.contains("valide") && p.contains("a_surveiller") && p.contains("ecartee"),
+                "{name} watchlist prompt missing verdict_validation values:\n{p}");
+        }
+        // None of the three may carry the held enum on a watchlist line.
+        for (name, p) in [("codex", &codex), ("native", &native), ("repair", &repair)] {
+            assert!(!p.contains("ACHAT_FORT|ACHAT|RENFORCEMENT|CONSERVER|ALLEGEMENT|VENTE|SURVEILLANCE"),
+                "{name} watchlist prompt must not carry the held enum:\n{p}");
+        }
+    }
+
+    #[test]
+    fn watchlist_topup_prompt_requests_gap_and_excludes_kept() {
+        // D3: build_watchlist_prompt asks for exactly `topup_count` tickers and
+        // lists the kept tickers as "do not re-propose". D4: feedback injected.
+        let positions = vec![json!({"ticker": "MC", "nom": "LVMH", "isin": "FR0000121014"})];
+        let portfolio = json!({"valeur_totale": 100000.0, "liquidites": 5000.0, "liquidites_known": true});
+        let kept = vec!["ASML".to_string(), "SAP".to_string()];
+        let prompt = build_watchlist_prompt(&WatchlistPromptArgs {
+            positions: &positions,
+            portfolio: &portfolio,
+            guidelines: "",
+            account: "PEA",
+            topup_count: 3,
+            kept_tickers: &kept,
+            account_feedback: "ce compte est ETF/fonds, pas de stock-picking",
+        });
+        assert!(prompt.contains("Suggere exactement 3 ticker"),
+            "top-up count must be the gap (3):\n{prompt}");
+        assert!(prompt.contains("DEJA EN WATCHLIST (ne PAS reproposer): ASML, SAP"),
+            "kept tickers must be listed as excluded:\n{prompt}");
+        assert!(prompt.contains("DIRECTIVES WATCHLIST (compte): ce compte est ETF/fonds"),
+            "account feedback must be injected:\n{prompt}");
+        assert!(prompt.contains("ETF/fonds"),
+            "feedback must bias toward ETF/fonds:\n{prompt}");
+    }
+
+    #[test]
+    fn watchlist_prompt_without_feedback_or_kept_is_clean() {
+        let positions = vec![json!({"ticker": "MC", "nom": "LVMH"})];
+        let portfolio = json!({"valeur_totale": 100000.0, "liquidites_known": false});
+        let prompt = build_watchlist_prompt(&WatchlistPromptArgs {
+            positions: &positions,
+            portfolio: &portfolio,
+            guidelines: "",
+            account: "PEA",
+            topup_count: 5,
+            kept_tickers: &[],
+            account_feedback: "",
+        });
+        assert!(prompt.contains("Suggere exactement 5 ticker"));
+        assert!(!prompt.contains("DEJA EN WATCHLIST"),
+            "no kept section when kept is empty:\n{prompt}");
+        assert!(!prompt.contains("DIRECTIVES WATCHLIST (compte)"),
+            "no feedback section when feedback is empty:\n{prompt}");
+    }
+
     #[test]
     fn technical_snapshot_serde_roundtrip() {
         use crate::models::TechnicalSnapshot;

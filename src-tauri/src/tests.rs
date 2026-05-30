@@ -4281,6 +4281,52 @@ use crate::storage::read_json_file;
         std::env::remove_var("ALFRED_STATE_DIR");
     }
 
+    #[test]
+    fn verdict_validation_survives_run_state_recommendation_roundtrip() {
+        // Watchlist Curation v2 (D1): verdict_validation lives INSIDE each
+        // recommendation object in pending_recommandations — not a top-level
+        // collection key — so the persist whitelist is unaffected. This pins
+        // that a watchlist recommendation carrying verdict_validation
+        // round-trips through run_state persistence untouched.
+        let _guard = env_lock();
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let runtime_dir = tmpdir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_dir).expect("mkdir runtime-state");
+        std::env::set_var("ALFRED_STATE_DIR", runtime_dir.as_os_str());
+        crate::run_state_cache::reset_cache();
+
+        let run_id = "test_verdict_validation_roundtrip";
+        std::fs::write(
+            runtime_dir.join(format!("{run_id}.json")),
+            json!({
+                "pending_recommandations": [{
+                    "line_id": "watchlist:asml",
+                    "ticker": "ASML",
+                    "type": "watchlist",
+                    "signal": "ECARTER",
+                    "verdict_validation": "ecartee",
+                    "conviction": "faible"
+                }]
+            }).to_string(),
+        ).expect("seed run state");
+
+        let loaded = crate::run_state_cache::load(tmpdir.path(), run_id)
+            .expect("read back run state");
+        let rec = loaded
+            .get("pending_recommandations")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .expect("recommendation present");
+        assert_eq!(
+            rec.get("verdict_validation").and_then(|v| v.as_str()),
+            Some("ecartee"),
+            "verdict_validation must survive run_state round-trip"
+        );
+        assert_eq!(rec.get("signal").and_then(|v| v.as_str()), Some("ECARTER"));
+
+        std::env::remove_var("ALFRED_STATE_DIR");
+    }
+
     // ── P0-2: run_narrator timeout, threshold, degrade status event ──────
     //
     // These tests pin the bug-fix contract for v0.3.2:
@@ -6014,6 +6060,22 @@ use crate::storage::read_json_file;
     }
 
     #[test]
+    fn classify_signal_maps_watchlist_verdict_vocabulary() {
+        // Watchlist Curation v2 (D1): ENTRER / ACHAT_SUR_REPLI are Buy-tier,
+        // SURVEILLER is Watch, ECARTER is the dedicated Discard kind (never
+        // Sell — there is no held position to sell).
+        use crate::command_handlers::{classify_signal_for_test, SignalKind};
+        assert!(matches!(classify_signal_for_test("ENTRER"), SignalKind::Buy));
+        assert!(matches!(classify_signal_for_test("entrer"), SignalKind::Buy));
+        assert!(matches!(classify_signal_for_test("ACHAT_SUR_REPLI"), SignalKind::Buy));
+        assert!(matches!(classify_signal_for_test("SURVEILLER"), SignalKind::Watch));
+        assert!(matches!(classify_signal_for_test("ECARTER"), SignalKind::Discard));
+        assert!(matches!(classify_signal_for_test("ecarter"), SignalKind::Discard));
+        // ECARTER must NOT be misclassified as Sell.
+        assert!(!matches!(classify_signal_for_test("ECARTER"), SignalKind::Sell));
+    }
+
+    #[test]
     fn scorecard_old_recent_signals_can_still_be_marked_incorrect() {
         // Guard against the pending logic over-triggering: a signal older than
         // SCOREABLE_AGE_DAYS must score normally, even if the drift is small.
@@ -7008,6 +7070,227 @@ use crate::storage::read_json_file;
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ── Watchlist Curation v2 (D2/D3/D4) ────────────────────────────
+
+    #[test]
+    fn watchlist_feedback_deep_merges_by_account() {
+        // D4: saving feedback for one account must not wipe another's, exactly
+        // like guidelines_by_account.
+        let _guard = env_lock();
+        let base = isolate_user_prefs_dir();
+
+        crate::runtime_settings::save_user_preferences(&json!({
+            "watchlist_feedback_by_account": { "PEA": "ETF only" }
+        }))
+        .expect("seed PEA feedback");
+        crate::runtime_settings::save_user_preferences(&json!({
+            "watchlist_feedback_by_account": { "CTO": "US growth" }
+        }))
+        .expect("add CTO feedback");
+
+        let read_back = crate::runtime_settings::get_user_preferences();
+        let fb = read_back.get("watchlist_feedback_by_account").expect("feedback map");
+        assert_eq!(fb.get("PEA").and_then(|v| v.as_str()), Some("ETF only"),
+            "PEA feedback must survive a CTO save");
+        assert_eq!(fb.get("CTO").and_then(|v| v.as_str()), Some("US growth"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn watchlist_by_account_round_trips_and_deep_merges() {
+        // D3: the confirmed curated list round-trips and per-account saves
+        // don't clobber siblings.
+        let _guard = env_lock();
+        let base = isolate_user_prefs_dir();
+
+        crate::runtime_settings::save_user_preferences(&json!({
+            "watchlist_by_account": { "PEA": [{"ticker": "ASML"}, {"ticker": "SAP"}] }
+        }))
+        .expect("seed PEA watchlist");
+        crate::runtime_settings::save_user_preferences(&json!({
+            "watchlist_by_account": { "CTO": [{"ticker": "AAPL"}] }
+        }))
+        .expect("add CTO watchlist");
+
+        let read_back = crate::runtime_settings::get_user_preferences();
+        let wl = read_back.get("watchlist_by_account").expect("watchlist map");
+        let pea = wl.get("PEA").and_then(|v| v.as_array()).expect("PEA list");
+        assert_eq!(pea.len(), 2, "PEA list must survive a CTO save");
+        assert_eq!(pea[0].get("ticker").and_then(|v| v.as_str()), Some("ASML"));
+        assert_eq!(
+            wl.get("CTO").and_then(|v| v.as_array()).map(|a| a.len()),
+            Some(1),
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn watchlist_per_account_null_deletes_one_account_only() {
+        // Setting an inner account value to null deletes just that account's
+        // entry, leaving siblings intact.
+        let _guard = env_lock();
+        let base = isolate_user_prefs_dir();
+
+        crate::runtime_settings::save_user_preferences(&json!({
+            "watchlist_by_account": { "PEA": [{"ticker": "ASML"}], "CTO": [{"ticker": "AAPL"}] }
+        }))
+        .expect("seed two accounts");
+        crate::runtime_settings::save_user_preferences(&json!({
+            "watchlist_by_account": { "CTO": null }
+        }))
+        .expect("delete CTO");
+
+        let read_back = crate::runtime_settings::get_user_preferences();
+        let wl = read_back.get("watchlist_by_account").expect("watchlist map");
+        assert!(wl.get("PEA").is_some(), "PEA must survive CTO deletion");
+        assert!(wl.get("CTO").is_none(), "CTO must be deleted by inner null");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn plan_watchlist_topup_requests_gap_to_target() {
+        use crate::native_collection::{plan_watchlist_topup, WATCHLIST_TARGET_SIZE};
+        let kept = vec![json!({"ticker": "ASML"}), json!({"ticker": "SAP"})];
+        let held = vec!["MC".to_string(), "AIR".to_string()];
+        let plan = plan_watchlist_topup(&kept, &held, WATCHLIST_TARGET_SIZE);
+        assert_eq!(plan.kept.len(), 2);
+        assert_eq!(plan.topup_count, 3, "gap to 5 is 3");
+        // Excludes held + kept tickers.
+        for t in ["MC", "AIR", "ASML", "SAP"] {
+            assert!(plan.excluded_tickers.iter().any(|e| e == t),
+                "{t} must be excluded; got {:?}", plan.excluded_tickers);
+        }
+    }
+
+    #[test]
+    fn plan_watchlist_topup_skips_llm_when_kept_meets_target() {
+        use crate::native_collection::{plan_watchlist_topup, WATCHLIST_TARGET_SIZE};
+        let kept: Vec<_> = ["A", "B", "C", "D", "E"].iter().map(|t| json!({"ticker": t})).collect();
+        let plan = plan_watchlist_topup(&kept, &[], WATCHLIST_TARGET_SIZE);
+        assert_eq!(plan.topup_count, 0, "kept>=target => no LLM top-up");
+        assert_eq!(plan.kept.len(), 5);
+    }
+
+    #[test]
+    fn plan_watchlist_topup_drops_kept_now_held_and_dedupes() {
+        use crate::native_collection::{plan_watchlist_topup, WATCHLIST_TARGET_SIZE};
+        // ASML is now held; the duplicate SAP entry collapses.
+        let kept = vec![
+            json!({"ticker": "ASML"}),
+            json!({"ticker": "SAP"}),
+            json!({"ticker": "sap"}),
+        ];
+        let held = vec!["ASML".to_string()];
+        let plan = plan_watchlist_topup(&kept, &held, WATCHLIST_TARGET_SIZE);
+        assert_eq!(plan.kept.len(), 1, "ASML dropped (now held), SAP deduped");
+        assert_eq!(plan.kept[0].get("ticker").and_then(|v| v.as_str()), Some("SAP"));
+        assert_eq!(plan.topup_count, 4);
+    }
+
+    #[test]
+    fn watchlist_gate_returns_submitted_value_before_timeout() {
+        use crate::analysis_ops::{
+            submit_watchlist_confirmation, wait_for_watchlist_confirmation, WatchlistGateOutcome,
+        };
+        let run_id = format!("wl-gate-confirm-{}", now_epoch_ms());
+        let rid = run_id.clone();
+        let waiter = std::thread::spawn(move || {
+            wait_for_watchlist_confirmation(&rid, std::time::Duration::from_secs(5))
+        });
+        // Give the waiter a moment to register the gate, then submit.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let signalled = submit_watchlist_confirmation(&run_id, json!({"items": [{"ticker": "MC"}]}));
+        assert!(signalled, "submit must find the waiting gate");
+        let outcome = waiter.join().expect("waiter joins");
+        match outcome {
+            WatchlistGateOutcome::Confirmed(v) => {
+                assert_eq!(
+                    v.get("items").and_then(|i| i.as_array()).map(|a| a.len()),
+                    Some(1),
+                );
+            }
+            other => panic!("expected Confirmed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn watchlist_gate_times_out_when_no_submission() {
+        use crate::analysis_ops::{wait_for_watchlist_confirmation, WatchlistGateOutcome};
+        let run_id = format!("wl-gate-timeout-{}", now_epoch_ms());
+        let outcome =
+            wait_for_watchlist_confirmation(&run_id, std::time::Duration::from_millis(300));
+        assert!(
+            matches!(outcome, WatchlistGateOutcome::TimedOut),
+            "expected TimedOut, got {outcome:?}",
+        );
+    }
+
+    #[test]
+    fn watchlist_gate_submit_returns_false_when_no_gate_registered() {
+        use crate::analysis_ops::submit_watchlist_confirmation;
+        let run_id = format!("wl-gate-absent-{}", now_epoch_ms());
+        assert!(
+            !submit_watchlist_confirmation(&run_id, json!({})),
+            "submitting to an unregistered run must return false",
+        );
+    }
+
+    #[test]
+    fn watchlist_gate_aborts_when_run_cancelled() {
+        // ESC/stop must abort the wait promptly via the cancel registry, not
+        // after the full timeout. We register a running operation bound to the
+        // run (so is_any_operation_cancelled_for_run can resolve op -> run) and
+        // trip its cancel flag the same way start_analysis + cancellation do.
+        let _guard = env_lock();
+        let run_id = format!("wl-gate-cancel-run-{}", now_epoch_ms());
+        let operation_id = format!("wl-gate-cancel-op-{}", now_epoch_ms());
+        {
+            let mut store = analysis_ops_store().lock().expect("ops lock");
+            store.insert(
+                operation_id.clone(),
+                AnalysisOperationRecord {
+                    operation_id: operation_id.clone(),
+                    status: "running".to_string(),
+                    stage: "analyzing".to_string(),
+                    run_id: Some(run_id.clone()),
+                    started_at_ms: now_epoch_ms(),
+                    finished_at_ms: None,
+                    result: None,
+                    error_code: None,
+                    error_message: None,
+                    collection_progress: None,
+                    line_progress: None,
+                    line_status: None,
+                },
+            );
+        }
+
+        let rid = run_id.clone();
+        let waiter = std::thread::spawn(move || {
+            crate::analysis_ops::wait_for_watchlist_confirmation(
+                &rid,
+                std::time::Duration::from_secs(10),
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        crate::analysis_ops::test_register_and_trip_cancel_flag(&operation_id);
+        let outcome = waiter.join().expect("waiter joins");
+
+        // Cleanup.
+        crate::analysis_ops::test_clear_cancel_flag(&operation_id);
+        if let Ok(mut store) = analysis_ops_store().lock() {
+            store.remove(&operation_id);
+        }
+
+        assert!(
+            matches!(outcome, crate::analysis_ops::WatchlistGateOutcome::Cancelled),
+            "expected Cancelled, got {outcome:?}",
+        );
     }
 
     // ── P0-53 / P0-54: CSV ticker reconciliation + ISIN validation ──────

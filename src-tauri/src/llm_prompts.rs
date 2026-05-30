@@ -1160,7 +1160,34 @@ pub(crate) fn build_conviction_calibration_section(
 // inject TECHNIQUE; watchlist is a 5th builder operating at a different
 // level and is exempt.
 
-pub(crate) fn build_watchlist_prompt(positions: &[Value], portfolio: &Value, guidelines: &str, account: &str) -> String {
+/// Inputs to the watchlist generation prompt. Watchlist Curation v2 (D3/D4)
+/// turns the generator into a *top-up*: the persisted/kept list is preserved,
+/// the LLM is only asked for `topup_count` additional tickers, and it must
+/// exclude both held tickers and already-kept watchlist tickers.
+pub(crate) struct WatchlistPromptArgs<'a> {
+    pub positions: &'a [Value],
+    pub portfolio: &'a Value,
+    pub guidelines: &'a str,
+    pub account: &'a str,
+    /// How many NEW tickers the LLM should propose (the gap to ~5).
+    pub topup_count: usize,
+    /// Tickers already kept on the watchlist that must NOT be re-proposed.
+    pub kept_tickers: &'a [String],
+    /// Free-text per-account directive (D4), e.g. "ce compte est ETF/fonds".
+    pub account_feedback: &'a str,
+}
+
+pub(crate) fn build_watchlist_prompt(args: &WatchlistPromptArgs) -> String {
+    let WatchlistPromptArgs {
+        positions,
+        portfolio,
+        guidelines,
+        account,
+        topup_count,
+        kept_tickers,
+        account_feedback,
+    } = *args;
+
     let position_tickers: Vec<String> = positions
         .iter()
         .map(|p| {
@@ -1171,12 +1198,33 @@ pub(crate) fn build_watchlist_prompt(positions: &[Value], portfolio: &Value, gui
         })
         .collect();
     let total_value = portfolio.get("valeur_totale").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let cash_display = render_cash_for_prompt(&portfolio);
+    let cash_display = render_cash_for_prompt(portfolio);
 
     let guidelines_section = if guidelines.is_empty() {
         String::new()
     } else {
         format!("\nDIRECTIVES INVESTISSEUR:\n{guidelines}\n")
+    };
+
+    // D4 — free-text per-account directive. When the user says the account is
+    // ETF/fund-oriented, bias the suggestions toward ETFs/funds.
+    let feedback_section = if account_feedback.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nDIRECTIVES WATCHLIST (compte): {}\n(Respecte ces directives en priorite : si elles impliquent une preference ETF/fonds, propose des ETF/fonds et evite le stock-picking d'actions individuelles.)\n",
+            account_feedback.trim()
+        )
+    };
+
+    // D3 — exclude already-kept watchlist tickers in addition to held ones.
+    let kept_section = if kept_tickers.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nDEJA EN WATCHLIST (ne PAS reproposer): {}\n",
+            kept_tickers.join(", ")
+        )
     };
 
     let account_lower = account.to_lowercase();
@@ -1198,15 +1246,15 @@ pub(crate) fn build_watchlist_prompt(positions: &[Value], portfolio: &Value, gui
 
 COMPTE: {account}
 
-POSITIONS ACTUELLES:
+POSITIONS ACTUELLES (deja detenues — ne PAS les reproposer):
 {positions}
-
+{kept_section}{feedback_section}
 PORTEFEUILLE: {total_value:.0}€ total, liquidites: {cash_display}
 {guidelines_section}
-Suggere exactement 5 tickers complementaires (non detenus) en te basant sur:
+Suggere exactement {topup_count} ticker(s) complementaire(s) (non detenus, non deja en watchlist) en te basant sur:
 - Diversification sectorielle (quels secteurs sont sous-representes?)
 {universe_constraint}
-- Complementarite (pas de duplication avec les positions existantes)
+- Complementarite (pas de duplication avec les positions existantes ni la watchlist)
 - Qualite (entreprises etablies avec fondamentaux solides)
 
 Reponds en JSON strict:
@@ -1223,9 +1271,12 @@ Reponds en JSON strict:
 }}"#,
         account = account,
         positions = position_tickers.join("\n"),
+        kept_section = kept_section,
+        feedback_section = feedback_section,
         total_value = total_value,
         cash_display = cash_display,
         guidelines_section = guidelines_section,
+        topup_count = topup_count,
         universe_constraint = universe_constraint,
         ticker_example = ticker_example,
     )
@@ -2286,12 +2337,15 @@ mod tests {
         let validation = json!({ "validation_issues": ["x"], "recommendation_to_fix": {} });
         let repair = build_repair_prompt(&line_context, &run_state, None, &validation, None);
         let positions = vec![json!({"ticker": "MC", "nom": "LVMH", "isin": "FR0000121014"})];
-        let watchlist = build_watchlist_prompt(
-            &positions,
-            run_state.get("portfolio").unwrap(),
-            "",
-            "PEA",
-        );
+        let watchlist = build_watchlist_prompt(&WatchlistPromptArgs {
+            positions: &positions,
+            portfolio: run_state.get("portfolio").unwrap(),
+            guidelines: "",
+            account: "PEA",
+            topup_count: 5,
+            kept_tickers: &[],
+            account_feedback: "",
+        });
 
         for (name, prompt) in [
             ("report", &report),
@@ -2341,12 +2395,15 @@ mod tests {
         let validation = json!({ "validation_issues": ["x"], "recommendation_to_fix": {} });
         let repair = build_repair_prompt(&line_context, &run_state, None, &validation, None);
         let positions = vec![json!({"ticker": "MC", "nom": "LVMH", "isin": "FR0000121014"})];
-        let watchlist = build_watchlist_prompt(
-            &positions,
-            run_state.get("portfolio").unwrap(),
-            "",
-            "PEA",
-        );
+        let watchlist = build_watchlist_prompt(&WatchlistPromptArgs {
+            positions: &positions,
+            portfolio: run_state.get("portfolio").unwrap(),
+            guidelines: "",
+            account: "PEA",
+            topup_count: 5,
+            kept_tickers: &[],
+            account_feedback: "",
+        });
 
         for (name, prompt) in [
             ("report", &report),

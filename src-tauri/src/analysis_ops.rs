@@ -129,6 +129,140 @@ pub fn is_any_operation_cancelled_for_run(run_id: &str) -> bool {
     false
 }
 
+// ── Watchlist confirmation gate (Watchlist Curation v2 — D2) ─────────────
+//
+// A per-run "awaiting user input" gate, mirroring the cancel-flag registry but
+// carrying a payload + a Condvar so the worker can BLOCK at the natural pause
+// point (positions analysed, watchlist line analysis not yet started) and wait
+// up to ~45 s for the user's confirmed watchlist set.
+//
+//   * The worker calls `wait_for_watchlist_confirmation(run_id, timeout)` after
+//     emitting `watchlist_confirmation_needed`. It returns:
+//       - `WatchlistGateOutcome::Confirmed(value)` when the resume command
+//         signalled before the deadline,
+//       - `WatchlistGateOutcome::TimedOut` when the deadline elapsed,
+//       - `WatchlistGateOutcome::Cancelled` when the run was cancelled while
+//         waiting (ESC / stop).
+//   * The resume command calls `submit_watchlist_confirmation(run_id, value)`.
+//
+// This is the first mid-run pause primitive in the codebase — there was only a
+// cancel flag before. It is intentionally minimal: one slot per run, no
+// re-arming (a watchlist gate fires at most once per run).
+
+/// Default time the worker waits for the user's confirmed watchlist set before
+/// proceeding with the candidate list as-is. ~45 s per the D2 decision.
+pub const WATCHLIST_GATE_TIMEOUT_MS: u64 = 45_000;
+
+struct WatchlistGate {
+    /// `None` until the resume command submits the confirmed payload.
+    submitted: Mutex<Option<serde_json::Value>>,
+    condvar: std::sync::Condvar,
+}
+
+static WATCHLIST_GATES: OnceLock<Mutex<HashMap<String, Arc<WatchlistGate>>>> = OnceLock::new();
+
+fn watchlist_gate_registry() -> &'static Mutex<HashMap<String, Arc<WatchlistGate>>> {
+    WATCHLIST_GATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Outcome of a watchlist confirmation wait.
+#[derive(Debug)]
+pub enum WatchlistGateOutcome {
+    /// The user confirmed before the deadline — carries the submitted payload.
+    Confirmed(serde_json::Value),
+    /// The deadline elapsed with no submission.
+    TimedOut,
+    /// The run was cancelled (ESC / stop) while waiting.
+    Cancelled,
+}
+
+fn register_watchlist_gate(run_id: &str) -> Arc<WatchlistGate> {
+    let gate = Arc::new(WatchlistGate {
+        submitted: Mutex::new(None),
+        condvar: std::sync::Condvar::new(),
+    });
+    if let Ok(mut store) = watchlist_gate_registry().lock() {
+        store.insert(run_id.to_string(), Arc::clone(&gate));
+    }
+    gate
+}
+
+fn unregister_watchlist_gate(run_id: &str) {
+    if let Ok(mut store) = watchlist_gate_registry().lock() {
+        store.remove(run_id);
+    }
+}
+
+/// Block until the user submits a confirmed watchlist set for `run_id`, the
+/// `timeout` elapses, or the run is cancelled. Registers the gate on entry and
+/// always unregisters it on exit (so a late submission for a finished run is a
+/// no-op rather than a leak). Polls the cancel registry on a short cadence so
+/// ESC/stop aborts the wait promptly instead of after the full timeout.
+pub fn wait_for_watchlist_confirmation(
+    run_id: &str,
+    timeout: std::time::Duration,
+) -> WatchlistGateOutcome {
+    let gate = register_watchlist_gate(run_id);
+    let deadline = std::time::Instant::now() + timeout;
+    // Cancellation is checked on this cadence; the condvar wakes immediately on
+    // an actual submission, so the poll only bounds the cancel-detection delay.
+    let poll = std::time::Duration::from_millis(250);
+
+    let outcome = {
+        let mut guard = match gate.submitted.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                unregister_watchlist_gate(run_id);
+                return WatchlistGateOutcome::TimedOut;
+            }
+        };
+        loop {
+            if let Some(value) = guard.take() {
+                break WatchlistGateOutcome::Confirmed(value);
+            }
+            if is_any_operation_cancelled_for_run(run_id) {
+                break WatchlistGateOutcome::Cancelled;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break WatchlistGateOutcome::TimedOut;
+            }
+            let wait_for = poll.min(deadline - now);
+            let (g, _timeout_result) = match gate.condvar.wait_timeout(guard, wait_for) {
+                Ok(pair) => pair,
+                Err(_) => break WatchlistGateOutcome::TimedOut,
+            };
+            guard = g;
+        }
+    };
+    unregister_watchlist_gate(run_id);
+    outcome
+}
+
+/// Submit the user's confirmed watchlist payload for `run_id`, waking the
+/// worker blocked in `wait_for_watchlist_confirmation`. Returns `true` when a
+/// gate was waiting, `false` when none was registered (timed out already, or
+/// no watchlist phase for this run).
+pub fn submit_watchlist_confirmation(run_id: &str, payload: serde_json::Value) -> bool {
+    let gate = {
+        let store = match watchlist_gate_registry().lock() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        store.get(run_id).map(Arc::clone)
+    };
+    match gate {
+        Some(gate) => {
+            if let Ok(mut guard) = gate.submitted.lock() {
+                *guard = Some(payload);
+            }
+            gate.condvar.notify_all();
+            true
+        }
+        None => false,
+    }
+}
+
 #[derive(Clone)]
 pub struct AnalysisOperationRecord {
     pub operation_id: String,

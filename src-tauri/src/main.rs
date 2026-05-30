@@ -373,6 +373,28 @@ async fn save_user_preferences_local(
 }
 
 #[tauri::command]
+async fn watchlist_confirm_local(
+    run_id: String,
+    account: String,
+    confirmed_items: serde_json::Value,
+    added_tickers: serde_json::Value,
+    feedback: Option<String>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        command_handlers::run_watchlist_confirm(
+            run_id,
+            account,
+            confirmed_items,
+            added_tickers,
+            feedback,
+        )
+    })
+    .await
+    .map_err(|e| format!("watchlist_confirm_failed:join:{e}"))?
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn account_positions_local(account: String) -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(move || command_handlers::run_account_positions(account))
         .await
@@ -1171,6 +1193,7 @@ fn run_tauri_app() -> anyhow::Result<()> {
             account_positions_local,
             get_user_preferences_local,
             save_user_preferences_local,
+            watchlist_confirm_local,
             storage_usage_local,
             storage_prune_local,
             storage_clear_log_local,

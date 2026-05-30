@@ -629,15 +629,31 @@ fn generate_line_from_cache(line_context: &Value) -> Result<Value> {
 
 // ── Watchlist generation ─────────────────────────────────────────
 
-/// Generate watchlist suggestions via LLM based on current portfolio.
+/// Generate watchlist *top-up* suggestions via LLM based on the current
+/// portfolio. Watchlist Curation v2 (D3): the caller passes how many NEW
+/// tickers to request (`topup_count`) and the tickers already kept on the
+/// watchlist (`kept_tickers`) so the LLM never re-proposes them; (D4) plus the
+/// free-text per-account directive (`account_feedback`).
+#[allow(clippy::too_many_arguments)]
 pub fn generate_watchlist_suggestions(
     positions: &[Value],
     portfolio: &Value,
     guidelines: &str,
     account: &str,
+    topup_count: usize,
+    kept_tickers: &[String],
+    account_feedback: &str,
 ) -> Result<Vec<Value>> {
     let mode = resolve_generation_mode();
-    let prompt = build_watchlist_prompt(positions, portfolio, guidelines, account);
+    let prompt = build_watchlist_prompt(&crate::llm_prompts::WatchlistPromptArgs {
+        positions,
+        portfolio,
+        guidelines,
+        account,
+        topup_count,
+        kept_tickers,
+        account_feedback,
+    });
     let timeout_ms: u64 = env::var("CODEX_PROXY_TIMEOUT_MS")
         .ok()
         .and_then(|v| v.parse().ok())

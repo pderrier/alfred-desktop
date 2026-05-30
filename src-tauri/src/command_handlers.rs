@@ -376,6 +376,78 @@ pub fn run_save_user_preferences(prefs: serde_json::Value) -> Result<serde_json:
     Ok(json!({ "ok": true }))
 }
 
+/// Watchlist Curation v2 (D2/D3/D4) — resume command for the mid-run
+/// confirmation modal. The frontend calls this when the user confirms the
+/// watchlist checklist. It:
+///   1. resolves any user-added tickers carrying an ISIN via `/api/resolve`
+///      (parity with `resolve_watchlist_items`),
+///   2. persists the confirmed set as `watchlist_by_account[account]` and the
+///      free-text directive as `watchlist_feedback_by_account[account]`
+///      (deep-merged so sibling accounts survive),
+///   3. signals the worker's watchlist gate with the confirmed item list so the
+///      run proceeds with exactly what the user kept.
+///
+/// `confirmed_items` is the final checklist (kept candidates the user left
+/// checked). `added_tickers` is a list of `{ticker, nom?, isin?}` objects the
+/// user typed in. They are merged + deduped by upper-cased ticker, kept first.
+pub fn run_watchlist_confirm(
+    run_id: String,
+    account: String,
+    confirmed_items: serde_json::Value,
+    added_tickers: serde_json::Value,
+    feedback: Option<String>,
+) -> Result<serde_json::Value> {
+    let run_id = run_id.trim().to_string();
+    if run_id.is_empty() {
+        return Err(anyhow::anyhow!("watchlist_confirm_run_id_required"));
+    }
+
+    let confirmed = confirmed_items.as_array().cloned().unwrap_or_default();
+    let added = added_tickers.as_array().cloned().unwrap_or_default();
+
+    // Resolve added items (ISIN-keyed; a no-op for bare-ticker entries — the
+    // collection pipeline routes those by ticker as usual).
+    let resolved_added = crate::native_collection::resolve_watchlist_items(added);
+
+    // Merge confirmed + added, dedupe by upper-cased ticker (kept first so a
+    // user re-adding a kept ticker doesn't duplicate it).
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut merged: Vec<serde_json::Value> = Vec::new();
+    for item in confirmed.into_iter().chain(resolved_added.into_iter()) {
+        let ticker = item
+            .get("ticker")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_uppercase();
+        if ticker.is_empty() || !seen.insert(ticker) {
+            continue;
+        }
+        merged.push(item);
+    }
+
+    // Persist the confirmed list + feedback (deep-merged by account).
+    let mut prefs = json!({
+        "watchlist_by_account": { account.clone(): merged.clone() }
+    });
+    if let Some(fb) = feedback.as_ref() {
+        if let Some(obj) = prefs.as_object_mut() {
+            obj.insert(
+                "watchlist_feedback_by_account".to_string(),
+                json!({ account.clone(): fb }),
+            );
+        }
+    }
+    runtime_settings::save_user_preferences(&prefs)?;
+
+    // Signal the gate so the worker proceeds with the confirmed set.
+    let waited = crate::analysis_ops::submit_watchlist_confirmation(
+        &run_id,
+        json!({ "items": merged, "account": account }),
+    );
+    Ok(json!({ "ok": true, "gate_signalled": waited, "count": merged.len() }))
+}
+
 // ── Stale Reanalysis Alerts (Phase 1b) ──
 
 pub fn run_get_stale_positions() -> Result<serde_json::Value> {

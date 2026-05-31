@@ -149,6 +149,11 @@ fn apply_auth(req: ureq::Request, path: &str) -> ureq::Request {
 ///   - `/quota` or anything under `/quota/` (v0.4.7 P3-31 — read-only
 ///     home-strip quota probe, mounted at root alongside `/run/start`,
 ///     gated by `require_auth` only — see `handlers::quota_routes`)
+///   - `/device` or anything under `/device/` (MON-A — device identity
+///     bootstrap `POST /device/register`, mounted at root, gated by
+///     `require_auth` only — see `device::device_routes`)
+///   - `/redeem` (MON-B — comp-code redemption, mounted at root, gated by
+///     `require_auth` only — see `redeem::redeem_routes`)
 ///
 /// Anything else returns false — there is no fuzzy / partial /
 /// case-insensitive match because the server-side routes are
@@ -156,7 +161,8 @@ fn apply_auth(req: ureq::Request, path: &str) -> ureq::Request {
 ///
 /// Renamed from `is_admin_path` in v0.4.0 P0-15 (P3-40 follow-up) when
 /// `/license/*` joined the exemption set. `/quota/*` joined in v0.4.7
-/// (P3-31). The behavioural contract is pinned by
+/// (P3-31). `/device*` + `/redeem` joined in MON (2026-05-31). The
+/// behavioural contract is pinned by
 /// `session_exempt_endpoints_skip_run_session_header`.
 fn is_session_exempt_path(path: &str) -> bool {
     path == "/admin"
@@ -165,6 +171,9 @@ fn is_session_exempt_path(path: &str) -> bool {
         || path.starts_with("/license/")
         || path == "/quota"
         || path.starts_with("/quota/")
+        || path == "/device"
+        || path.starts_with("/device/")
+        || path == "/redeem"
 }
 
 // ── Run-session context (v0.4.0 P0-11) ──────────────────────────────
@@ -1715,6 +1724,24 @@ mod tests {
     }
 
     #[test]
+    fn is_session_exempt_path_matches_device_and_redeem() {
+        // MON-A / MON-B (2026-05-31): /device* + /redeem are account-scope
+        // ops mounted at root server-side (`device::device_routes`,
+        // `redeem::redeem_routes`), gated by `require_auth` only and NOT
+        // under `require_run_session`. They must skip X-Run-Session
+        // injection like the other account-level surfaces.
+        assert!(is_session_exempt_path("/device"));
+        assert!(is_session_exempt_path("/device/register"));
+        // Future device sub-routes inherit the rule.
+        assert!(is_session_exempt_path("/device/anything/nested"));
+        // /redeem is an exact path (no documented sub-routes).
+        assert!(is_session_exempt_path("/redeem"));
+        // ...so a nested path under it is NOT exempt (would be a new route
+        // we'd have to add deliberately).
+        assert!(!is_session_exempt_path("/redeem/extra"));
+    }
+
+    #[test]
     fn is_session_exempt_path_rejects_non_exempt_paths() {
         // Make sure we don't accidentally over-match. Every gated
         // analysis endpoint must continue to receive X-Run-Session.
@@ -1756,6 +1783,10 @@ mod tests {
             "/license/activate",
             "/license/validate",
             "/license/status",
+            // MON-A / MON-B: device bootstrap + comp-code redemption are
+            // account-scope, mounted at root, not under require_run_session.
+            "/device/register",
+            "/redeem",
         ] {
             let raw = ureq::get(&format!("https://example.test{path}"));
             let signed = apply_auth(raw, path);

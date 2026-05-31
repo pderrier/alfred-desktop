@@ -228,6 +228,30 @@ pub fn active_run_session() -> Option<String> {
     session_slot().lock().ok().and_then(|s| s.clone())
 }
 
+/// Single canonical serialization lock for tests that read or mutate the
+/// process-global `ACTIVE_RUN_SESSION` slot.
+///
+/// `ACTIVE_RUN_SESSION` is process-wide, so ANY test touching it — whether
+/// it lives in `alfred_api_client::tests` (the `apply_auth` / exempt-path
+/// suites) or in `analysis_ops::run_session_tests` (`acquire_run_session_*`)
+/// — must serialize against EVERY other such test, across module
+/// boundaries. A per-module `Mutex` only serializes that module's own
+/// tests and lets a sibling module clear the slot mid-assertion (this was
+/// the MON-F1 flake: `acquire_run_session_skips_when_api_disabled` cleared
+/// the slot while `session_exempt_endpoints_skip_run_session_header` was
+/// asserting a non-exempt path still carried `X-Run-Session`).
+///
+/// Defined next to the slot it guards and exposed `pub(crate)` so both
+/// test modules acquire the SAME mutex. Poisoning is tolerated (a panic in
+/// one test must not cascade into spurious failures in the next).
+#[cfg(test)]
+pub(crate) fn run_session_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 // ── Device identity (MON-A, 2026-05-31) ─────────────────────────────
 //
 // A server-issued `device_id` + `device_secret` (see
@@ -1581,13 +1605,12 @@ mod tests {
     }
 
     // ── X-Run-Session propagation (v0.4.0 P0-11) ────────────────────
-
-    /// Sequential lock guard so the set/clear tests don't race each other
-    /// (they share a process-global slot — see ACTIVE_RUN_SESSION).
-    fn run_session_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
-    }
+    //
+    // Every test below serializes on the crate-wide
+    // `run_session_test_lock` (defined next to the `ACTIVE_RUN_SESSION`
+    // slot in the parent module, in scope here via `use super::*`). It is
+    // the SAME mutex used by `analysis_ops::run_session_tests`, so the two
+    // suites cannot race on the shared global slot.
 
     #[test]
     fn active_run_session_returns_none_when_unset() {

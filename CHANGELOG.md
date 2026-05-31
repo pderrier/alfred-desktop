@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.4.10
+
+**Mandatory upgrade.** macOS fix, activation codes, and more accurate market data.
+
+### What's new
+
+- **macOS: the app now finds its bundled analysis engine.** On macOS the embedded `codex` runtime lives in the app bundle's `Resources` folder, but Alfred was looking for it next to the executable — so it fell back to asking you to run `npm install`. It now looks in the right place and self-heals the binary's permissions/quarantine on first launch. (Windows was unaffected.)
+- **Unlock unlimited access with an activation code.** Reaching the free weekly limit (or the home strip) now offers "Obtiens un code d'activation en échange d'un feedback" instead of a generic contact link. Enter the code in the new activation window to unlock unlimited access for 3 months; when it lapses, a clear "Demander un renouvellement" prompt appears with a copyable contact email (no longer hidden behind a mail-client error).
+- **More accurate market data.** Fixed several enrichment bugs: US ADRs like TSMC that resolved to an unrelated mutual fund (showing ~$18 instead of ~$418), a bogus P/E value (155.98) that leaked onto many lines, a price/NAV desync on money-market funds, and missing sector classification for US, foreign, and fund holdings (the "Allocation sectorielle" widget is now populated for them).
+- **Steadier free-tier identity.** Behind the scenes, your free weekly quota now tracks your install more reliably (it no longer resets when your sign-in token rotates).
+
+### Compatibility
+
+- **Mandatory.** Earlier versions show the update screen on next launch.
+- Privacy and authentication unchanged from v0.4.0 — your sign-in token is never sent to the server.
+
 ## v0.4.9
 
 **Mandatory upgrade.** Smarter watchlist opportunities and a first-launch consent screen.

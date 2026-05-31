@@ -108,6 +108,22 @@ fn apply_auth(req: ureq::Request, path: &str) -> ureq::Request {
             req = req.set("X-Run-Session", &session_id);
         }
     }
+
+    // ── MON-A: device auth (PREFERRED on the server) ──────────────────
+    // When a server-issued device identity exists (registered on first run),
+    // add `X-Device-Id` + `X-Device-Signature = HMAC(device_secret, path:ts)`.
+    // The redeployed server prefers this stable, non-forgeable identity over
+    // `X-Client-Hash`. We ALSO keep the legacy headers below so a NEW desktop
+    // build still authenticates against an OLD server (no device-auth branch
+    // yet) during the API rollout — the old server simply ignores the device
+    // headers and falls back to the legacy HMAC. Additive, never replacing.
+    if let Some((device_id, device_secret)) = device_identity() {
+        let dsig = hmac_sign(sign_path, ts, &device_secret);
+        req = req
+            .set("X-Device-Id", &device_id)
+            .set("X-Device-Signature", &dsig);
+    }
+
     let runtime_secret = env::var("ALFRED_API_SECRET").ok();
     let secret = API_SECRET.or(runtime_secret.as_deref());
     if let Some(s) = secret {
@@ -133,6 +149,11 @@ fn apply_auth(req: ureq::Request, path: &str) -> ureq::Request {
 ///   - `/quota` or anything under `/quota/` (v0.4.7 P3-31 — read-only
 ///     home-strip quota probe, mounted at root alongside `/run/start`,
 ///     gated by `require_auth` only — see `handlers::quota_routes`)
+///   - `/device` or anything under `/device/` (MON-A — device identity
+///     bootstrap `POST /device/register`, mounted at root, gated by
+///     `require_auth` only — see `device::device_routes`)
+///   - `/redeem` (MON-B — comp-code redemption, mounted at root, gated by
+///     `require_auth` only — see `redeem::redeem_routes`)
 ///
 /// Anything else returns false — there is no fuzzy / partial /
 /// case-insensitive match because the server-side routes are
@@ -140,7 +161,8 @@ fn apply_auth(req: ureq::Request, path: &str) -> ureq::Request {
 ///
 /// Renamed from `is_admin_path` in v0.4.0 P0-15 (P3-40 follow-up) when
 /// `/license/*` joined the exemption set. `/quota/*` joined in v0.4.7
-/// (P3-31). The behavioural contract is pinned by
+/// (P3-31). `/device*` + `/redeem` joined in MON (2026-05-31). The
+/// behavioural contract is pinned by
 /// `session_exempt_endpoints_skip_run_session_header`.
 fn is_session_exempt_path(path: &str) -> bool {
     path == "/admin"
@@ -149,6 +171,9 @@ fn is_session_exempt_path(path: &str) -> bool {
         || path.starts_with("/license/")
         || path == "/quota"
         || path.starts_with("/quota/")
+        || path == "/device"
+        || path.starts_with("/device/")
+        || path == "/redeem"
 }
 
 // ── Run-session context (v0.4.0 P0-11) ──────────────────────────────
@@ -201,6 +226,76 @@ pub fn clear_active_run_session() {
 /// across the HTTP call). Returns `None` when no run is in flight.
 pub fn active_run_session() -> Option<String> {
     session_slot().lock().ok().and_then(|s| s.clone())
+}
+
+// ── Device identity (MON-A, 2026-05-31) ─────────────────────────────
+//
+// A server-issued `device_id` + `device_secret` (see
+// `apps/alfred-api/src/device.rs`) replaces the volatile/forgeable
+// `X-Client-Hash` as the primary identity. Stored in user-preferences
+// (merge-only) so it survives across launches; cached in a process-global
+// slot to avoid re-reading the file on every `apply_auth`. The cache is
+// invalidated by `set_device_identity` after a fresh registration.
+//
+// Storage note: user-preferences.json is the same store that already holds
+// `tier` / `license_key`. An OS-keychain backing is a future hardening
+// (the secret is a bearer credential) — flagged in the report, not done
+// here to keep the transition surface small.
+
+static DEVICE_IDENTITY: OnceLock<Mutex<Option<(String, String)>>> = OnceLock::new();
+
+fn device_identity_slot() -> &'static Mutex<Option<(String, String)>> {
+    DEVICE_IDENTITY.get_or_init(|| Mutex::new(None))
+}
+
+/// Return the cached `(device_id, device_secret)` pair, loading it from
+/// user-preferences on first access. `None` when the device hasn't been
+/// registered yet (first run before `register_device`, or an older install
+/// that predates MON-A — both fall back to legacy `X-Client-Hash` auth).
+pub fn device_identity() -> Option<(String, String)> {
+    {
+        let slot = device_identity_slot().lock().ok()?;
+        if let Some(pair) = slot.as_ref() {
+            return Some(pair.clone());
+        }
+    }
+    // Cache miss → read from preferences once and memoise.
+    let pair = read_device_identity_from_prefs()?;
+    if let Ok(mut slot) = device_identity_slot().lock() {
+        *slot = Some(pair.clone());
+    }
+    Some(pair)
+}
+
+/// Pure helper: extract a `(device_id, device_secret)` pair from a
+/// preferences value. Both fields must be present + non-empty. Extracted so
+/// the parse contract is unit-testable without touching the filesystem.
+pub(crate) fn parse_device_identity(prefs: &Value) -> Option<(String, String)> {
+    let id = prefs.get("device_id").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty())?;
+    let secret = prefs.get("device_secret").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty())?;
+    Some((id.to_string(), secret.to_string()))
+}
+
+fn read_device_identity_from_prefs() -> Option<(String, String)> {
+    let prefs = crate::runtime_settings::get_user_preferences();
+    parse_device_identity(&prefs)
+}
+
+/// Persist a freshly-registered device identity to user-preferences and
+/// update the in-process cache. Called by `register_device` after a
+/// successful `POST /device/register`.
+fn set_device_identity(device_id: &str, device_secret: &str) {
+    let prefs = serde_json::json!({
+        "device_id": device_id,
+        "device_secret": device_secret,
+    });
+    if let Err(e) = crate::runtime_settings::save_user_preferences(&prefs) {
+        crate::debug_log(&format!("alfred-api: failed to persist device identity: {e}"));
+        return;
+    }
+    if let Ok(mut slot) = device_identity_slot().lock() {
+        *slot = Some((device_id.to_string(), device_secret.to_string()));
+    }
 }
 
 /// Read the OpenAI JWT from local Codex session (never sent to the API).
@@ -944,6 +1039,75 @@ pub fn get_quota_status() -> Result<Value> {
     api_get("/quota/status", TIMEOUT_SECS)
 }
 
+// ── MON-A: device registration ──────────────────────────────────────
+
+/// Ensure the device has a server-issued identity. No-op when one already
+/// exists. On first run, calls `POST /device/register` (authenticated via
+/// the LEGACY HMAC bootstrap) and persists `device_id` + `device_secret`.
+///
+/// Fail-soft: if the API is down or doesn't yet support `/device/register`
+/// (older deployment — 404), the desktop keeps working on legacy
+/// `X-Client-Hash` auth. Registration is retried on the next launch. Called
+/// once at startup (see `command_handlers::register_device_local`).
+pub fn ensure_device_registered() -> Result<bool> {
+    if device_identity().is_some() {
+        return Ok(false); // already registered
+    }
+    let resp = api_post_json("/device/register", &serde_json::json!({}))?;
+    let device_id = resp.get("device_id").and_then(|v| v.as_str()).unwrap_or_default();
+    let device_secret = resp.get("device_secret").and_then(|v| v.as_str()).unwrap_or_default();
+    if device_id.is_empty() || device_secret.is_empty() {
+        return Err(anyhow!("alfred_device_register_incomplete"));
+    }
+    set_device_identity(device_id, device_secret);
+    crate::debug_log("alfred-api: device identity registered");
+    Ok(true)
+}
+
+// ── MON-B/C: comp-code redemption ───────────────────────────────────
+
+/// Redeem an activation (comp) code via `POST /redeem`. On success the
+/// server binds the code to this device and returns `{tier, expires_at}`.
+///
+/// Maps the structured error bodies to stable codes the UI routes on:
+/// - 400 `code_invalid`       → `alfred_redeem_invalid`
+/// - 409 `code_already_used`  → `alfred_redeem_already_used`
+/// - other 4xx/5xx / transport → existing `alfred_api_*` codes
+pub fn redeem_code(code: &str) -> Result<Value> {
+    let trimmed = code.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("alfred_redeem_invalid"));
+    }
+    let base = api_url().ok_or_else(|| anyhow!("alfred_api_not_configured"))?;
+    let url = format!("{base}/redeem");
+    let body = serde_json::json!({ "code": trimmed });
+    let req = apply_auth(ureq::post(&url), "/redeem")
+        .set("Content-Type", "application/json")
+        .timeout(Duration::from_secs(TIMEOUT_SECS));
+    match req.send_string(&serde_json::to_string(&body).unwrap_or_default()) {
+        Ok(resp) => resp
+            .into_json::<Value>()
+            .map_err(|e| anyhow!("alfred_api_parse_failed:{e}")),
+        Err(ureq::Error::Status(code_status, resp)) => {
+            let body_text = resp.into_string().unwrap_or_default();
+            let parsed: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
+            Err(anyhow!("{}", classify_redeem_error(code_status, &parsed)))
+        }
+        Err(e) => Err(map_api_error(e)),
+    }
+}
+
+/// Pure helper: classify a non-2xx `/redeem` response into a stable code.
+/// Extracted so the mapping is unit-testable without an HTTP round trip.
+pub(crate) fn classify_redeem_error(status: u16, body: &Value) -> String {
+    let err = body.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    match (status, err) {
+        (400, "code_invalid") => "alfred_redeem_invalid".to_string(),
+        (409, "code_already_used") => "alfred_redeem_already_used".to_string(),
+        (s, _) => format!("alfred_api_http_error:{s}"),
+    }
+}
+
 /// Authenticated POST request with a JSON body that parses and returns
 /// the response envelope. Used by `/license/*` calls where the server
 /// returns a structured response we want to consume (unlike `api_post`
@@ -1234,6 +1398,69 @@ fn map_api_error(e: ureq::Error) -> anyhow::Error {
 mod tests {
     use super::*;
 
+    // ── MON-A: device identity parse ────────────────────────────────
+    #[test]
+    fn parse_device_identity_returns_pair_when_both_present() {
+        let prefs = serde_json::json!({
+            "device_id": "abc123",
+            "device_secret": "deadbeef",
+            "tier": "free"
+        });
+        assert_eq!(
+            parse_device_identity(&prefs),
+            Some(("abc123".to_string(), "deadbeef".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_device_identity_none_when_either_missing_or_empty() {
+        assert_eq!(parse_device_identity(&serde_json::json!({})), None);
+        assert_eq!(
+            parse_device_identity(&serde_json::json!({"device_id": "abc"})),
+            None
+        );
+        assert_eq!(
+            parse_device_identity(&serde_json::json!({"device_id": "", "device_secret": "x"})),
+            None
+        );
+        assert_eq!(
+            parse_device_identity(&serde_json::json!({"device_id": "  ", "device_secret": "x"})),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_device_identity_trims_whitespace() {
+        let prefs = serde_json::json!({"device_id": " id ", "device_secret": " sec "});
+        assert_eq!(
+            parse_device_identity(&prefs),
+            Some(("id".to_string(), "sec".to_string()))
+        );
+    }
+
+    // ── MON-C: redeem error classification ──────────────────────────
+    #[test]
+    fn classify_redeem_error_maps_invalid_and_already_used() {
+        let invalid = serde_json::json!({"error": "code_invalid"});
+        assert_eq!(classify_redeem_error(400, &invalid), "alfred_redeem_invalid");
+
+        let used = serde_json::json!({"error": "code_already_used"});
+        assert_eq!(
+            classify_redeem_error(409, &used),
+            "alfred_redeem_already_used"
+        );
+    }
+
+    #[test]
+    fn classify_redeem_error_falls_back_to_http_code() {
+        let other = serde_json::json!({"error": "something_else"});
+        assert_eq!(classify_redeem_error(500, &other), "alfred_api_http_error:500");
+        assert_eq!(
+            classify_redeem_error(400, &serde_json::Value::Null),
+            "alfred_api_http_error:400"
+        );
+    }
+
     #[test]
     fn technicals_path_without_isin_keeps_ticker_only_shape() {
         // Existing callers (US tickers, watchlist entries without ISIN) must
@@ -1497,6 +1724,24 @@ mod tests {
     }
 
     #[test]
+    fn is_session_exempt_path_matches_device_and_redeem() {
+        // MON-A / MON-B (2026-05-31): /device* + /redeem are account-scope
+        // ops mounted at root server-side (`device::device_routes`,
+        // `redeem::redeem_routes`), gated by `require_auth` only and NOT
+        // under `require_run_session`. They must skip X-Run-Session
+        // injection like the other account-level surfaces.
+        assert!(is_session_exempt_path("/device"));
+        assert!(is_session_exempt_path("/device/register"));
+        // Future device sub-routes inherit the rule.
+        assert!(is_session_exempt_path("/device/anything/nested"));
+        // /redeem is an exact path (no documented sub-routes).
+        assert!(is_session_exempt_path("/redeem"));
+        // ...so a nested path under it is NOT exempt (would be a new route
+        // we'd have to add deliberately).
+        assert!(!is_session_exempt_path("/redeem/extra"));
+    }
+
+    #[test]
     fn is_session_exempt_path_rejects_non_exempt_paths() {
         // Make sure we don't accidentally over-match. Every gated
         // analysis endpoint must continue to receive X-Run-Session.
@@ -1538,6 +1783,10 @@ mod tests {
             "/license/activate",
             "/license/validate",
             "/license/status",
+            // MON-A / MON-B: device bootstrap + comp-code redemption are
+            // account-scope, mounted at root, not under require_run_session.
+            "/device/register",
+            "/redeem",
         ] {
             let raw = ureq::get(&format!("https://example.test{path}"));
             let signed = apply_auth(raw, path);

@@ -976,6 +976,27 @@ export function createDesktopBridgeClient({
     async licenseCheckoutUrl() {
       const payload = await invoke("license_checkout_url_local");
       return normalizeTauriPayload(payload, ["license:checkout-url-local"]);
+    },
+    /**
+     * MON-A — register a server-issued device identity on first run.
+     * No-op when one already exists. Fail-soft on the Rust side (a
+     * transport / 404 error is swallowed so legacy auth keeps working).
+     * Returns `{registered: bool}`.
+     */
+    async registerDevice() {
+      const payload = await invoke("register_device_local");
+      return normalizeTauriPayload(payload, ["device:register-local"]);
+    },
+    /**
+     * MON-C — redeem an activation (comp) code. Returns
+     * `{tier, expires_at, ok}` on success. Throws a normalized bridge
+     * error whose code is `alfred_redeem_invalid` (bad/unknown code) or
+     * `alfred_redeem_already_used` (used by another device / expired) so
+     * the caller can route to the right UI state.
+     */
+    async redeemCode(code) {
+      const payload = await invoke("redeem_code_local", { code });
+      return normalizeTauriPayload(payload, ["redeem:code-local"]);
     }
   };
   return bridge;

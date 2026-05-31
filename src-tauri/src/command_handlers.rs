@@ -1725,6 +1725,76 @@ pub fn run_license_status() -> Result<serde_json::Value> {
     Ok(bridge_envelope("license:status-local", payload))
 }
 
+/// MON-A — register a server-issued device identity on first run. No-op
+/// when one already exists. Fail-soft: a transport / 404 error is swallowed
+/// (the desktop keeps working on legacy `X-Client-Hash` auth; registration
+/// retries on the next launch) so this never blocks startup. Returns
+/// `{registered: bool}` — `true` when a fresh identity was minted.
+pub fn run_register_device() -> Result<serde_json::Value> {
+    let registered = match crate::alfred_api_client::ensure_device_registered() {
+        Ok(r) => r,
+        Err(e) => {
+            crate::debug_log(&format!(
+                "alfred-api: device registration deferred (legacy auth still active): {e}"
+            ));
+            false
+        }
+    };
+    Ok(bridge_envelope(
+        "device:register-local",
+        serde_json::json!({ "registered": registered }),
+    ))
+}
+
+/// MON-C — redeem an activation (comp) code via `POST /redeem`. On success
+/// the server binds the code to this device and returns `{tier, expires_at}`;
+/// the UI refreshes tier from the result. Structured error codes
+/// (`alfred_redeem_invalid`, `alfred_redeem_already_used`) propagate so the
+/// JS layer can route to the right state (invalid vs already-used/expired).
+pub fn run_redeem_code(code: String) -> Result<serde_json::Value> {
+    let trimmed = code.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("alfred_redeem_invalid"));
+    }
+    let resp = crate::alfred_api_client::redeem_code(trimmed)?;
+
+    // Mirror the activation path: persist the paid tier locally so a cold
+    // start before the next `/license/status` round-trip still shows the
+    // user as paid. Best-effort — server `tier:<id>` is authoritative.
+    persist_redeem_to_user_prefs(&resp);
+
+    Ok(bridge_envelope("redeem:code-local", resp))
+}
+
+/// Build the user-preferences patch from a successful `/redeem` response and
+/// persist it (merge-only). Pure-ish split so the prefs contract is testable.
+/// Best-effort: a write failure is logged + swallowed.
+fn persist_redeem_to_user_prefs(resp: &serde_json::Value) {
+    let patch = build_redeem_prefs_patch(resp);
+    if let Err(e) = crate::runtime_settings::save_user_preferences(&patch) {
+        crate::debug_log(&format!(
+            "redeem: failed to persist tier to user-preferences: {e} (server-side tier authoritative)"
+        ));
+    }
+}
+
+/// Pure helper: build the `{tier, license_expires_at}` patch from a
+/// `/redeem` response. `expires_at` (epoch secs) is stored as ISO 8601 to
+/// match the rest of the timestamp prefs. Pinned by a unit test.
+fn build_redeem_prefs_patch(resp: &serde_json::Value) -> serde_json::Value {
+    let tier = resp.get("tier").and_then(|v| v.as_str()).unwrap_or("paid");
+    let iso_ts = resp
+        .get("expires_at")
+        .and_then(|v| v.as_u64())
+        .and_then(|secs| chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0))
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_default();
+    serde_json::json!({
+        "tier": tier,
+        "license_expires_at": iso_ts,
+    })
+}
+
 /// Return the Lemon Squeezy checkout URL the desktop overlay opens via
 /// `LemonSqueezy.Url.Open(...)`. v0.4.0 P0-15.
 ///
@@ -1857,6 +1927,36 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap();
         assert_eq!(iso, "", "validated_at=0 maps to empty string sentinel");
+    }
+
+    #[test]
+    fn build_redeem_prefs_patch_converts_expiry_to_iso() {
+        // MON-C: a /redeem response {tier:paid, expires_at:<epoch>} maps to
+        // {tier, license_expires_at:<ISO8601>} for the cold-start cache.
+        let resp = serde_json::json!({
+            "ok": true,
+            "tier": "paid",
+            "expires_at": 1_800_000_000u64
+        });
+        let patch = build_redeem_prefs_patch(&resp);
+        let obj = patch.as_object().unwrap();
+        assert_eq!(obj.get("tier").and_then(|v| v.as_str()), Some("paid"));
+        let iso = obj.get("license_expires_at").and_then(|v| v.as_str()).unwrap();
+        assert!(iso.starts_with("20"), "ISO 8601 timestamp, got: {iso}");
+        assert_eq!(obj.len(), 2, "patch is merge-only minimal, got: {obj:?}");
+    }
+
+    #[test]
+    fn build_redeem_prefs_patch_defaults_tier_and_empty_iso() {
+        // Defensive: a malformed/partial response (no tier, no expires_at)
+        // still yields a stable patch shape — tier defaults to "paid"
+        // (we only persist on a successful redeem) and the ISO is empty.
+        let patch = build_redeem_prefs_patch(&serde_json::json!({}));
+        assert_eq!(patch.get("tier").and_then(|v| v.as_str()), Some("paid"));
+        assert_eq!(
+            patch.get("license_expires_at").and_then(|v| v.as_str()),
+            Some("")
+        );
     }
 
     #[test]

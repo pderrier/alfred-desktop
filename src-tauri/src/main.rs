@@ -945,6 +945,29 @@ async fn license_status_local() -> Result<serde_json::Value, String> {
         .map_err(|e| e.to_string())
 }
 
+/// `register_device_local` — MON-A. Register a server-issued device
+/// identity on first run (no-op if one exists). Fail-soft. Called once at
+/// startup by the JS bootstrap.
+#[tauri::command]
+async fn register_device_local() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(command_handlers::run_register_device)
+        .await
+        .map_err(|e| format!("register_device_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+/// `redeem_code_local` — MON-C. Redeem an activation (comp) code via
+/// `POST /redeem`. Returns `{tier, expires_at}` on success; structured
+/// error codes (`alfred_redeem_invalid`, `alfred_redeem_already_used`)
+/// propagate to the JS layer for state routing.
+#[tauri::command]
+async fn redeem_code_local(code: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || command_handlers::run_redeem_code(code))
+        .await
+        .map_err(|e| format!("redeem_code_local_failed:join:{e}"))?
+        .map_err(|e| e.to_string())
+}
+
 /// `license_checkout_url_local` — return the Lemon Squeezy checkout URL
 /// the upgrade-view overlay opens. v0.4.0 P0-15.
 ///
@@ -1229,7 +1252,9 @@ fn run_tauri_app() -> anyhow::Result<()> {
             license_activate_local,
             license_validate_local,
             license_status_local,
-            license_checkout_url_local
+            license_checkout_url_local,
+            register_device_local,
+            redeem_code_local
         ])
         .run(tauri::generate_context!())
         .map_err(|e| anyhow!("tauri_app_launch_failed:{e}"))?;

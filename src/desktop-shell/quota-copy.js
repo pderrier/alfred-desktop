@@ -88,11 +88,14 @@ export function buildFreeTierExhaustedModalCopy(envelope, nowFn = Date.now) {
     : "Une nouvelle analyse sera disponible plus tard cette semaine.";
   return {
     title: "Quota atteint",
-    message: `Vous avez utilisé vos ${limit} analyses gratuites pour les 7 derniers jours. ${resetClause}`,
-    hint: "Mode illimité bientôt disponible — contactez l'auteur !",
+    message: `Tu as utilisé tes ${limit} analyses gratuites pour les 7 derniers jours. ${resetClause}`,
+    // MON-D (2026-05-31): CTA pivots from "contacte l'auteur" (a dead-end
+    // mailto) to a concrete value exchange — a feedback-for-code offer that
+    // opens the activation-code entry (MON-C). FR-tutoiement.
+    hint: "Obtiens un code d'activation en échange d'un feedback.",
     cta: {
-      label: "Contacter l'auteur",
-      detail: envelope || {},
+      label: "Obtenir un code d'activation",
+      detail: { ...(envelope || {}), intent: "redeem" },
     },
   };
 }

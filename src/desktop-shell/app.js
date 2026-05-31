@@ -60,6 +60,7 @@ import { initAlfredOverlay } from "/desktop-shell/app-alfred-overlay.js";
 import { registerDefaultTriggers } from "/desktop-shell/app-alfred-triggers.js";
 import { startIdleTimer } from "/desktop-shell/app-alfred-idle.js";
 import { installUpgradeFlow } from "/desktop-shell/upgrade-view.js";
+import { openRedeemModal } from "/desktop-shell/app-redeem-modal.js";
 import { enforceLegalConsentGate } from "/desktop-shell/app-legal-consent.js";
 import {
   initShellLayout,
@@ -1768,19 +1769,15 @@ if (typeof window !== "undefined") {
     bridge,
     showToast,
   });
-  window.addEventListener("alfred://upgrade-requested", () => {
-    // v0.4.6 — Premium pas encore dispo : on ouvre un email pré-rempli vers
-    // l'auteur au lieu de l'overlay de paiement Lemon Squeezy.
-    const subject = encodeURIComponent(
-      "Je suis intéressé par un plus grand quota d'analyses"
-    );
-    const mailto = `mailto:pierre.derrier@gmail.com?subject=${subject}`;
-    bridge.openExternalUrl(mailto).catch(() => {
-      showToast(
-        "Impossible d'ouvrir le client mail — écris à pierre.derrier@gmail.com",
-        "info"
-      );
-    });
+  window.addEventListener("alfred://upgrade-requested", (ev) => {
+    // MON-C/D (2026-05-31) — open the activation-code modal instead of the
+    // old dead-end mailto. The user gets a code from the author "en échange
+    // d'un feedback" and activates it here; the email is a first-class,
+    // copyable element in the modal (never hidden behind a mailto that may
+    // fail silently). `mode: "renew"` pivots the copy to a renewal ask when
+    // a prior unlimited access has expired (MON-B).
+    const mode = ev?.detail?.mode === "renew" ? "renew" : "activate";
+    openRedeemModal({ bridge, showToast, mode });
   });
   window.addEventListener("alfred://upgrade-activated", () => {
     showToast(
@@ -2623,6 +2620,15 @@ function renderWelcome() {
     const pendingNotice = data.pending_notice
       ? `<span style="color:var(--sea-muted);margin-left:0.5rem">${escapeHtml(data.pending_notice)}</span>`
       : "";
+    // MON-D (2026-05-31) item 3: when a prior unlimited access has EXPIRED
+    // (notice "expired"), surface a renewal CTA that opens the redeem modal
+    // in "renew" mode (heading pivots to "Demander un renouvellement…" with
+    // the reliable + copyable email). `expired` is the canonical notice
+    // written by the webhook / set on tier lapse.
+    const isExpired = String(data.pending_notice || "").toLowerCase().includes("expir");
+    const renewLink = isExpired
+      ? `<a href="#" class="welcome-renew-link" onclick="event.preventDefault(); window.dispatchEvent(new CustomEvent('alfred://upgrade-requested', { detail: { mode: 'renew' } }));" style="color:var(--accent);text-decoration:none">Demander un renouvellement de l'accès illimité →</a>`
+      : "";
     if (isPaid) {
       return `
         <div class="welcome-step welcome-home-header" style="padding:0.55rem 0.8rem;background:var(--surface-2);border-radius:6px;margin-bottom:0.6rem">
@@ -2638,7 +2644,7 @@ function renderWelcome() {
     return `
       <div class="welcome-step welcome-home-header" style="padding:0.55rem 0.8rem;background:var(--surface-2);border-radius:6px;margin-bottom:0.6rem;display:flex;justify-content:space-between;align-items:center;gap:0.6rem;flex-wrap:wrap">
         <span><strong>Gratuit</strong> · ${count}/${limit} cette semaine${escapeHtml(resetClause)}</span>
-        <a href="#" class="welcome-upgrade-link" onclick="event.preventDefault(); window.dispatchEvent(new CustomEvent('alfred://upgrade-requested'));" style="color:var(--accent);text-decoration:none">Mode illimité bientôt disponible — contactez l'auteur ! →</a>
+        ${renewLink || `<a href="#" class="welcome-upgrade-link" onclick="event.preventDefault(); window.dispatchEvent(new CustomEvent('alfred://upgrade-requested'));" style="color:var(--accent);text-decoration:none">Obtiens un code d'activation en échange d'un feedback →</a>`}
         ${pendingNotice}
       </div>
     `;
@@ -3135,6 +3141,13 @@ void refreshRuntimeSettings().catch(() => {});
 // the app and runStartupSessionCheck never runs.
 void enforceLegalConsentGate().then(() => {
 bootstrap.runStartupSessionCheck().then(async () => {
+  // MON-A (2026-05-31) — register a server-issued device identity on first
+  // run so subsequent requests authenticate with the stable, non-forgeable
+  // device auth instead of the volatile X-Client-Hash. No-op when already
+  // registered; fail-soft on the Rust side (legacy auth keeps working).
+  // Fire-and-forget — must never block startup.
+  bridge.registerDevice?.().catch(() => { /* registration retries next launch */ });
+
   await refreshAccountStatus();
   updateAuthPills();
   renderWelcome();

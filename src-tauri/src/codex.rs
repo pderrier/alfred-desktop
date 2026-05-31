@@ -13,7 +13,7 @@
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -49,13 +49,39 @@ fn codex_install_dir() -> PathBuf {
     PathBuf::from("data").join("bin")
 }
 
+/// Candidate locations for the bundled `codex-runtime` directory, in priority
+/// order, given the directory holding the running executable.
+///
+/// Pure (no filesystem access) so it is unit-testable without a real `.app`
+/// bundle. The platforms differ in how Tauri lays out bundled `resources`:
+///
+/// 1. `<exe_dir>/codex-runtime` — Windows (NSIS), Linux, and dev builds, where
+///    the executable and the `codex-runtime/` resource dir are siblings.
+/// 2. `<exe_dir>/../Resources/codex-runtime` — macOS `.app` bundle: the binary
+///    lives at `Alfred.app/Contents/MacOS/<bin>` while `resources`
+///    (`"resources": ["codex-runtime/**/*"]` in `tauri.macos.conf.json`) are
+///    placed under `Alfred.app/Contents/Resources/codex-runtime`.
+///
+/// All candidates are returned on every platform — probing an extra path that
+/// cannot exist on Windows/Linux is harmless and keeps the helper branch-free.
+fn bundled_codex_candidates(exe_dir: &Path) -> Vec<PathBuf> {
+    vec![
+        exe_dir.join("codex-runtime"),
+        exe_dir.join("..").join("Resources").join("codex-runtime"),
+    ]
+}
+
 /// Directory containing the bundled Node.js + codex shipped with the installer.
-/// Located at `<exe_dir>/codex-runtime/` in production builds.
+/// Resolves `env::current_exe()` then returns the first
+/// [`bundled_codex_candidates`] entry that exists on disk (see that helper for
+/// the per-platform layout rationale). Returns `None` when no bundle is present
+/// (e.g. a dev build without the runtime, or a broken install).
 fn bundled_codex_dir() -> Option<PathBuf> {
     let exe = env::current_exe().ok()?;
     let exe_dir = exe.parent()?;
-    let dir = exe_dir.join("codex-runtime");
-    if dir.exists() { Some(dir) } else { None }
+    bundled_codex_candidates(exe_dir)
+        .into_iter()
+        .find(|dir| dir.exists())
 }
 
 /// Prepare a Command for codex execution: hide console on Windows and
@@ -73,6 +99,86 @@ fn prepare_codex_cmd(cmd: &mut Command) {
     }
     hide_console_window(cmd);
 }
+
+/// Build the macOS self-heal command set for a freshly-resolved *bundled*
+/// codex: make the codex binary (and the sibling `path/rg` if present)
+/// executable, and recursively strip the `com.apple.quarantine` xattr from the
+/// whole bundle dir so Gatekeeper stops blocking execution.
+///
+/// Pure (no process spawn, no filesystem mutation — only an `exists()` probe
+/// for the optional `rg`) so the command set is unit-testable. Each entry is
+/// `(program, args)`. Returned commands are run best-effort by
+/// [`self_heal_bundled_codex`]; a failure of any one is logged and ignored.
+///
+/// Only consumed on macOS (or under `cfg(test)`, which runs on every platform)
+/// — gated so a non-test Windows/Linux build doesn't flag it as dead code.
+#[cfg(any(target_os = "macos", test))]
+fn quarantine_heal_commands(bundle_dir: &Path, codex_path: &Path) -> Vec<(String, Vec<String>)> {
+    let mut cmds: Vec<(String, Vec<String>)> = Vec::new();
+
+    let mut chmod_targets = vec![codex_path.to_string_lossy().to_string()];
+    let rg_path = bundle_dir.join("path").join("rg");
+    if rg_path.exists() {
+        chmod_targets.push(rg_path.to_string_lossy().to_string());
+    }
+    let mut chmod_args = vec!["+x".to_string()];
+    chmod_args.extend(chmod_targets);
+    cmds.push(("chmod".to_string(), chmod_args));
+
+    // `-r` recurse, `-d` delete the named attribute from every entry.
+    cmds.push((
+        "xattr".to_string(),
+        vec![
+            "-dr".to_string(),
+            "com.apple.quarantine".to_string(),
+            bundle_dir.to_string_lossy().to_string(),
+        ],
+    ));
+
+    cmds
+}
+
+/// macOS-only, best-effort, run-once self-heal for the bundled codex.
+///
+/// The bundled `codex`/`rg` are unsigned (signing/notarization not configured)
+/// and ship inside a downloaded DMG, so they carry the `com.apple.quarantine`
+/// xattr and may lose their +x bit when extracted as Tauri resources — macOS
+/// then refuses to exec them even once found. We `chmod +x` and strip the
+/// quarantine attribute. Best-effort: any failure is logged, never propagated
+/// (the app still tries to run codex). Idempotent via a `std::sync::Once`.
+///
+/// Only ever called with an *app-bundled* codex path — never a system/PATH
+/// codex (we must not chmod/strip xattrs on binaries we didn't ship).
+#[cfg(target_os = "macos")]
+fn self_heal_bundled_codex(bundle_dir: &Path, codex_path: &Path) {
+    static HEALED: std::sync::Once = std::sync::Once::new();
+    HEALED.call_once(|| {
+        for (program, args) in quarantine_heal_commands(bundle_dir, codex_path) {
+            match Command::new(&program).args(&args).output() {
+                Ok(out) if out.status.success() => {
+                    crate::debug_log(&format!("codex: self-heal `{program}` ok"));
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    crate::debug_log(&format!(
+                        "codex: self-heal `{program}` exited {:?}: {}",
+                        out.status.code(),
+                        truncate(stderr.trim(), 200)
+                    ));
+                }
+                Err(e) => {
+                    crate::debug_log(&format!("codex: self-heal `{program}` failed to spawn: {e}"));
+                }
+            }
+        }
+    });
+}
+
+/// No-op on non-macOS platforms: only macOS Gatekeeper quarantines downloaded
+/// binaries. The pure [`quarantine_heal_commands`] helper stays compiled (and
+/// tested) on all platforms.
+#[cfg(not(target_os = "macos"))]
+fn self_heal_bundled_codex(_bundle_dir: &Path, _codex_path: &Path) {}
 
 fn resolve_codex_binary() -> Result<PathBuf> {
     // Explicit override
@@ -95,6 +201,11 @@ fn resolve_codex_binary() -> Result<PathBuf> {
             let path = bundle_dir.join(name);
             if path.exists() {
                 crate::debug_log(&format!("codex: using bundled binary {}", path.display()));
+                // macOS only: the bundled codex/rg are unsigned and shipped in a
+                // downloaded DMG, so they carry `com.apple.quarantine` and may
+                // lose +x on resource extraction. Best-effort self-heal once so
+                // Gatekeeper doesn't block `codex --version`. No-op elsewhere.
+                self_heal_bundled_codex(&bundle_dir, &path);
                 return Ok(path);
             }
         }
@@ -2005,6 +2116,95 @@ fn truncate(text: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Bundled codex path resolution (MAC-1) ────────────────────────
+
+    #[test]
+    fn bundled_codex_candidates_returns_both_paths_in_priority_order() {
+        let exe_dir = Path::new("/opt/Alfred/Contents/MacOS");
+        let candidates = bundled_codex_candidates(exe_dir);
+        assert_eq!(candidates.len(), 2, "exactly two candidate locations");
+        // 1. Sibling layout (Windows / Linux / dev) comes first.
+        assert_eq!(candidates[0], exe_dir.join("codex-runtime"));
+        // 2. macOS .app bundle: <exe_dir>/../Resources/codex-runtime.
+        assert_eq!(
+            candidates[1],
+            exe_dir.join("..").join("Resources").join("codex-runtime")
+        );
+    }
+
+    #[test]
+    fn bundled_codex_candidates_macos_resources_path_is_sibling_of_macos_dir() {
+        // For a real .app layout (Alfred.app/Contents/MacOS/), the Resources
+        // candidate must resolve to Alfred.app/Contents/Resources/codex-runtime.
+        let exe_dir = Path::new("/Applications/Alfred.app/Contents/MacOS");
+        let candidates = bundled_codex_candidates(exe_dir);
+        let resources = &candidates[1];
+        // Normalise the `..` segment to prove it points at Contents/Resources.
+        let normalised: PathBuf = resources
+            .components()
+            .fold(PathBuf::new(), |mut acc, comp| {
+                if comp.as_os_str() == ".." {
+                    acc.pop();
+                } else {
+                    acc.push(comp);
+                }
+                acc
+            });
+        assert_eq!(
+            normalised,
+            PathBuf::from("/Applications/Alfred.app/Contents/Resources/codex-runtime")
+        );
+    }
+
+    // ── Gatekeeper quarantine self-heal command set (MAC-2) ───────────
+
+    #[test]
+    fn quarantine_heal_commands_chmod_and_xattr_without_rg() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle_dir = dir.path();
+        let codex_path = bundle_dir.join("codex");
+        // No `path/rg` present → only the codex binary is chmod'd.
+        let cmds = quarantine_heal_commands(bundle_dir, &codex_path);
+        assert_eq!(cmds.len(), 2, "chmod + xattr");
+
+        let (chmod_prog, chmod_args) = &cmds[0];
+        assert_eq!(chmod_prog, "chmod");
+        assert_eq!(chmod_args[0], "+x");
+        assert_eq!(chmod_args.len(), 2, "only codex, no rg");
+        assert_eq!(chmod_args[1], codex_path.to_string_lossy());
+
+        let (xattr_prog, xattr_args) = &cmds[1];
+        assert_eq!(xattr_prog, "xattr");
+        assert_eq!(xattr_args[0], "-dr");
+        assert_eq!(xattr_args[1], "com.apple.quarantine");
+        assert_eq!(xattr_args[2], bundle_dir.to_string_lossy());
+    }
+
+    #[test]
+    fn quarantine_heal_commands_includes_rg_when_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle_dir = dir.path();
+        let codex_path = bundle_dir.join("codex");
+        let path_dir = bundle_dir.join("path");
+        std::fs::create_dir_all(&path_dir).expect("mkdir path");
+        let rg_path = path_dir.join("rg");
+        fs::write(&rg_path, b"#!/bin/sh\n").expect("write rg stub");
+
+        let cmds = quarantine_heal_commands(bundle_dir, &codex_path);
+        let (chmod_prog, chmod_args) = &cmds[0];
+        assert_eq!(chmod_prog, "chmod");
+        assert_eq!(chmod_args[0], "+x");
+        // +x, codex, rg
+        assert_eq!(chmod_args.len(), 3, "codex + rg both chmod'd");
+        assert_eq!(chmod_args[1], codex_path.to_string_lossy());
+        assert_eq!(chmod_args[2], rg_path.to_string_lossy());
+
+        // xattr always targets the bundle dir recursively, regardless of rg.
+        let (xattr_prog, xattr_args) = &cmds[1];
+        assert_eq!(xattr_prog, "xattr");
+        assert_eq!(xattr_args[2], bundle_dir.to_string_lossy());
+    }
 
     #[test]
     fn extract_json_from_clean_output() {

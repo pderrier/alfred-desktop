@@ -758,14 +758,14 @@ mod run_session_tests {
     //! classification is unit-tested in `alfred_api_client::tests::
     //! classify_run_start_*`.
 
-    /// Sequential lock for the active-session slot — shared state, same
-    /// pattern as `alfred_api_client::tests::run_session_test_lock`.
-    fn run_session_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
+    // The active-session slot (`alfred_api_client::ACTIVE_RUN_SESSION`) is
+    // process-global, so these tests must serialize against the
+    // `alfred_api_client::tests` suite that also touches it — NOT just
+    // against each other. We acquire the single canonical lock defined
+    // next to the slot rather than a per-module mutex (a per-module mutex
+    // was the MON-F1 flake: it let this suite clear the slot mid-assertion
+    // in `session_exempt_endpoints_skip_run_session_header`).
+    use crate::alfred_api_client::run_session_test_lock;
 
     #[test]
     fn acquire_run_session_skips_when_api_disabled() {

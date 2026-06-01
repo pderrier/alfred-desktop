@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.4.11
+
+**Mandatory upgrade.** Your activation code now works on a second device — and survives a reinstall.
+
+### What's new
+
+- **Use your activation code on up to 2 machines.** An activation code can now unlock unlimited access on two distinct devices instead of one. Reinstalling Alfred — or clearing its data — on a machine you've already activated no longer "uses up" a slot: that machine is recognised and keeps its access. A third, different machine is declined with a clear message telling you to request a new code.
+- **One shared 3-month window, clearer expiry.** The 3-month unlimited period now starts at first activation and is shared across your devices; when it lapses, both show the "Demander un renouvellement" prompt with a copyable contact email. Your code is remembered and shown (copyable) in the activation window, so re-entering it after clearing data is one paste away.
+
+### Compatibility
+
+- **Mandatory.** Earlier versions show the update screen on next launch.
+- Privacy and authentication unchanged from v0.4.0 — your sign-in token is never sent to the server.
+
 ## v0.4.10
 
 **Mandatory upgrade.** macOS fix, activation codes, and more accurate market data.

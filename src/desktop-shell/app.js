@@ -1769,7 +1769,7 @@ if (typeof window !== "undefined") {
     bridge,
     showToast,
   });
-  window.addEventListener("alfred://upgrade-requested", (ev) => {
+  window.addEventListener("alfred://upgrade-requested", async (ev) => {
     // MON-C/D (2026-05-31) — open the activation-code modal instead of the
     // old dead-end mailto. The user gets a code from the author "en échange
     // d'un feedback" and activates it here; the email is a first-class,
@@ -1777,7 +1777,20 @@ if (typeof window !== "undefined") {
     // fail silently). `mode: "renew"` pivots the copy to a renewal ask when
     // a prior unlimited access has expired (MON-B).
     const mode = ev?.detail?.mode === "renew" ? "renew" : "activate";
-    openRedeemModal({ bridge, showToast, mode });
+    // MON-E (P0-83) — surface a previously-redeemed code read-only (with a
+    // copy affordance) by passing it from the persisted `redeemed_code`
+    // preference. Best-effort: a read failure just omits the row (additive).
+    let redeemedCode = "";
+    try {
+      const tauriInvoke = window?.__TAURI__?.core?.invoke;
+      if (tauriInvoke) {
+        const prefs = (await tauriInvoke("get_user_preferences_local")) || {};
+        redeemedCode = prefs.redeemed_code || "";
+      }
+    } catch {
+      /* prefs read is best-effort — omit the code row on failure */
+    }
+    openRedeemModal({ bridge, showToast, mode, redeemedCode });
   });
   window.addEventListener("alfred://upgrade-activated", () => {
     showToast(

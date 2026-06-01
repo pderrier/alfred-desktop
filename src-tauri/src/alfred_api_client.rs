@@ -322,6 +322,109 @@ fn set_device_identity(device_id: &str, device_secret: &str) {
     }
 }
 
+// ── MON-E (P0-83): stable per-machine fingerprint ───────────────────
+//
+// The server's `/redeem` now binds a comp code to up to 2 machines, keyed
+// by a stable machine fingerprint, within a 90-day shared window. The
+// desktop sends `machine_hash` on `/device/register` and `/redeem` so the
+// same physical machine re-uses its slot across re-installs and code
+// re-entries instead of burning a fresh slot each time.
+//
+// Privacy (feedback_no_leak_tokens / feedback_no_leak_creds): the raw OS
+// machine id is NEVER transmitted or logged — only a salted FNV-1a hash.
+// The salt (`alfred-mach-v1:`) namespaces the hash to this app + scheme
+// version so the same machine id can't be correlated across apps and so a
+// future scheme bump (`v2:`) yields fresh slots cleanly.
+
+/// Domain-separation salt for the machine fingerprint. Bump the version
+/// suffix to force every machine onto a fresh slot (e.g. if the hash input
+/// ever changes shape). Kept here, next to the hasher, so the contract is
+/// in one place.
+const MACHINE_FINGERPRINT_SALT: &str = "alfred-mach-v1:";
+
+/// User-preferences key holding the persisted random fallback id used when
+/// `machine_uid::get()` is unavailable (locked-down OS, container without
+/// a machine-id file, etc.). Stored once, then stable — guaranteeing
+/// exactly one slot per machine even without an OS machine id.
+const DEVICE_MACHINE_FALLBACK_KEY: &str = "device_machine_fallback";
+
+/// Pure helper: salt + FNV-1a hash a raw machine id into the hex string sent
+/// as `machine_hash`. Extracted so the hashing contract (salt + encoding) is
+/// unit-testable and identical for both the OS-id and fallback-id paths.
+fn fingerprint_hash(raw: &str) -> String {
+    let salted = format!("{MACHINE_FINGERPRINT_SALT}{raw}");
+    format!("{:016x}", fnv1a_64(salted.as_bytes()))
+}
+
+/// Generate a fresh random fallback id with no extra rng crate. The id only
+/// needs to be unique-enough and is persisted on first generation, so a
+/// one-shot mix of the high-resolution clock (nanos), the process id, and an
+/// address-space value run through the FNV-1a avalanche is sufficient —
+/// after the first call the value is read back from preferences, so
+/// determinism is provided by persistence, not by the generator.
+fn generate_fallback_machine_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let pid = std::process::id() as u64;
+    // A stack address gives a little ASLR entropy without any crate.
+    let stack_marker = &nanos as *const u64 as u64;
+    let mixed = fnv1a_64(&nanos.to_le_bytes())
+        ^ fnv1a_64(&pid.to_le_bytes())
+        ^ fnv1a_64(&stack_marker.to_le_bytes());
+    format!("{mixed:016x}{nanos:016x}")
+}
+
+/// Pure helper: resolve the fallback machine hash from a preferences value.
+/// Returns `(hash, patch)` where `patch` is `Some(json)` ONLY when a new id
+/// had to be generated (so the caller can persist it merge-only). When the
+/// prefs already hold a non-empty `device_machine_fallback`, `patch` is
+/// `None` (nothing to write). Splitting the I/O out keeps the
+/// generate-or-read decision testable without the filesystem.
+fn fallback_fingerprint_from_prefs(prefs: &Value) -> (String, Option<Value>) {
+    let existing = prefs
+        .get(DEVICE_MACHINE_FALLBACK_KEY)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match existing {
+        Some(id) => (fingerprint_hash(id), None),
+        None => {
+            let id = generate_fallback_machine_id();
+            let patch = serde_json::json!({ DEVICE_MACHINE_FALLBACK_KEY: id });
+            (fingerprint_hash(&id), Some(patch))
+        }
+    }
+}
+
+/// Return the stable per-machine fingerprint hash sent as `machine_hash`.
+///
+/// - Primary: the OS-native machine id (`machine_uid::get()`), salted +
+///   hashed. Stable across re-installs on the same machine.
+/// - Fallback (machine id unavailable): a persisted random id from the
+///   `device_machine_fallback` preference, generated once then reused. This
+///   guarantees exactly one slot per machine even without an OS machine id.
+///
+/// NEVER returns or logs the raw machine id — only the salted hash.
+pub fn machine_fingerprint() -> String {
+    match machine_uid::get() {
+        Ok(raw) if !raw.trim().is_empty() => fingerprint_hash(raw.trim()),
+        _ => {
+            let prefs = crate::runtime_settings::get_user_preferences();
+            let (hash, patch) = fallback_fingerprint_from_prefs(&prefs);
+            if let Some(patch) = patch {
+                if let Err(e) = crate::runtime_settings::save_user_preferences(&patch) {
+                    crate::debug_log(&format!(
+                        "alfred-api: failed to persist machine fallback id: {e}"
+                    ));
+                }
+            }
+            hash
+        }
+    }
+}
+
 /// Read the OpenAI JWT from local Codex session (never sent to the API).
 fn get_local_jwt() -> Option<String> {
     if let Some(token) = env::var("ALFRED_API_TOKEN").ok().filter(|t| !t.is_empty()) {
@@ -1077,7 +1180,13 @@ pub fn ensure_device_registered() -> Result<bool> {
     if device_identity().is_some() {
         return Ok(false); // already registered
     }
-    let resp = api_post_json("/device/register", &serde_json::json!({}))?;
+    // MON-E (P0-83): send the salted machine fingerprint so the server can
+    // bind this device to a stable slot (the raw machine id never leaves the
+    // device). An older server that predates MON-E ignores the extra field.
+    let resp = api_post_json(
+        "/device/register",
+        &serde_json::json!({ "machine_hash": machine_fingerprint() }),
+    )?;
     let device_id = resp.get("device_id").and_then(|v| v.as_str()).unwrap_or_default();
     let device_secret = resp.get("device_secret").and_then(|v| v.as_str()).unwrap_or_default();
     if device_id.is_empty() || device_secret.is_empty() {
@@ -1096,7 +1205,14 @@ pub fn ensure_device_registered() -> Result<bool> {
 /// Maps the structured error bodies to stable codes the UI routes on:
 /// - 400 `code_invalid`       → `alfred_redeem_invalid`
 /// - 409 `code_already_used`  → `alfred_redeem_already_used`
+/// - 410 `code_expired`       → `alfred_redeem_expired`       (MON-E)
+/// - 409 `code_device_limit`  → `alfred_redeem_device_limit`  (MON-E)
 /// - other 4xx/5xx / transport → existing `alfred_api_*` codes
+///
+/// MON-E (P0-83): the body carries `machine_hash` so the server binds the
+/// code to this stable machine slot (up to 2 machines / code, 90-day shared
+/// window). The raw machine id never leaves the device — only the salted
+/// hash. An older server ignores the extra field (one-slot-per-device).
 pub fn redeem_code(code: &str) -> Result<Value> {
     let trimmed = code.trim();
     if trimmed.is_empty() {
@@ -1104,7 +1220,7 @@ pub fn redeem_code(code: &str) -> Result<Value> {
     }
     let base = api_url().ok_or_else(|| anyhow!("alfred_api_not_configured"))?;
     let url = format!("{base}/redeem");
-    let body = serde_json::json!({ "code": trimmed });
+    let body = serde_json::json!({ "code": trimmed, "machine_hash": machine_fingerprint() });
     let req = apply_auth(ureq::post(&url), "/redeem")
         .set("Content-Type", "application/json")
         .timeout(Duration::from_secs(TIMEOUT_SECS));
@@ -1123,12 +1239,24 @@ pub fn redeem_code(code: &str) -> Result<Value> {
 
 /// Pure helper: classify a non-2xx `/redeem` response into a stable code.
 /// Extracted so the mapping is unit-testable without an HTTP round trip.
+///
+/// We route on the body `error` string FIRST (status-independent) because the
+/// server half owns the exact HTTP status per code and the desktop must not
+/// couple to it — a `code_device_limit` is the same user-facing state whether
+/// the server returns 409 or 403. The `status` only drives the generic
+/// `alfred_api_http_error:<status>` fallback when the body carries no known
+/// `error` code.
+///
+/// MON-E (P0-83) adds `code_expired` + `code_device_limit`; the existing
+/// `code_invalid` / `code_already_used` mappings are preserved verbatim.
 pub(crate) fn classify_redeem_error(status: u16, body: &Value) -> String {
     let err = body.get("error").and_then(|v| v.as_str()).unwrap_or("");
-    match (status, err) {
-        (400, "code_invalid") => "alfred_redeem_invalid".to_string(),
-        (409, "code_already_used") => "alfred_redeem_already_used".to_string(),
-        (s, _) => format!("alfred_api_http_error:{s}"),
+    match err {
+        "code_invalid" => "alfred_redeem_invalid".to_string(),
+        "code_already_used" => "alfred_redeem_already_used".to_string(),
+        "code_expired" => "alfred_redeem_expired".to_string(),
+        "code_device_limit" => "alfred_redeem_device_limit".to_string(),
+        _ => format!("alfred_api_http_error:{status}"),
     }
 }
 
@@ -1462,7 +1590,7 @@ mod tests {
         );
     }
 
-    // ── MON-C: redeem error classification ──────────────────────────
+    // ── MON-C / MON-E: redeem error classification ──────────────────
     #[test]
     fn classify_redeem_error_maps_invalid_and_already_used() {
         let invalid = serde_json::json!({"error": "code_invalid"});
@@ -1476,6 +1604,26 @@ mod tests {
     }
 
     #[test]
+    fn classify_redeem_error_maps_mon_e_expired_and_device_limit() {
+        // MON-E (P0-83): two new server codes. We route on the body `error`
+        // string regardless of HTTP status (the server half owns the status).
+        let expired = serde_json::json!({"error": "code_expired"});
+        assert_eq!(classify_redeem_error(410, &expired), "alfred_redeem_expired");
+        // Status-independence: same code via 400 still maps to expired.
+        assert_eq!(classify_redeem_error(400, &expired), "alfred_redeem_expired");
+
+        let limit = serde_json::json!({"error": "code_device_limit"});
+        assert_eq!(
+            classify_redeem_error(409, &limit),
+            "alfred_redeem_device_limit"
+        );
+        assert_eq!(
+            classify_redeem_error(403, &limit),
+            "alfred_redeem_device_limit"
+        );
+    }
+
+    #[test]
     fn classify_redeem_error_falls_back_to_http_code() {
         let other = serde_json::json!({"error": "something_else"});
         assert_eq!(classify_redeem_error(500, &other), "alfred_api_http_error:500");
@@ -1483,6 +1631,69 @@ mod tests {
             classify_redeem_error(400, &serde_json::Value::Null),
             "alfred_api_http_error:400"
         );
+    }
+
+    // ── MON-E: machine fingerprint ──────────────────────────────────
+    #[test]
+    fn fingerprint_hash_is_deterministic_and_salted() {
+        // Same raw id → same hash (determinism is the whole point: the same
+        // machine must re-use its server slot across re-installs).
+        let a = fingerprint_hash("raw-machine-id-123");
+        let b = fingerprint_hash("raw-machine-id-123");
+        assert_eq!(a, b, "hash must be deterministic for a given raw id");
+        // 16 hex chars (64-bit FNV-1a).
+        assert_eq!(a.len(), 16, "hash is a 16-char hex string, got: {a}");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        // The raw id never appears in the hash (no-leak contract).
+        assert!(!a.contains("raw-machine-id-123"));
+        // Different raw ids → different hashes.
+        assert_ne!(fingerprint_hash("id-a"), fingerprint_hash("id-b"));
+        // The salt actually participates: hashing the raw id WITHOUT the salt
+        // (i.e. the bare value) must differ from the salted fingerprint.
+        let unsalted = format!("{:016x}", fnv1a_64("id-a".as_bytes()));
+        assert_ne!(fingerprint_hash("id-a"), unsalted, "salt must be applied");
+    }
+
+    #[test]
+    fn fallback_fingerprint_reuses_persisted_id_without_patch() {
+        // When prefs already hold a fallback id, the hash is derived from it
+        // and NO patch is emitted (nothing to persist) — so the slot is
+        // stable across launches.
+        let prefs = serde_json::json!({ "device_machine_fallback": "persisted-xyz" });
+        let (hash, patch) = fallback_fingerprint_from_prefs(&prefs);
+        assert_eq!(hash, fingerprint_hash("persisted-xyz"));
+        assert!(patch.is_none(), "existing id must not be regenerated/persisted");
+    }
+
+    #[test]
+    fn fallback_fingerprint_generates_and_emits_patch_when_absent() {
+        // First run (no fallback id): a fresh id is generated, the hash is
+        // derived from it, and a merge-only patch is returned so the caller
+        // can persist it. The patch's id must hash to the returned hash.
+        let (hash, patch) = fallback_fingerprint_from_prefs(&serde_json::json!({}));
+        let patch = patch.expect("a fresh id must yield a persistence patch");
+        let id = patch
+            .get("device_machine_fallback")
+            .and_then(|v| v.as_str())
+            .expect("patch carries the new id under the canonical key");
+        assert!(!id.is_empty(), "generated id must be non-empty");
+        assert_eq!(hash, fingerprint_hash(id), "returned hash must match the persisted id");
+        // Empty/whitespace stored value is treated as absent (regenerated).
+        let (_, patch_blank) =
+            fallback_fingerprint_from_prefs(&serde_json::json!({"device_machine_fallback": "  "}));
+        assert!(patch_blank.is_some(), "blank stored id is treated as absent");
+    }
+
+    #[test]
+    fn machine_fingerprint_is_stable_hex_within_a_process() {
+        // Whether backed by the OS machine id or the persisted fallback, the
+        // public entry point must return a stable 16-char hex hash within a
+        // process (two calls agree) and never leak a raw id shape.
+        let a = machine_fingerprint();
+        let b = machine_fingerprint();
+        assert_eq!(a, b, "fingerprint must be stable within a process");
+        assert_eq!(a.len(), 16);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]

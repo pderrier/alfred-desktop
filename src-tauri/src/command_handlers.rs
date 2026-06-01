@@ -1760,8 +1760,10 @@ pub fn run_redeem_code(code: String) -> Result<serde_json::Value> {
 
     // Mirror the activation path: persist the paid tier locally so a cold
     // start before the next `/license/status` round-trip still shows the
-    // user as paid. Best-effort — server `tier:<id>` is authoritative.
-    persist_redeem_to_user_prefs(&resp);
+    // user as paid. MON-E (P0-83) also persists the redeemed code so the
+    // modal can show it read-only with a copy affordance. Best-effort —
+    // server `tier:<id>` is authoritative.
+    persist_redeem_to_user_prefs(trimmed, &resp);
 
     Ok(bridge_envelope("redeem:code-local", resp))
 }
@@ -1769,8 +1771,8 @@ pub fn run_redeem_code(code: String) -> Result<serde_json::Value> {
 /// Build the user-preferences patch from a successful `/redeem` response and
 /// persist it (merge-only). Pure-ish split so the prefs contract is testable.
 /// Best-effort: a write failure is logged + swallowed.
-fn persist_redeem_to_user_prefs(resp: &serde_json::Value) {
-    let patch = build_redeem_prefs_patch(resp);
+fn persist_redeem_to_user_prefs(code: &str, resp: &serde_json::Value) {
+    let patch = build_redeem_prefs_patch(code, resp);
     if let Err(e) = crate::runtime_settings::save_user_preferences(&patch) {
         crate::debug_log(&format!(
             "redeem: failed to persist tier to user-preferences: {e} (server-side tier authoritative)"
@@ -1778,10 +1780,14 @@ fn persist_redeem_to_user_prefs(resp: &serde_json::Value) {
     }
 }
 
-/// Pure helper: build the `{tier, license_expires_at}` patch from a
-/// `/redeem` response. `expires_at` (epoch secs) is stored as ISO 8601 to
-/// match the rest of the timestamp prefs. Pinned by a unit test.
-fn build_redeem_prefs_patch(resp: &serde_json::Value) -> serde_json::Value {
+/// Pure helper: build the `{tier, license_expires_at, redeemed_code}` patch
+/// from a `/redeem` response + the entered code. `expires_at` (epoch secs) is
+/// stored as ISO 8601 to match the rest of the timestamp prefs.
+///
+/// MON-E (P0-83): `redeemed_code` is the code the user actually entered (the
+/// server never echoes it back), persisted so the modal can display it
+/// read-only with a copy affordance on a later open. Pinned by a unit test.
+fn build_redeem_prefs_patch(code: &str, resp: &serde_json::Value) -> serde_json::Value {
     let tier = resp.get("tier").and_then(|v| v.as_str()).unwrap_or("paid");
     let iso_ts = resp
         .get("expires_at")
@@ -1792,6 +1798,7 @@ fn build_redeem_prefs_patch(resp: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "tier": tier,
         "license_expires_at": iso_ts,
+        "redeemed_code": code.trim(),
     })
 }
 
@@ -1933,17 +1940,23 @@ mod tests {
     fn build_redeem_prefs_patch_converts_expiry_to_iso() {
         // MON-C: a /redeem response {tier:paid, expires_at:<epoch>} maps to
         // {tier, license_expires_at:<ISO8601>} for the cold-start cache.
+        // MON-E (P0-83): also persists the entered code under `redeemed_code`.
         let resp = serde_json::json!({
             "ok": true,
             "tier": "paid",
             "expires_at": 1_800_000_000u64
         });
-        let patch = build_redeem_prefs_patch(&resp);
+        let patch = build_redeem_prefs_patch("ABCD-1234", &resp);
         let obj = patch.as_object().unwrap();
         assert_eq!(obj.get("tier").and_then(|v| v.as_str()), Some("paid"));
         let iso = obj.get("license_expires_at").and_then(|v| v.as_str()).unwrap();
         assert!(iso.starts_with("20"), "ISO 8601 timestamp, got: {iso}");
-        assert_eq!(obj.len(), 2, "patch is merge-only minimal, got: {obj:?}");
+        assert_eq!(
+            obj.get("redeemed_code").and_then(|v| v.as_str()),
+            Some("ABCD-1234"),
+            "MON-E: the entered code is persisted for read-back"
+        );
+        assert_eq!(obj.len(), 3, "patch is merge-only minimal, got: {obj:?}");
     }
 
     #[test]
@@ -1951,11 +1964,27 @@ mod tests {
         // Defensive: a malformed/partial response (no tier, no expires_at)
         // still yields a stable patch shape — tier defaults to "paid"
         // (we only persist on a successful redeem) and the ISO is empty.
-        let patch = build_redeem_prefs_patch(&serde_json::json!({}));
+        let patch = build_redeem_prefs_patch("CODE-1", &serde_json::json!({}));
         assert_eq!(patch.get("tier").and_then(|v| v.as_str()), Some("paid"));
         assert_eq!(
             patch.get("license_expires_at").and_then(|v| v.as_str()),
             Some("")
+        );
+        assert_eq!(
+            patch.get("redeemed_code").and_then(|v| v.as_str()),
+            Some("CODE-1")
+        );
+    }
+
+    #[test]
+    fn build_redeem_prefs_patch_trims_redeemed_code() {
+        // The persisted code is trimmed so a stray paste with surrounding
+        // whitespace stores the canonical code (matches the server-side trim
+        // in `redeem_code`).
+        let patch = build_redeem_prefs_patch("  PADDED-CODE  ", &serde_json::json!({}));
+        assert_eq!(
+            patch.get("redeemed_code").and_then(|v| v.as_str()),
+            Some("PADDED-CODE")
         );
     }
 

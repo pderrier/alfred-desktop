@@ -80,6 +80,16 @@ export function buildRedeemResultMessage(result = {}) {
         tone: "error",
         text: "Ce code a déjà été utilisé ou a expiré. Demande-en un nouveau à l'auteur.",
       };
+    case "alfred_redeem_expired":
+      return {
+        tone: "error",
+        text: "Ce code a expiré. Demande un nouveau code pour réactiver l'accès illimité.",
+      };
+    case "alfred_redeem_device_limit":
+      return {
+        tone: "error",
+        text: "Ce code est déjà utilisé sur 2 appareils. Écris à l'auteur pour obtenir un nouveau code.",
+      };
     case "alfred_api_not_configured":
       return {
         tone: "error",
@@ -91,6 +101,35 @@ export function buildRedeemResultMessage(result = {}) {
         text: "Impossible d'activer le code pour l'instant. Réessaie plus tard.",
       };
   }
+}
+
+/**
+ * Pure helper: normalise a candidate redeemed-code value to a trimmed string,
+ * or `""` when absent/blank. Centralised so the "is there a code to show"
+ * decision is identical whether the code comes from a fresh redeem response
+ * or from the persisted `redeemed_code` preference.
+ */
+export function normalizeRedeemedCode(code) {
+  return typeof code === "string" ? code.trim() : "";
+}
+
+/** Stable id of the read-only redeemed-code row (so it can be re-rendered). */
+const REDEEMED_CODE_ROW_ID = "redeem-active-code-row";
+
+/**
+ * Pure helper: HTML for the read-only "your active code" row with a copy
+ * affordance, consistent with the copyable-email pattern above. Returns "" when
+ * there is no code to show (so the row is simply absent — fully additive).
+ */
+export function buildRedeemedCodeRowHtml(code) {
+  const value = normalizeRedeemedCode(code);
+  if (!value) return "";
+  return `
+      <div class="redeem-active-code-row" id="${REDEEMED_CODE_ROW_ID}">
+        <span class="redeem-active-code-label">Ton code d'activation :</span>
+        <code class="redeem-active-code-value">${escapeHtml(value)}</code>
+        <button type="button" class="redeem-copy-code-btn">Copier le code</button>
+      </div>`;
 }
 
 /** Format an epoch-seconds expiry as a French date (JJ/MM/AAAA), or "". */
@@ -114,6 +153,10 @@ const MODAL_ID = "redeem-code-modal-overlay";
  * @param {Document} [deps.doc] — injectable for tests.
  * @param {Window} [deps.win] — injectable for tests (clipboard + events).
  * @param {string} [deps.mode] — "activate" (default) | "renew".
+ * @param {string} [deps.redeemedCode] — MON-E: a previously-redeemed code
+ *   (resolved from the `redeemed_code` preference at the call site). When
+ *   present, the modal shows it read-only with a copy affordance. ADDITIVE —
+ *   absent/blank means the row simply isn't rendered.
  */
 export function openRedeemModal(deps = {}) {
   const doc = deps.doc || document;
@@ -140,6 +183,7 @@ export function openRedeemModal(deps = {}) {
         <code class="redeem-email-value">${escapeHtml(CONTACT_EMAIL)}</code>
         <button type="button" class="redeem-copy-email-btn">Copier l'email</button>
       </div>
+      ${buildRedeemedCodeRowHtml(deps.redeemedCode)}
       <label class="redeem-code-label" for="redeem-code-input">Code d'activation</label>
       <input id="redeem-code-input" class="redeem-code-input" type="text"
              autocomplete="off" spellcheck="false" placeholder="XXXX-XXXX-XXXX-XXXX" />
@@ -156,7 +200,6 @@ export function openRedeemModal(deps = {}) {
   const resultEl = overlay.querySelector(".redeem-result-message");
   const activateBtn = overlay.querySelector(".redeem-activate-btn");
   const cancelBtn = overlay.querySelector(".redeem-cancel-btn");
-  const copyBtn = overlay.querySelector(".redeem-copy-email-btn");
 
   const renderResult = (msg) => {
     resultEl.textContent = msg.text;
@@ -167,13 +210,51 @@ export function openRedeemModal(deps = {}) {
     overlay.classList.add("hidden");
   };
 
-  copyBtn.addEventListener("click", async () => {
-    const ok = await copyToClipboard(win, CONTACT_EMAIL);
-    showToast(
-      ok ? "Email copié dans le presse-papiers." : `Copie indisponible — écris à ${CONTACT_EMAIL}`,
-      ok ? "success" : "info"
+  // Shared copy-button wiring (DRY) — the email row (always present) and the
+  // read-only redeemed-code row (present only when a code exists) both copy a
+  // value to the clipboard and toast the same success/failure pattern.
+  const wireCopyButton = (btn, value, okMsg, failMsg) => {
+    if (!btn) return;
+    btn.addEventListener("click", async () => {
+      const ok = await copyToClipboard(win, value);
+      showToast(ok ? okMsg : failMsg, ok ? "success" : "info");
+    });
+  };
+
+  wireCopyButton(
+    overlay.querySelector(".redeem-copy-email-btn"),
+    CONTACT_EMAIL,
+    "Email copié dans le presse-papiers.",
+    `Copie indisponible — écris à ${CONTACT_EMAIL}`
+  );
+
+  // MON-E: read-only redeemed-code row. Present in the initial HTML when
+  // `deps.redeemedCode` was passed (a prior code); re-rendered on a fresh
+  // successful redeem to reflect the just-entered code. Idempotent —
+  // replaces any existing row in place rather than duplicating it, and wires
+  // the (possibly new) copy button each time.
+  const renderRedeemedCode = (code) => {
+    const value = normalizeRedeemedCode(code);
+    if (!value) return;
+    const html = buildRedeemedCodeRowHtml(value);
+    const existing = overlay.querySelector(`#${REDEEMED_CODE_ROW_ID}`);
+    if (existing) {
+      existing.outerHTML = html; // reflect a freshly-redeemed code
+    } else {
+      // Inject just before the code-input label so it sits with the other
+      // identity rows (additive — never disturbs the input/actions).
+      const label = overlay.querySelector(".redeem-code-label");
+      if (label) label.insertAdjacentHTML("beforebegin", html);
+    }
+    wireCopyButton(
+      overlay.querySelector(".redeem-copy-code-btn"),
+      value,
+      "Code copié dans le presse-papiers.",
+      "Copie indisponible — sélectionne le code à la main."
     );
-  });
+  };
+  // Wire the copy button for a code row rendered in the initial HTML.
+  renderRedeemedCode(deps.redeemedCode);
 
   cancelBtn.addEventListener("click", close);
 
@@ -197,6 +278,9 @@ export function openRedeemModal(deps = {}) {
       input.disabled = true;
       activateBtn.style.display = "none";
       cancelBtn.textContent = "Terminé";
+      // MON-E: surface the just-redeemed code read-only with a copy
+      // affordance (Rust persisted it to `redeemed_code` for later opens).
+      renderRedeemedCode(code);
       // Reuse the existing tier-refresh plumbing: the upgrade-activated
       // listener (app.js) refreshes the health pill + busts the home-header
       // debounce so the new tier surfaces immediately.
@@ -269,6 +353,9 @@ export const __test = {
   buildRedeemIntro,
   buildRedeemResultMessage,
   formatExpiryFr,
+  normalizeRedeemedCode,
+  buildRedeemedCodeRowHtml,
   bridgeErrorCode,
   MODAL_ID,
+  REDEEMED_CODE_ROW_ID,
 };

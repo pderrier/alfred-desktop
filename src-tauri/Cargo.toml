@@ -20,6 +20,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 ureq = { version = "2", features = ["json", "tls"] }
 tungstenite = "0.24"
 regex = "1"
+# MON-E (P0-83): stable per-machine fingerprint for the comp-code device
+# slot (up to 2 machines per code, server-side). Reads the OS-native machine
+# id without root; we never transmit the raw id — only a salted FNV-1a hash.
+machine-uid = "0.6"
 
 [dev-dependencies]
 tempfile = "3"

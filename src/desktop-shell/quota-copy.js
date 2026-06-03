@@ -65,6 +65,81 @@ export function buildQuotaStripResetClause(resetAtEpochSecs) {
 }
 
 /**
+ * A `limit` at or above this sentinel is the server's "unlimited" cap
+ * (paid tier coerces `"unlimited"` → a huge number). The home strip must
+ * never declare a paid/unlimited user "exhausted", so any limit this large
+ * is treated as non-exhaustible regardless of the count.
+ */
+const PAID_UNLIMITED_LIMIT_SENTINEL = 1_000_000;
+
+/**
+ * P0-79 (REDUCED-A) — build the inner content of the home free-tier quota
+ * strip and decide whether the user is genuinely OUT of free analyses.
+ *
+ * Returns `{ html, exhausted }`:
+ *   - `html`      — the inner markup for the strip's `<span>` (a `<strong>`
+ *                   label + the count/limit + the caller-supplied
+ *                   `resetClause`). Count/limit are numbers so they are
+ *                   inherently injection-safe; `resetClause` is controlled
+ *                   FR copy from `buildQuotaStripResetClause` — the caller
+ *                   passes it ALREADY escaped (parity with the prior
+ *                   `escapeHtml(resetClause)` call site).
+ *   - `exhausted` — `true` ONLY when we are confident the free user has hit
+ *                   the cap, so the caller can swap in the "quota atteint"
+ *                   wording + redeem CTA.
+ *
+ * ## Degraded-safe contract (BINDING feedback_free_trial_never_blocked_by_-
+ * antiabuse)
+ *
+ * `exhausted` is `true` ONLY when ALL of:
+ *   1. `source === "server"` — the authoritative `/quota/status` count.
+ *      The local fallback drifts ±1 and the inert "both-down" payload is
+ *      meaningless, so neither may ever produce an "exhausted" verdict.
+ *   2. `count` and `limit` are finite numbers.
+ *   3. `limit` is a real small free cap (< the paid/unlimited sentinel) —
+ *      a paid/unlimited user is never "exhausted".
+ *   4. `count >= limit`.
+ * In every other case (missing/unreliable data, non-finite values, paid
+ * sentinel, under-limit) the strip renders the NEUTRAL count and
+ * `exhausted` is `false` — the user is never blocked or told they are out.
+ *
+ * @param {{count:number, limit:number, resetClause?:string, source?:string}} input
+ * @returns {{ html: string, exhausted: boolean }}
+ */
+export function buildQuotaStripContent(input) {
+  const count = input?.count;
+  const limit = input?.limit;
+  const resetClause = input?.resetClause || "";
+  const reliable =
+    input?.source === "server" &&
+    typeof count === "number" &&
+    Number.isFinite(count) &&
+    typeof limit === "number" &&
+    Number.isFinite(limit);
+
+  const isUnlimited = reliable && limit >= PAID_UNLIMITED_LIMIT_SENTINEL;
+  const exhausted = reliable && !isUnlimited && limit > 0 && count >= limit;
+
+  if (exhausted) {
+    // FR-tutoiement, additive: keep the "Gratuit" label + the reset clause,
+    // swap the count phrasing to make the cap explicit.
+    return {
+      exhausted: true,
+      html: `<strong>Gratuit</strong> · quota atteint (${count}/${limit}) cette semaine${resetClause}`,
+    };
+  }
+
+  // Neutral state — the prior behaviour. Non-finite count/limit fall back
+  // to the historical 0 / 3 defaults so the strip never renders "NaN".
+  const safeCount = typeof count === "number" && Number.isFinite(count) ? count : 0;
+  const safeLimit = typeof limit === "number" && Number.isFinite(limit) ? limit : 3;
+  return {
+    exhausted: false,
+    html: `<strong>Gratuit</strong> · ${safeCount}/${safeLimit} cette semaine${resetClause}`,
+  };
+}
+
+/**
  * Build the user-facing copy for the free-tier-exhausted upgrade modal.
  * Returns `{title, message, hint, cta}` ready to pass to `showErrorModal`.
  *

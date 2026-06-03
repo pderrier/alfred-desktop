@@ -46,7 +46,7 @@ import { buildGlobalPortfolioSynthesis } from "/desktop-shell/global-portfolio-s
 import { buildCrossAccountThemeView, findConcentrationThemeToTrigger, shouldNotifyConcentration } from "/desktop-shell/report-view-model.js";
 import { getThemeLabel } from "/desktop-shell/theme-labels.js";
 import { getLocalQuotaState, resetLocalQuotaCache } from "/desktop-shell/quota-local-counter.js";
-import { buildFreeTierExhaustedModalCopy, buildQuotaStripResetClause, displayQuotaAwareError, friendlyErrorSummary } from "/desktop-shell/quota-copy.js";
+import { buildFreeTierExhaustedModalCopy, buildQuotaStripResetClause, buildQuotaStripContent, displayQuotaAwareError, friendlyErrorSummary } from "/desktop-shell/quota-copy.js";
 import { extractFirstSentence, countPendingRecos } from "/desktop-shell/home-last-synthesis.js";
 import { extractTradeMoves, formatTradeRow } from "/desktop-shell/home-recent-trades.js";
 import { extractDatedCatalysts, formatCatalystRow } from "/desktop-shell/catalyst-calendar.js";
@@ -1261,6 +1261,10 @@ async function refreshHomeHeader() {
         // P3-31: epoch secs at which the oldest run slides out of the
         // rolling window (or null for an empty window / fallback path).
         reset_at: quota?.reset_at ?? null,
+        // P0-79 (REDUCED-A): reliability marker ("server" | "local" |
+        // "unavailable"). Only "server" data may render an "exhausted"
+        // strip; a missing/degraded source falls through to neutral.
+        quota_source: quota?.source ?? null,
       },
       error: null,
     };
@@ -2649,15 +2653,31 @@ function renderWelcome() {
         </div>
       `;
     }
-    const count = Number.isFinite(data.count) ? data.count : 0;
-    const limit = Number.isFinite(data.limit) ? data.limit : 3;
     // P3-31: append the reset date when the server gave us one. Empty
     // string when unknown (fresh user / fallback path) — never "NaN".
-    const resetClause = buildQuotaStripResetClause(data.reset_at);
+    // Controlled FR copy, escaped at the boundary as before.
+    const resetClause = escapeHtml(buildQuotaStripResetClause(data.reset_at));
+    // P0-79 (REDUCED-A): single helper decides the count wording + whether
+    // the free user is genuinely exhausted. Degraded/unknown quota data
+    // (quota_source !== "server") always renders the NEUTRAL state — the
+    // free trial is never blocked by an unreliable count.
+    const { html: stripHtml, exhausted } = buildQuotaStripContent({
+      count: data.count,
+      limit: data.limit,
+      resetClause,
+      source: data.quota_source,
+    });
+    // Exhausted free users get a stronger, explicit CTA — but it fires the
+    // SAME `alfred://upgrade-requested` event as the standard link (it
+    // opens the redeem/activation modal). Additive: the renew link still
+    // wins when a prior unlimited access expired.
+    const exhaustedCta = `<a href="#" class="welcome-upgrade-link" onclick="event.preventDefault(); window.dispatchEvent(new CustomEvent('alfred://upgrade-requested'));" style="color:var(--accent);text-decoration:none;font-weight:600">Obtiens un code d'activation pour continuer →</a>`;
+    const standardCta = `<a href="#" class="welcome-upgrade-link" onclick="event.preventDefault(); window.dispatchEvent(new CustomEvent('alfred://upgrade-requested'));" style="color:var(--accent);text-decoration:none">Obtiens un code d'activation en échange d'un feedback →</a>`;
+    const ctaLink = renewLink || (exhausted ? exhaustedCta : standardCta);
     return `
       <div class="welcome-step welcome-home-header" style="padding:0.55rem 0.8rem;background:var(--surface-2);border-radius:6px;margin-bottom:0.6rem;display:flex;justify-content:space-between;align-items:center;gap:0.6rem;flex-wrap:wrap">
-        <span><strong>Gratuit</strong> · ${count}/${limit} cette semaine${escapeHtml(resetClause)}</span>
-        ${renewLink || `<a href="#" class="welcome-upgrade-link" onclick="event.preventDefault(); window.dispatchEvent(new CustomEvent('alfred://upgrade-requested'));" style="color:var(--accent);text-decoration:none">Obtiens un code d'activation en échange d'un feedback →</a>`}
+        <span>${stripHtml}</span>
+        ${ctaLink}
         ${pendingNotice}
       </div>
     `;

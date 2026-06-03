@@ -20,7 +20,7 @@ test("getLocalQuotaState: primary source is the server quotaStatus probe", async
     runsCountLast7d: async () => { usedFallback = true; return { count: 99, limit: 3, period: "rolling_7d" }; },
   };
   const state = await getLocalQuotaState(bridge);
-  assert.deepEqual(state, { count: 2, limit: 3, period: "rolling_7d", reset_at: 1_700_000_000 });
+  assert.deepEqual(state, { count: 2, limit: 3, period: "rolling_7d", reset_at: 1_700_000_000, source: "server" });
   assert.equal(usedFallback, false, "fallback must NOT be hit when the server probe succeeds");
 });
 
@@ -32,7 +32,7 @@ test("getLocalQuotaState: falls back to local count when server probe fails", as
   };
   const state = await getLocalQuotaState(bridge);
   // Fallback path has no reset_at — must surface null, not undefined/NaN.
-  assert.deepEqual(state, { count: 1, limit: 3, period: "rolling_7d", reset_at: null });
+  assert.deepEqual(state, { count: 1, limit: 3, period: "rolling_7d", reset_at: null, source: "local" });
 });
 
 test("getLocalQuotaState: memoises the result for 60s (server probe only once)", async () => {

@@ -27,15 +27,31 @@
  *
  * ## Return shape
  *
- * `{count, limit, period, reset_at}` (+ optional `error` when even the
- * fallback failed). `reset_at` is epoch secs or `null` (empty window /
+ * `{count, limit, period, reset_at, source}` (+ optional `error` when even
+ * the fallback failed). `reset_at` is epoch secs or `null` (empty window /
  * fallback path which has no reset info). `limit` is always a number
  * (the server's `"unlimited"` paid sentinel coerces to the desktop
  * default 3 — paid tier renders from `licenseStatus().tier`, not from
  * this limit). Memoised 60 s — safe to call repeatedly per render.
  *
+ * ## `source` — reliability marker (P0-79 REDUCED-A)
+ *
+ *   `"server"`      — authoritative `/quota/status` count. The ONLY source
+ *                     the home strip trusts enough to render an
+ *                     "exhausted" state (`count >= limit`): it is the SAME
+ *                     count the enforcement gate sees, so the strip and the
+ *                     run-start 429 cannot disagree.
+ *   `"local"`       — `run-index.json` fallback. Drifts ±1 vs the server
+ *                     ZSET, so it is NOT reliable enough to declare
+ *                     exhaustion — the strip renders the neutral count
+ *                     only. (BINDING feedback_free_trial_never_blocked_by_-
+ *                     antiabuse: a degraded approximation must never block
+ *                     or show "exhausted".)
+ *   `"unavailable"` — both sources down; inert `{count:0, limit:3}`.
+ *                     Neutral only — never exhausted.
+ *
  * Voice — the home strip itself is rendered in `app.js` ; this module
- * only returns the raw `{count, limit, period, reset_at}` shape.
+ * only returns the raw `{count, limit, period, reset_at, source}` shape.
  */
 
 let _cache = null;
@@ -49,14 +65,17 @@ function coerceNumber(value, fallback) {
 
 /**
  * Normalise a raw quota payload (from either source) into the canonical
- * `{count, limit, period, reset_at}` shape. Stricter than `Number(x)` —
- * `Number(null)` is 0, but a null `limit` means "missing from payload"
- * (fall back to the desktop default 3) and a null `count` means
- * "unknown" (0). The server's `"unlimited"` string limit is non-numeric
- * → coerces to 3, which is correct: the limit is never shown for paid
- * tier (the strip branches on `licenseStatus().tier`).
+ * `{count, limit, period, reset_at, source}` shape. Stricter than
+ * `Number(x)` — `Number(null)` is 0, but a null `limit` means "missing
+ * from payload" (fall back to the desktop default 3) and a null `count`
+ * means "unknown" (0). The server's `"unlimited"` string limit is
+ * non-numeric → coerces to 3, which is correct: the limit is never shown
+ * for paid tier (the strip branches on `licenseStatus().tier`).
+ *
+ * `source` ("server" | "local") tags the origin so the strip can decide
+ * whether the data is reliable enough to declare an "exhausted" state.
  */
-function normalizeQuotaPayload(payload) {
+function normalizeQuotaPayload(payload, source) {
   const limit = coerceNumber(payload?.limit, 0);
   const resetAt = coerceNumber(payload?.reset_at, null);
   return {
@@ -64,6 +83,7 @@ function normalizeQuotaPayload(payload) {
     limit: limit > 0 ? limit : 3,
     period: payload?.period || "rolling_7d",
     reset_at: resetAt !== null && resetAt > 0 ? resetAt : null,
+    source,
   };
 }
 
@@ -83,27 +103,32 @@ export async function getLocalQuotaState(bridge) {
   const now = Date.now();
   if (_cache && now - _cacheAt < TTL_MS) return _cache;
 
-  // PRIMARY — authoritative server count (P3-31).
+  // PRIMARY — authoritative server count (P3-31). `source: "server"` is
+  // the only marker the home strip trusts for an "exhausted" verdict.
   try {
     const payload = await bridge.quotaStatus();
-    _cache = normalizeQuotaPayload(payload);
+    _cache = normalizeQuotaPayload(payload, "server");
     _cacheAt = now;
     return _cache;
   } catch (primaryErr) {
-    // FALLBACK — local run-index count. No reset_at available locally.
+    // FALLBACK — local run-index count. No reset_at available locally and
+    // the count drifts ±1 vs the server ZSET → `source: "local"` so the
+    // strip renders the neutral count only, never "exhausted".
     try {
       const payload = await bridge.runsCountLast7d();
-      _cache = normalizeQuotaPayload(payload);
+      _cache = normalizeQuotaPayload(payload, "local");
       _cacheAt = now;
       return _cache;
     } catch (fallbackErr) {
       // Both sources down — don't cache the inert value so the next
       // render retries instead of being stuck at 0/3 for 60 s.
+      // `source: "unavailable"` → strip stays neutral, never blocks.
       return {
         count: 0,
         limit: 3,
         period: "rolling_7d",
         reset_at: null,
+        source: "unavailable",
         error: String(
           fallbackErr?.message || primaryErr?.message || fallbackErr || primaryErr || "unknown"
         ),

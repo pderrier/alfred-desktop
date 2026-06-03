@@ -4,6 +4,7 @@ import {
   formatResetDateFr,
   resolveResetEpochSecs,
   buildQuotaStripResetClause,
+  buildQuotaStripContent,
   buildFreeTierExhaustedModalCopy,
   displayQuotaAwareError,
   friendlyErrorSummary,
@@ -83,14 +84,14 @@ test("buildFreeTierExhaustedModalCopy: includes the reset date from retryAfter",
     () => fixedNowMs
   );
   assert.equal(copy.title, "Quota atteint");
-  assert.match(copy.message, /Vous avez utilisé vos 3 analyses gratuites/);
+  assert.match(copy.message, /Tu as utilisé tes 3 analyses gratuites/);
   assert.equal(
     copy.message.includes(`Prochaine analyse disponible le ${expectedFr(resetEpoch)}.`),
     true,
     "message must carry the exact reset date"
   );
-  assert.equal(copy.hint, "Mode illimité bientôt disponible — contactez l'auteur !");
-  assert.equal(copy.cta.label, "Contacter l'auteur");
+  assert.equal(copy.hint, "Obtiens un code d'activation en échange d'un feedback.");
+  assert.equal(copy.cta.label, "Obtenir un code d'activation");
 });
 
 test("buildFreeTierExhaustedModalCopy: honours absolute reset_at (home/quota path)", () => {
@@ -111,15 +112,15 @@ test("buildFreeTierExhaustedModalCopy: falls back to coarse copy when no reset i
 
 test("buildFreeTierExhaustedModalCopy: defaults limit to 3 when missing/invalid", () => {
   const copy = buildFreeTierExhaustedModalCopy({ retryAfter: 100, limit: 0 }, () => 1_700_000_000_000);
-  assert.match(copy.message, /vos 3 analyses gratuites/);
+  assert.match(copy.message, /tes 3 analyses gratuites/);
   const copy2 = buildFreeTierExhaustedModalCopy({}, () => 1_700_000_000_000);
-  assert.match(copy2.message, /vos 3 analyses gratuites/);
+  assert.match(copy2.message, /tes 3 analyses gratuites/);
 });
 
 test("buildFreeTierExhaustedModalCopy: passes the envelope through as cta.detail", () => {
   const env = { retryAfter: 200, limit: 3, period: "rolling_7d" };
   const copy = buildFreeTierExhaustedModalCopy(env, () => 1_700_000_000_000);
-  assert.deepEqual(copy.cta.detail, env);
+  assert.deepEqual(copy.cta.detail, { ...env, intent: "redeem" });
 });
 
 // ── v0.4.8 P0 — displayQuotaAwareError routing ──────────────────────
@@ -150,14 +151,14 @@ test("displayQuotaAwareError: routes friendly modal for free_tier_exhausted (raw
   assert.equal(calls.length, 1, "must invoke showErrorModal exactly once and NOT the fallback");
   assert.equal(calls[0].kind, "modal");
   assert.equal(calls[0].title, "Quota atteint");
-  assert.match(calls[0].message, /Vous avez utilisé vos 3 analyses gratuites/);
+  assert.match(calls[0].message, /Tu as utilisé tes 3 analyses gratuites/);
   // Reset-date copy derived from retry_after=179364s + fixed clock.
   const expectedReset = new Intl.DateTimeFormat("fr-FR", { day: "2-digit", month: "2-digit" }).format(
     new Date(fixedNowMs + 179364 * 1000)
   );
   assert.match(calls[0].message, new RegExp(`Prochaine analyse disponible le ${expectedReset}\\.`));
-  assert.equal(calls[0].hint, "Mode illimité bientôt disponible — contactez l'auteur !");
-  assert.equal(calls[0].cta.label, "Contacter l'auteur");
+  assert.equal(calls[0].hint, "Obtiens un code d'activation en échange d'un feedback.");
+  assert.equal(calls[0].cta.label, "Obtenir un code d'activation");
   // CRITICAL: the raw code must NEVER leak into the modal body.
   assert.equal(
     /alfred_free_tier_exhausted/.test(calls[0].message),
@@ -292,4 +293,96 @@ test("friendlyErrorSummary: returns null when parseStructuredErrorCode dep is mi
     friendlyErrorSummary("alfred_free_tier_exhausted:60:3:rolling_7d", undefined),
     null
   );
+});
+
+// ── P0-79 (REDUCED-A): buildQuotaStripContent — home quota strip ────
+//
+// The home strip must render an "exhausted" state ONLY when it has
+// RELIABLE server data showing a genuinely over-limit free user. Any
+// degraded / unknown / paid / under-limit case renders the neutral count
+// and never blocks (BINDING feedback_free_trial_never_blocked_by_-
+// antiabuse). These tests pin every branch.
+
+test("buildQuotaStripContent: (a) count<limit & reliable & free → neutral, exhausted=false", () => {
+  const out = buildQuotaStripContent({ count: 1, limit: 3, source: "server" });
+  assert.equal(out.exhausted, false);
+  assert.match(out.html, /<strong>Gratuit<\/strong> · 1\/3 cette semaine/);
+  assert.equal(/quota atteint/.test(out.html), false);
+});
+
+test("buildQuotaStripContent: (b) count===limit & reliable & free → exhausted=true + CTA-able wording", () => {
+  const out = buildQuotaStripContent({ count: 3, limit: 3, source: "server" });
+  assert.equal(out.exhausted, true);
+  assert.match(out.html, /quota atteint \(3\/3\) cette semaine/);
+  // Still carries the "Gratuit" label (additive — header structure kept).
+  assert.match(out.html, /<strong>Gratuit<\/strong>/);
+});
+
+test("buildQuotaStripContent: (c) count>limit & reliable & free → exhausted=true (the '4/3' edge)", () => {
+  const out = buildQuotaStripContent({ count: 4, limit: 3, source: "server" });
+  assert.equal(out.exhausted, true);
+  assert.match(out.html, /quota atteint \(4\/3\) cette semaine/);
+});
+
+test("buildQuotaStripContent: (d) paid/unlimited sentinel limit → exhausted=false (never block paid)", () => {
+  const out = buildQuotaStripContent({ count: 999, limit: 1_000_000, source: "server" });
+  assert.equal(out.exhausted, false);
+  assert.equal(/quota atteint/.test(out.html), false);
+});
+
+test("buildQuotaStripContent: (e) count non-finite / data missing → neutral, exhausted=false (degraded-safe)", () => {
+  for (const bad of [undefined, null, NaN]) {
+    const out = buildQuotaStripContent({ count: bad, limit: 3, source: "server" });
+    assert.equal(out.exhausted, false, `count=${String(bad)} must not exhaust`);
+    // Falls back to the historical 0/3 wording, never "NaN".
+    assert.match(out.html, /<strong>Gratuit<\/strong> · 0\/3 cette semaine/);
+    assert.equal(/NaN/.test(out.html), false);
+  }
+});
+
+test("buildQuotaStripContent: (f) limit non-finite → neutral, exhausted=false", () => {
+  for (const bad of [undefined, null, NaN]) {
+    const out = buildQuotaStripContent({ count: 5, limit: bad, source: "server" });
+    assert.equal(out.exhausted, false, `limit=${String(bad)} must not exhaust`);
+    // count is kept (5) but limit falls back to the default 3 for display.
+    assert.match(out.html, /<strong>Gratuit<\/strong> · 5\/3 cette semaine/);
+    assert.equal(/quota atteint/.test(out.html), false);
+  }
+});
+
+test("buildQuotaStripContent: local fallback source is NOT reliable → neutral even when count>=limit (drift-safe)", () => {
+  // The local run-index count drifts ±1 vs the server ZSET. A '3/3' from
+  // the local fallback must NOT block the trial — only server data may.
+  const out = buildQuotaStripContent({ count: 3, limit: 3, source: "local" });
+  assert.equal(out.exhausted, false);
+  assert.match(out.html, /<strong>Gratuit<\/strong> · 3\/3 cette semaine/);
+  assert.equal(/quota atteint/.test(out.html), false);
+});
+
+test("buildQuotaStripContent: 'unavailable' source (both probes down) → neutral, exhausted=false", () => {
+  const out = buildQuotaStripContent({ count: 0, limit: 3, source: "unavailable" });
+  assert.equal(out.exhausted, false);
+  assert.match(out.html, /<strong>Gratuit<\/strong> · 0\/3 cette semaine/);
+});
+
+test("buildQuotaStripContent: missing source (undefined) → neutral, exhausted=false (degraded-safe)", () => {
+  // A render before the source tag is wired, or any payload without it,
+  // must default to neutral — unreliable until proven server-authoritative.
+  const out = buildQuotaStripContent({ count: 5, limit: 3 });
+  assert.equal(out.exhausted, false);
+  assert.equal(/quota atteint/.test(out.html), false);
+});
+
+test("buildQuotaStripContent: appends the caller-supplied (escaped) reset clause verbatim", () => {
+  const reset = " · réinitialisation le 10/06";
+  const neutral = buildQuotaStripContent({ count: 1, limit: 3, source: "server", resetClause: reset });
+  assert.equal(neutral.html.endsWith(reset), true);
+  const exhausted = buildQuotaStripContent({ count: 3, limit: 3, source: "server", resetClause: reset });
+  assert.equal(exhausted.exhausted, true);
+  assert.equal(exhausted.html.endsWith(reset), true);
+});
+
+test("buildQuotaStripContent: zero limit never exhausts (avoids 0/0 false-positive)", () => {
+  const out = buildQuotaStripContent({ count: 0, limit: 0, source: "server" });
+  assert.equal(out.exhausted, false);
 });

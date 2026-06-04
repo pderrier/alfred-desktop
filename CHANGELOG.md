@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.4.13
+
+**Mandatory upgrade.** No more analyses that look finished while some of your lines were never actually analyzed.
+
+### What's new
+
+- **Every line gets analyzed — or the run is honestly flagged.** Previously a run could end as "Completed" even when the AI had skipped some of your holdings (it ran out of room mid-analysis), and those lines silently showed the *previous* run's verdict with no warning. Alfred now detects the missing lines before writing the final synthesis and re-analyzes just those (up to 2 extra passes). If a line still can't be analyzed, the run is marked **"Partial analysis"** (orange badge) instead of pretending to be complete.
+
+### Under the hood
+
+- The coverage gate lives at the single shared synthesis entry point, so it applies identically whether you run in Codex or native mode (LLM-mode parity contract).
+
+### Compatibility
+
+- **Mandatory.** Earlier versions show the update screen on next launch.
+- Privacy and authentication unchanged — your sign-in token is never sent to the server.
+
 ## v0.4.12
 
 **Mandatory upgrade.** Company names show for more of your holdings, and shared analysis insights are contributed reliably again.

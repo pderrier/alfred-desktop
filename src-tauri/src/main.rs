@@ -1276,6 +1276,19 @@ fn main() {
                     .unwrap_or(std::path::Path::new("."))
                     .to_path_buf()
             });
+        // Pin the run-session bridge dir for this MCP subprocess to
+        // `<data-dir>/runtime-state` — the SAME absolute path the main
+        // process writes `active-run-session.json` to (the main process
+        // uses `resolve_runtime_state_dir()`, and codex.rs spawns us with
+        // `--data-dir = resolve_runtime_state_dir().parent()`, so
+        // `<data-dir>/runtime-state == resolve_runtime_state_dir()` for the
+        // canonical layout). Without this, the subprocess's in-memory
+        // ACTIVE_RUN_SESSION slot is never set, `apply_auth` omits
+        // `X-Run-Session`, and every codex `persist_*` write 401s and is
+        // silently swallowed (the bug this fixes). The MCP tool handlers
+        // already key every other `runtime-state/<run_id>_*` file off this
+        // same `<data-dir>/runtime-state` join.
+        alfred_api_client::set_mcp_runtime_state_dir(data_dir.join("runtime-state"));
         let tool_filter: Option<Vec<String>> = args
             .windows(2)
             .find(|w| w[0] == "--tools")

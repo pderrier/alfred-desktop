@@ -129,6 +129,178 @@ use crate::storage::read_json_file;
         }
     }
 
+    // ── Coverage-reprise mock (synthesis-turn targeted re-analysis) ──────
+    //
+    // `CodexMockFn` is a bare `fn` pointer with no captured state, so the
+    // controllable "which tickers does the agent refuse to analyze" behaviour
+    // is driven by this process-global skip set. Tests set it under `env_lock`
+    // (already serialized), then install `coverage_reprise_mock`.
+
+    static COVERAGE_SKIP_TICKERS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    fn set_coverage_skip(tickers: &[&str]) {
+        let mut guard = COVERAGE_SKIP_TICKERS.lock().expect("skip set lock");
+        *guard = tickers.iter().map(|t| t.to_uppercase()).collect();
+    }
+
+    fn clear_coverage_skip() {
+        if let Ok(mut guard) = COVERAGE_SKIP_TICKERS.lock() {
+            guard.clear();
+        }
+    }
+
+    fn coverage_skip_contains(ticker: &str) -> bool {
+        COVERAGE_SKIP_TICKERS
+            .lock()
+            .map(|g| g.iter().any(|t| t == &ticker.to_uppercase()))
+            .unwrap_or(false)
+    }
+
+    /// Mock that mirrors `codex_test_mock` for synthesis but, for batch
+    /// prompts, refuses to write a recommendation for any ticker in
+    /// `COVERAGE_SKIP_TICKERS`. This reproduces the real bug: the agent turn
+    /// "succeeds" while leaving some lines uncovered.
+    fn coverage_reprise_mock(prompt: &str) -> anyhow::Result<serde_json::Value> {
+        let run_id = prompt
+            .find("run_id=\"").or_else(|| prompt.find("run \""))
+            .and_then(|start| {
+                let rest = &prompt[start..];
+                let quote_start = rest.find('"')? + 1;
+                let rest2 = &rest[quote_start..];
+                let quote_end = rest2.find('"')?;
+                Some(rest2[..quote_end].to_string())
+            })
+            .unwrap_or_default();
+        if run_id.is_empty() {
+            return Ok(json!({"ok": true, "mock": true}));
+        }
+
+        let is_synthesis = prompt.contains("synthese globale") || prompt.contains("check_coverage");
+        if is_synthesis {
+            let run_state = crate::load_run_by_id_direct(&run_id)?;
+            let reco_count = run_state.get("pending_recommandations")
+                .and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+            if reco_count == 0 {
+                return Ok(json!({"ok": true, "mock": true, "skipped": "no_recommendations"}));
+            }
+            let draft = json!({
+                "synthese_marche": "Synthese mock: portefeuille equilibre avec des fondamentaux solides et une diversification adequate pour la couverture.",
+                "actions_immediates": [],
+                "llm_utilise": "codex-mock",
+            });
+            // Evict BEFORE persist so the (cache-bypassing) `completed` write
+            // is authoritative: `evict` flushes the cached `running`+recs to
+            // disk and DROPS the entry, so persist reads a synced disk and no
+            // stale cached `running` can clobber the `completed` afterwards.
+            // (The real codex path evicts the main-process cache likewise; the
+            // MCP `finalize_report` write happens in a separate sidecar process
+            // with its own cache.)
+            crate::run_state_cache::evict(&run_id);
+            let _ = crate::report::persist_retry_global_synthesis(&run_id, &draft)?;
+            return Ok(json!({"ok": true, "mock": true, "orchestration_status": "completed"}));
+        }
+
+        // Batch analysis: write a mock recommendation for each requested line
+        // EXCEPT tickers in the skip set (simulating the agent dropping lines).
+        let run_state = crate::load_run_by_id_direct(&run_id)?;
+        let positions = run_state.get("portfolio")
+            .and_then(|p| p.get("positions"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        for pos in &positions {
+            let ticker = pos.get("ticker").and_then(|v| v.as_str()).unwrap_or("").to_uppercase();
+            if ticker.is_empty() || coverage_skip_contains(&ticker) {
+                continue;
+            }
+            // Only analyze lines actually named in THIS batch prompt's line list.
+            if !prompt.contains(&format!(":{ticker} ")) && !prompt.contains(&format!(":{ticker}\n")) {
+                continue;
+            }
+            let line_type = pos.get("type").and_then(|v| v.as_str()).unwrap_or("position");
+            let nom = pos.get("nom").and_then(|v| v.as_str()).unwrap_or("");
+            let line_id = format!("{line_type}:{ticker}");
+            let already_has = run_state.get("pending_recommandations")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().any(|r| r.get("line_id").and_then(|v| v.as_str()) == Some(&line_id)))
+                .unwrap_or(false);
+            if already_has { continue; }
+            let rec = json!({
+                "line_id": line_id,
+                "ticker": ticker,
+                "type": line_type,
+                "nom": nom,
+                "signal": "CONSERVER",
+                "conviction": "moderee",
+                "synthese": format!("{ticker}: conserver la position avec discipline et suivi du risque structurel sur la duree."),
+                "action_recommandee": "Conserver, pas d'action immediate",
+            });
+            let _ = crate::patch_run_state_direct_with(&run_id, |rs| {
+                let obj = rs.as_object_mut().expect("run_state object");
+                let mut pending = obj.get("pending_recommandations")
+                    .and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                pending.retain(|r| r.get("line_id").and_then(|v| v.as_str()) != Some(&line_id));
+                pending.push(rec.clone());
+                obj.insert("pending_recommandations".to_string(), json!(pending));
+            });
+        }
+        Ok(json!({"ok": true, "mock": true}))
+    }
+
+    /// Build a 3-position run_state on disk with `pending_recommandations`
+    /// pre-seeded for `pre_covered` only — the rest are "missing" going into
+    /// the synthesis turn. Returns (base_dir, run_id).
+    fn seed_coverage_run_state(
+        tag: &str,
+        tickers: &[&str],
+        pre_covered: &[&str],
+    ) -> (std::path::PathBuf, String) {
+        let base_dir = std::env::temp_dir()
+            .join(format!("alfred-coverage-{tag}-{}-{}", std::process::id(), now_epoch_ms()));
+        let state_dir = base_dir.join("runtime-state");
+        let reports_dir = base_dir.join("reports");
+        fs::create_dir_all(&state_dir).expect("state dir");
+        fs::create_dir_all(reports_dir.join("history")).expect("history dir");
+
+        let run_id = format!("cov_{tag}_{}", now_epoch_ms());
+        let positions: Vec<serde_json::Value> = tickers.iter().map(|t| json!({
+            "ticker": t, "nom": format!("{t} SA"), "type": "position",
+            "quantite": 10, "prix_actuel": 100.0, "valeur_actuelle": 1000.0,
+        })).collect();
+        let pending: Vec<serde_json::Value> = pre_covered.iter().map(|t| {
+            let tk = t.to_uppercase();
+            json!({
+                "line_id": format!("position:{tk}"),
+                "ticker": tk,
+                "type": "position",
+                "signal": "CONSERVER",
+                "synthese": format!("{tk}: position deja analysee avec un contexte suffisamment detaille pour la validation locale."),
+            })
+        }).collect();
+
+        fs::write(
+            state_dir.join(format!("{run_id}.json")),
+            serde_json::to_string(&json!({
+                "run_id": run_id,
+                "account": "PEA",
+                "updated_at": now_iso_string(),
+                "portfolio": {
+                    "valeur_totale": 3000.0,
+                    "plus_value_totale": 100.0,
+                    "liquidites": 50.0,
+                    "positions": positions,
+                },
+                "pending_recommandations": pending,
+                "orchestration": { "status": "running", "stage": "analyzing_lines" },
+            })).expect("serialize"),
+        ).expect("write run state");
+
+        std::env::set_var("ALFRED_STATE_DIR", state_dir.as_os_str());
+        std::env::set_var("ALFRED_REPORTS_DIR", reports_dir.as_os_str());
+        (base_dir, run_id)
+    }
+
     /// RAII guard that removes env vars on drop (even on panic).
     struct EnvCleanup(&'static [&'static str]);
     impl Drop for EnvCleanup {
@@ -596,6 +768,181 @@ use crate::storage::read_json_file;
         ));
         assert_eq!(persisted["pending_recommandations"].as_array().map(|rows| rows.len()), Some(1));
         assert_eq!(persisted["portfolio"]["positions"].as_array().map(|rows| rows.len()), Some(1));
+    }
+
+    // ── Coverage-reprise: synthesis-turn targeted re-analysis (bug
+    // 019e9455124c — run finalized `completed` with 5/34 lines uncovered).
+    // The four scenarios from the brief: (a) reprise fires, (c) reprise heals
+    // → clean completed, (b) NON-REGRESSION: still incomplete after cap →
+    // completed_degraded (not completed), (d) abort during reprise → no
+    // re-dispatch. ──────────────────────────────────────────────────────────
+
+    /// (a) + (c): a run missing one line triggers re-analysis; the mock heals
+    /// it on the first sweep, so the run finalizes clean `completed`.
+    #[test]
+    fn coverage_reprise_recovers_missing_line_and_completes_clean() {
+        let _guard = env_lock();
+        let _env_cleanup = EnvCleanup(TEST_ENV_KEYS);
+        crate::codex::set_codex_mock(Some(coverage_reprise_mock));
+        clear_coverage_skip(); // mock writes ALL requested lines → heals CAP
+        let (base_dir, run_id) =
+            seed_coverage_run_state("heal", &["MC", "AI", "CAP"], &["MC", "AI"]);
+
+        // Precondition: CAP is missing before synthesis.
+        let pre = crate::load_run_by_id_direct(&run_id).expect("load");
+        assert_eq!(
+            crate::report::missing_line_ids(&pre),
+            vec!["position:CAP".to_string()],
+            "precondition: CAP uncovered going into synthesis"
+        );
+
+        let result = crate::native_mcp_analysis::run_synthesis_turn(
+            &run_id,
+            base_dir.to_str().unwrap(),
+        )
+        .expect("synthesis turn should succeed");
+
+        clear_coverage_skip();
+        let persisted = crate::load_run_by_id_direct(&run_id).expect("reload");
+        let _ = fs::remove_dir_all(&base_dir);
+
+        assert_eq!(
+            result["orchestration_status"], "completed",
+            "fully-covered run must finalize clean completed"
+        );
+        assert!(
+            crate::report::missing_line_ids(&persisted).is_empty(),
+            "CAP must be covered after the reprise sweep"
+        );
+        assert_eq!(persisted["orchestration"]["status"], "completed");
+    }
+
+    /// (b) NON-REGRESSION for the real bug: a line the agent keeps refusing
+    /// stays uncovered after the retry cap → the run MUST finalize
+    /// `completed_degraded`, never clean `completed`.
+    #[test]
+    fn coverage_reprise_forces_degraded_when_still_incomplete_after_cap() {
+        let _guard = env_lock();
+        let _env_cleanup = EnvCleanup(TEST_ENV_KEYS);
+        crate::codex::set_codex_mock(Some(coverage_reprise_mock));
+        // The agent permanently refuses CAP — every reprise sweep leaves it
+        // uncovered, exactly like ENGI/CAP/ALDNX/CS/NAE in run 019e9455124c.
+        set_coverage_skip(&["CAP"]);
+        let (base_dir, run_id) =
+            seed_coverage_run_state("degraded", &["MC", "AI", "CAP"], &["MC", "AI"]);
+
+        let result = crate::native_mcp_analysis::run_synthesis_turn(
+            &run_id,
+            base_dir.to_str().unwrap(),
+        )
+        .expect("synthesis turn should still produce a report");
+
+        clear_coverage_skip();
+        let persisted = crate::load_run_by_id_direct(&run_id).expect("reload");
+        let _ = fs::remove_dir_all(&base_dir);
+
+        assert_eq!(
+            result["orchestration_status"], "completed_degraded",
+            "a run with a permanently-uncovered line must NOT report clean completed"
+        );
+        assert_eq!(
+            persisted["orchestration"]["status"], "completed_degraded",
+            "on-disk orchestration must reflect the degradation for the UI"
+        );
+        assert_eq!(
+            crate::report::missing_line_ids(&persisted),
+            vec!["position:CAP".to_string()],
+            "CAP remains uncovered — the degradation is real, not cosmetic"
+        );
+    }
+
+    /// (c) explicit: a run already fully covered does NOT trigger any reprise
+    /// and finalizes clean `completed`.
+    #[test]
+    fn coverage_reprise_noop_when_already_complete() {
+        let _guard = env_lock();
+        let _env_cleanup = EnvCleanup(TEST_ENV_KEYS);
+        crate::codex::set_codex_mock(Some(coverage_reprise_mock));
+        clear_coverage_skip();
+        let (base_dir, run_id) =
+            seed_coverage_run_state("complete", &["MC", "AI"], &["MC", "AI"]);
+
+        let outcome = crate::native_mcp_analysis::reanalyze_missing_lines(
+            &run_id,
+            base_dir.to_str().unwrap(),
+        );
+
+        let _ = fs::remove_dir_all(&base_dir);
+        assert_eq!(
+            outcome,
+            crate::native_mcp_analysis::CoverageOutcome::Complete,
+            "no missing lines → Complete, no re-dispatch"
+        );
+    }
+
+    /// (d): a user abort during the reprise window stops re-dispatch — the
+    /// loop returns `Aborted` and run_synthesis_turn propagates run_aborted.
+    #[test]
+    fn coverage_reprise_respects_user_abort() {
+        let _guard = env_lock();
+        let _env_cleanup = EnvCleanup(TEST_ENV_KEYS);
+        crate::codex::set_codex_mock(Some(coverage_reprise_mock));
+        set_coverage_skip(&["CAP"]); // CAP missing so the loop would otherwise run
+        let (base_dir, run_id) =
+            seed_coverage_run_state("abort", &["MC", "AI", "CAP"], &["MC", "AI"]);
+
+        // Register a cancel flag bound to this run and trip it BEFORE the
+        // reprise loop checks for abort. `is_any_operation_cancelled_for_run`
+        // walks ops_store → cancel registry, so we seed an ops record too.
+        let op_id = format!("op_{run_id}");
+        {
+            let mut store = analysis_ops_store().lock().expect("ops store");
+            store.insert(
+                op_id.clone(),
+                AnalysisOperationRecord {
+                    operation_id: op_id.clone(),
+                    status: "running".to_string(),
+                    stage: "analyzing_lines".to_string(),
+                    run_id: Some(run_id.clone()),
+                    started_at_ms: now_epoch_ms(),
+                    finished_at_ms: None,
+                    result: None,
+                    error_code: None,
+                    error_message: None,
+                    collection_progress: None,
+                    line_progress: None,
+                    line_status: None,
+                },
+            );
+        }
+        crate::analysis_ops::test_register_and_trip_cancel_flag(&op_id);
+
+        let outcome = crate::native_mcp_analysis::reanalyze_missing_lines(
+            &run_id,
+            base_dir.to_str().unwrap(),
+        );
+
+        // The reprise must NOT have re-dispatched CAP (abort short-circuits).
+        let persisted = crate::load_run_by_id_direct(&run_id).expect("reload");
+
+        // Cleanup
+        crate::analysis_ops::test_clear_cancel_flag(&op_id);
+        if let Ok(mut store) = analysis_ops_store().lock() {
+            store.remove(&op_id);
+        }
+        clear_coverage_skip();
+        let _ = fs::remove_dir_all(&base_dir);
+
+        assert_eq!(
+            outcome,
+            crate::native_mcp_analysis::CoverageOutcome::Aborted,
+            "abort during reprise window must return Aborted"
+        );
+        assert_eq!(
+            crate::report::missing_line_ids(&persisted),
+            vec!["position:CAP".to_string()],
+            "aborted reprise must not have analyzed CAP"
+        );
     }
 
     #[test]

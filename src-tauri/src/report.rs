@@ -82,6 +82,35 @@ pub fn derive_expected_line_ids(run_state: &serde_json::Value) -> Vec<String> {
     ids
 }
 
+/// Set of expected line_ids that currently have NO recommendation in
+/// `pending_recommandations`. This is the load-bearing coverage gap shared by
+/// the MCP `check_coverage` tool (`mcp_server::tool_check_coverage`) and the
+/// synthesis-turn targeted re-analysis loop
+/// (`native_mcp_analysis::reanalyze_missing_lines`). Returned sorted, matching
+/// `derive_expected_line_ids`, so callers get deterministic ordering.
+///
+/// A recommendation is considered "covering" a line iff its resolved line_id
+/// (via `as_line_id` — direct `line_id` or `type:ticker` reconstruction) is in
+/// the expected set. Duplicates and unexpected recommendations do not affect
+/// the *missing* set (they are surfaced separately by `tool_check_coverage`).
+pub fn missing_line_ids(run_state: &serde_json::Value) -> Vec<String> {
+    let expected = derive_expected_line_ids(run_state);
+    let covered: std::collections::HashSet<String> = run_state
+        .get("pending_recommandations")
+        .and_then(|v| v.as_array())
+        .map(|recs| {
+            recs.iter()
+                .map(as_line_id)
+                .filter(|id| !id.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    expected
+        .into_iter()
+        .filter(|id| !covered.contains(id))
+        .collect()
+}
+
 // ── Action enrichment from line recommendations ──
 
 // Held-position signals that warrant a portfolio `actions_immediates` entry.

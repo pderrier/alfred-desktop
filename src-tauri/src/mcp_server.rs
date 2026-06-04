@@ -318,38 +318,12 @@ fn make_line_id(value: &Value) -> String {
     format!("{line_type}:{ticker}")
 }
 
-fn derive_expected_line_ids(run_state: &Value) -> Vec<String> {
-    let mut ids = Vec::new();
-    let mut seen = HashSet::new();
-    for (line_type, rows) in [
-        (
-            "position",
-            run_state
-                .get("portfolio")
-                .and_then(|v| v.get("positions"))
-                .and_then(|v| v.as_array()),
-        ),
-        (
-            "watchlist",
-            run_state
-                .get("watchlist")
-                .and_then(|v| v.get("items"))
-                .and_then(|v| v.as_array()),
-        ),
-    ] {
-        for row in rows.unwrap_or(&Vec::new()) {
-            let ticker = as_upper(row.get("ticker"));
-            if ticker.is_empty() {
-                continue;
-            }
-            let line_id = format!("{line_type}:{ticker}");
-            if seen.insert(line_id.clone()) {
-                ids.push(line_id);
-            }
-        }
-    }
-    ids
-}
+// The expected-line-id set is derived by the single source of truth in
+// `report.rs` (`crate::report::derive_expected_line_ids`), which computes the
+// same position+watchlist line-id set and additionally sorts it for
+// deterministic ordering. The duplicate that previously lived here was removed
+// to keep the coverage contract DRY — `tool_check_coverage` now delegates to
+// the shared helper.
 
 // ── Alfred API client (delegates to alfred_api_client with HMAC auth) ───────
 
@@ -1510,8 +1484,13 @@ fn tool_check_coverage(data_dir: &Path, params: &Value) -> Result<Value> {
 
     let run_state = load_run_state(data_dir, &run_id)?;
 
-    let expected = derive_expected_line_ids(&run_state);
+    // Expected set + missing gap come from the single source of truth in
+    // `report.rs` so the synthesis-turn re-analysis loop and this tool agree
+    // on coverage byte-for-byte. `make_line_id` reconstructs `type:ticker`
+    // when the LLM omits `line_id` — identical to `report::as_line_id`.
+    let expected = crate::report::derive_expected_line_ids(&run_state);
     let expected_set: HashSet<String> = expected.iter().cloned().collect();
+    let missing = crate::report::missing_line_ids(&run_state);
 
     let pending = run_state
         .get("pending_recommandations")
@@ -1524,7 +1503,7 @@ fn tool_check_coverage(data_dir: &Path, params: &Value) -> Result<Value> {
     let mut unexpected = Vec::new();
 
     for rec in &pending {
-        let lid = as_text(rec.get("line_id"));
+        let lid = make_line_id(rec);
         if lid.is_empty() {
             continue;
         }
@@ -1535,12 +1514,6 @@ fn tool_check_coverage(data_dir: &Path, params: &Value) -> Result<Value> {
             unexpected.push(lid);
         }
     }
-
-    let missing: Vec<String> = expected
-        .iter()
-        .filter(|id| !covered.contains(*id))
-        .cloned()
-        .collect();
 
     let ok = missing.is_empty() && duplicates.is_empty();
 

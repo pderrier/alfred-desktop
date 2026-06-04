@@ -3123,9 +3123,241 @@ impl McpBatchDispatchQueue {
 
 // ── Synthesis turn ───────────────────────────────────────────────
 
+/// Outcome of the targeted re-analysis pass that runs BEFORE synthesis.
+/// Distinguishes a fully-covered run from one that stays incomplete (which
+/// must finalize as `completed_degraded`, never clean `completed`) and from a
+/// user-aborted run (which must not finalize at all).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CoverageOutcome {
+    /// Every expected line has a recommendation — synthesis proceeds normally.
+    Complete,
+    /// Lines are still missing after the re-analysis cap — synthesis proceeds
+    /// but the run is force-marked `completed_degraded`.
+    Degraded,
+    /// The user aborted during re-analysis — caller must abort the run.
+    Aborted,
+}
+
+/// Maximum number of targeted re-analysis sweeps for lines the initial pass
+/// left uncovered. Each sweep re-dispatches ONLY the missing tickers through
+/// the same `McpBatchDispatchQueue` mechanism the initial pass uses, so the
+/// MCP sidecar/relay lifecycle and the `pending_recommandations` write-back
+/// path are identical (codex: agent calls `validate_recommendation`; native:
+/// per-line in-process `dispatch_tool_direct`). After each sweep `join_all`
+/// runs `merge_mcp_results`, landing the new recommendations on disk before
+/// the next coverage check.
+const MAX_COVERAGE_RETRIES: u32 = 2;
+
+/// Re-analyze any expected lines the initial pass failed to cover, BEFORE the
+/// synthesis turn generates the global report. This is the shared chokepoint
+/// for codex AND native modes (parity contract — the prior bug was that a run
+/// could finalize `completed` with 5/34 lines silently falling back to the
+/// previous run's stale synthesis).
+///
+/// Reuses `McpBatchDispatchQueue` (same construct as the initial analysis
+/// pass) so there is no second, divergent dispatch path. Respects user abort
+/// via `is_any_operation_cancelled_for_run`. Caps the work at
+/// `MAX_COVERAGE_RETRIES` sweeps.
+pub(crate) fn reanalyze_missing_lines(run_id: &str, data_dir: &str) -> CoverageOutcome {
+    // Read the authoritative on-disk state (the initial pass has flushed via
+    // `join_all` → `merge_mcp_results` before the worker delegated synthesis).
+    crate::run_state_cache::flush_now(run_id);
+    let run_state = match crate::load_run_by_id_direct(run_id) {
+        Ok(rs) => rs,
+        Err(e) => {
+            crate::debug_log(&format!(
+                "[coverage-reprise] cannot load run_state for {run_id}: {e} — treating as complete"
+            ));
+            return CoverageOutcome::Complete;
+        }
+    };
+
+    let mut missing = crate::report::missing_line_ids(&run_state);
+    if missing.is_empty() {
+        return CoverageOutcome::Complete;
+    }
+
+    crate::debug_log(&format!(
+        "[coverage-reprise] run {run_id}: {} line(s) missing before synthesis: {:?}",
+        missing.len(),
+        missing
+    ));
+
+    for attempt in 1..=MAX_COVERAGE_RETRIES {
+        // Respect user abort — do not re-dispatch if the run was stopped.
+        if crate::analysis_ops::is_any_operation_cancelled_for_run(run_id) {
+            crate::debug_log(&format!(
+                "[coverage-reprise] run {run_id} aborted during re-analysis (attempt {attempt})"
+            ));
+            return CoverageOutcome::Aborted;
+        }
+
+        // Resolve each missing line_id ("type:ticker") to a dispatch packet.
+        // `nom` is sourced from the run_state rows (best-effort, only used in
+        // the batch prompt's line list); empty is acceptable.
+        let packets = build_missing_line_packets(&run_state, &missing);
+        if packets.is_empty() {
+            // No resolvable tickers (e.g. malformed line_ids) — cannot make
+            // progress; treat as degraded rather than loop fruitlessly.
+            break;
+        }
+
+        for packet in &packets {
+            let _ = crate::run_state::update_line_status_with_progress(
+                run_id,
+                &packet.ticker,
+                "analyzing",
+                "re-analyse couverture\u{2026}",
+            );
+        }
+
+        // Reuse the exact initial-pass dispatch construct. batch_size = number
+        // of missing lines so they go out in a single turn (codex) / fan-out
+        // (native). `new` re-ensures the codex MCP config.
+        let mut queue = McpBatchDispatchQueue::new(run_id, data_dir, packets.len().max(1));
+        let dispatch_result = (|| -> Result<()> {
+            for packet in packets {
+                queue.push(packet)?;
+            }
+            queue.flush_pending()?;
+            queue.join_all()?;
+            Ok(())
+        })();
+        if let Err(e) = dispatch_result {
+            crate::debug_log(&format!(
+                "[coverage-reprise] run {run_id} re-dispatch attempt {attempt} failed: {e}"
+            ));
+        }
+
+        // `join_all` already merged sidecar results into
+        // `pending_recommandations` (codex) or they were written in-process
+        // (native). Re-read from disk and re-check the gap.
+        crate::run_state_cache::flush_now(run_id);
+        let refreshed = match crate::load_run_by_id_direct(run_id) {
+            Ok(rs) => rs,
+            Err(e) => {
+                crate::debug_log(&format!(
+                    "[coverage-reprise] reload after attempt {attempt} failed: {e}"
+                ));
+                break;
+            }
+        };
+        missing = crate::report::missing_line_ids(&refreshed);
+        crate::debug_log(&format!(
+            "[coverage-reprise] run {run_id} after attempt {attempt}/{MAX_COVERAGE_RETRIES}: {} still missing",
+            missing.len()
+        ));
+        if missing.is_empty() {
+            return CoverageOutcome::Complete;
+        }
+    }
+
+    crate::debug_log(&format!(
+        "[coverage-reprise] run {run_id} still incomplete after {MAX_COVERAGE_RETRIES} retries \
+         ({} missing) — finalizing as completed_degraded",
+        missing.len()
+    ));
+    CoverageOutcome::Degraded
+}
+
+/// Resolve missing line_ids ("type:ticker") into dispatch packets, sourcing
+/// `nom` from the matching position/watchlist row when available.
+fn build_missing_line_packets(run_state: &Value, missing: &[String]) -> Vec<McpLinePacket> {
+    let positions = run_state
+        .get("portfolio")
+        .and_then(|p| p.get("positions"))
+        .and_then(|v| v.as_array());
+    let watchlist = run_state
+        .get("watchlist")
+        .and_then(|w| w.get("items"))
+        .and_then(|v| v.as_array());
+
+    let lookup_nom = |line_type: &str, ticker: &str| -> String {
+        let rows = if line_type == "watchlist" { watchlist } else { positions };
+        rows.and_then(|arr| {
+            arr.iter().find(|row| {
+                row.get("ticker")
+                    .and_then(|v| v.as_str())
+                    .map(|t| t.trim().eq_ignore_ascii_case(ticker))
+                    .unwrap_or(false)
+            })
+        })
+        .and_then(|row| row.get("nom").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string()
+    };
+
+    missing
+        .iter()
+        .filter_map(|line_id| {
+            // line_id is canonical "type:ticker" from derive_expected_line_ids.
+            let (line_type, ticker) = match line_id.split_once(':') {
+                Some((lt, tk)) if !tk.trim().is_empty() => {
+                    (lt.trim().to_string(), tk.trim().to_uppercase())
+                }
+                _ => return None,
+            };
+            let nom = lookup_nom(&line_type, &ticker);
+            Some(McpLinePacket { ticker, nom, line_type })
+        })
+        .collect()
+}
+
 pub fn run_synthesis_turn(run_id: &str, data_dir: &str) -> Result<Value> {
     crate::run_state::set_native_run_stage(run_id, "llm_generating", None, None)?;
 
+    // Targeted re-analysis of any lines the initial pass left uncovered.
+    // Shared chokepoint for codex + native (parity). Determines whether the
+    // run may finalize clean `completed` or must be forced `completed_degraded`.
+    let coverage = reanalyze_missing_lines(run_id, data_dir);
+    if coverage == CoverageOutcome::Aborted {
+        return Err(anyhow::anyhow!("run_aborted:analysis stopped by user"));
+    }
+
+    let synthesis_result = run_synthesis_inner(run_id, data_dir);
+
+    // If coverage is still incomplete after the re-analysis cap, the run must
+    // NOT present as clean `completed`. Override the orchestration status to
+    // `completed_degraded` on disk AND in the returned payload so the worker
+    // finalization (`analysis_ops.rs` reads `result.orchestration_status`) and
+    // the UI both reflect the degradation.
+    if coverage == CoverageOutcome::Degraded {
+        return finalize_as_degraded(run_id, synthesis_result);
+    }
+
+    synthesis_result
+}
+
+/// Force the run to `completed_degraded` regardless of the (clean) status the
+/// synthesis path produced. Persists the stage to disk and rewrites the
+/// returned `orchestration_status` so the finalization read in
+/// `analysis_ops.rs` degrades the record. A synthesis error is propagated
+/// unchanged (a failed run is already non-clean).
+fn finalize_as_degraded(run_id: &str, synthesis_result: Result<Value>) -> Result<Value> {
+    match synthesis_result {
+        Ok(mut payload) => {
+            let _ = crate::run_state::set_native_run_stage(run_id, "completed_degraded", None, None);
+            // The synthesis path evicts/flushes the cache; force the degraded
+            // stage to disk so a UI re-read (which loads from disk) sees it,
+            // not just the in-memory cache.
+            crate::run_state_cache::flush_now(run_id);
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert(
+                    "orchestration_status".to_string(),
+                    Value::String("completed_degraded".to_string()),
+                );
+                obj.insert("coverage_degraded".to_string(), Value::Bool(true));
+            }
+            Ok(payload)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The synthesis generation itself (mode dispatch). Split out of
+/// `run_synthesis_turn` so the coverage-reprise gate can wrap it and override
+/// the orchestration status when coverage stays incomplete.
+fn run_synthesis_inner(run_id: &str, data_dir: &str) -> Result<Value> {
     let is_native = crate::llm_backend::current_backend_name() != "codex";
 
     if is_native {

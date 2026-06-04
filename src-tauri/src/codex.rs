@@ -1389,6 +1389,17 @@ pub fn run_synthesis_prompt(
     prompt: &str,
     on_progress: Option<CodexProgressFn>,
 ) -> Result<Value> {
+    // Test mock hook — shared with `run_codex_prompt_with_progress` and
+    // `run_codex_prompt_narration` so the synthesis turn is mockable too
+    // (otherwise tests that drive `run_synthesis_turn` end-to-end would try to
+    // spawn a real codex app-server).
+    if let Some(slot) = CODEX_MOCK.get() {
+        if let Ok(guard) = slot.lock() {
+            if let Some(mock_fn) = *guard {
+                return mock_fn(prompt);
+            }
+        }
+    }
     const SYNTHESIS_TOOLS: &[&str] = &[
         "get_run_context", "check_coverage", "validate_synthesis", "finalize_report",
     ];

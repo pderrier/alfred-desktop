@@ -176,7 +176,7 @@ fn is_session_exempt_path(path: &str) -> bool {
         || path == "/redeem"
 }
 
-// ── Run-session context (v0.4.0 P0-11) ──────────────────────────────
+// ── Run-session context (v0.4.0 P0-11; disk bridge 2026-06-04) ───────
 //
 // The desktop holds a single, process-wide "active run-session" slot.
 // `analysis_ops::start_analysis` calls `set_active_run_session` after a
@@ -192,6 +192,30 @@ fn is_session_exempt_path(path: &str) -> bool {
 // runtime benefit. The desktop runs ONE analysis at a time (verified by
 // the cancellation registry and ops_store invariants — see
 // `analysis_ops::ops_store`), so a single global slot is correct.
+//
+// ── Cross-process bridge (2026-06-04) ───────────────────────────────
+// The in-memory slot lives in the MAIN process. But codex spawns the MCP
+// server as a SEPARATE subprocess (`codex.rs::spawn_with_tools` →
+// `mcp_servers.alfred-mcp.command = <self_binary> --mcp-server --data-dir <dir>`).
+// That subprocess has its OWN copy of this `static` slot, which nobody ever
+// sets — only the main process calls `set_active_run_session`. So when codex
+// invokes the `persist_*` MCP tools, the subprocess's `active_run_session()`
+// returned `None`, `apply_auth` omitted `X-Run-Session`, and the
+// session-gated `/api/insights` etc. endpoints 401'd with
+// `run_session_invalid`. Because `api_post` is fire-and-forget, the failure
+// was swallowed and the write silently lost (prod: shared-insights frozen
+// since ~2026-05-16, the date run-session enforcement deployed).
+//
+// Fix: `set_active_run_session` ALSO writes the session id + its server
+// `expires_at` to a small JSON file in the runtime-state dir; `clear` removes
+// it. When the in-memory slot is `None` (i.e. in the MCP subprocess), the
+// reader FALLS BACK to that file. The file path is computed identically by
+// both processes — see `resolve_session_runtime_state_dir` /
+// `session_file_path` below for the make-or-break detail.
+
+/// Filename (inside the runtime-state dir) of the cross-process run-session
+/// bridge. Held next to the other `runtime-state/*.json` run artefacts.
+const SESSION_FILE_NAME: &str = "active-run-session.json";
 
 static ACTIVE_RUN_SESSION: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
@@ -199,33 +223,182 @@ fn session_slot() -> &'static Mutex<Option<String>> {
     ACTIVE_RUN_SESSION.get_or_init(|| Mutex::new(None))
 }
 
-/// Set the active run-session ID. Called by `analysis_ops::start_analysis`
-/// after the server has issued one via `POST /run/start`.
+/// Process-global override for the runtime-state dir used by the session
+/// bridge file. Set ONLY by the `--mcp-server` entrypoint
+/// (`main.rs::main`) to `<--data-dir>/runtime-state`. In the main process
+/// this stays `None` and the bridge derives the dir from
+/// `crate::resolve_runtime_state_dir()` directly.
+static MCP_RUNTIME_STATE_DIR: OnceLock<Mutex<Option<std::path::PathBuf>>> = OnceLock::new();
+
+fn mcp_runtime_state_dir_slot() -> &'static Mutex<Option<std::path::PathBuf>> {
+    MCP_RUNTIME_STATE_DIR.get_or_init(|| Mutex::new(None))
+}
+
+/// Pin the runtime-state dir for the session bridge. Called once by the
+/// `--mcp-server` entrypoint with `<--data-dir>/runtime-state` so the MCP
+/// subprocess reads the session file from the SAME absolute path the main
+/// process wrote it to.
 ///
-/// Mutex-protected to be safe under the (rare) case where the cancellation
-/// thread races the worker thread on completion. Replaces any prior value
-/// — the contract is "one run, one session", and a fresh `/run/start`
-/// always supersedes a stale slot.
-pub fn set_active_run_session(session_id: impl Into<String>) {
-    if let Ok(mut slot) = session_slot().lock() {
-        *slot = Some(session_id.into());
+/// Path-identity invariant (the make-or-break detail):
+/// - Main process writes to `crate::resolve_runtime_state_dir()`.
+/// - codex.rs spawns the subprocess with
+///   `--data-dir = resolve_runtime_state_dir().parent()` (the `data/` dir).
+/// - The entrypoint passes `<data-dir>/runtime-state` here, i.e.
+///   `resolve_runtime_state_dir().parent().join("runtime-state")`, which
+///   equals `resolve_runtime_state_dir()` for the canonical layout — the
+///   SAME invariant codex.rs already relies on for every other
+///   `runtime-state/<run_id>_*.jsonl` file the subprocess reads/writes.
+pub fn set_mcp_runtime_state_dir(dir: impl Into<std::path::PathBuf>) {
+    if let Ok(mut slot) = mcp_runtime_state_dir_slot().lock() {
+        *slot = Some(dir.into());
     }
+}
+
+/// Resolve the runtime-state dir the session bridge file lives in. Honours
+/// the MCP-subprocess override when set, otherwise falls back to the
+/// canonical main-process resolver.
+fn resolve_session_runtime_state_dir() -> std::path::PathBuf {
+    if let Ok(slot) = mcp_runtime_state_dir_slot().lock() {
+        if let Some(dir) = slot.as_ref() {
+            return dir.clone();
+        }
+    }
+    crate::resolve_runtime_state_dir()
+}
+
+/// Pure helper: compute the absolute session-bridge file path from a
+/// runtime-state dir. Single source of truth so the writer and the reader
+/// can NEVER drift on the filename.
+fn session_file_path(runtime_state_dir: &std::path::Path) -> std::path::PathBuf {
+    runtime_state_dir.join(SESSION_FILE_NAME)
+}
+
+/// Serialise `{session_id, expires_at}` and atomically write it to the
+/// bridge file. Best-effort: a write failure logs but never blocks the run
+/// (the in-memory slot still carries the session for the main process).
+fn write_session_file(session_id: &str, expires_at: u64) {
+    let dir = resolve_session_runtime_state_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        crate::debug_log(&format!(
+            "alfred-api: run-session bridge: create_dir_all({}) failed: {e}",
+            dir.display()
+        ));
+        return;
+    }
+    let path = session_file_path(&dir);
+    let payload = serde_json::json!({ "session_id": session_id, "expires_at": expires_at });
+    let body = serde_json::to_string(&payload).unwrap_or_default();
+    // Atomic write: temp file in the same dir + rename, so a concurrent
+    // reader never sees a half-written file.
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&tmp, body.as_bytes()) {
+        crate::debug_log(&format!(
+            "alfred-api: run-session bridge: write tmp {} failed: {e}",
+            tmp.display()
+        ));
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        crate::debug_log(&format!(
+            "alfred-api: run-session bridge: rename to {} failed: {e}",
+            path.display()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Best-effort remove the bridge file (run completion / cancellation).
+fn remove_session_file() {
+    let path = session_file_path(&resolve_session_runtime_state_dir());
+    if path.exists() {
+        if let Err(e) = std::fs::remove_file(&path) {
+            crate::debug_log(&format!(
+                "alfred-api: run-session bridge: remove {} failed: {e}",
+                path.display()
+            ));
+        }
+    }
+}
+
+/// Pure helper: parse a bridge-file body into `Some(session_id)` when it is
+/// well-formed AND not expired relative to `now_secs`. Returns `None` for a
+/// malformed body or an `expires_at` in the past — a known-expired session
+/// must never be sent (it would 401 with `run_session_invalid`). `expires_at`
+/// is treated as a hard boundary; `0` (missing/older writer) is treated as
+/// "no expiry known" and accepted, since the server is still the authority.
+fn parse_session_file(body: &str, now_secs: u64) -> Option<String> {
+    let parsed: Value = serde_json::from_str(body).ok()?;
+    let session_id = parsed
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let expires_at = parsed.get("expires_at").and_then(|v| v.as_u64()).unwrap_or(0);
+    if expires_at != 0 && expires_at <= now_secs {
+        return None;
+    }
+    Some(session_id.to_string())
+}
+
+/// Read the session id from the bridge file, honouring `expires_at`. Used as
+/// the fallback when the in-memory slot is `None` (the MCP subprocess case).
+/// An expired or malformed file is best-effort deleted so it doesn't linger.
+fn read_session_file() -> Option<String> {
+    let path = session_file_path(&resolve_session_runtime_state_dir());
+    let body = std::fs::read_to_string(&path).ok()?;
+    match parse_session_file(&body, now_epoch_secs()) {
+        Some(id) => Some(id),
+        None => {
+            // Stale / corrupt — clean it up so we never re-read it.
+            let _ = std::fs::remove_file(&path);
+            None
+        }
+    }
+}
+
+/// Set the active run-session ID + its server `expires_at`. Called by
+/// `analysis_ops::start_analysis` after the server issues one via
+/// `POST /run/start`.
+///
+/// Writes BOTH the in-memory slot (fast path, main process) AND the disk
+/// bridge file (so the codex-spawned MCP subprocess can read the session —
+/// see the module comment). Mutex-protected for the (rare) cancellation /
+/// worker completion race. Replaces any prior value — the contract is "one
+/// run, one session", and a fresh `/run/start` always supersedes a stale
+/// slot.
+pub fn set_active_run_session(session_id: impl Into<String>, expires_at: u64) {
+    let session_id = session_id.into();
+    if let Ok(mut slot) = session_slot().lock() {
+        *slot = Some(session_id.clone());
+    }
+    write_session_file(&session_id, expires_at);
 }
 
 /// Clear the active run-session ID. Called on run completion / failure /
 /// cancellation so a subsequent `api_get` outside of a run does NOT
 /// silently use a stale session header (which would 401 with confusing
-/// `run_session_invalid` instead of the cleaner "no session" path).
+/// `run_session_invalid` instead of the cleaner "no session" path). Removes
+/// the disk bridge file too, so the MCP subprocess stops reading a dead
+/// session.
 pub fn clear_active_run_session() {
     if let Ok(mut slot) = session_slot().lock() {
         *slot = None;
     }
+    remove_session_file();
 }
 
 /// Read the active run-session ID (cloned to avoid holding the lock
 /// across the HTTP call). Returns `None` when no run is in flight.
+///
+/// In-memory slot first (main process). When it's empty — the codex MCP
+/// subprocess, which never had the slot set — fall back to the disk bridge
+/// file written by the main process. The file read enforces `expires_at`
+/// so a known-expired session is never returned.
 pub fn active_run_session() -> Option<String> {
-    session_slot().lock().ok().and_then(|s| s.clone())
+    if let Some(id) = session_slot().lock().ok().and_then(|s| s.clone()) {
+        return Some(id);
+    }
+    read_session_file()
 }
 
 /// Single canonical serialization lock for tests that read or mutate the
@@ -250,6 +423,27 @@ pub(crate) fn run_session_test_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Test-only: point the session-bridge file at a process-unique temp dir so
+/// session-touching tests never read or pollute the real
+/// `data/runtime-state/active-run-session.json` (and never race a parallel
+/// test binary on that path). Idempotent — repeated calls re-point at a
+/// fresh empty dir. Callers already hold `run_session_test_lock`, so the
+/// process-global override is uncontended for the duration of the test.
+#[cfg(test)]
+pub(crate) fn redirect_session_bridge_to_temp_dir() {
+    let unique = format!(
+        "alfred-session-bridge-test-{}-{}",
+        std::process::id(),
+        now_epoch_secs(),
+    );
+    let dir = std::env::temp_dir().join(unique);
+    let _ = std::fs::create_dir_all(&dir);
+    // Start from a clean slate so a leftover file from a prior test in the
+    // same dir can't leak in.
+    let _ = std::fs::remove_file(session_file_path(&dir));
+    set_mcp_runtime_state_dir(dir);
 }
 
 // ── Device identity (MON-A, 2026-05-31) ─────────────────────────────
@@ -667,13 +861,79 @@ fn api_get(path: &str, timeout: u64) -> Result<Value> {
 }
 
 /// Authenticated POST request to the API (fire-and-forget).
+///
+/// Stays fire-and-forget by contract (`-> ()`, never propagates to callers —
+/// the `persist_*` writes are best-effort enrichment, not a reason to fail a
+/// run). But the result is NO LONGER silently discarded: non-2xx statuses and
+/// transport errors are logged via `crate::debug_log`. This visibility is
+/// exactly what was missing for ~3 weeks — the codex MCP subprocess was
+/// 401'ing on every `persist_*` write (no `X-Run-Session`) and the
+/// `let _ = req.send_string(...)` swallowed it, so the desktop logged
+/// "persisted" while the server never stored anything.
 fn api_post(path: &str, body: &Value) {
     let base = match api_url() { Some(u) => u, None => return };
     let url = format!("{base}{path}");
     let req = apply_auth(ureq::post(&url), path)
         .set("Content-Type", "application/json")
         .timeout(Duration::from_secs(5));
-    let _ = req.send_string(&serde_json::to_string(body).unwrap_or_default());
+    let outcome = req.send_string(&serde_json::to_string(body).unwrap_or_default());
+    if let Some(msg) = classify_post_outcome(path, outcome) {
+        crate::debug_log(&msg);
+    }
+}
+
+/// Pure classifier for an `api_post` outcome → optional log line.
+///
+/// Returns:
+/// - `None` on a 2xx success (the happy path stays quiet).
+/// - `Some("alfred-api: POST {path} -> {status}[ body=...]")` on a non-2xx
+///   HTTP status. For 4xx with a small body (≤ `MAX_LOGGED_BODY` bytes) the
+///   body is appended so the failure cause (e.g. `run_session_invalid`) is
+///   visible in the log. Larger / 5xx bodies are omitted to keep the log
+///   readable — the status code is the actionable signal there.
+/// - `Some("alfred-api: POST {path} failed: {err}")` on a transport error
+///   (DNS, timeout, TLS, connection refused).
+///
+/// Split out from `api_post` so the classification is unit-testable without
+/// an HTTP round-trip. `api_post` itself does only the I/O + the log call.
+fn classify_post_outcome(
+    path: &str,
+    outcome: Result<ureq::Response, ureq::Error>,
+) -> Option<String> {
+    /// Cap on how many bytes of a 4xx body we inline into the log line.
+    const MAX_LOGGED_BODY: usize = 512;
+    match outcome {
+        Ok(resp) => {
+            let status = resp.status();
+            if (200..300).contains(&status) {
+                None
+            } else {
+                // 2xx-other (shouldn't happen for these endpoints) — still
+                // surface it; the body is unlikely to be useful, so skip it.
+                Some(format!("alfred-api: POST {path} -> {status}"))
+            }
+        }
+        Err(ureq::Error::Status(status, resp)) => {
+            // Read the body for client errors — it carries the structured
+            // `{"error": "..."}` envelope that tells us WHY (the missing
+            // `X-Run-Session` → `run_session_invalid` was invisible before).
+            if (400..500).contains(&status) {
+                let body = resp.into_string().unwrap_or_default();
+                let trimmed = body.trim();
+                if trimmed.is_empty() {
+                    Some(format!("alfred-api: POST {path} -> {status}"))
+                } else {
+                    let snippet: String = trimmed.chars().take(MAX_LOGGED_BODY).collect();
+                    Some(format!("alfred-api: POST {path} -> {status} body={snippet}"))
+                }
+            } else {
+                Some(format!("alfred-api: POST {path} -> {status}"))
+            }
+        }
+        Err(ureq::Error::Transport(t)) => {
+            Some(format!("alfred-api: POST {path} failed: {t}"))
+        }
+    }
 }
 
 /// Fetch market data from the remote API.
@@ -1826,6 +2086,7 @@ mod tests {
     #[test]
     fn active_run_session_returns_none_when_unset() {
         let _guard = run_session_test_lock();
+        redirect_session_bridge_to_temp_dir();
         clear_active_run_session();
         assert!(active_run_session().is_none());
     }
@@ -1833,8 +2094,9 @@ mod tests {
     #[test]
     fn set_active_run_session_round_trips_through_active_run_session() {
         let _guard = run_session_test_lock();
+        redirect_session_bridge_to_temp_dir();
         clear_active_run_session();
-        set_active_run_session("abc123");
+        set_active_run_session("abc123", u64::MAX);
         assert_eq!(active_run_session().as_deref(), Some("abc123"));
         clear_active_run_session();
     }
@@ -1842,7 +2104,8 @@ mod tests {
     #[test]
     fn clear_active_run_session_resets_slot() {
         let _guard = run_session_test_lock();
-        set_active_run_session("xyz789");
+        redirect_session_bridge_to_temp_dir();
+        set_active_run_session("xyz789", u64::MAX);
         assert!(active_run_session().is_some());
         clear_active_run_session();
         assert!(active_run_session().is_none());
@@ -1855,11 +2118,199 @@ mod tests {
         // the new session must supersede the stale one rather than
         // being silently ignored.
         let _guard = run_session_test_lock();
+        redirect_session_bridge_to_temp_dir();
         clear_active_run_session();
-        set_active_run_session("first");
-        set_active_run_session("second");
+        set_active_run_session("first", u64::MAX);
+        set_active_run_session("second", u64::MAX);
         assert_eq!(active_run_session().as_deref(), Some("second"));
         clear_active_run_session();
+    }
+
+    // ── Cross-process disk bridge (2026-06-04) ──────────────────────
+    //
+    // The codex MCP subprocess never has the in-memory slot set; it must
+    // read the session from the bridge file the main process wrote. These
+    // tests simulate that by writing the file, clearing the in-memory slot,
+    // and asserting `active_run_session()` still resolves from disk.
+
+    #[test]
+    fn set_writes_bridge_file_and_active_session_reads_it_when_in_memory_none() {
+        let _guard = run_session_test_lock();
+        redirect_session_bridge_to_temp_dir();
+        clear_active_run_session();
+
+        // Main process writes both slot + file.
+        set_active_run_session("disk-session-id", u64::MAX);
+        // The file exists at the resolved path.
+        let path = session_file_path(&resolve_session_runtime_state_dir());
+        assert!(path.exists(), "set_active_run_session must write the bridge file");
+
+        // Simulate the SUBPROCESS: in-memory slot empty, only the file
+        // carries the session. We clear ONLY the in-memory slot here
+        // (clear_active_run_session would remove the file too).
+        if let Ok(mut slot) = session_slot().lock() {
+            *slot = None;
+        }
+        assert_eq!(
+            active_run_session().as_deref(),
+            Some("disk-session-id"),
+            "subprocess must fall back to the bridge file when the in-memory slot is None",
+        );
+
+        clear_active_run_session();
+    }
+
+    #[test]
+    fn clear_removes_bridge_file() {
+        let _guard = run_session_test_lock();
+        redirect_session_bridge_to_temp_dir();
+        set_active_run_session("to-be-cleared", u64::MAX);
+        let path = session_file_path(&resolve_session_runtime_state_dir());
+        assert!(path.exists());
+
+        clear_active_run_session();
+        assert!(!path.exists(), "clear_active_run_session must remove the bridge file");
+        assert!(active_run_session().is_none());
+    }
+
+    #[test]
+    fn expired_bridge_file_is_ignored_and_deleted() {
+        let _guard = run_session_test_lock();
+        redirect_session_bridge_to_temp_dir();
+        clear_active_run_session();
+
+        // Write a session whose expiry is already in the past.
+        let past = now_epoch_secs().saturating_sub(60);
+        write_session_file("expired-session", past);
+        let path = session_file_path(&resolve_session_runtime_state_dir());
+        assert!(path.exists());
+
+        // In-memory slot empty → reader hits the file → must reject the
+        // expired session AND best-effort delete the stale file so it is
+        // never re-read.
+        if let Ok(mut slot) = session_slot().lock() {
+            *slot = None;
+        }
+        assert!(
+            active_run_session().is_none(),
+            "a known-expired session must never be returned (would 401 run_session_invalid)",
+        );
+        assert!(!path.exists(), "expired bridge file must be cleaned up on read");
+    }
+
+    #[test]
+    fn parse_session_file_honours_expiry_boundary() {
+        // expires_at strictly in the future → accepted.
+        let body = r#"{"session_id":"s1","expires_at":1000}"#;
+        assert_eq!(parse_session_file(body, 999), Some("s1".to_string()));
+        // expires_at == now → expired (boundary is inclusive on the dead side).
+        assert_eq!(parse_session_file(body, 1000), None);
+        // expires_at in the past → expired.
+        assert_eq!(parse_session_file(body, 1001), None);
+        // expires_at == 0 → "no expiry known" (older writer) → accepted.
+        let body0 = r#"{"session_id":"s2","expires_at":0}"#;
+        assert_eq!(parse_session_file(body0, 9_999_999), Some("s2".to_string()));
+        // Missing expires_at → treated as 0 → accepted.
+        let body_no_exp = r#"{"session_id":"s3"}"#;
+        assert_eq!(parse_session_file(body_no_exp, 9_999_999), Some("s3".to_string()));
+        // Empty / missing session_id → rejected.
+        assert_eq!(parse_session_file(r#"{"session_id":"","expires_at":0}"#, 0), None);
+        assert_eq!(parse_session_file(r#"{"expires_at":0}"#, 0), None);
+        // Malformed JSON → rejected, never panics.
+        assert_eq!(parse_session_file("not json", 0), None);
+    }
+
+    #[test]
+    fn bridge_file_path_matches_between_main_process_and_mcp_subprocess() {
+        // THE make-or-break invariant: the path the main process writes and
+        // the path the `--mcp-server` subprocess reads must be byte-identical.
+        //
+        // Main process writer derives the dir from
+        // `crate::resolve_runtime_state_dir()`. codex.rs spawns the
+        // subprocess with `--data-dir = resolve_runtime_state_dir().parent()`,
+        // and `main.rs` then pins the bridge dir to `<data-dir>/runtime-state`.
+        // For the canonical layout these MUST be the same absolute file.
+        let _guard = run_session_test_lock();
+
+        let main_dir = crate::resolve_runtime_state_dir();
+        let main_path = session_file_path(&main_dir);
+
+        // Reproduce exactly what codex.rs + main.rs compute for the
+        // subprocess, then point the override at it (as the entrypoint does).
+        let data_dir = main_dir
+            .parent()
+            .expect("runtime-state dir always has a parent")
+            .to_path_buf();
+        set_mcp_runtime_state_dir(data_dir.join("runtime-state"));
+        let subprocess_path = session_file_path(&resolve_session_runtime_state_dir());
+
+        assert_eq!(
+            main_path, subprocess_path,
+            "main-process writer path and MCP-subprocess reader path diverged — \
+             the cross-process bridge would silently never connect",
+        );
+
+        // Reset the override so we don't leak it into sibling tests.
+        if let Ok(mut slot) = mcp_runtime_state_dir_slot().lock() {
+            *slot = None;
+        }
+    }
+
+    // ── api_post visibility (#3-B) ──────────────────────────────────
+
+    #[test]
+    fn classify_post_outcome_quiet_on_success() {
+        let resp = ureq::Response::new(200, "OK", "{\"ok\":true}").unwrap();
+        assert_eq!(classify_post_outcome("/api/insights", Ok(resp)), None);
+        let resp = ureq::Response::new(204, "No Content", "").unwrap();
+        assert_eq!(classify_post_outcome("/api/deep-news", Ok(resp)), None);
+    }
+
+    #[test]
+    fn classify_post_outcome_logs_4xx_with_body() {
+        // The exact failure mode that was invisible for 3 weeks: a
+        // session-gated endpoint 401'ing with run_session_invalid.
+        let resp = ureq::Response::new(401, "Unauthorized", "{\"error\":\"run_session_invalid\"}").unwrap();
+        let msg = classify_post_outcome("/api/insights", Err(ureq::Error::Status(401, resp)))
+            .expect("non-2xx must produce a log line");
+        assert!(msg.contains("/api/insights"), "msg={msg}");
+        assert!(msg.contains("401"), "msg={msg}");
+        assert!(msg.contains("run_session_invalid"), "4xx body must be surfaced: {msg}");
+    }
+
+    #[test]
+    fn classify_post_outcome_logs_4xx_empty_body_without_body_suffix() {
+        let resp = ureq::Response::new(400, "Bad Request", "").unwrap();
+        let msg = classify_post_outcome("/api/market/extracted", Err(ureq::Error::Status(400, resp)))
+            .expect("non-2xx must produce a log line");
+        assert_eq!(msg, "alfred-api: POST /api/market/extracted -> 400");
+    }
+
+    #[test]
+    fn classify_post_outcome_logs_5xx_without_body() {
+        let resp = ureq::Response::new(500, "Internal Server Error", "stacktrace blah blah").unwrap();
+        let msg = classify_post_outcome("/api/deep-news", Err(ureq::Error::Status(500, resp)))
+            .expect("5xx must produce a log line");
+        assert_eq!(msg, "alfred-api: POST /api/deep-news -> 500");
+        assert!(!msg.contains("stacktrace"), "5xx body must NOT be inlined");
+    }
+
+    #[test]
+    fn classify_post_outcome_logs_transport_error() {
+        // Connecting to port 0 on loopback is guaranteed to fail at the
+        // transport layer (no listener), exercising the Transport arm
+        // without any network dependency.
+        let outcome = ureq::post("http://127.0.0.1:0/x")
+            .timeout(Duration::from_millis(200))
+            .send_string("{}");
+        assert!(
+            matches!(outcome, Err(ureq::Error::Transport(_))),
+            "expected a transport error connecting to 127.0.0.1:0",
+        );
+        let msg = classify_post_outcome("/api/insights", outcome)
+            .expect("transport error must produce a log line");
+        assert!(msg.contains("/api/insights"), "msg={msg}");
+        assert!(msg.contains("failed:"), "transport errors use the 'failed:' shape: {msg}");
     }
 
     #[test]
@@ -1869,8 +2320,9 @@ mod tests {
         // a dummy base URL since ureq::get accepts arbitrary strings
         // and apply_auth doesn't fire the request.
         let _guard = run_session_test_lock();
+        redirect_session_bridge_to_temp_dir();
         clear_active_run_session();
-        set_active_run_session("test-session-id");
+        set_active_run_session("test-session-id", u64::MAX);
 
         let raw = ureq::get("https://example.test/api/news");
         let signed = apply_auth(raw, "/api/news");
@@ -1891,6 +2343,7 @@ mod tests {
         // /run/start itself runs through apply_auth with no active
         // session — must NOT inject a stale X-Run-Session.
         let _guard = run_session_test_lock();
+        redirect_session_bridge_to_temp_dir();
         clear_active_run_session();
 
         let raw = ureq::get("https://example.test/run/start");
@@ -2008,8 +2461,9 @@ mod tests {
         // in v0.4.0 P0-15 (P3-40) when /license/* joined the exempt
         // set. Same assertions, expanded coverage.
         let _guard = run_session_test_lock();
+        redirect_session_bridge_to_temp_dir();
         clear_active_run_session();
-        set_active_run_session("active-run-while-account-call-fires");
+        set_active_run_session("active-run-while-account-call-fires", u64::MAX);
 
         for path in [
             "/admin/usage",
@@ -2055,6 +2509,7 @@ mod tests {
         // Renamed from `admin_endpoint_calls_still_inject_hmac_auth` in
         // v0.4.0 P0-15 when license was added to the exempt set.
         let _guard = run_session_test_lock();
+        redirect_session_bridge_to_temp_dir();
         clear_active_run_session();
         // Set a compile-time-style secret via the runtime env fallback
         // so apply_auth signs the request even in test builds (the

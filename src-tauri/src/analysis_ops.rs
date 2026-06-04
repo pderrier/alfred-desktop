@@ -715,7 +715,10 @@ fn acquire_run_session_or_bail() -> Result<()> {
                 success.runs_this_week,
                 success.tier,
             ));
-            crate::alfred_api_client::set_active_run_session(success.run_session_id);
+            crate::alfred_api_client::set_active_run_session(
+                success.run_session_id,
+                success.expires_at,
+            );
             Ok(())
         }
         Ok(crate::alfred_api_client::RunStartOutcome::QuotaExhausted(info)) => {
@@ -770,9 +773,10 @@ mod run_session_tests {
     #[test]
     fn acquire_run_session_skips_when_api_disabled() {
         let _guard = run_session_test_lock();
+        crate::alfred_api_client::redirect_session_bridge_to_temp_dir();
         // Stamp a fake session into the slot to prove the disable path
         // clears it (no stale header leaks once the API comes back).
-        crate::alfred_api_client::set_active_run_session("stale-session");
+        crate::alfred_api_client::set_active_run_session("stale-session", u64::MAX);
         std::env::set_var("ALFRED_API_ENABLED", "0");
 
         let result = super::acquire_run_session_or_bail();

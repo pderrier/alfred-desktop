@@ -201,6 +201,14 @@ fn merge_mcp_results(run_id: &str, data_dir: &str) {
     let data_path = std::path::Path::new(data_dir);
     let mut merged_count = 0;
 
+    // #3-C: the codex path relies on the LLM voluntarily calling the
+    // `persist_*` MCP tools and sometimes makes ZERO such calls. After
+    // merging, run a deterministic in-process persist sweep (this fn runs in
+    // the MAIN process, which holds the run session). The native path already
+    // persists deterministically in `persist_line_extras`, so skip the sweep
+    // there to avoid redundant (idempotent, but wasteful) re-posts.
+    let is_codex = crate::llm_backend::current_backend_name() == "codex";
+
     for line in content.lines() {
         let entry: Value = match serde_json::from_str(line) {
             Ok(v) => v,
@@ -257,6 +265,26 @@ fn merge_mcp_results(run_id: &str, data_dir: &str) {
                             resolved_owned.as_deref(),
                         );
                         sync_line_memory(run_id, ticker, resolved_owned.as_deref(), &rec, price);
+
+                        // #3-C: deterministic codex persist sweep. Reads the
+                        // ISIN + per-ticker news from the freshly-merged run
+                        // state, then re-persists shared insights / extracted
+                        // fundamentals / deep news through the same MCP tool
+                        // path the native sweep uses. Idempotent server-side.
+                        if is_codex {
+                            if let Ok(state) = crate::run_state_cache::load(data_path, run_id) {
+                                let (isin, news) = codex_line_isin_and_news(&state, ticker);
+                                let selection = persist_codex_line_contributions(
+                                    data_path, run_id, ticker, &isin, &news, &rec,
+                                );
+                                if selection.any() {
+                                    crate::debug_log(&format!(
+                                        "[mcp-merge] codex persist sweep {ticker}: insights={} fundamentals={} deep_news={}",
+                                        selection.insights, selection.fundamentals, selection.deep_news,
+                                    ));
+                                }
+                            }
+                        }
                     }
                     merged_count += 1;
                 }
@@ -2239,6 +2267,169 @@ pub(crate) fn pick_deep_news_target(news: &Value) -> Option<(String, String)> {
     }
 
     None
+}
+
+// ── Codex deterministic post-run persist sweep (#3-C, 2026-06-04) ──────
+//
+// The NATIVE path persists shared insights / extracted fundamentals / deep
+// news DETERMINISTICALLY in `persist_line_extras` (called for every line in
+// `run_native_line_analysis`). The CODEX path does NOT: it relies on the LLM
+// voluntarily emitting `tools/call persist_shared_insights` (etc.) during the
+// batch turn. In production (run 2026-06-04) codex completed but made ZERO
+// persist calls, so nothing reached the API cache.
+//
+// Belt-and-suspenders: after the codex sidecar is merged, sweep each
+// recommendation and re-persist the same contributions the native path does,
+// IN-PROCESS (so the main process's run session is attached). The server's
+// `insights_post_handler` (etc.) merges/dedupes idempotently, so re-persisting
+// what codex may already have sent is safe.
+
+/// Pure selection: which persist contributions a single codex recommendation
+/// yields. Decoupled from I/O so the "which lines get persisted" logic is
+/// unit-testable. Mirrors the gates inside `persist_line_extras`:
+/// - `insights`: `extract_shared_insights(rec)` found ≥1 populated generic field.
+/// - `fundamentals`: `rec.extracted_fundamentals` present and non-null.
+/// - `deep_news`: `rec.deep_news_summary` (or `_memory_summary`) non-empty AND
+///   a target article URL exists in the per-ticker `news`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct CodexPersistSelection {
+    pub insights: bool,
+    pub fundamentals: bool,
+    pub deep_news: bool,
+}
+
+impl CodexPersistSelection {
+    pub fn any(&self) -> bool {
+        self.insights || self.fundamentals || self.deep_news
+    }
+}
+
+/// Pure helper: decide what to persist for one codex line. `news` is the
+/// per-ticker news value from run_state (used only to confirm a deep-news
+/// URL target exists — same gate as `persist_line_extras`).
+pub(crate) fn select_codex_persist(rec: &Value, news: &Value) -> CodexPersistSelection {
+    let insights = extract_shared_insights(rec).is_some();
+    let fundamentals = rec
+        .get("extracted_fundamentals")
+        .map(|v| !v.is_null())
+        .unwrap_or(false);
+    let deep_news_summary = rec
+        .get("deep_news_summary")
+        .or_else(|| rec.get("deep_news_memory_summary"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let deep_news = !deep_news_summary.is_empty() && pick_deep_news_target(news).is_some();
+    CodexPersistSelection { insights, fundamentals, deep_news }
+}
+
+/// Dispatch the codex line's persist contributions through the SAME MCP
+/// tool path the native sweep uses (`dispatch_tool_direct`), so the wire
+/// shape, progress events, and server endpoints are byte-identical across
+/// modes (parity contract — `docs/llm-mode-parity-contract.md`). Returns the
+/// selection actually dispatched (for logging / tests).
+fn persist_codex_line_contributions(
+    data_dir: &std::path::Path,
+    run_id: &str,
+    ticker: &str,
+    isin: &str,
+    news: &Value,
+    rec: &Value,
+) -> CodexPersistSelection {
+    let selection = select_codex_persist(rec, news);
+    if !selection.any() {
+        return selection;
+    }
+
+    if selection.insights {
+        if let Some(insights) = extract_shared_insights(rec) {
+            let mut params = json!({
+                "ticker": ticker,
+                "isin": isin,
+                "run_id": run_id,
+                "insights": serde_json::to_string(&insights).unwrap_or_default(),
+            });
+            if let Some(sector) = rec.get("sector").and_then(|v| v.as_str()) {
+                params["sector"] = json!(sector);
+            }
+            if let Some(sa) = rec.get("sector_analysis").and_then(|v| v.as_str()) {
+                params["sector_analysis"] = json!(sa);
+            }
+            crate::mcp_server::dispatch_tool_direct(data_dir, "persist_shared_insights", &params);
+        }
+    }
+
+    if selection.fundamentals {
+        if let Some(fundamentals) = rec.get("extracted_fundamentals") {
+            crate::mcp_server::dispatch_tool_direct(
+                data_dir,
+                "persist_extracted_fundamentals",
+                &json!({
+                    "ticker": ticker,
+                    "isin": isin,
+                    "run_id": run_id,
+                    "fundamentals": serde_json::to_string(fundamentals).unwrap_or_default(),
+                }),
+            );
+        }
+    }
+
+    if selection.deep_news {
+        let summary = rec
+            .get("deep_news_summary")
+            .or_else(|| rec.get("deep_news_memory_summary"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if let Some((best_url, best_title)) = pick_deep_news_target(news) {
+            let quality_score = rec.get("deep_news_quality_score").and_then(|v| v.as_u64()).unwrap_or(50);
+            let relevance = rec.get("deep_news_relevance").and_then(|v| v.as_str()).unwrap_or("medium");
+            let staleness = rec.get("deep_news_staleness").and_then(|v| v.as_str()).unwrap_or("recent");
+            crate::mcp_server::dispatch_tool_direct(
+                data_dir,
+                "persist_deep_news",
+                &json!({
+                    "ticker": ticker,
+                    "isin": isin,
+                    "run_id": run_id,
+                    "url": best_url,
+                    "title": best_title,
+                    "summary": summary,
+                    "quality_score": quality_score,
+                    "relevance": relevance,
+                    "staleness": staleness,
+                }),
+            );
+        }
+    }
+
+    selection
+}
+
+/// Pure helper: resolve the ISIN + per-ticker news for a codex line from the
+/// run-state value, mirroring `tool_get_line_data`'s lookups (position-row
+/// `isin`, `news[ticker]`). Falls back to the ticker when no ISIN is on the
+/// position row (watchlist lines), matching the native path's
+/// `isin = position.isin.unwrap_or(ticker)`.
+fn codex_line_isin_and_news(state: &Value, ticker: &str) -> (String, Value) {
+    let upper = ticker.trim().to_uppercase();
+    let isin = state
+        .get("portfolio")
+        .and_then(|p| p.get("positions"))
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .find(|row| as_str(row.get("ticker")).to_uppercase() == upper)
+        .and_then(|row| row.get("isin").and_then(|v| v.as_str()))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| ticker.to_string());
+    let news = state
+        .get("news")
+        .and_then(|n| n.get(&upper).or_else(|| n.get(&upper.to_lowercase())))
+        .cloned()
+        .unwrap_or(Value::Null);
+    (isin, news)
 }
 
 fn build_batch_prompt(run_id: &str, tickers: &[(String, String, String)]) -> String {

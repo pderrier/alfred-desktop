@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.4.12
+
+**Mandatory upgrade.** Company names show for more of your holdings, and shared analysis insights are contributed reliably again.
+
+### What's new
+
+- **Real company names instead of bare ISIN codes.** Holdings priced through the Yahoo fallback (many foreign and US lines) now display the actual company name (e.g. "SAP SE", "Amazon.com, Inc.") instead of a raw ISIN. Names already shown are never changed — this only fills the gaps.
+- **Shared insights reach the collective again.** Contributing your analysis insights (and extracted fundamentals / deep-news summaries) to the shared cache silently stopped working around mid-May after a server hardening change: the analysis sub-process could no longer prove it belonged to your active run, so every contribution was rejected without any visible error. Contributions now carry the run session correctly and land again — and a deterministic end-of-run pass makes sure nothing is skipped.
+
+### Under the hood
+
+- Failed background contributions are now logged instead of swallowed, so this class of silent failure can't hide again.
+- Server-side: the market-data refresh worker no longer spams its log with a benign "empty ticker" error on every cycle.
+
+### Compatibility
+
+- **Mandatory.** Earlier versions show the update screen on next launch.
+- Privacy and authentication unchanged — your sign-in token is never sent to the server.
+
 ## v0.4.11
 
 **Mandatory upgrade.** Your activation code now works on a second device — and survives a reinstall.

@@ -4110,6 +4110,92 @@ use crate::storage::read_json_file;
         );
     }
 
+    // ── #3-C: codex deterministic persist sweep selection ───────────
+
+    #[test]
+    fn select_codex_persist_picks_insights_when_generic_fields_present() {
+        // A rec carrying ≥1 populated SHARED_INSIGHT_FIELD must be selected
+        // for insights persistence, mirroring `extract_shared_insights`.
+        let rec = json!({
+            "ticker": "AAPL",
+            "analyse_technique": "RSI 62, above 50d SMA",
+            "catalyseurs": ["earnings beat"],
+        });
+        let sel = crate::native_mcp_analysis::select_codex_persist(&rec, &serde_json::Value::Null);
+        assert!(sel.insights, "populated generic insight fields → persist insights");
+        assert!(!sel.fundamentals);
+        assert!(!sel.deep_news);
+        assert!(sel.any());
+    }
+
+    #[test]
+    fn select_codex_persist_skips_insights_when_all_generic_fields_empty() {
+        // Empty strings / empty arrays must NOT count as content (same gate
+        // as extract_shared_insights), so a bare signal-only rec persists
+        // nothing.
+        let rec = json!({
+            "ticker": "AAPL",
+            "signal": "ACHAT",
+            "analyse_technique": "",
+            "catalyseurs": [],
+        });
+        let sel = crate::native_mcp_analysis::select_codex_persist(&rec, &serde_json::Value::Null);
+        assert!(!sel.insights);
+        assert!(!sel.any(), "a content-free rec must yield no persist work");
+    }
+
+    #[test]
+    fn select_codex_persist_picks_fundamentals_only_when_non_null() {
+        let with = json!({ "extracted_fundamentals": { "pe": 18.2 } });
+        assert!(crate::native_mcp_analysis::select_codex_persist(&with, &serde_json::Value::Null).fundamentals);
+
+        let null = json!({ "extracted_fundamentals": null });
+        assert!(!crate::native_mcp_analysis::select_codex_persist(&null, &serde_json::Value::Null).fundamentals);
+
+        let absent = json!({ "ticker": "X" });
+        assert!(!crate::native_mcp_analysis::select_codex_persist(&absent, &serde_json::Value::Null).fundamentals);
+    }
+
+    #[test]
+    fn select_codex_persist_deep_news_requires_summary_and_url_target() {
+        let news = json!([{ "url": "https://ex.com/a", "title": "A" }]);
+
+        // Summary present + a URL target exists → persist deep news.
+        let rec_ok = json!({ "deep_news_summary": "fresh read of the quarterly" });
+        assert!(crate::native_mcp_analysis::select_codex_persist(&rec_ok, &news).deep_news);
+
+        // Summary present but NO article URL → cannot key the cache → skip.
+        let rec_no_url = json!({ "deep_news_summary": "fresh read" });
+        assert!(!crate::native_mcp_analysis::select_codex_persist(&rec_no_url, &serde_json::Value::Null).deep_news);
+
+        // No summary, even with a URL → nothing to persist.
+        let rec_no_summary = json!({ "ticker": "X" });
+        assert!(!crate::native_mcp_analysis::select_codex_persist(&rec_no_summary, &news).deep_news);
+
+        // Fallback field `deep_news_memory_summary` also triggers it.
+        let rec_mem = json!({ "deep_news_memory_summary": "evolving memory" });
+        assert!(crate::native_mcp_analysis::select_codex_persist(&rec_mem, &news).deep_news);
+    }
+
+    #[test]
+    fn select_codex_persist_combines_all_kinds() {
+        let news = json!([{ "url": "https://ex.com/a", "title": "A" }]);
+        let rec = json!({
+            "analyse_fondamentale": "strong moat",
+            "extracted_fundamentals": { "pe": 18.2 },
+            "deep_news_summary": "fresh read",
+        });
+        let sel = crate::native_mcp_analysis::select_codex_persist(&rec, &news);
+        assert_eq!(
+            sel,
+            crate::native_mcp_analysis::CodexPersistSelection {
+                insights: true,
+                fundamentals: true,
+                deep_news: true,
+            },
+        );
+    }
+
     #[test]
     fn sync_line_memory_writes_single_entry_for_cross_account_dup() {
         // The whole point of v0.3 #22: same ISIN held in two accounts under
@@ -5305,7 +5391,7 @@ use crate::storage::read_json_file;
     fn parse_technical_snapshot_drops_null_indicators() {
         // Server populates the technicals cache with an `{"indicators": null}`
         // shell when upstream OHLC fails — pre-v0.3.2 the snapshot was stored
-        // because `.get("indicators").is_some()` accepts `Some(&Value::Null)`,
+        // because `.get("indicators").is_some()` accepts `Some(&serde_json::Value::Null)`,
         // so `technicals[ticker]` got an unusable shell. Parser must drop.
         let resp = json!({
             "technical_snapshot": {

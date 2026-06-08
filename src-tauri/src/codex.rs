@@ -1714,17 +1714,17 @@ pub fn probe_quota() -> Result<Value> {
         let _ = std::io::Read::read_to_string(&mut err, &mut stderr_buf);
     }
 
-    match exit_status {
-        None => Ok(json!({
+    let verdict = match exit_status {
+        None => json!({
             "status": "error",
             "failure_reason": "network",
             "message": "codex exec probe timed out after 30s",
-        })),
-        Some(status) if status.success() => Ok(json!({
+        }),
+        Some(status) if status.success() => json!({
             "status": "ok",
             "failure_reason": serde_json::Value::Null,
             "message": "quota_ok",
-        })),
+        }),
         Some(_) => {
             let combined = format!("{stdout_buf}\n{stderr_buf}");
             let failure_reason = classify_session_failure(&combined);
@@ -1739,13 +1739,42 @@ pub fn probe_quota() -> Result<Value> {
                 Some("auth") => "codex login required.".to_string(),
                 _ => truncate(combined.trim(), 400),
             };
-            Ok(json!({
+            json!({
                 "status": status,
                 "failure_reason": failure_reason,
                 "message": message,
-            }))
+            })
         }
-    }
+    };
+
+    // Surface the verdict (status + failure_reason ONLY — never the raw
+    // codex stdout/stderr, which can echo tokens/prompt text) so splash
+    // reconnect issues are diagnosable from debug.log. The decision logic
+    // downstream (`decideFallback` in `codex-fallback-policy.js`) keys off
+    // exactly these two fields.
+    crate::debug_log(&format!(
+        "codex: probe_quota verdict — {}",
+        format_probe_verdict(
+            verdict.get("status").and_then(Value::as_str).unwrap_or("unknown"),
+            verdict.get("failure_reason").unwrap_or(&Value::Null),
+        )
+    ));
+
+    Ok(verdict)
+}
+
+/// Format a `probe_quota` verdict for the debug log.
+///
+/// Emits ONLY `status` + `failure_reason` — NEVER the raw codex
+/// stdout/stderr (which can echo OAuth tokens or prompt text). Pure /
+/// side-effect-free so it is unit-testable without spawning a subprocess.
+fn format_probe_verdict(status: &str, failure_reason: &Value) -> String {
+    let reason = match failure_reason {
+        Value::Null => "none".to_string(),
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    format!("status={status} failure_reason={reason}")
 }
 
 /// Swap the codex CLI auth from chatgpt OAuth to a user-provided API key.
@@ -2624,5 +2653,41 @@ mod tests {
             pool.narration_slot.lock().unwrap().is_none(),
             "narration slot must be None after stop_app_server"
         );
+    }
+
+    // ── probe_quota verdict logging (BUG-2) ──────────────────────────
+
+    #[test]
+    fn format_probe_verdict_emits_status_and_failure_reason_only() {
+        // A null failure_reason renders as "none" (the OK / no-binary path).
+        let ok = format_probe_verdict("ok", &Value::Null);
+        assert_eq!(ok, "status=ok failure_reason=none");
+
+        // A string failure_reason is emitted verbatim (rate_limited / auth).
+        let rate = format_probe_verdict("rate_limited", &json!("rate_limited"));
+        assert_eq!(rate, "status=rate_limited failure_reason=rate_limited");
+        let auth = format_probe_verdict("auth", &json!("auth"));
+        assert_eq!(auth, "status=auth failure_reason=auth");
+    }
+
+    #[test]
+    fn format_probe_verdict_never_leaks_raw_output() {
+        // The verdict line must NEVER contain raw codex stdout/stderr — which
+        // can echo OAuth tokens or prompt text (feedback_no_leak_tokens). The
+        // helper only ever receives status + failure_reason, so even if a
+        // caller fed it tainted strings the format string is fixed: there is
+        // no field that carries `message` or the combined output buffer.
+        let secret = "sk-LEAKED-TOKEN-abc123 prompt: do the thing";
+        let verdict = format_probe_verdict("error", &Value::Null);
+        assert!(
+            !verdict.contains(secret),
+            "verdict must not echo raw output"
+        );
+        assert!(
+            !verdict.contains("message"),
+            "verdict carries only status + failure_reason, never the message/raw buffer"
+        );
+        // Sanity: it is exactly the two sanctioned fields, nothing else.
+        assert_eq!(verdict, "status=error failure_reason=none");
     }
 }

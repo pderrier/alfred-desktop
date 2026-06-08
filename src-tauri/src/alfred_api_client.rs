@@ -154,6 +154,12 @@ fn apply_auth(req: ureq::Request, path: &str) -> ureq::Request {
 ///     `require_auth` only — see `device::device_routes`)
 ///   - `/redeem` (MON-B — comp-code redemption, mounted at root, gated by
 ///     `require_auth` only — see `redeem::redeem_routes`)
+///   - `/api/macro` (BUG-1, 2026-06-08 — the home macro briefing is a
+///     PRE-RUN, globally-cached read (`macro:briefing:v1`) with no
+///     per-user quota/session. Server-side it was moved OUT of the
+///     `require_run_session`-gated `analysis_routes` to sit behind
+///     `require_auth` only — see `build_router` in `alfred-api/src/lib.rs`.
+///     EXACT match: `/api/market`, `/api/news`, etc. stay gated.)
 ///
 /// Anything else returns false — there is no fuzzy / partial /
 /// case-insensitive match because the server-side routes are
@@ -161,9 +167,9 @@ fn apply_auth(req: ureq::Request, path: &str) -> ureq::Request {
 ///
 /// Renamed from `is_admin_path` in v0.4.0 P0-15 (P3-40 follow-up) when
 /// `/license/*` joined the exemption set. `/quota/*` joined in v0.4.7
-/// (P3-31). `/device*` + `/redeem` joined in MON (2026-05-31). The
-/// behavioural contract is pinned by
-/// `session_exempt_endpoints_skip_run_session_header`.
+/// (P3-31). `/device*` + `/redeem` joined in MON (2026-05-31).
+/// `/api/macro` joined in BUG-1 (2026-06-08). The behavioural contract is
+/// pinned by `session_exempt_endpoints_skip_run_session_header`.
 fn is_session_exempt_path(path: &str) -> bool {
     path == "/admin"
         || path.starts_with("/admin/")
@@ -174,6 +180,7 @@ fn is_session_exempt_path(path: &str) -> bool {
         || path == "/device"
         || path.starts_with("/device/")
         || path == "/redeem"
+        || path == "/api/macro"
 }
 
 // ── Run-session context (v0.4.0 P0-11; disk bridge 2026-06-04) ───────
@@ -2429,6 +2436,20 @@ mod tests {
     }
 
     #[test]
+    fn is_session_exempt_path_matches_api_macro() {
+        // BUG-1 (2026-06-08): the home macro briefing (`GET /api/macro`) is a
+        // PRE-RUN, globally-cached read with no per-user quota/session.
+        // Server-side it was moved OUT of `require_run_session` to sit behind
+        // `require_auth` only, so the client must NOT inject X-Run-Session —
+        // doing so 401'd the home briefing forever (`run_session_invalid`).
+        assert!(is_session_exempt_path("/api/macro"));
+        // EXACT match only — the other /api/* analysis endpoints stay gated
+        // (also pinned in is_session_exempt_path_rejects_non_exempt_paths).
+        assert!(!is_session_exempt_path("/api/macro/extra"));
+        assert!(!is_session_exempt_path("/api/market"));
+    }
+
+    #[test]
     fn is_session_exempt_path_rejects_non_exempt_paths() {
         // Make sure we don't accidentally over-match. Every gated
         // analysis endpoint must continue to receive X-Run-Session.
@@ -2475,6 +2496,7 @@ mod tests {
             // account-scope, mounted at root, not under require_run_session.
             "/device/register",
             "/redeem",
+            "/api/macro", // BUG-1 (2026-06-08): home macro briefing, pre-run, auth-only
         ] {
             let raw = ureq::get(&format!("https://example.test{path}"));
             let signed = apply_auth(raw, path);

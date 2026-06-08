@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.4.14
+
+**Optional update.** Your home page market briefing is back, plus a behind-the-scenes diagnostics fix for sign-in checks.
+
+### What's new
+
+- **Home market briefing restored.** The macro snapshot on your home page (US 10-year yield, VIX, EUR/USD, Brent) silently failed to load on every launch: the app requested it from the server before an analysis session existed, and the server refused it. It now loads correctly — the briefing is public market data, so it no longer requires an active run session.
+
+### Under the hood
+
+- Codex sign-in quota checks now record their verdict in the local debug log (status + reason only, never your token), so "reconnect" prompts on the splash can actually be diagnosed.
+
+### Compatibility
+
+- **Optional.** Older versions keep working — this is not a forced upgrade.
+- Privacy and authentication unchanged — your sign-in token is never sent to the server.
+
 ## v0.4.13
 
 **Mandatory upgrade.** No more analyses that look finished while some of your lines were never actually analyzed.

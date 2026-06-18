@@ -1579,22 +1579,18 @@ fn tool_finalize_report(data_dir: &Path, params: &Value) -> Result<Value> {
         "llm_utilise": "codex-mcp",
     });
 
-    // Evict BEFORE persist — `evict` flushes the cached `running`+recommendations
-    // to disk and DROPS the entry, so `persist_retry_global_synthesis` (which reads
-    // run state from disk, never the cache) sees a synced disk AND there is no stale
-    // cached snapshot left to clobber the `completed` write afterwards.
-    //
-    // Ordering matters: the previous `flush_now → persist → evict` order was a race.
-    // At this point the in-memory cache still holds the pre-synthesis snapshot
-    // (orchestration.status=running / stage=llm_generating, set at the top of
-    // run_synthesis_turn). `persist_retry_global_synthesis` writes `completed` to
-    // disk directly, but a *trailing* `evict` re-flushes that stale `running`
-    // snapshot OVER the `completed` state before dropping the entry — leaving the
-    // run stuck at `running` on disk (the "Partial latest-run artifact" bug in
-    // native / native-oauth mode, where finalize runs in-process and shares the
-    // main cache). Codex mode escaped this only because finalize runs in a separate
-    // MCP process whose cache is irrelevant, and the main cache is re-synced from
-    // the completed disk by `merge_mcp_results` before its own evict.
+    // Evict (flush dirty cache to disk, then DROP the in-memory entry) BEFORE
+    // composing the report. `persist_retry_global_synthesis` reads run_state
+    // from disk and writes the composed report back to disk, bypassing the
+    // cache entirely. If the cache entry were still resident, the 2s background
+    // flush (or a later evict) would overwrite the disk file with the now-stale
+    // cache snapshot — clobbering composed_payload, validation_corrections, and
+    // the completed orchestration status (the "Partial latest-run artifact" bug
+    // in native / native-oauth mode). Evicting first makes disk the single
+    // source of truth for the whole compose step: the read sees the freshly
+    // flushed state (positions + watchlist.items + recommendations + done
+    // line_status, all written through the cache), and nothing flushes over the
+    // write afterwards. (Same fix independently reached by bugs #1 and #4.)
     crate::run_state_cache::evict(&run_id);
 
     // Delegate to the same function the legacy path uses — ensures identical format,

@@ -177,6 +177,20 @@ pub fn evict(run_id: &str) {
     guard.entries.remove(run_id);
 }
 
+/// Drop a run from the cache WITHOUT flushing to disk.
+///
+/// Use this when an authoritative write has already happened directly to the
+/// disk file from outside this cache (e.g. the separate MCP-server process'
+/// `finalize_report` wrote the completed report + validation_corrections +
+/// completed orchestration). In that case the resident cache entry is strictly
+/// staler than disk, and `evict` (which flushes first) would clobber the disk
+/// state with the stale snapshot — the exact bug this avoids. After dropping,
+/// the next `load`/`load_run_by_id` reads the authoritative on-disk state.
+pub fn drop_without_flush(run_id: &str) {
+    let mut guard = cache().lock().unwrap_or_else(|p| p.into_inner());
+    guard.entries.remove(run_id);
+}
+
 // ── Legacy compatibility (used by line_status updates from non-MCP code) ──
 
 /// Cache a line status update (same as patch but specialized for line_status).
@@ -230,5 +244,88 @@ pub fn should_flush() -> bool {
 pub fn reset_cache() {
     let mut guard = cache().lock().unwrap_or_else(|p| p.into_inner());
     guard.entries.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn unique_run_id() -> String {
+        format!(
+            "test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    /// `drop_without_flush` must NOT write the stale cache snapshot over an
+    /// authoritative direct-to-disk write made after the snapshot. This is the
+    /// production clobber: the MCP-server process writes the finalized report to
+    /// disk, then the desktop process must discard its (older) cache entry
+    /// without flushing. Contrast with `evict`, which flushes first.
+    #[test]
+    fn drop_without_flush_preserves_direct_disk_write() {
+        let dir = std::env::temp_dir().join(unique_run_id());
+        std::fs::create_dir_all(dir.join("runtime-state")).unwrap();
+        let run_id = unique_run_id();
+        let path = run_state_path(&dir, &run_id);
+
+        // Seed disk + load into cache (status: running).
+        std::fs::write(&path, json!({ "status": "running" }).to_string()).unwrap();
+        load(&dir, &run_id).unwrap();
+        // Mutate in cache → dirty (the stale snapshot).
+        patch(&dir, &run_id, |s| {
+            s.as_object_mut().unwrap().insert("stale".into(), json!(true));
+        })
+        .unwrap();
+
+        // Authoritative direct-to-disk write (simulates the finalize compose).
+        std::fs::write(&path, json!({ "status": "completed" }).to_string()).unwrap();
+
+        // Drop without flush → disk must keep the completed write.
+        drop_without_flush(&run_id);
+        let on_disk: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            on_disk.get("status").and_then(|v| v.as_str()),
+            Some("completed"),
+            "drop_without_flush must not clobber the direct-to-disk write"
+        );
+        assert!(
+            on_disk.get("stale").is_none(),
+            "the stale cache snapshot must not have been flushed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sanity contrast: `evict` DOES flush the dirty cache (and thus would
+    /// clobber a later direct-disk write — which is exactly why finalize uses
+    /// `drop_without_flush` instead).
+    #[test]
+    fn evict_flushes_dirty_cache_to_disk() {
+        let dir = std::env::temp_dir().join(unique_run_id());
+        std::fs::create_dir_all(dir.join("runtime-state")).unwrap();
+        let run_id = unique_run_id();
+        let path = run_state_path(&dir, &run_id);
+
+        std::fs::write(&path, json!({ "status": "running" }).to_string()).unwrap();
+        load(&dir, &run_id).unwrap();
+        patch(&dir, &run_id, |s| {
+            s.as_object_mut().unwrap().insert("cached".into(), json!(true));
+        })
+        .unwrap();
+
+        evict(&run_id);
+        let on_disk: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(on_disk.get("cached").and_then(|v| v.as_bool()), Some(true));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 

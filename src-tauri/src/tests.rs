@@ -931,6 +931,160 @@ use crate::storage::read_json_file;
         );
     }
 
+    // ── BUG #2: native narrator progress counter stuck at "1/N" ─────────────
+    // The `line_done` event's `completed` field feeds both the live UI counter
+    // and the run narrator's ProgressSnapshot. It used to be derived by counting
+    // `"recommendation"` lines in the `_mcp_results.jsonl` sidecar, which
+    // `merge_mcp_results` renames away after every batch — so in native /
+    // native-oauth (multi-batch) the count reset to ~1 each batch and the
+    // narrator concluded Alfred was stuck/looping ("1/35"). It is now derived
+    // from `pending_recommandations` (cumulative, deduped by line_id), the same
+    // set the coverage gate counts.
+
+    /// Pure helper: `count_covered_lines` is cumulative and dedups by line_id
+    /// (a line re-analyzed by the coverage-reprise sweep is counted once).
+    #[test]
+    fn count_covered_lines_is_cumulative_and_dedups_by_line_id() {
+        let state = json!({
+            "pending_recommandations": [
+                { "line_id": "position:MC", "ticker": "MC", "type": "position" },
+                { "line_id": "position:AI", "ticker": "AI", "type": "position" },
+                // Duplicate line_id (reprise re-analysis) — must NOT double-count.
+                { "line_id": "position:MC", "ticker": "MC", "type": "position" },
+                // line_id omitted — reconstructed from type+ticker.
+                { "ticker": "CAP", "type": "position" },
+            ]
+        });
+        assert_eq!(
+            crate::mcp_server::count_covered_lines(&state),
+            3,
+            "MC (deduped) + AI + CAP (reconstructed) = 3 distinct lines"
+        );
+        // Empty / missing → 0 (no panic).
+        assert_eq!(crate::mcp_server::count_covered_lines(&json!({})), 0);
+    }
+
+    /// End-to-end: drive `validate_recommendation` across a simulated batch-merge
+    /// boundary (sidecar renamed away, recos folded into run_state) and assert the
+    /// emitted `line_done.completed` keeps climbing instead of resetting to 1.
+    #[test]
+    fn native_line_done_completed_does_not_reset_across_batch_merge() {
+        let _guard = env_lock();
+        let _env_cleanup = EnvCleanup(TEST_ENV_KEYS);
+        crate::run_state_cache::reset_cache();
+
+        let base_dir = std::env::temp_dir().join(format!(
+            "alfred-progress-{}-{}",
+            std::process::id(),
+            now_epoch_ms()
+        ));
+        let state_dir = base_dir.join("runtime-state");
+        fs::create_dir_all(&state_dir).expect("state dir");
+        std::env::set_var("ALFRED_STATE_DIR", state_dir.as_os_str());
+
+        let run_id = format!("prog_{}", now_epoch_ms());
+        let data_dir = state_dir.parent().expect("data dir").to_path_buf();
+        let tickers = ["MC", "AI", "CAP"];
+
+        // 3-position portfolio → total must read 3 throughout.
+        let positions: Vec<serde_json::Value> = tickers
+            .iter()
+            .map(|t| json!({ "ticker": t, "nom": format!("{t} SA"), "type": "position" }))
+            .collect();
+        fs::write(
+            state_dir.join(format!("{run_id}.json")),
+            serde_json::to_string(&json!({
+                "run_id": run_id,
+                "portfolio": { "positions": positions },
+                "pending_recommandations": [],
+                "orchestration": { "status": "running", "stage": "analyzing_lines" },
+            }))
+            .expect("serialize"),
+        )
+        .expect("write run state");
+
+        // Build a recommendation that passes validation (no hard issues).
+        let rec = |ticker: &str| {
+            json!({
+                "line_id": format!("position:{ticker}"),
+                "ticker": ticker,
+                "type": "position",
+                "signal": "CONSERVER",
+                "conviction": "moderee",
+                "synthese": format!(
+                    "{ticker}: conserver la ligne avec discipline active, suivi du \
+                     risque et lecture fondamentale suffisamment detaillee pour valider."
+                ),
+                "analyse_technique": "Momentum stable.",
+                "analyse_fondamentale": "Qualite robuste.",
+                "analyse_sentiment": "Neutre.",
+                "raisons_principales": ["Qualite", "Execution"],
+                "action_recommandee": "Conserver",
+            })
+        };
+
+        // Read the LAST `line_done.completed` from the progress sidecar.
+        let last_completed = |run_id: &str| -> u64 {
+            let p = state_dir.join(format!("{run_id}_mcp_progress.jsonl"));
+            let content = fs::read_to_string(&p).unwrap_or_default();
+            content
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter(|e| e.get("type").and_then(|v| v.as_str()) == Some("line_done"))
+                .filter_map(|e| e.get("completed").and_then(|v| v.as_u64()))
+                .last()
+                .unwrap_or(0)
+        };
+
+        let validate = |ticker: &str| {
+            crate::mcp_server::dispatch_tool_direct(
+                &data_dir,
+                "validate_recommendation",
+                &json!({
+                    "run_id": run_id,
+                    "recommendation": serde_json::to_string(&rec(ticker)).unwrap(),
+                }),
+            )
+        };
+
+        // Batch 1: two lines validated → completed climbs 1, 2.
+        validate("MC");
+        assert_eq!(last_completed(&run_id), 1, "after MC: 1 covered");
+        validate("AI");
+        assert_eq!(last_completed(&run_id), 2, "after AI: 2 covered");
+
+        // Simulate `merge_mcp_results`: the two recos are folded into run_state
+        // (cache + disk) and the sidecar is consumed/renamed away.
+        crate::patch_run_state_direct_with(&run_id, |rs| {
+            if let Some(obj) = rs.as_object_mut() {
+                obj.insert(
+                    "pending_recommandations".to_string(),
+                    json!([
+                        rec("MC"),
+                        rec("AI"),
+                    ]),
+                );
+            }
+        })
+        .expect("merge into run_state");
+        crate::run_state_cache::flush_to_disk();
+        let _ = fs::remove_file(state_dir.join(format!("{run_id}_mcp_results.jsonl")));
+
+        // Batch 2: the third line. With the OLD sidecar-count logic this reset to
+        // 1; with the fix it must read 3 (cumulative).
+        validate("CAP");
+        let completed_after_merge = last_completed(&run_id);
+
+        std::env::remove_var("ALFRED_STATE_DIR");
+        let _ = fs::remove_dir_all(&base_dir);
+
+        assert_eq!(
+            completed_after_merge, 3,
+            "after the batch-merge boundary the counter must stay cumulative (3/3), \
+             not reset to 1 — this is the 'stuck at 1/N' narrator bug"
+        );
+    }
+
     // ── Coverage-reprise: synthesis-turn targeted re-analysis (bug
     // 019e9455124c — run finalized `completed` with 5/34 lines uncovered).
     // The four scenarios from the brief: (a) reprise fires, (c) reprise heals

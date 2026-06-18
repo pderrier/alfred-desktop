@@ -318,6 +318,29 @@ fn make_line_id(value: &Value) -> String {
     format!("{line_type}:{ticker}")
 }
 
+/// Number of DISTINCT lines covered so far, counted from `pending_recommandations`.
+///
+/// This is the cumulative progress source of truth for the live `line_done`
+/// counter and the run narrator's ProgressSnapshot. Deduplicates by `line_id`
+/// (reconstructed via `make_line_id` when the recommendation omits it) so a line
+/// re-analyzed by the coverage-reprise sweep is counted once, not twice. Pure:
+/// no I/O, takes an already-loaded run state.
+pub(crate) fn count_covered_lines(run_state: &Value) -> usize {
+    let mut covered: HashSet<String> = HashSet::new();
+    if let Some(arr) = run_state
+        .get("pending_recommandations")
+        .and_then(|v| v.as_array())
+    {
+        for rec in arr {
+            let lid = make_line_id(rec);
+            if !lid.is_empty() {
+                covered.insert(lid);
+            }
+        }
+    }
+    covered.len()
+}
+
 // The expected-line-id set is derived by the single source of truth in
 // `report.rs` (`crate::report::derive_expected_line_ids`), which computes the
 // same position+watchlist line-id set and additionally sorts it for
@@ -1270,12 +1293,19 @@ fn tool_validate_recommendation(data_dir: &Path, params: &Value) -> Result<Value
         "at": now_iso(),
     }));
 
-    // Count progress from sidecar file
-    let results_path = data_dir.join("runtime-state").join(format!("{run_id}_mcp_results.jsonl"));
-    let completed = std::fs::read_to_string(&results_path).ok()
-        .map(|s| s.lines().filter(|l| l.contains("\"recommendation\"")).count())
-        .unwrap_or(0);
+    // Progress for the `line_done` event (consumed by the run narrator's
+    // ProgressSnapshot and the live UI counter).
+    //
+    // `completed` is the number of DISTINCT lines covered so far. It is derived
+    // from `pending_recommandations` (disk + sidecar overlay, deduped by line_id
+    // inside `load_run_state`) — the cumulative source of truth — NOT from a raw
+    // line count of the `_mcp_results.jsonl` sidecar. The sidecar is renamed away
+    // by `merge_mcp_results` after every batch, so counting its lines reset the
+    // count to ~1 each batch in native/native-oauth mode (the narrator then
+    // reported "1/35" and concluded Alfred was stuck/looping). `pending_recommandations`
+    // accumulates across batches and is the same set the coverage gate counts.
     let run_state = load_run_state(data_dir, &run_id)?;
+    let completed = count_covered_lines(&run_state);
     let total = {
         let pos_count = run_state.get("portfolio")
             .and_then(|p| p.get("positions")).and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);

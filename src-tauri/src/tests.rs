@@ -770,6 +770,167 @@ use crate::storage::read_json_file;
         assert_eq!(persisted["portfolio"]["positions"].as_array().map(|rows| rows.len()), Some(1));
     }
 
+    /// Parity / non-regression for the "Partial latest-run artifact" bug
+    /// (native + native-oauth, runs 019edc1c0aeb / 019edc06b126 stuck at
+    /// orchestration.status=running / stage=llm_generating with an empty
+    /// composed_payload while the report DID contain the synthesis).
+    ///
+    /// Root cause: `tool_finalize_report` ran `flush_now → persist → evict`. At
+    /// finalize time the in-memory run-state cache still held the pre-synthesis
+    /// snapshot (status=running / stage=llm_generating, set at the top of
+    /// run_synthesis_turn). `persist_retry_global_synthesis` wrote `completed`
+    /// straight to disk, but the trailing `evict` (=flush_now+remove) re-flushed
+    /// the stale `running` snapshot OVER the `completed` state before dropping the
+    /// entry — leaving the run stuck at `running` on disk.
+    ///
+    /// This test reproduces the exact race: it primes the cache with the stale
+    /// `llm_generating` snapshot (exactly as `run_synthesis_turn` does), seeds the
+    /// validated synthesis in the MCP results sidecar (as `validate_synthesis`
+    /// does), then drives the real in-process native path
+    /// (`dispatch_tool_direct("finalize_report")`) and asserts that the run-state
+    /// **read back from disk** is `completed` with a non-empty synthesis — i.e.
+    /// the on-disk run-state agrees with the composed report. Pins the parity
+    /// contract: run-state ↔ report must converge in every mode.
+    #[test]
+    fn native_finalize_report_persists_completed_and_synthesis_to_disk_not_stale_running() {
+        let _guard = env_lock();
+        let _env_cleanup = EnvCleanup(TEST_ENV_KEYS);
+        crate::run_state_cache::reset_cache();
+
+        // Force the native (in-process finalize) path. Without this the test
+        // could read the codex backend name and take a divergent branch; the
+        // bug is specific to native/native-oauth where finalize shares the cache.
+        std::env::set_var("LITELLM_GENERATION_MODE", "native");
+
+        let base_dir = std::env::temp_dir().join(format!(
+            "alfred-finalize-race-{}-{}",
+            std::process::id(),
+            now_epoch_ms()
+        ));
+        let state_dir = base_dir.join("runtime-state");
+        let reports_dir = base_dir.join("reports");
+        fs::create_dir_all(&state_dir).expect("state dir");
+        fs::create_dir_all(reports_dir.join("history")).expect("history dir");
+        std::env::set_var("ALFRED_STATE_DIR", state_dir.as_os_str());
+        std::env::set_var("ALFRED_REPORTS_DIR", reports_dir.as_os_str());
+
+        let run_id = format!("finrace_{}", now_epoch_ms());
+        let synthese = "Synthese globale finalisee nativement avec une lecture \
+            portefeuille complete, une priorisation exploitable et un suivi du \
+            risque adapte au contexte de marche actuel.";
+
+        // (1) Run-state on disk: line analysis finished — pending recos present,
+        // but orchestration still "running" (synthesis not yet finalized).
+        fs::write(
+            state_dir.join(format!("{run_id}.json")),
+            serde_json::to_string(&json!({
+                "run_id": run_id,
+                "account": "PEA",
+                "updated_at": now_iso_string(),
+                "portfolio": {
+                    "valeur_totale": 1000.0,
+                    "plus_value_totale": 50.0,
+                    "liquidites": 25.0,
+                    "positions": [{
+                        "ticker": "MC", "nom": "LVMH SA", "type": "position",
+                        "quantite": 1, "prix_actuel": 800.0, "valeur_actuelle": 800.0,
+                    }],
+                },
+                "pending_recommandations": [{
+                    "line_id": "position:MC",
+                    "ticker": "MC",
+                    "type": "position",
+                    "signal": "CONSERVER",
+                    "synthese": "MC: ligne analysee avec un contexte suffisamment detaille.",
+                }],
+                "orchestration": { "status": "running", "stage": "analyzing_lines" },
+            }))
+            .expect("serialize"),
+        )
+        .expect("write run state");
+
+        // (2) Validated synthesis lives in the MCP results sidecar (what
+        // `tool_validate_synthesis` writes before finalize reads it back).
+        fs::write(
+            state_dir.join(format!("{run_id}_mcp_results.jsonl")),
+            serde_json::to_string(&json!({
+                "type": "synthesis",
+                "composed_payload": {
+                    "synthese_marche": synthese,
+                    "actions_immediates": [],
+                    "prochaine_analyse": "",
+                    "opportunites_watchlist": "",
+                },
+                "at": now_iso_string(),
+            }))
+            .expect("serialize sidecar")
+                + "\n",
+        )
+        .expect("write sidecar");
+
+        // (3) Prime the cache with the STALE pre-synthesis snapshot, exactly as
+        // `run_synthesis_turn` does on entry. This is the snapshot that the buggy
+        // trailing `evict` would flush over the `completed` disk write.
+        crate::run_state::set_native_run_stage(&run_id, "llm_generating", None, None)
+            .expect("set llm_generating stage");
+        // Sanity: cache now holds the stale running snapshot.
+        let cache_dd = state_dir.parent().expect("data dir");
+        let cached = crate::run_state_cache::load(cache_dd, &run_id).expect("load cache");
+        assert_eq!(
+            cached["orchestration"]["stage"], "llm_generating",
+            "precondition: cache holds the stale pre-synthesis snapshot"
+        );
+
+        // (4) Drive the real native finalize path (in-process dispatch).
+        let result = crate::mcp_server::dispatch_tool_direct(
+            cache_dd,
+            "finalize_report",
+            &json!({ "run_id": run_id }),
+        );
+        assert!(
+            result.get("error").is_none(),
+            "finalize_report should not error: {result}"
+        );
+
+        // (5) Force any pending dirty cache flush so a *stale* surviving entry
+        // (the old bug) would clobber disk here. With the fix, the entry was
+        // dropped (evict before persist) so there is nothing to clobber.
+        crate::run_state_cache::flush_to_disk();
+
+        // (6) Read run-state straight from disk — the UI provenance
+        // (`build_run_summary`) reads run-state, not the report.
+        let persisted = read_json_file(&state_dir.join(format!("{run_id}.json")))
+            .expect("persisted run should be readable");
+
+        std::env::remove_var("ALFRED_STATE_DIR");
+        std::env::remove_var("ALFRED_REPORTS_DIR");
+        std::env::remove_var("LITELLM_GENERATION_MODE");
+        let _ = fs::remove_dir_all(&base_dir);
+
+        assert_eq!(
+            persisted["orchestration"]["status"], "completed",
+            "run-state on disk must be `completed`, not stuck at `running` (Partial \
+             latest-run artifact bug)"
+        );
+        let disk_synthese = persisted["composed_payload"]["synthese_marche"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            disk_synthese.len() >= 20,
+            "run-state composed_payload.synthese_marche must be non-empty on disk \
+             (run-state ↔ report parity); got {disk_synthese:?}"
+        );
+        // Recommendations that were already on disk must not be lost by the
+        // evict-flush of the cache base.
+        assert_eq!(
+            persisted["pending_recommandations"]
+                .as_array()
+                .map(|rows| rows.len()),
+            Some(1),
+            "pending recommendations must survive finalize"
+        );
+    }
+
     // ── Coverage-reprise: synthesis-turn targeted re-analysis (bug
     // 019e9455124c — run finalized `completed` with 5/34 lines uncovered).
     // The four scenarios from the brief: (a) reprise fires, (c) reprise heals

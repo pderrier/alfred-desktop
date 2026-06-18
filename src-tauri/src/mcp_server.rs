@@ -1549,15 +1549,27 @@ fn tool_finalize_report(data_dir: &Path, params: &Value) -> Result<Value> {
         "llm_utilise": "codex-mcp",
     });
 
-    // Flush cache to disk before report finalization — report module reads from disk
-    crate::run_state_cache::flush_now(&run_id);
+    // Evict BEFORE persist — `evict` flushes the cached `running`+recommendations
+    // to disk and DROPS the entry, so `persist_retry_global_synthesis` (which reads
+    // run state from disk, never the cache) sees a synced disk AND there is no stale
+    // cached snapshot left to clobber the `completed` write afterwards.
+    //
+    // Ordering matters: the previous `flush_now → persist → evict` order was a race.
+    // At this point the in-memory cache still holds the pre-synthesis snapshot
+    // (orchestration.status=running / stage=llm_generating, set at the top of
+    // run_synthesis_turn). `persist_retry_global_synthesis` writes `completed` to
+    // disk directly, but a *trailing* `evict` re-flushes that stale `running`
+    // snapshot OVER the `completed` state before dropping the entry — leaving the
+    // run stuck at `running` on disk (the "Partial latest-run artifact" bug in
+    // native / native-oauth mode, where finalize runs in-process and shares the
+    // main cache). Codex mode escaped this only because finalize runs in a separate
+    // MCP process whose cache is irrelevant, and the main cache is re-synced from
+    // the completed disk by `merge_mcp_results` before its own evict.
+    crate::run_state_cache::evict(&run_id);
 
     // Delegate to the same function the legacy path uses — ensures identical format,
     // validation, composed_payload writing, report artifacts, orchestration status.
     let result = crate::report::persist_retry_global_synthesis(&run_id, &draft)?;
-
-    // Evict from cache — run is done, disk is the source of truth now
-    crate::run_state_cache::evict(&run_id);
 
     // Write progress event
     append_progress(

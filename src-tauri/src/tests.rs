@@ -931,6 +931,189 @@ use crate::storage::read_json_file;
         );
     }
 
+    /// Parity / non-regression for the SAME "Partial latest-run artifact" bug,
+    /// but reproducing the CODEX sidecar context rather than the native one.
+    ///
+    /// In codex mode the MCP server runs as a separate subprocess. Its own
+    /// line-analysis tool calls (`validate_recommendation`, line_status updates)
+    /// mutate the run state THROUGH the run-state cache (`patch`), so by the time
+    /// the codex agent calls `finalize_report` — IN THE SAME SUBPROCESS — that
+    /// subprocess' cache holds a dirty `orchestration.status=running` snapshot
+    /// (stage `analyzing_lines`, never `llm_generating`: codex has no in-process
+    /// native synthesis turn). `finalize_report` is the single shared funnel
+    /// (`dispatch_tool_direct`) for every mode, with NO codex/native branch, so
+    /// the evict-before-persist ordering must protect codex identically.
+    ///
+    /// The buggy order `flush_now → persist → evict` clobbers disk in codex too:
+    /// `persist_retry_global_synthesis` writes `completed` straight to disk, then
+    /// the trailing `evict` (`flush_now` writes the resident state UNCONDITIONALLY,
+    /// dirty or not, then removes) re-flushes the stale `running` snapshot over
+    /// `completed`. With the fix, `evict` runs FIRST, so the entry is gone before
+    /// persist writes and nothing survives to clobber it.
+    ///
+    /// This test primes the cache the way a codex subprocess would (a real
+    /// mutating `patch`, marking the entry dirty with `status=running`), seeds the
+    /// validated synthesis in the MCP results sidecar exactly as
+    /// `tool_validate_synthesis` does in the subprocess, drives the real shared
+    /// finalize funnel, and asserts the on-disk run-state is `completed` with a
+    /// non-empty synthesis. It fails on the old `flush_now → persist → evict`
+    /// order and passes on `evict → persist`.
+    #[test]
+    fn codex_finalize_report_persists_completed_and_synthesis_to_disk_not_stale_running() {
+        let _guard = env_lock();
+        let _env_cleanup = EnvCleanup(TEST_ENV_KEYS);
+        crate::run_state_cache::reset_cache();
+
+        // Codex generation mode. The finalize funnel has no mode branch, but pin
+        // the mode so a future divergence on this path would surface here.
+        std::env::set_var("LITELLM_GENERATION_MODE", "codex_proxy");
+
+        let base_dir = std::env::temp_dir().join(format!(
+            "alfred-finalize-race-codex-{}-{}",
+            std::process::id(),
+            now_epoch_ms()
+        ));
+        let state_dir = base_dir.join("runtime-state");
+        let reports_dir = base_dir.join("reports");
+        fs::create_dir_all(&state_dir).expect("state dir");
+        fs::create_dir_all(reports_dir.join("history")).expect("history dir");
+        std::env::set_var("ALFRED_STATE_DIR", state_dir.as_os_str());
+        std::env::set_var("ALFRED_REPORTS_DIR", reports_dir.as_os_str());
+
+        let run_id = format!("finrace_codex_{}", now_epoch_ms());
+        let synthese = "Synthese globale finalisee via le sous-processus MCP codex \
+            avec une lecture portefeuille complete, une priorisation exploitable \
+            et un suivi du risque adapte au contexte de marche actuel.";
+
+        // (1) Run-state on disk: line analysis finished — pending recos present,
+        // orchestration still `running` (synthesis not yet finalized).
+        fs::write(
+            state_dir.join(format!("{run_id}.json")),
+            serde_json::to_string(&json!({
+                "run_id": run_id,
+                "account": "PEA",
+                "updated_at": now_iso_string(),
+                "portfolio": {
+                    "valeur_totale": 1000.0,
+                    "plus_value_totale": 50.0,
+                    "liquidites": 25.0,
+                    "positions": [{
+                        "ticker": "MC", "nom": "LVMH SA", "type": "position",
+                        "quantite": 1, "prix_actuel": 800.0, "valeur_actuelle": 800.0,
+                    }],
+                },
+                "pending_recommandations": [{
+                    "line_id": "position:MC",
+                    "ticker": "MC",
+                    "type": "position",
+                    "signal": "CONSERVER",
+                    "synthese": "MC: ligne analysee avec un contexte suffisamment detaille.",
+                }],
+                "orchestration": { "status": "running", "stage": "analyzing_lines" },
+            }))
+            .expect("serialize"),
+        )
+        .expect("write run state");
+
+        // (2) Validated synthesis lives in the MCP results sidecar — written by
+        // `tool_validate_synthesis` running INSIDE the codex subprocess before it
+        // calls finalize. `load_run_state` overlays this into `composed_payload`.
+        fs::write(
+            state_dir.join(format!("{run_id}_mcp_results.jsonl")),
+            serde_json::to_string(&json!({
+                "type": "synthesis",
+                "composed_payload": {
+                    "synthese_marche": synthese,
+                    "actions_immediates": [],
+                    "prochaine_analyse": "",
+                    "opportunites_watchlist": "",
+                },
+                "at": now_iso_string(),
+            }))
+            .expect("serialize sidecar")
+                + "\n",
+        )
+        .expect("write sidecar");
+
+        // (3) Prime the cache the way a CODEX subprocess does: a real mutating
+        // `patch` through the run-state cache (as line_status / recommendation
+        // tool calls do during analysis). This loads the on-disk `running`
+        // snapshot into the subprocess cache and marks it DIRTY — exactly the
+        // stale entry the buggy trailing `evict` would flush over `completed`.
+        // Note: no `set_native_run_stage` / `llm_generating` here — codex never
+        // runs the in-process native synthesis turn; status stays `running`.
+        let cache_dd = state_dir.parent().expect("data dir");
+        crate::run_state_cache::patch(cache_dd, &run_id, |state| {
+            if let Some(obj) = state.as_object_mut() {
+                let ls = obj
+                    .entry("line_status")
+                    .or_insert_with(|| json!({}));
+                if let Some(ls_obj) = ls.as_object_mut() {
+                    ls_obj.insert("MC".to_string(), json!("done"));
+                }
+            }
+        })
+        .expect("prime codex subprocess cache via patch");
+        // Sanity: cache now holds the stale running snapshot (dirty).
+        let cached = crate::run_state_cache::load(cache_dd, &run_id).expect("load cache");
+        assert_eq!(
+            cached["orchestration"]["status"], "running",
+            "precondition: codex subprocess cache holds the stale running snapshot"
+        );
+        assert!(
+            crate::run_state_cache::should_flush(),
+            "precondition: the primed codex cache entry is dirty (would flush over disk)"
+        );
+
+        // (4) Drive the real shared finalize funnel (in-process dispatch) — the
+        // identical entry point the codex subprocess uses.
+        let result = crate::mcp_server::dispatch_tool_direct(
+            cache_dd,
+            "finalize_report",
+            &json!({ "run_id": run_id }),
+        );
+        assert!(
+            result.get("error").is_none(),
+            "finalize_report should not error: {result}"
+        );
+
+        // (5) Force any pending dirty cache flush so a *stale* surviving entry
+        // (the old bug) would clobber disk here. With the fix, the entry was
+        // dropped (evict before persist) so there is nothing to clobber.
+        crate::run_state_cache::flush_to_disk();
+
+        // (6) Read run-state straight from disk — the UI provenance reads
+        // run-state, not the report.
+        let persisted = read_json_file(&state_dir.join(format!("{run_id}.json")))
+            .expect("persisted run should be readable");
+
+        std::env::remove_var("ALFRED_STATE_DIR");
+        std::env::remove_var("ALFRED_REPORTS_DIR");
+        std::env::remove_var("LITELLM_GENERATION_MODE");
+        let _ = fs::remove_dir_all(&base_dir);
+
+        assert_eq!(
+            persisted["orchestration"]["status"], "completed",
+            "run-state on disk must be `completed`, not stuck at `running` (Partial \
+             latest-run artifact bug — codex sidecar context)"
+        );
+        let disk_synthese = persisted["composed_payload"]["synthese_marche"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            disk_synthese.len() >= 20,
+            "run-state composed_payload.synthese_marche must be non-empty on disk \
+             (run-state ↔ report parity); got {disk_synthese:?}"
+        );
+        assert_eq!(
+            persisted["pending_recommandations"]
+                .as_array()
+                .map(|rows| rows.len()),
+            Some(1),
+            "pending recommendations must survive finalize"
+        );
+    }
+
     // ── BUG #2: native narrator progress counter stuck at "1/N" ─────────────
     // The `line_done` event's `completed` field feeds both the live UI counter
     // and the run narrator's ProgressSnapshot. It used to be derived by counting

@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.4.15
+
+**Required update.** Restores the full portfolio synthesis in your report and fixes several analysis-quality issues.
+
+### What's new
+
+- **Global synthesis is back.** Recent analyses could finish but show only "Partial latest-run artifact" instead of the full market synthesis and recommendations — the completed report was being overwritten on disk by a stale in-progress snapshot. Reports now reliably show the complete synthesis. (This mainly affected the native / OpenAI sign-in analysis modes.)
+- **Accurate live progress & narration.** The live analysis counter no longer freezes at "1/N", and Alfred's running commentary no longer claims it's "stuck" or "looping" when the analysis is simply working through your lines.
+- **Paying users are never sent to the free wall.** If your activation lapsed locally (e.g. after a reinstall), the app now silently re-activates your stored code at startup instead of showing the "quota reached" screen. And if you ever need to re-enter it, the activation dialog now has a one-click "Réactiver mon code" button.
+- **Cleaner analysis report.** Eliminated spurious "validation warnings" on watchlist lines and on valid limit orders.
+
+### Compatibility
+
+- **Required.** Earlier versions keep the synthesis-persistence bug, so this upgrade is mandatory.
+- Privacy and authentication unchanged — your sign-in token is never sent to the server.
+
 ## v0.4.14
 
 **Optional update.** Your home page market briefing is back, plus a behind-the-scenes diagnostics fix for sign-in checks.

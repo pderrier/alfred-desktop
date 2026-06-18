@@ -1549,15 +1549,22 @@ fn tool_finalize_report(data_dir: &Path, params: &Value) -> Result<Value> {
         "llm_utilise": "codex-mcp",
     });
 
-    // Flush cache to disk before report finalization — report module reads from disk
-    crate::run_state_cache::flush_now(&run_id);
+    // Evict (flush dirty cache to disk, then DROP the in-memory entry) BEFORE
+    // composing the report. `persist_retry_global_synthesis` reads run_state
+    // from disk and writes the composed report back to disk, bypassing the
+    // cache entirely. If the cache entry were still resident, the 2s background
+    // flush (or a later evict) would overwrite the disk file with the now-stale
+    // cache snapshot — clobbering composed_payload, validation_corrections, and
+    // the completed orchestration status. Evicting first makes disk the single
+    // source of truth for the whole compose step: the read sees the freshly
+    // flushed state (positions + watchlist.items + recommendations + done
+    // line_status, all written through the cache), and nothing flushes over the
+    // write afterwards.
+    crate::run_state_cache::evict(&run_id);
 
     // Delegate to the same function the legacy path uses — ensures identical format,
     // validation, composed_payload writing, report artifacts, orchestration status.
     let result = crate::report::persist_retry_global_synthesis(&run_id, &draft)?;
-
-    // Evict from cache — run is done, disk is the source of truth now
-    crate::run_state_cache::evict(&run_id);
 
     // Write progress event
     append_progress(

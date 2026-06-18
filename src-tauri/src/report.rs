@@ -60,6 +60,26 @@ fn push_ticker_issue(
     }
 }
 
+/// Expected line_ids = the set of lines this run actually dispatched for
+/// analysis. Two corroborating sources are unioned so the expected set stays
+/// coherent with what was analysed even if the run_state persistence channels
+/// race (the in-memory cache and direct-to-disk compose writes can momentarily
+/// disagree on `watchlist.items`):
+///
+/// 1. **Declared inputs** — `portfolio.positions[]` + `watchlist.items[]`. The
+///    canonical source: these are the rows fed to the dispatch worker.
+/// 2. **Corroborated recommendations** — any `pending_recommandations[]` entry
+///    whose bare ticker also has a `line_status` entry. A recommendation only
+///    exists for a line the run dispatched, and `line_status[ticker]` is written
+///    the moment a line is dispatched (`update_line_status(.., "collecting")`),
+///    so the pair proves the line was a real dispatched input — NOT an LLM
+///    hallucination. This recovers `type:ticker` ids (e.g. `watchlist:MRN`) when
+///    `watchlist.items` was dropped by a flush race, without ever whitelisting a
+///    reco for a ticker that was never dispatched.
+///
+/// The `line_status` corroboration is load-bearing: dropping it would let a
+/// reco for an off-portfolio ticker silence the `unexpected_line_recommendation`
+/// check that exists to catch exactly that.
 pub fn derive_expected_line_ids(run_state: &serde_json::Value) -> Vec<String> {
     let mut ids = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -78,6 +98,33 @@ pub fn derive_expected_line_ids(run_state: &serde_json::Value) -> Vec<String> {
             }
         }
     }
+
+    // Source 2: recommendations corroborated by a line_status entry for the
+    // same ticker. Tickers with a status row were genuinely dispatched.
+    let dispatched_tickers: std::collections::HashSet<String> = run_state
+        .get("line_status")
+        .and_then(|v| v.as_object())
+        .map(|map| map.keys().map(|k| k.trim().to_ascii_uppercase()).collect())
+        .unwrap_or_default();
+    if let Some(recs) = run_state
+        .get("pending_recommandations")
+        .and_then(|v| v.as_array())
+    {
+        for rec in recs {
+            let line_id = as_line_id(rec);
+            if line_id.is_empty() {
+                continue;
+            }
+            let ticker = line_ticker(&line_id);
+            if ticker.is_empty() || !dispatched_tickers.contains(&ticker) {
+                continue;
+            }
+            if seen.insert(line_id.clone()) {
+                ids.push(line_id);
+            }
+        }
+    }
+
     ids.sort();
     ids
 }
@@ -224,6 +271,75 @@ pub(crate) fn enrich_actions_from_recommendations(
     actions
 }
 
+// ── Action normalization ──
+
+/// Normalize `order_type` on a single action to the canonical {MARKET, LIMIT}
+/// contract before validation. The LLM frequently omits `order_type` (or emits
+/// a French/empty value) while still expressing intent through `limit_price`.
+///
+/// Rule (matches the order-placement default at `command_handlers.rs` and the
+/// LIMIT⇒`limit_price`>0 / MARKET⇒no `limit_price` invariants):
+///   * order_type already MARKET or LIMIT → leave untouched.
+///   * otherwise, infer: a populated positive `limit_price` ⇒ "LIMIT",
+///     else ⇒ "MARKET".
+///
+/// This is a deterministic enrichment of incomplete LLM output to the canonical
+/// shape (parallel to the P2-7 `limit_price` backfill), NOT a validation-error
+/// suppressor: a LIMIT with no price still fails `price_limit_required_for_limit`,
+/// and a MARKET that carries a stray price still fails the forbidden-price check.
+/// Returns `true` when `order_type` was written/changed (for audit logging).
+pub(crate) fn normalize_action_order_type(action: &mut serde_json::Value) -> bool {
+    let Some(obj) = action.as_object_mut() else {
+        return false;
+    };
+    let has_camel = obj.contains_key("orderType");
+    let current = safe_upper(obj.get("order_type").or_else(|| obj.get("orderType")));
+    let already_canonical = current == safe_text(obj.get("order_type"))
+        && matches!(current.as_str(), "MARKET" | "LIMIT")
+        && !has_camel;
+    if already_canonical {
+        // Single canonical `order_type` already holds MARKET/LIMIT — nothing to do.
+        return false;
+    }
+
+    let canonical = if matches!(current.as_str(), "MARKET" | "LIMIT") {
+        // Valid value but wrong spelling/case (e.g. camelCase or lowercase) —
+        // converge to the uppercase snake_case key.
+        current
+    } else {
+        // Missing/invalid value — infer from a populated positive limit_price.
+        let has_limit_price = obj
+            .get("limit_price")
+            .or_else(|| obj.get("limitPrice"))
+            .and_then(|v| v.as_f64())
+            .map(|v| v > 0.0)
+            .unwrap_or(false);
+        if has_limit_price { "LIMIT".to_string() } else { "MARKET".to_string() }
+    };
+    // Remove the stray camelCase variant so validation reads a single canonical key.
+    obj.remove("orderType");
+    obj.insert(
+        "order_type".to_string(),
+        serde_json::Value::String(canonical),
+    );
+    true
+}
+
+/// Apply `normalize_action_order_type` to every element of an actions array.
+/// Returns the number of actions whose `order_type` was written/changed.
+pub(crate) fn normalize_actions_order_type(actions: &mut serde_json::Value) -> usize {
+    let Some(arr) = actions.as_array_mut() else {
+        return 0;
+    };
+    let mut count = 0;
+    for action in arr.iter_mut() {
+        if normalize_action_order_type(action) {
+            count += 1;
+        }
+    }
+    count
+}
+
 // ── Validation ──
 
 fn validate_synthesis_quality(synthese: &str) -> Vec<String> {
@@ -234,7 +350,7 @@ fn validate_synthesis_quality(synthese: &str) -> Vec<String> {
     errors
 }
 
-fn validate_immediate_actions(actions: &[serde_json::Value]) -> (Vec<String>, serde_json::Map<String, serde_json::Value>) {
+pub(crate) fn validate_immediate_actions(actions: &[serde_json::Value]) -> (Vec<String>, serde_json::Map<String, serde_json::Value>) {
     let mut errors = Vec::new();
     let mut by_ticker = serde_json::Map::new();
     if actions.len() > 5 {
@@ -249,8 +365,14 @@ fn validate_immediate_actions(actions: &[serde_json::Value]) -> (Vec<String>, se
         let rationale = safe_text(action.get("rationale"));
         let priority = action.get("priority").and_then(|v| v.as_i64());
         let quantity = action.get("quantity").and_then(|v| v.as_f64());
-        let price_limit = action
-            .get("price_limit")
+        // Canonical limit-price field is `limit_price` (emitted by the LLM, by
+        // the auto-injection path, and filled by the P2-7 backfill). The legacy
+        // `price_limit`/`priceLimit` spellings are tolerated only as a read
+        // fallback so an older draft still validates.
+        let limit_price = action
+            .get("limit_price")
+            .or_else(|| action.get("limitPrice"))
+            .or_else(|| action.get("price_limit"))
             .or_else(|| action.get("priceLimit"))
             .and_then(|v| v.as_f64());
         let estimated_amount = action
@@ -285,10 +407,10 @@ fn validate_immediate_actions(actions: &[serde_json::Value]) -> (Vec<String>, se
         if !is_transactional && matches!(estimated_amount, Some(value) if value < 0.0) {
             action_errors.push(format!("{prefix}:estimated_amount_invalid"));
         }
-        if order_type == "LIMIT" && !matches!(price_limit, Some(value) if value > 0.0) {
+        if order_type == "LIMIT" && !matches!(limit_price, Some(value) if value > 0.0) {
             action_errors.push(format!("{prefix}:price_limit_required_for_limit"));
         }
-        if order_type == "MARKET" && matches!(price_limit, Some(value) if value > 0.0) {
+        if order_type == "MARKET" && matches!(limit_price, Some(value) if value > 0.0) {
             action_errors.push(format!("{prefix}:price_limit_forbidden_for_market"));
         }
         for issue in action_errors {
@@ -301,7 +423,7 @@ fn validate_immediate_actions(actions: &[serde_json::Value]) -> (Vec<String>, se
     (errors, by_ticker)
 }
 
-fn validate_recommendation_coverage(
+pub(crate) fn validate_recommendation_coverage(
     recommendations: &[serde_json::Value],
     expected_line_ids: &[String],
 ) -> (Vec<String>, serde_json::Map<String, serde_json::Value>) {
@@ -466,6 +588,17 @@ pub fn persist_retry_global_synthesis(run_id: &str, generated_draft: &serde_json
         if mutated_count > 0 {
             crate::debug_log(&format!(
                 "[p2-7] backfilled {mutated_count} action_immediate(s) at persist for run {run_id}"
+            ));
+        }
+        // Normalize `order_type` AFTER the limit_price backfill so an action
+        // that just gained a limit_price is correctly inferred as LIMIT, and a
+        // missing/non-canonical order_type defaults to MARKET. This is what
+        // keeps a perfectly valid LLM action (e.g. RENFORCEMENT with a price but
+        // no order_type) from tripping `order_type_invalid`.
+        let normalized_count = normalize_actions_order_type(&mut actions_value);
+        if normalized_count > 0 {
+            crate::debug_log(&format!(
+                "[order-type] normalized {normalized_count} action_immediate(s) at persist for run {run_id}"
             ));
         }
         actions = actions_value.as_array().cloned().unwrap_or_default();

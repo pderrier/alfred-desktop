@@ -3423,28 +3423,44 @@ fn run_synthesis_inner(run_id: &str, data_dir: &str) -> Result<Value> {
 
     match last_result.unwrap_or_else(|| Err(anyhow::anyhow!("synthesis_no_result"))) {
         Ok(turn_result) => {
-            // Evict (not just flush) — the MCP server process may have written
-            // a completed state directly to disk via finalize_report. If we only
-            // flush, the cache overwrites that completed state with the stale
-            // "running" version. Evict discards the cache so load_run_by_id_direct
-            // reads the authoritative on-disk state.
-            crate::run_state_cache::evict(run_id);
             line_memory_flush_now();
-            let run_state = crate::load_run_by_id_direct(run_id)?;
-            let status = run_state
+            // The MCP `finalize_report` tool runs in the separate MCP-server
+            // process and, on success, writes the authoritative completed report
+            // (composed_payload + validation_corrections + completed
+            // orchestration) straight to the on-disk run_state file. This
+            // desktop-process cache entry is the OLDER "running" snapshot (plus
+            // the recos `merge_mcp_results` just folded in) — strictly staler
+            // than disk. `evict` would flush that stale snapshot over the
+            // finalized disk state, reverting orchestration to "running" and
+            // dropping validation_corrections (the production clobber).
+            //
+            // So we read the on-disk orchestration status directly (bypassing
+            // the cache) to learn whether finalize ran:
+            //   * finalize ran  → DROP the cache without flushing; disk is
+            //     authoritative.
+            //   * finalize did NOT run → the desktop cache (with merged recos)
+            //     is what `codex_synthesis_fallback` must compose from, so
+            //     flush it to disk before falling back.
+            let on_disk = crate::load_run_by_id_direct(run_id)?;
+            let status = on_disk
                 .get("orchestration")
                 .and_then(|o| o.get("status"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("running");
+                .unwrap_or("running")
+                .to_string();
+            let finalize_ran = status == "completed" || status == "completed_degraded";
 
-            if status == "completed" || status == "completed_degraded" {
+            if finalize_ran {
+                crate::run_state_cache::drop_without_flush(run_id);
                 Ok(json!({
                     "ok": true,
                     "orchestration_status": status,
                     "run_id": run_id,
                 }))
             } else {
-                // Model didn't call finalize_report — extract from turn output
+                // Model didn't call finalize_report — persist the merged recos,
+                // then extract a report from the turn output.
+                crate::run_state_cache::flush_now(run_id);
                 codex_synthesis_fallback(run_id, &turn_result)
             }
         }
@@ -3657,6 +3673,12 @@ fn codex_synthesis_fallback(run_id: &str, turn_result: &Value) -> Result<Value> 
                 crate::debug_log(&format!(
                     "[synthesis-fallback] persist_retry_global_synthesis succeeded for {run_id}"
                 ));
+                // `persist_retry_global_synthesis` wrote the authoritative
+                // completed report straight to disk (bypassing the cache). The
+                // resident cache entry is the staler "running" snapshot; drop it
+                // WITHOUT flushing so the 2s background flush can't clobber the
+                // finalized disk state. (Same clobber class as the finalize path.)
+                crate::run_state_cache::drop_without_flush(run_id);
                 return Ok(result);
             }
             Err(e) => {

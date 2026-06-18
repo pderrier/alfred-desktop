@@ -4809,6 +4809,231 @@ use crate::storage::read_json_file;
         );
     }
 
+    // ── Validation warnings regression (PEA-PME run 019edc1c0aeb) ──────────
+    //
+    // Two production bugs surfaced as a "⚠ 6 validation warnings" banner:
+    //   A) 5× `unexpected_line_recommendation:watchlist:<TICKER>` — the analysed
+    //      watchlist recos were flagged unexpected because `derive_expected_line_ids`
+    //      read `watchlist.items`, which a run_state persistence race could drop
+    //      while the recos (written through a different channel) survived.
+    //   B) 1× `actions_immediates_invalid:0:order_type_invalid` — the LLM emitted
+    //      an action with a populated `limit_price` but a missing `order_type`,
+    //      and the validator (a) had no normalization and (b) read the limit
+    //      price from the wrong field name (`price_limit`, never written).
+
+    fn run_state_with_dispatched_watchlist() -> serde_json::Value {
+        // 1 position + 2 watchlist items, all dispatched (line_status present),
+        // all with recommendations. This is the shape that produced Bug A.
+        json!({
+            "portfolio": { "positions": [ { "ticker": "EQS" } ] },
+            "watchlist": { "items": [ { "ticker": "MRN" }, { "ticker": "RBT" } ] },
+            "line_status": {
+                "EQS": { "status": "done" },
+                "MRN": { "status": "done" },
+                "RBT": { "status": "done" }
+            },
+            "pending_recommandations": [
+                { "line_id": "position:EQS", "type": "position", "ticker": "EQS", "signal": "RENFORCEMENT" },
+                { "line_id": "watchlist:MRN", "type": "watchlist", "ticker": "MRN", "signal": "ACHAT_SUR_REPLI" },
+                { "line_id": "watchlist:RBT", "type": "watchlist", "ticker": "RBT", "signal": "ACHAT_SUR_REPLI" }
+            ]
+        })
+    }
+
+    #[test]
+    fn derive_expected_includes_watchlist_from_items() {
+        // Baseline: when watchlist.items is intact, all three expected.
+        let rs = run_state_with_dispatched_watchlist();
+        let expected = crate::report::derive_expected_line_ids(&rs);
+        assert_eq!(
+            expected,
+            vec![
+                "position:EQS".to_string(),
+                "watchlist:MRN".to_string(),
+                "watchlist:RBT".to_string(),
+            ],
+            "expected set must contain the position + both watchlist lines"
+        );
+    }
+
+    #[test]
+    fn derive_expected_recovers_watchlist_when_items_dropped() {
+        // Bug A root cause: the watchlist.items field was lost to a flush race,
+        // but the watchlist recos + line_status survived. The corroborated-reco
+        // source must recover the `watchlist:*` ids so they are NOT flagged
+        // unexpected.
+        let mut rs = run_state_with_dispatched_watchlist();
+        rs.as_object_mut().unwrap().remove("watchlist");
+        let expected = crate::report::derive_expected_line_ids(&rs);
+        assert!(
+            expected.contains(&"watchlist:MRN".to_string())
+                && expected.contains(&"watchlist:RBT".to_string()),
+            "watchlist lines proven by line_status must stay expected even when \
+             watchlist.items is missing: {expected:?}"
+        );
+        assert!(expected.contains(&"position:EQS".to_string()));
+    }
+
+    #[test]
+    fn derive_expected_does_not_whitelist_undispatched_reco() {
+        // The line_status corroboration is load-bearing: a reco for a ticker
+        // that was never dispatched (no line_status entry) must NOT become
+        // "expected" — otherwise we'd silence the very check that catches an
+        // off-portfolio / hallucinated recommendation.
+        let mut rs = run_state_with_dispatched_watchlist();
+        rs.as_object_mut().unwrap().remove("watchlist");
+        // Inject a reco with no matching line_status entry.
+        rs["pending_recommandations"].as_array_mut().unwrap().push(json!({
+            "line_id": "watchlist:GHOST", "type": "watchlist", "ticker": "GHOST", "signal": "ENTRER"
+        }));
+        let expected = crate::report::derive_expected_line_ids(&rs);
+        assert!(
+            !expected.contains(&"watchlist:GHOST".to_string()),
+            "an un-dispatched reco must never be whitelisted into expected: {expected:?}"
+        );
+    }
+
+    #[test]
+    fn coverage_no_unexpected_for_analysed_watchlist_even_without_items() {
+        // End-to-end of Bug A: dropped watchlist.items, recos present →
+        // ZERO `unexpected_line_recommendation` warnings.
+        let mut rs = run_state_with_dispatched_watchlist();
+        rs.as_object_mut().unwrap().remove("watchlist");
+        let expected = crate::report::derive_expected_line_ids(&rs);
+        let recos = rs["pending_recommandations"].as_array().unwrap().clone();
+        // Give each reco a long enough synthese to isolate the coverage check.
+        let recos: Vec<_> = recos
+            .into_iter()
+            .map(|mut r| {
+                r["synthese"] = json!("x".repeat(120));
+                r
+            })
+            .collect();
+        let (errors, _) =
+            crate::report::validate_recommendation_coverage(&recos, &expected);
+        let unexpected: Vec<_> = errors
+            .iter()
+            .filter(|e| e.starts_with("unexpected_line_recommendation"))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "watchlist recos for analysed lines must not be flagged unexpected: {unexpected:?}"
+        );
+        let missing: Vec<_> = errors
+            .iter()
+            .filter(|e| e.starts_with("missing_line_recommendation"))
+            .collect();
+        assert!(missing.is_empty(), "no line should be missing: {missing:?}");
+    }
+
+    #[test]
+    fn coverage_still_flags_genuinely_unexpected_reco() {
+        // Regression guard: a reco whose line_id is NOT in the expected set
+        // must still be flagged. (Expected derived from inputs only here.)
+        let expected = vec!["position:EQS".to_string()];
+        let recos = vec![json!({
+            "line_id": "position:HALLU", "type": "position", "ticker": "HALLU",
+            "synthese": "x".repeat(120)
+        })];
+        let (errors, _) =
+            crate::report::validate_recommendation_coverage(&recos, &expected);
+        assert!(
+            errors.iter().any(|e| e == "unexpected_line_recommendation:position:HALLU"),
+            "genuinely unexpected reco must still be flagged: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn normalize_order_type_infers_limit_from_price() {
+        // Bug B exact case: RENFORCEMENT with limit_price but no order_type.
+        let mut action = json!({
+            "ticker": "EQS", "action": "RENFORCEMENT", "limit_price": 46.0, "priority": 1
+        });
+        assert!(crate::report::normalize_action_order_type(&mut action));
+        assert_eq!(action["order_type"], json!("LIMIT"));
+    }
+
+    #[test]
+    fn normalize_order_type_defaults_market_when_no_price() {
+        let mut action = json!({ "ticker": "EQS", "action": "CONSERVER", "priority": 1 });
+        assert!(crate::report::normalize_action_order_type(&mut action));
+        assert_eq!(action["order_type"], json!("MARKET"));
+    }
+
+    #[test]
+    fn normalize_order_type_leaves_valid_value_untouched() {
+        for ot in ["MARKET", "LIMIT"] {
+            let mut action = json!({ "ticker": "EQS", "order_type": ot });
+            assert!(
+                !crate::report::normalize_action_order_type(&mut action),
+                "{ot} must be left untouched"
+            );
+            assert_eq!(action["order_type"], json!(ot));
+        }
+    }
+
+    #[test]
+    fn normalize_order_type_drops_stray_camelcase() {
+        // Only the canonical snake_case key must remain.
+        let mut action = json!({ "ticker": "EQS", "orderType": "limit", "limit_price": 12.0 });
+        assert!(crate::report::normalize_action_order_type(&mut action));
+        assert_eq!(action["order_type"], json!("LIMIT"));
+        assert!(action.get("orderType").is_none(), "camelCase key must be removed");
+    }
+
+    #[test]
+    fn validate_actions_reads_limit_price_field() {
+        // The validator must read `limit_price` (the canonical field), not the
+        // never-written `price_limit`. A normalized LIMIT action with a valid
+        // limit_price must produce ZERO errors.
+        let actions = vec![json!({
+            "ticker": "EQS", "action": "RENFORCEMENT", "order_type": "LIMIT",
+            "limit_price": 46.0, "quantity": 1.0, "estimated_amount_eur": 46.0,
+            "rationale": "Renforcer par petite tranche.", "priority": 1
+        })];
+        let (errors, _) = crate::report::validate_immediate_actions(&actions);
+        assert!(
+            errors.is_empty(),
+            "valid LIMIT action with limit_price must not warn: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_actions_market_with_limit_price_is_forbidden() {
+        // The forbidden-price-on-MARKET check must now actually fire (it read the
+        // wrong field before, so it never did).
+        let actions = vec![json!({
+            "ticker": "EQS", "action": "ACHETER", "order_type": "MARKET",
+            "limit_price": 46.0, "quantity": 1.0, "estimated_amount_eur": 46.0,
+            "rationale": "...", "priority": 1
+        })];
+        let (errors, _) = crate::report::validate_immediate_actions(&actions);
+        assert!(
+            errors.iter().any(|e| e.ends_with(":price_limit_forbidden_for_market")),
+            "MARKET carrying a limit_price must be flagged: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn normalized_then_validated_pea_pme_action_has_zero_warnings() {
+        // Full Bug B reproduction: the raw LLM action that produced
+        // `order_type_invalid` in run 019edc307b65 (order_type missing,
+        // limit_price present) must normalize to LIMIT and validate clean.
+        let mut actions_value = json!([{
+            "ticker": "EQS", "action": "RENFORCEMENT", "limit_price": 73.0,
+            "quantity": 1.0, "estimated_amount_eur": 73.0,
+            "rationale": "Renforcer seulement par petite tranche.", "priority": 1
+        }]);
+        crate::report::normalize_actions_order_type(&mut actions_value);
+        let actions = actions_value.as_array().unwrap().clone();
+        assert_eq!(actions[0]["order_type"], json!("LIMIT"));
+        let (errors, _) = crate::report::validate_immediate_actions(&actions);
+        assert!(
+            errors.is_empty(),
+            "PEA-PME action must validate clean after normalization: {errors:?}"
+        );
+    }
+
     // ── P0-2: run_narrator timeout, threshold, degrade status event ──────
     //
     // These tests pin the bug-fix contract for v0.3.2:

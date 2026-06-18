@@ -117,9 +117,17 @@ export function normalizeRedeemedCode(code) {
 const REDEEMED_CODE_ROW_ID = "redeem-active-code-row";
 
 /**
- * Pure helper: HTML for the read-only "your active code" row with a copy
- * affordance, consistent with the copyable-email pattern above. Returns "" when
- * there is no code to show (so the row is simply absent — fully additive).
+ * Pure helper: HTML for the "your active code" row.
+ *
+ * MON-E UX fix (2026-06-18): the app already HOLDS the code, so it must not
+ * make the user copy-paste it back into the input. The primary affordance is
+ * now a one-click "Réactiver mon code" button that submits the stored code
+ * directly. A discreet "Copier" remains for the user who wants the raw value
+ * (e.g. to use it on another machine). The input below stays available +
+ * pre-filled (handled at the call site) so entering a DIFFERENT code still
+ * works — fully additive.
+ *
+ * Returns "" when there is no code to show (row simply absent).
  */
 export function buildRedeemedCodeRowHtml(code) {
   const value = normalizeRedeemedCode(code);
@@ -128,7 +136,8 @@ export function buildRedeemedCodeRowHtml(code) {
       <div class="redeem-active-code-row" id="${REDEEMED_CODE_ROW_ID}">
         <span class="redeem-active-code-label">Ton code d'activation :</span>
         <code class="redeem-active-code-value">${escapeHtml(value)}</code>
-        <button type="button" class="redeem-copy-code-btn">Copier le code</button>
+        <button type="button" class="redeem-reactivate-code-btn">Réactiver mon code</button>
+        <button type="button" class="redeem-copy-code-btn">Copier</button>
       </div>`;
 }
 
@@ -228,40 +237,20 @@ export function openRedeemModal(deps = {}) {
     `Copie indisponible — écris à ${CONTACT_EMAIL}`
   );
 
-  // MON-E: read-only redeemed-code row. Present in the initial HTML when
-  // `deps.redeemedCode` was passed (a prior code); re-rendered on a fresh
-  // successful redeem to reflect the just-entered code. Idempotent —
-  // replaces any existing row in place rather than duplicating it, and wires
-  // the (possibly new) copy button each time.
-  const renderRedeemedCode = (code) => {
-    const value = normalizeRedeemedCode(code);
-    if (!value) return;
-    const html = buildRedeemedCodeRowHtml(value);
-    const existing = overlay.querySelector(`#${REDEEMED_CODE_ROW_ID}`);
-    if (existing) {
-      existing.outerHTML = html; // reflect a freshly-redeemed code
-    } else {
-      // Inject just before the code-input label so it sits with the other
-      // identity rows (additive — never disturbs the input/actions).
-      const label = overlay.querySelector(".redeem-code-label");
-      if (label) label.insertAdjacentHTML("beforebegin", html);
-    }
-    wireCopyButton(
-      overlay.querySelector(".redeem-copy-code-btn"),
-      value,
-      "Code copié dans le presse-papiers.",
-      "Copie indisponible — sélectionne le code à la main."
-    );
-  };
-  // Wire the copy button for a code row rendered in the initial HTML.
-  renderRedeemedCode(deps.redeemedCode);
-
-  cancelBtn.addEventListener("click", close);
-
   let inFlight = false;
-  const submit = async () => {
+
+  /**
+   * Submit a code for redemption. `overrideCode` is supplied by the one-click
+   * "Réactiver mon code" button (the stored code); otherwise we read whatever
+   * is in the input (a fresh / different code the user typed).
+   */
+  const submit = async (overrideCode) => {
     if (inFlight) return;
-    const code = (input.value || "").trim();
+    const code = (
+      typeof overrideCode === "string" && overrideCode.trim()
+        ? overrideCode
+        : input.value || ""
+    ).trim();
     if (!code) {
       renderResult(buildRedeemResultMessage({ kind: "error", code: "alfred_redeem_invalid" }));
       return;
@@ -278,8 +267,9 @@ export function openRedeemModal(deps = {}) {
       input.disabled = true;
       activateBtn.style.display = "none";
       cancelBtn.textContent = "Terminé";
-      // MON-E: surface the just-redeemed code read-only with a copy
-      // affordance (Rust persisted it to `redeemed_code` for later opens).
+      // MON-E: surface the just-redeemed code read-only with the one-click
+      // reactivate + copy affordances (Rust persisted it to `redeemed_code`
+      // for later opens).
       renderRedeemedCode(code);
       // Reuse the existing tier-refresh plumbing: the upgrade-activated
       // listener (app.js) refreshes the health pill + busts the home-header
@@ -296,12 +286,53 @@ export function openRedeemModal(deps = {}) {
     }
   };
 
-  activateBtn.addEventListener("click", submit);
+  // MON-E: the "your active code" row. Present in the initial HTML when
+  // `deps.redeemedCode` was passed (a prior code); re-rendered on a fresh
+  // successful redeem to reflect the just-entered code. Idempotent —
+  // replaces any existing row in place rather than duplicating it, and wires
+  // both the one-click reactivate button and the copy button each time.
+  const renderRedeemedCode = (code) => {
+    const value = normalizeRedeemedCode(code);
+    if (!value) return;
+    const html = buildRedeemedCodeRowHtml(value);
+    const existing = overlay.querySelector(`#${REDEEMED_CODE_ROW_ID}`);
+    if (existing) {
+      existing.outerHTML = html; // reflect a freshly-redeemed code
+    } else {
+      // Inject just before the code-input label so it sits with the other
+      // identity rows (additive — never disturbs the input/actions).
+      const label = overlay.querySelector(".redeem-code-label");
+      if (label) label.insertAdjacentHTML("beforebegin", html);
+    }
+    // One-click reactivate: submit the stored code directly, no copy-paste.
+    const reactivateBtn = overlay.querySelector(".redeem-reactivate-code-btn");
+    if (reactivateBtn) {
+      reactivateBtn.addEventListener("click", () => submit(value));
+    }
+    wireCopyButton(
+      overlay.querySelector(".redeem-copy-code-btn"),
+      value,
+      "Code copié dans le presse-papiers.",
+      "Copie indisponible — sélectionne le code à la main."
+    );
+  };
+  // Render + wire the code row for a code passed in the initial open call.
+  renderRedeemedCode(deps.redeemedCode);
+
+  // Pre-fill the input with the stored code so the primary "Activer" button
+  // (and Enter) also work without a manual paste — while still letting the
+  // user clear/replace it to enter a DIFFERENT code (additive).
+  const storedCode = normalizeRedeemedCode(deps.redeemedCode);
+  if (storedCode) input.value = storedCode;
+
+  cancelBtn.addEventListener("click", close);
+
+  activateBtn.addEventListener("click", () => submit());
   input.addEventListener("keydown", (e) => {
     if (e.key === "Enter") submit();
   });
 
-  // Focus the input so the user can paste immediately.
+  // Focus the input so the user can paste / edit immediately.
   try {
     input.focus();
   } catch {

@@ -1331,6 +1331,62 @@ main {
   background: rgba(47, 143, 93, 0.32);
 }
 
+/* ── Redeem (activation-code) modal rows ───────────────────────────
+ * The email row and the "your active code" row share a flex layout so the
+ * label + value + action(s) sit on one line and wrap cleanly on narrow
+ * viewports. MON-E UX fix (2026-06-18): the active-code row leads with a
+ * one-click "Réactiver mon code" (greenish primary, matching .error-modal-cta)
+ * so a holder never copy-pastes a code the app already has; "Copier" is a
+ * discreet secondary. */
+.redeem-email-row,
+.redeem-active-code-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.5rem 0;
+  font-size: 0.82rem;
+}
+.redeem-email-label,
+.redeem-active-code-label {
+  color: var(--sea-text, #c9d1d9);
+}
+.redeem-email-value,
+.redeem-active-code-value {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #8ecae6;
+  background: rgba(142, 202, 230, 0.08);
+  border-radius: 4px;
+  padding: 0.15rem 0.4rem;
+}
+.redeem-copy-email-btn,
+.redeem-copy-code-btn {
+  padding: 0.3rem 0.9rem;
+  background: rgba(142, 202, 230, 0.12);
+  border: 1px solid rgba(142, 202, 230, 0.32);
+  border-radius: 4px;
+  color: #8ecae6;
+  cursor: pointer;
+  font-size: 0.78rem;
+}
+.redeem-copy-email-btn:hover,
+.redeem-copy-code-btn:hover {
+  background: rgba(142, 202, 230, 0.22);
+}
+.redeem-reactivate-code-btn {
+  padding: 0.3rem 1rem;
+  background: rgba(47, 143, 93, 0.2);
+  border: 1px solid rgba(47, 143, 93, 0.45);
+  border-radius: 4px;
+  color: #4cbf85;
+  cursor: pointer;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+.redeem-reactivate-code-btn:hover {
+  background: rgba(47, 143, 93, 0.32);
+}
+
 /* ── Cards (shared) ────────────────────────────────────────────── */
 
 .card,

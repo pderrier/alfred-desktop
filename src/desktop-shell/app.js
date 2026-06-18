@@ -61,6 +61,7 @@ import { registerDefaultTriggers } from "/desktop-shell/app-alfred-triggers.js";
 import { startIdleTimer } from "/desktop-shell/app-alfred-idle.js";
 import { installUpgradeFlow } from "/desktop-shell/upgrade-view.js";
 import { openRedeemModal } from "/desktop-shell/app-redeem-modal.js";
+import { reconcileEntitlement } from "/desktop-shell/app-entitlement-reconcile.js";
 import { enforceLegalConsentGate } from "/desktop-shell/app-legal-consent.js";
 import {
   initShellLayout,
@@ -1823,6 +1824,28 @@ const bootstrap = initBootstrap({
   refreshHealthPill,
   refreshAccountStatus,
   getLatestFinarySessionPayload: () => latestFinarySessionPayload,
+  // Root-cause fix (2026-06-18): a paying user holding a valid `redeemed_code`
+  // must never land on the free wall. Before the splash health probe can
+  // surface the "Quota atteint" modal, reconcile the local entitlement —
+  // if the server isn't currently granting `paid`, silently re-redeem the
+  // stored code (re-binding this device, 0 server slot consumed). Fail-soft,
+  // idempotent (at most one attempt per session). On success it dispatches
+  // `alfred://upgrade-activated`, reusing the existing tier-refresh plumbing.
+  reconcileEntitlement: () =>
+    reconcileEntitlement({
+      bridge,
+      getPreferences: async () => {
+        const tauriInvoke = window?.__TAURI__?.core?.invoke;
+        return tauriInvoke ? await tauriInvoke("get_user_preferences_local") : null;
+      },
+      dispatchActivated: (res) => {
+        window.dispatchEvent(
+          new CustomEvent("alfred://upgrade-activated", {
+            detail: { via: "auto-reactivate", ...res },
+          })
+        );
+      },
+    }),
 });
 
 // ── Intent routing ───────────────────────────────────────────────

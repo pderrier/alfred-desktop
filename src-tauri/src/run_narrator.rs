@@ -431,6 +431,13 @@ pub(crate) fn build_narration_prompt(
          (1) la progression c\u{00f4}t\u{00e9} Alfred (ce qui vient de se passer, et si pertinent le compteur X/Y),\n\
          (2) quand c'est pertinent, une br\u{00e8}ve sur une de ces entreprises \
          (secteur, contexte connu, fait notable) en t'appuyant sur ta connaissance g\u{00e9}n\u{00e9}rale.\n\
+         Reste FACTUEL : d\u{00e9}cris seulement ce que montrent les \u{00e9}v\u{00e8}nements ci-dessus. \
+         Une analyse de portefeuille prend du temps (chaque ligne demande plusieurs appels) : \
+         ne d\u{00e9}duis JAMAIS qu'Alfred est « bloqu\u{00e9} », « en boucle » ou « en panne » \
+         \u{00e0} partir d'une simple latence, d'un compteur stable ou d'\u{00e9}v\u{00e8}nements r\u{00e9}p\u{00e9}t\u{00e9}s — \
+         tant que de nouveaux \u{00e9}v\u{00e8}nements arrivent, l'analyse progresse normalement. \
+         N'\u{00e9}voque un ralentissement que si un \u{00e9}v\u{00e8}nement l'indique explicitement \
+         (statut « repairing », « retry », ou erreur). Sinon, garde un ton positif et neutre.\n\
          Ne fais pas r\u{00e9}p\u{00e9}ter une entreprise comme « agent ». Pas de pr\u{00e9}ambule. \
          R\u{00e9}ponds uniquement avec la ou les phrases.",
         previous = previous_block,
@@ -598,8 +605,9 @@ mod tests {
             },
         ];
         let prompt = build_narration_prompt(&events, None, None);
-        // Prompt is richer than v1 (system framing + insight ask) but still bounded.
-        assert!(prompt.len() < 1500, "prompt should be < 1500 chars, got {}", prompt.len());
+        // Prompt is richer than v1 (system framing + insight ask + BUG #3 factual
+        // anti-catastrophizing guard) but still bounded.
+        assert!(prompt.len() < 1800, "prompt should be < 1800 chars, got {}", prompt.len());
         for ticker in ["AAPL", "MSFT", "NVDA"] {
             assert!(prompt.contains(ticker), "prompt missing ticker {ticker}");
         }
@@ -658,6 +666,32 @@ mod tests {
         };
         let prompt_zero = build_narration_prompt(&events, None, Some(&progress_zero));
         assert!(!prompt_zero.contains("Progression globale"));
+    }
+
+    /// BUG #3: the narration prompt must instruct the model to stay factual and
+    /// NOT invent a "blocage"/"boucle" from mere latency or a stable counter.
+    /// (Before the BUG #2 counter fix, the model saw "1/N" repeatedly and
+    /// narrated that Alfred was stuck/looping even though no line was ever
+    /// re-analyzed.) The guard is a standing instruction independent of inputs.
+    #[test]
+    fn narration_prompt_forbids_inventing_blockage_from_latency() {
+        let events = vec![RecordedEvent {
+            ts: SystemTime::now(),
+            kind: "line_done".to_string(),
+            payload: json!({"ticker": "MC", "recommendation": {"signal": "CONSERVER"}}),
+        }];
+        let prompt = build_narration_prompt(&events, None, None);
+        assert!(
+            prompt.contains("Reste FACTUEL"),
+            "prompt must instruct the model to stay factual"
+        );
+        // The model must be told NOT to conclude "bloqué"/"en boucle" from latency.
+        assert!(prompt.contains("bloqu"), "prompt must name the forbidden 'bloqué' framing");
+        assert!(prompt.contains("boucle"), "prompt must name the forbidden 'boucle' framing");
+        assert!(
+            prompt.contains("repairing") || prompt.contains("retry"),
+            "prompt must scope slowdown mentions to explicit repairing/retry signals"
+        );
     }
 
     #[test]

@@ -65,8 +65,14 @@ done
 # of its current value, so the CLI stays aligned even if it lagged behind.
 sed_in_place "0,/^version = \"[^\"]*\"/{s/^version = \"[^\"]*\"/version = \"$NEW\"/}" "$DIR/alfred-cli/Cargo.toml"
 
-# 7. README download links
-sed_in_place "s/v$OLD/v$NEW/g" "$DIR/README.md"
+# 7. README download links — the download-link lines must ALWAYS advertise the
+# new version, even if their text drifted away from $OLD (e.g. it was frozen at
+# v0.3.2 across several releases because a plain `s/v$OLD/.../` only rewrites the
+# *current* version). Scope to the release-link lines (matched by the stable
+# `/alfred/release/` URL marker so the changelog history is never touched) and
+# replace whatever `vX.Y.Z` token they carry, independent of its prior value.
+# `[0-9]\{1,\}` is portable BRE (works under both GNU and BSD sed).
+sed_in_place "/alfred\/release\//s/v[0-9]\{1,\}\.[0-9]\{1,\}\.[0-9]\{1,\}/v$NEW/g" "$DIR/README.md"
 
 # 8. Rebuild Cargo.lock files
 echo "Rebuilding Cargo.lock files..."

@@ -45,6 +45,7 @@ export function initBootstrap(deps) {
     refreshAccountStatus,
     getLatestFinarySessionPayload,
     dismissSplash: externalDismissSplash,
+    reconcileEntitlement,
   } = deps;
 
   function setSplashStatus(text) {
@@ -701,6 +702,17 @@ export function initBootstrap(deps) {
     refreshWizardSourcePolicy(getLatestFinarySessionPayload());
 
     // 2b. Health check — includes auth verification when OpenAI is connected
+    // Entitlement reconciliation MUST run before this health probe so a
+    // paying user holding a valid `redeemed_code` is restored to `paid`
+    // BEFORE refreshHealthPill could surface the "Quota atteint" free-tier
+    // modal (extractFreeTierExhaustion in app.js). Fail-soft + idempotent:
+    // a failure here never blocks startup; the health probe still runs.
+    if (reconcileEntitlement) {
+      try {
+        await reconcileEntitlement();
+      } catch { /* reconciliation is best-effort -- never block startup */ }
+    }
+
     setSplashStatus("Running health check\u2026");
     await refreshHealthPill(openaiOk);
 

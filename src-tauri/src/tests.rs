@@ -770,6 +770,321 @@ use crate::storage::read_json_file;
         assert_eq!(persisted["portfolio"]["positions"].as_array().map(|rows| rows.len()), Some(1));
     }
 
+    /// Parity / non-regression for the "Partial latest-run artifact" bug
+    /// (native + native-oauth, runs 019edc1c0aeb / 019edc06b126 stuck at
+    /// orchestration.status=running / stage=llm_generating with an empty
+    /// composed_payload while the report DID contain the synthesis).
+    ///
+    /// Root cause: `tool_finalize_report` ran `flush_now → persist → evict`. At
+    /// finalize time the in-memory run-state cache still held the pre-synthesis
+    /// snapshot (status=running / stage=llm_generating, set at the top of
+    /// run_synthesis_turn). `persist_retry_global_synthesis` wrote `completed`
+    /// straight to disk, but the trailing `evict` (=flush_now+remove) re-flushed
+    /// the stale `running` snapshot OVER the `completed` state before dropping the
+    /// entry — leaving the run stuck at `running` on disk.
+    ///
+    /// This test reproduces the exact race: it primes the cache with the stale
+    /// `llm_generating` snapshot (exactly as `run_synthesis_turn` does), seeds the
+    /// validated synthesis in the MCP results sidecar (as `validate_synthesis`
+    /// does), then drives the real in-process native path
+    /// (`dispatch_tool_direct("finalize_report")`) and asserts that the run-state
+    /// **read back from disk** is `completed` with a non-empty synthesis — i.e.
+    /// the on-disk run-state agrees with the composed report. Pins the parity
+    /// contract: run-state ↔ report must converge in every mode.
+    #[test]
+    fn native_finalize_report_persists_completed_and_synthesis_to_disk_not_stale_running() {
+        let _guard = env_lock();
+        let _env_cleanup = EnvCleanup(TEST_ENV_KEYS);
+        crate::run_state_cache::reset_cache();
+
+        // Force the native (in-process finalize) path. Without this the test
+        // could read the codex backend name and take a divergent branch; the
+        // bug is specific to native/native-oauth where finalize shares the cache.
+        std::env::set_var("LITELLM_GENERATION_MODE", "native");
+
+        let base_dir = std::env::temp_dir().join(format!(
+            "alfred-finalize-race-{}-{}",
+            std::process::id(),
+            now_epoch_ms()
+        ));
+        let state_dir = base_dir.join("runtime-state");
+        let reports_dir = base_dir.join("reports");
+        fs::create_dir_all(&state_dir).expect("state dir");
+        fs::create_dir_all(reports_dir.join("history")).expect("history dir");
+        std::env::set_var("ALFRED_STATE_DIR", state_dir.as_os_str());
+        std::env::set_var("ALFRED_REPORTS_DIR", reports_dir.as_os_str());
+
+        let run_id = format!("finrace_{}", now_epoch_ms());
+        let synthese = "Synthese globale finalisee nativement avec une lecture \
+            portefeuille complete, une priorisation exploitable et un suivi du \
+            risque adapte au contexte de marche actuel.";
+
+        // (1) Run-state on disk: line analysis finished — pending recos present,
+        // but orchestration still "running" (synthesis not yet finalized).
+        fs::write(
+            state_dir.join(format!("{run_id}.json")),
+            serde_json::to_string(&json!({
+                "run_id": run_id,
+                "account": "PEA",
+                "updated_at": now_iso_string(),
+                "portfolio": {
+                    "valeur_totale": 1000.0,
+                    "plus_value_totale": 50.0,
+                    "liquidites": 25.0,
+                    "positions": [{
+                        "ticker": "MC", "nom": "LVMH SA", "type": "position",
+                        "quantite": 1, "prix_actuel": 800.0, "valeur_actuelle": 800.0,
+                    }],
+                },
+                "pending_recommandations": [{
+                    "line_id": "position:MC",
+                    "ticker": "MC",
+                    "type": "position",
+                    "signal": "CONSERVER",
+                    "synthese": "MC: ligne analysee avec un contexte suffisamment detaille.",
+                }],
+                "orchestration": { "status": "running", "stage": "analyzing_lines" },
+            }))
+            .expect("serialize"),
+        )
+        .expect("write run state");
+
+        // (2) Validated synthesis lives in the MCP results sidecar (what
+        // `tool_validate_synthesis` writes before finalize reads it back).
+        fs::write(
+            state_dir.join(format!("{run_id}_mcp_results.jsonl")),
+            serde_json::to_string(&json!({
+                "type": "synthesis",
+                "composed_payload": {
+                    "synthese_marche": synthese,
+                    "actions_immediates": [],
+                    "prochaine_analyse": "",
+                    "opportunites_watchlist": "",
+                },
+                "at": now_iso_string(),
+            }))
+            .expect("serialize sidecar")
+                + "\n",
+        )
+        .expect("write sidecar");
+
+        // (3) Prime the cache with the STALE pre-synthesis snapshot, exactly as
+        // `run_synthesis_turn` does on entry. This is the snapshot that the buggy
+        // trailing `evict` would flush over the `completed` disk write.
+        crate::run_state::set_native_run_stage(&run_id, "llm_generating", None, None)
+            .expect("set llm_generating stage");
+        // Sanity: cache now holds the stale running snapshot.
+        let cache_dd = state_dir.parent().expect("data dir");
+        let cached = crate::run_state_cache::load(cache_dd, &run_id).expect("load cache");
+        assert_eq!(
+            cached["orchestration"]["stage"], "llm_generating",
+            "precondition: cache holds the stale pre-synthesis snapshot"
+        );
+
+        // (4) Drive the real native finalize path (in-process dispatch).
+        let result = crate::mcp_server::dispatch_tool_direct(
+            cache_dd,
+            "finalize_report",
+            &json!({ "run_id": run_id }),
+        );
+        assert!(
+            result.get("error").is_none(),
+            "finalize_report should not error: {result}"
+        );
+
+        // (5) Force any pending dirty cache flush so a *stale* surviving entry
+        // (the old bug) would clobber disk here. With the fix, the entry was
+        // dropped (evict before persist) so there is nothing to clobber.
+        crate::run_state_cache::flush_to_disk();
+
+        // (6) Read run-state straight from disk — the UI provenance
+        // (`build_run_summary`) reads run-state, not the report.
+        let persisted = read_json_file(&state_dir.join(format!("{run_id}.json")))
+            .expect("persisted run should be readable");
+
+        std::env::remove_var("ALFRED_STATE_DIR");
+        std::env::remove_var("ALFRED_REPORTS_DIR");
+        std::env::remove_var("LITELLM_GENERATION_MODE");
+        let _ = fs::remove_dir_all(&base_dir);
+
+        assert_eq!(
+            persisted["orchestration"]["status"], "completed",
+            "run-state on disk must be `completed`, not stuck at `running` (Partial \
+             latest-run artifact bug)"
+        );
+        let disk_synthese = persisted["composed_payload"]["synthese_marche"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            disk_synthese.len() >= 20,
+            "run-state composed_payload.synthese_marche must be non-empty on disk \
+             (run-state ↔ report parity); got {disk_synthese:?}"
+        );
+        // Recommendations that were already on disk must not be lost by the
+        // evict-flush of the cache base.
+        assert_eq!(
+            persisted["pending_recommandations"]
+                .as_array()
+                .map(|rows| rows.len()),
+            Some(1),
+            "pending recommendations must survive finalize"
+        );
+    }
+
+    // ── BUG #2: native narrator progress counter stuck at "1/N" ─────────────
+    // The `line_done` event's `completed` field feeds both the live UI counter
+    // and the run narrator's ProgressSnapshot. It used to be derived by counting
+    // `"recommendation"` lines in the `_mcp_results.jsonl` sidecar, which
+    // `merge_mcp_results` renames away after every batch — so in native /
+    // native-oauth (multi-batch) the count reset to ~1 each batch and the
+    // narrator concluded Alfred was stuck/looping ("1/35"). It is now derived
+    // from `pending_recommandations` (cumulative, deduped by line_id), the same
+    // set the coverage gate counts.
+
+    /// Pure helper: `count_covered_lines` is cumulative and dedups by line_id
+    /// (a line re-analyzed by the coverage-reprise sweep is counted once).
+    #[test]
+    fn count_covered_lines_is_cumulative_and_dedups_by_line_id() {
+        let state = json!({
+            "pending_recommandations": [
+                { "line_id": "position:MC", "ticker": "MC", "type": "position" },
+                { "line_id": "position:AI", "ticker": "AI", "type": "position" },
+                // Duplicate line_id (reprise re-analysis) — must NOT double-count.
+                { "line_id": "position:MC", "ticker": "MC", "type": "position" },
+                // line_id omitted — reconstructed from type+ticker.
+                { "ticker": "CAP", "type": "position" },
+            ]
+        });
+        assert_eq!(
+            crate::mcp_server::count_covered_lines(&state),
+            3,
+            "MC (deduped) + AI + CAP (reconstructed) = 3 distinct lines"
+        );
+        // Empty / missing → 0 (no panic).
+        assert_eq!(crate::mcp_server::count_covered_lines(&json!({})), 0);
+    }
+
+    /// End-to-end: drive `validate_recommendation` across a simulated batch-merge
+    /// boundary (sidecar renamed away, recos folded into run_state) and assert the
+    /// emitted `line_done.completed` keeps climbing instead of resetting to 1.
+    #[test]
+    fn native_line_done_completed_does_not_reset_across_batch_merge() {
+        let _guard = env_lock();
+        let _env_cleanup = EnvCleanup(TEST_ENV_KEYS);
+        crate::run_state_cache::reset_cache();
+
+        let base_dir = std::env::temp_dir().join(format!(
+            "alfred-progress-{}-{}",
+            std::process::id(),
+            now_epoch_ms()
+        ));
+        let state_dir = base_dir.join("runtime-state");
+        fs::create_dir_all(&state_dir).expect("state dir");
+        std::env::set_var("ALFRED_STATE_DIR", state_dir.as_os_str());
+
+        let run_id = format!("prog_{}", now_epoch_ms());
+        let data_dir = state_dir.parent().expect("data dir").to_path_buf();
+        let tickers = ["MC", "AI", "CAP"];
+
+        // 3-position portfolio → total must read 3 throughout.
+        let positions: Vec<serde_json::Value> = tickers
+            .iter()
+            .map(|t| json!({ "ticker": t, "nom": format!("{t} SA"), "type": "position" }))
+            .collect();
+        fs::write(
+            state_dir.join(format!("{run_id}.json")),
+            serde_json::to_string(&json!({
+                "run_id": run_id,
+                "portfolio": { "positions": positions },
+                "pending_recommandations": [],
+                "orchestration": { "status": "running", "stage": "analyzing_lines" },
+            }))
+            .expect("serialize"),
+        )
+        .expect("write run state");
+
+        // Build a recommendation that passes validation (no hard issues).
+        let rec = |ticker: &str| {
+            json!({
+                "line_id": format!("position:{ticker}"),
+                "ticker": ticker,
+                "type": "position",
+                "signal": "CONSERVER",
+                "conviction": "moderee",
+                "synthese": format!(
+                    "{ticker}: conserver la ligne avec discipline active, suivi du \
+                     risque et lecture fondamentale suffisamment detaillee pour valider."
+                ),
+                "analyse_technique": "Momentum stable.",
+                "analyse_fondamentale": "Qualite robuste.",
+                "analyse_sentiment": "Neutre.",
+                "raisons_principales": ["Qualite", "Execution"],
+                "action_recommandee": "Conserver",
+            })
+        };
+
+        // Read the LAST `line_done.completed` from the progress sidecar.
+        let last_completed = |run_id: &str| -> u64 {
+            let p = state_dir.join(format!("{run_id}_mcp_progress.jsonl"));
+            let content = fs::read_to_string(&p).unwrap_or_default();
+            content
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter(|e| e.get("type").and_then(|v| v.as_str()) == Some("line_done"))
+                .filter_map(|e| e.get("completed").and_then(|v| v.as_u64()))
+                .last()
+                .unwrap_or(0)
+        };
+
+        let validate = |ticker: &str| {
+            crate::mcp_server::dispatch_tool_direct(
+                &data_dir,
+                "validate_recommendation",
+                &json!({
+                    "run_id": run_id,
+                    "recommendation": serde_json::to_string(&rec(ticker)).unwrap(),
+                }),
+            )
+        };
+
+        // Batch 1: two lines validated → completed climbs 1, 2.
+        validate("MC");
+        assert_eq!(last_completed(&run_id), 1, "after MC: 1 covered");
+        validate("AI");
+        assert_eq!(last_completed(&run_id), 2, "after AI: 2 covered");
+
+        // Simulate `merge_mcp_results`: the two recos are folded into run_state
+        // (cache + disk) and the sidecar is consumed/renamed away.
+        crate::patch_run_state_direct_with(&run_id, |rs| {
+            if let Some(obj) = rs.as_object_mut() {
+                obj.insert(
+                    "pending_recommandations".to_string(),
+                    json!([
+                        rec("MC"),
+                        rec("AI"),
+                    ]),
+                );
+            }
+        })
+        .expect("merge into run_state");
+        crate::run_state_cache::flush_to_disk();
+        let _ = fs::remove_file(state_dir.join(format!("{run_id}_mcp_results.jsonl")));
+
+        // Batch 2: the third line. With the OLD sidecar-count logic this reset to
+        // 1; with the fix it must read 3 (cumulative).
+        validate("CAP");
+        let completed_after_merge = last_completed(&run_id);
+
+        std::env::remove_var("ALFRED_STATE_DIR");
+        let _ = fs::remove_dir_all(&base_dir);
+
+        assert_eq!(
+            completed_after_merge, 3,
+            "after the batch-merge boundary the counter must stay cumulative (3/3), \
+             not reset to 1 — this is the 'stuck at 1/N' narrator bug"
+        );
+    }
+
     // ── Coverage-reprise: synthesis-turn targeted re-analysis (bug
     // 019e9455124c — run finalized `completed` with 5/34 lines uncovered).
     // The four scenarios from the brief: (a) reprise fires, (c) reprise heals
